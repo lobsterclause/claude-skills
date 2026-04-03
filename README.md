@@ -9,6 +9,16 @@ This repository collects reusable Claude skills for accessibility review, protot
 - Cowork review skill packages: 2
 - Planned skill directories already scaffolded in the repo: 11
 
+## Collection Summary
+
+| Collection | Status | Packaged skills | Notes |
+|------------|--------|-----------------|-------|
+| `accessibility-skills-complete/` | Active | 33 `.skill` archives | Accessibility-focused suite organized by workflow stage |
+| `cowork-agent-audit/` | Active | 1 `SKILL.md` package | Standalone multi-reviewer prototype audit package |
+| `cowork-skills/cowork-agent-audit/` | Active | 1 `SKILL.md` package | Namespaced copy of the cowork audit package |
+| `design-skills/` | Scaffolded | 0 packaged skills | Concept directories only, no `.skill` or `SKILL.md` files yet |
+| `other/` | Scaffolded | 0 packaged skills | Miscellaneous concept directories only |
+
 ## Implemented Collections
 
 ### `accessibility-skills-complete/`
@@ -101,6 +111,12 @@ Use these collections when you want focused Claude expertise for:
 - accessibility strategy, audits, testing, and handoff
 - prototype and frontend design reviews
 - future design-system and research-oriented skill expansion
+
+## Where To Start
+
+- Start with `accessibility-skills-complete/README.md` if you want the full accessibility suite with category-by-category detail.
+- Start with `cowork-agent-audit/README.md` if you want a guided, multi-perspective prototype review workflow.
+- Use the root README as the inventory view: what is packaged today, what is duplicated in namespaced form, and what is still only scaffolded.
 
 ## Contributing
 
