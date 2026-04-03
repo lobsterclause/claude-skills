@@ -4,10 +4,11 @@ This repository collects reusable Claude skills for accessibility review, protot
 
 ## Inventory
 
-- Implemented skills/packages: 35 total (`33` `.skill` files and `2` `SKILL.md` packages)
+- Implemented skills/packages: 36 total (`34` `.skill` files and `2` `SKILL.md` packages)
 - Accessibility skills: 33
 - Cowork review skill packages: 2
-- Planned skill directories already scaffolded in the repo: 11
+- Design skill packages: 1
+- Planned skill directories already scaffolded in the repo: 10
 
 ## Collection Summary
 
@@ -16,7 +17,7 @@ This repository collects reusable Claude skills for accessibility review, protot
 | `accessibility-skills-complete/` | Active | 33 `.skill` archives | Accessibility-focused suite organized by workflow stage |
 | `cowork-agent-audit/` | Active | 1 `SKILL.md` package | Standalone multi-reviewer prototype audit package |
 | `cowork-skills/cowork-agent-audit/` | Active | 1 `SKILL.md` package | Namespaced copy of the cowork audit package |
-| `design-skills/` | Scaffolded | 0 packaged skills | Concept directories only, no `.skill` or `SKILL.md` files yet |
+| `design-skills/` | Active | 1 `.skill` archive | Currently includes the Futures Wheel template plus scaffolded concept directories |
 | `other/` | Scaffolded | 0 packaged skills | Miscellaneous concept directories only |
 
 ## Implemented Collections
@@ -85,6 +86,13 @@ Namespaced copy of the cowork review package for teams that want it grouped unde
 - Skill package: `design-review-cowork`
 - Included reviewer modules in this copy: `accessibility`, `brand-consistency`, `design-critic`, `frontend`, `orchestrator`
 
+### `design-skills/`
+
+Early-stage design skill collection with one packaged template and several scaffolded concept folders.
+
+#### Packaged skills
+- `futures-wheel`
+
 ## Planned Skill Directories
 
 These folders already exist in the repository, but they do not currently contain packaged `.skill` or `SKILL.md` files.
@@ -96,7 +104,6 @@ These folders already exist in the repository, but they do not currently contain
 - `design-critique`
 - `design-system-auditor`
 - `ethical-lean-design`
-- `futures-wheel`
 - `gamification-auditor`
 - `research-synthesis`
 
