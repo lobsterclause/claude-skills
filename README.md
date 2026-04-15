@@ -18,8 +18,13 @@ Enabling only the plugins you need keeps each session's skill list small.
 
 **Regenerating the marketplace:** the `plugins/` tree and
 `.claude-plugin/marketplace.json` are generated from the `.skill` archives by
-`scripts/build-marketplace.py`. Rerun it after adding or updating a `.skill`
-source.
+[`claude-skill-marketplace`](https://github.com/lobsterclause/claude-skill-marketplace).
+After editing a `.skill` source:
+
+```bash
+pip install claude-skill-marketplace
+./scripts/build-marketplace.sh
+```
 
 ## Inventory
 
