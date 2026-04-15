@@ -1,0 +1,9 @@
+{
+  "name": "contrast-checker",
+  "version": "0.1.0",
+  "description": "Calculate and evaluate color contrast ratios for accessibility compliance. Use this skill whenever the user provides color values (hex, RGB, HSL, CSS named colors) and wants to check contrast, find accessible color alternatives, audit a palette, or understand WCAG contrast requirements. Trigger on phrases like \"contrast ratio\", \"color contrast\", \"check these colors\", \"does this pass WCAG\", \"accessible color\", \"contrast checker\", \"what's the contrast between\", \"fix my contrast\", \"find a color that passes\", \"dark mode contrast\", \"color blind\", \"deuteranopia\", \"protanopia\", or any mention of 1.4.3, 1.4.6, 1.4.11, or APCA. Also trigger when the user shares a color palette and asks if it's accessible, or when reviewing design tokens for accessibility. Always show the math, not just pass/fail.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

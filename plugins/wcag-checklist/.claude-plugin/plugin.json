@@ -1,0 +1,9 @@
+{
+  "name": "wcag-checklist",
+  "version": "0.1.0",
+  "description": "Generate a custom WCAG 2.2 checklist scoped to a specific product type, component, user flow, or compliance level. Use this skill whenever the user needs a WCAG checklist, compliance checklist, audit checklist, or accessibility review checklist for any specific context. Generates scoped, actionable checklists\u2014not a dump of all 78 criteria regardless of relevance. Includes effort estimation, severity/impact ratings, plain-language test instructions, and identifies most commonly failed criteria.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

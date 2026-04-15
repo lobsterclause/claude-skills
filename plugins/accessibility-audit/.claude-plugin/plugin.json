@@ -1,0 +1,9 @@
+{
+  "name": "accessibility-audit",
+  "version": "0.1.0",
+  "description": "Audit designs, Figma files, screenshots, or UI descriptions for accessibility issues. Use this skill whenever the user shares a design, mockup, screen, component, or Figma file and asks about accessibility, WCAG compliance, Section 508, inclusive design, or wants to find issues before handoff. Also trigger when the user mentions color contrast, touch targets, focus order, visual hierarchy, or any phrase like \"is this accessible?\", \"accessibility review\", \"a11y audit\", or \"check this for accessibility\". Go deep \u2014 this skill covers WCAG 2.2 AAA, Section 508, and design-layer accessibility that automated tools cannot catch. Provides severity ratings, detailed audit criteria, and Figma-specific guidance.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

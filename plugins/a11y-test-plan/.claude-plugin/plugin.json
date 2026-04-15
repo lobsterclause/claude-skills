@@ -1,0 +1,9 @@
+{
+  "name": "a11y-test-plan",
+  "version": "0.1.0",
+  "description": "Generate comprehensive accessibility test plans with manual and automated test cases tied to WCAG criteria, organized by component, flow, or release phase. Includes effort estimation, regression test guidance, CI/CD integration, and test documentation templates. Use this skill whenever the user needs to plan, structure, or document accessibility testing \u2014 including QA test plans, sprint acceptance criteria, regression suites, release checklists, or testing documentation for audits. Trigger on phrases like \"accessibility test plan\", \"a11y test cases\", \"QA accessibility\", \"how to test accessibility\", \"test for screen readers\", \"accessibility acceptance criteria\", \"regression testing accessibility\", \"testing checklist\", \"what to test\", or any request to define or structure accessibility testing. Output is ready for QA teams, GitHub issues, Jira tickets, or test management tools.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "disability-testing",
+  "version": "0.1.0",
+  "description": "\"Test digital products through disability-specific profiles \u2014 including simulation techniques, AT testing patterns, and per-disability findings templates. Use this skill for disability-specific UX testing, simulation guidance, or when recruiting disabled testers for usability studies. Trigger on phrases like disability testing, test with screen reader users, simulate low vision, motor impairment testing, deaf user testing, cognitive disability testing, or any request to evaluate a product through specific disability experiences.\"",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "accessibility-annotations",
+  "version": "0.1.0",
+  "description": "Generate accessibility annotation content for design handoff \u2014 including focus order numbers, ARIA roles and labels, landmark regions, heading levels, alt text, interaction states, keyboard behavior specs, and completeness checklists. Use this skill whenever a designer needs to annotate Figma files or design specs for developer handoff, or when creating accessibility documentation that bridges design and engineering. Includes annotation completeness checklist, visual annotation examples, and developer Q&A. Trigger on phrases like \"accessibility annotations\", \"annotate this design\", \"design handoff\", \"Figma annotations\", \"focus order annotations\", \"ARIA annotations\", \"accessibility specs\", \"handoff documentation\", \"annotate for developers\", \"design to dev accessibility\", or any request to document accessibility intent in a design. Produces annotation content ready to place in Figma, Zeplin, Storybook, or any design handoff tool.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

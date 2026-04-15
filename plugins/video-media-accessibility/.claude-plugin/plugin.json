@@ -1,0 +1,9 @@
+{
+  "name": "video-media-accessibility",
+  "version": "0.1.0",
+  "description": "Audit and improve accessibility of video, audio, and media content \u2014 including captions, audio descriptions, transcripts, accessible media players, and WCAG 1.2.x compliance. Use this skill whenever the user is working with video, audio, podcasts, webinars, live streaming, animations with narration, or any time-based media. Trigger on phrases like \"video accessibility\", \"caption\", \"captions\", \"subtitle\", \"audio description\", \"transcript\", \"media player\", \"accessible video\", \"WCAG 1.2\", \"closed captions\", \"open captions\", \"CC\", \"video audit\", \"audio accessibility\", \"podcast accessibility\", \"webinar accessibility\", \"live caption\", \"CART\", \"sign language interpretation\", or any request involving making video or audio content accessible.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

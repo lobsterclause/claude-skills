@@ -1,0 +1,9 @@
+{
+  "name": "full-accessibility-audit",
+  "version": "0.1.0",
+  "description": "\"Perform a complete, multi-dimensional accessibility audit by orchestrating all audit-category skills into a single unified report. Use this skill whenever the user asks for a full audit, complete accessibility review, end-to-end assessment, or wants to audit an entire product, page, or component suite from every angle. Trigger on phrases like 'full accessibility audit', 'complete audit', 'audit everything', 'comprehensive accessibility review', 'full a11y audit', 'audit this product', 'audit this page', or any audit request that does not specify a single narrow dimension. Covers design, code, contrast, copy, keyboard, motion, forms, tables, alt text, cognitive, mobile/touch, PDF/document, video/media, and design handoff annotations. Produces a prioritized remediation roadmap, business impact narrative, and test plan. Do not use narrow single-dimension skills when the user wants the full picture \u2014 use this.\"",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

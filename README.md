@@ -2,6 +2,25 @@
 
 This repository collects reusable Claude skills for accessibility review, prototype critique, design analysis, and related workflows.
 
+> **Note:** This fork adds a `/plugin` marketplace layer so each skill can be
+> installed and toggled on demand via Claude Code's plugin manager. See
+> [Use as a Claude Code marketplace](#use-as-a-claude-code-marketplace). All
+> original `.skill` archives are preserved unchanged.
+
+## Use as a Claude Code marketplace
+
+```
+claude plugin marketplace add lobsterclause/claude-skills
+/plugin                      # browse + enable the skills you want
+```
+
+Enabling only the plugins you need keeps each session's skill list small.
+
+**Regenerating the marketplace:** the `plugins/` tree and
+`.claude-plugin/marketplace.json` are generated from the `.skill` archives by
+`scripts/build-marketplace.py`. Rerun it after adding or updating a `.skill`
+source.
+
 ## Inventory
 
 - Implemented skills/packages: 36 total (`34` `.skill` files and `2` `SKILL.md` packages)

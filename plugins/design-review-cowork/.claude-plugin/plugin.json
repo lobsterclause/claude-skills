@@ -1,0 +1,9 @@
+{
+  "name": "design-review-cowork",
+  "version": "0.1.0",
+  "description": "Comprehensive prototype review from multiple expert perspectives with scoring, Ship/No Ship recommendation, accessibility depth, performance metrics, and business impact analysis. Use this skill whenever you have a prototype (HTML, React, screenshot, or code) and need critical feedback from Senior UX Designer, Accessibility Specialist, Frontend Engineer, Performance Reviewer, and Design Critic. Generates detailed report with Prototype Readiness Score and actionable fix instructions.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

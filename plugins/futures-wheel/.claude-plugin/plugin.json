@@ -1,0 +1,9 @@
+{
+  "name": "futures-wheel",
+  "version": "0.1.0",
+  "description": "Map the first-, second-, and third-order consequences of any decision, feature, event, or trend using the AI-powered Futures Wheel method. Use this skill whenever someone needs to think through ripple effects, unintended consequences, or downstream impacts of a choice before committing to it. Trigger on phrases like \"futures wheel\", \"consequences of\", \"ripple effects\", \"second-order effects\", \"what happens if we\", \"scenario planning\", \"what could go wrong\", \"map the impact\", \"decision analysis\", \"what are the downstream effects\", \"think through this decision\", \"launch risk review\", \"strategic foresight\", \"unintended consequences\", or any request to map out what might happen as a result of a product, business, or life decision. Always use this skill \u2014 do not attempt a futures wheel analysis without it.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "screen-reader-scripting",
+  "version": "0.1.0",
+  "description": "Write screen reader test scripts for NVDA, JAWS, and VoiceOver \u2014 documenting expected announcements, keyboard commands, navigation flows, and pass/fail criteria for assistive technology testing. Includes component-specific test scripts for common patterns (accordion, combobox, date picker, toast, notification), AT quirks documentation, and bug reporting templates. Use this skill whenever the user needs to test with a screen reader, document expected screen reader behavior, write AT test scripts, or verify what a screen reader should announce for a component or flow. Trigger on phrases like \"screen reader test\", \"NVDA test\", \"JAWS test\", \"VoiceOver test\", \"what should screen reader say\", \"screen reader script\", \"AT testing\", \"assistive technology test\", \"test with NVDA\", \"test announcement\", or any request to verify or document screen reader behavior. Covers NVDA, JAWS, VoiceOver (macOS + iOS), and TalkBack.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

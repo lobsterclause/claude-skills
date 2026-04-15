@@ -1,0 +1,9 @@
+{
+  "name": "motion-auditor",
+  "version": "0.1.0",
+  "description": "Audit animations, transitions, and motion in UI for accessibility \u2014 including prefers-reduced-motion implementation, vestibular disorder risk, seizure thresholds, and WCAG 2.3 and 2.2 compliance. Use this skill whenever the user is building or reviewing any animation, transition, scroll effect, parallax, auto-playing content, loading spinner, skeleton screen, toast, carousel, video, or any moving UI element. Trigger on phrases like \"animation accessibility\", \"reduced motion\", \"prefers-reduced-motion\", \"vestibular\", \"motion sensitivity\", \"seizure risk\", \"flashing content\", \"parallax accessibility\", \"scroll animation\", \"view transitions\", \"skeleton screen motion\", \"animated loading\", \"WCAG 2.3\", \"motion intensity\", or any request to make motion accessible. Goes beyond compliance \u2014 addresses real harm caused by inaccessible motion.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

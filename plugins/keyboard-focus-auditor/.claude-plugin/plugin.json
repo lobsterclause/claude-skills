@@ -1,0 +1,9 @@
+{
+  "name": "keyboard-focus-auditor",
+  "version": "0.1.0",
+  "description": "Audit, document, and fix keyboard navigation flows, tab order, focus indicators, focus traps, skip links, and focus management for dynamic content. Use this skill whenever the user needs to test or improve keyboard accessibility \u2014 including auditing tab order, documenting expected keyboard behavior, fixing focus management after state changes, implementing focus traps, or verifying WCAG 2.1 keyboard criteria. Trigger on phrases like \"keyboard navigation\", \"tab order\", \"focus management\", \"focus trap\", \"skip link\", \"keyboard accessible\", \"focus indicator\", \"focus visible\", \"keyboard flow\", \"keyboard audit\", \"roving tabindex\", \"combobox\", \"nested dialog\", \"virtual scrolling\", \"Windows High Contrast\", \"keyboard shortcut\", \"can't use keyboard\", or any request to make a UI operable without a mouse. Covers WCAG 2.2 AA/AAA keyboard criteria and real assistive technology keyboard patterns.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

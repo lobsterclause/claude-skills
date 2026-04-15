@@ -1,0 +1,9 @@
+{
+  "name": "alt-text-generator",
+  "version": "0.1.0",
+  "description": "Generate accurate, context-aware alt text for images. Use this skill whenever the user shares an image or describes one and asks for alt text, image descriptions, figure captions, or accessible image annotations. Also trigger when the user asks about whether an image is decorative, needs a long description, or how to describe a chart, graph, infographic, diagram, screenshot, product photo, portrait, illustration, icon, social media image, or e-commerce image. Trigger on phrases like \"write alt text\", \"describe this image\", \"what should the alt be\", \"is this decorative\", \"long description\", \"accessible image\", \"figure caption\", \"alt for chart\", \"product image alt\", \"social media accessibility\", or \"screen reader description\". Goes beyond generic descriptions \u2014 alt text is context-dependent and purposeful.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

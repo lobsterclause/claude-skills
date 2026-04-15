@@ -1,0 +1,9 @@
+{
+  "name": "gamification-auditor",
+  "version": "0.1.0",
+  "description": "Audit products for how responsibly they use gamification \u2014 scoring each of the 10 Core Drives of human motivation against ethical guardrails to detect manipulation, addiction design, and dark patterns. Includes age-specific considerations, regulatory awareness, and healthy engagement alternatives for every exploitative pattern identified.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

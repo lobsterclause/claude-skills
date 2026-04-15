@@ -1,0 +1,9 @@
+{
+  "name": "accessible-tables",
+  "version": "0.1.0",
+  "description": "Design, code, and audit accessible data tables \u2014 including complex headers, scope, summaries, responsive patterns, responsive strategies, editable cells, filtering, and screen reader behavior. Use this skill whenever the user is building or reviewing any HTML table, data grid, comparison table, schedule, pricing table, data dashboard, spreadsheet-like UI, or tabular data presentation. Trigger on phrases like \"accessible table\", \"data table\", \"table headers\", \"scope attribute\", \"colspan\", \"rowspan\", \"complex table\", \"responsive table\", \"comparison table\", \"pricing table\", \"schedule\", \"screen reader table\", \"virtual table\", \"infinite scroll\", \"editable cells\", \"inline editing\", \"filter table\", or any request involving tabular data. Covers WCAG 2.2 AAA, Section 508, real screen reader behavior across NVDA, JAWS, and VoiceOver, data grids, virtualization, and modern responsive table patterns.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

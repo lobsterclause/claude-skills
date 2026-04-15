@@ -1,0 +1,9 @@
+{
+  "name": "pdf-document-accessibility",
+  "version": "0.1.0",
+  "description": "Audit, remediate, and create accessible PDFs and documents \u2014 including tagged PDFs, reading order, headings, alt text for figures, form fields, tables, language declaration, and Section 508 document compliance. Use this skill whenever the user is working with PDFs, Word documents, PowerPoint files, or any downloadable document and needs to make it accessible. Trigger on phrases like \"accessible PDF\", \"tagged PDF\", \"PDF accessibility\", \"document accessibility\", \"Word accessibility\", \"PowerPoint accessibility\", \"PDF remediation\", \"Section 508 document\", \"PDF/UA\", \"Acrobat accessibility\", \"PDF/UA-2\", \"document audit\", or any request involving accessible documents.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

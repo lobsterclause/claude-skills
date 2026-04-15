@@ -1,0 +1,9 @@
+{
+  "name": "older-audiences-auditor",
+  "version": "0.1.0",
+  "description": "Audit prototypes, apps, and digital products for how well they serve users aged 50 and older \u2014 scoring across vision, cognition, motor control, hearing, trust, and content clarity, with specific age-band guidance (50-65, 65-80, 80+), concrete measurement thresholds, and technology comfort assessment. Use this skill whenever someone needs to evaluate a product for older user audiences, check if a design accommodates age-related physical or cognitive changes, audit typography and touch targets for older adults, or ensure a product isn't inadvertently excluding users over 50. Trigger on phrases like older audiences audit, designing for seniors, older adults UX, age-inclusive design, 50+ users, elder UX, senior-friendly design, aging population design, older user accessibility, is this usable for older adults, or any request to evaluate how well a product serves users experiencing age-related changes. Always use this skill \u2014 do not attempt an older audiences audit without it.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

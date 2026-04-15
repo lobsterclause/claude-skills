@@ -1,0 +1,9 @@
+{
+  "name": "accessibility-advisor",
+  "version": "0.1.0",
+  "description": "Help design and product leaders make the business case for accessibility, build organizational strategy, plan remediation roadmaps, respond to stakeholder objections, and develop accessibility policy. Use this skill whenever stakeholders need persuasion on accessibility value\u2014including ROI framing, legal risk assessment, maturity evaluation, competitive positioning, or Accessibility Statement development.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "mobile-touch-auditor",
+  "version": "0.1.0",
+  "description": "Audit mobile and touch interfaces for accessibility \u2014 including gesture alternatives, touch target sizing, orientation, virtual keyboards, iOS VoiceOver, Android TalkBack, wearables, and mobile-specific WCAG criteria. Use this skill whenever the user is building or reviewing a mobile app, responsive web app, touch interface, wearable, or tablet UI and needs mobile-specific accessibility guidance. Trigger on phrases like \"mobile accessibility\", \"touch accessibility\", \"iOS accessibility\", \"Android accessibility\", \"VoiceOver iOS\", \"TalkBack\", \"touch target\", \"gesture alternative\", \"swipe gesture\", \"mobile audit\", \"responsive accessibility\", \"accessible app\", \"orientation lock\", \"tablet accessibility\", \"wearable accessibility\", or any request involving mobile or tablet UI. Covers WCAG 2.2 AA/AAA mobile criteria, iOS 17+ VoiceOver, Android 14+ TalkBack, and platform-specific accessibility APIs.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

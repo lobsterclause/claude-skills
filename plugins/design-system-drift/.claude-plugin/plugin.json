@@ -1,0 +1,9 @@
+{
+  "name": "design-system-drift",
+  "version": "0.1.0",
+  "description": "Scans a code repository and detects drift from the design system across token drift, component drift, pattern drift, accessibility drift, and Storybook drift. Produces a prioritized report with Drift Score (0-100), Drift Velocity trend analysis, severity-weighted findings, and applies fixes with human approval. Trigger on design system audits, hardcoded values, component drift, Storybook sync, or design consistency checks.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

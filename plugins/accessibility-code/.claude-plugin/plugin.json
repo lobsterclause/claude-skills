@@ -1,0 +1,9 @@
+{
+  "name": "accessibility-code",
+  "version": "0.1.0",
+  "description": "Review, audit, or write accessible frontend code \u2014 HTML, CSS, JavaScript, React, Vue, Svelte, or other UI frameworks. Use this skill whenever the user shares code and asks about accessibility, semantic HTML, ARIA, keyboard navigation, focus management, screen reader compatibility, or WCAG conformance. Also trigger for requests like \"make this component accessible\", \"add ARIA to this\", \"fix the keyboard navigation\", \"is this semantic?\", \"accessible React component\", \"fix focus trap\", \"accessible modal\", \"accessible dropdown\", or any code-related accessibility question. Covers WCAG 2.2 AAA, Section 508, and ARIA APG patterns. Goes deeper than Lighthouse or axe-core\u2014catches logic, interaction, dynamic state, and framework-specific issues automated tools miss.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "wcag-compliance-auditor",
+  "version": "0.1.0",
+  "description": "\"Systematically audit against all WCAG 2.2 success criteria with severity ratings, effort estimates, and business impact narratives. Use this skill for criterion-level compliance audits, conformance declarations, or VPAT preparation. Trigger on phrases like WCAG compliance audit, WCAG 2.2 audit, criterion-by-criterion, conformance level, compliance report, Section 508 audit, or any request for detailed standards-based accessibility assessment.\"",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

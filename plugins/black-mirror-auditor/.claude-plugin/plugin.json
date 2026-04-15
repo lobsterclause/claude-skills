@@ -1,0 +1,9 @@
+{
+  "name": "black-mirror-auditor",
+  "version": "0.1.0",
+  "description": "Run a Black Mirror Exercise on any prototype, product, feature, or design concept to surface ethical risks, unintended harms, and worst-case futures \u2014 before they ship. Stress-test products for dark patterns, identify anti-goals, and generate concrete mitigation strategies informed by regulatory frameworks and real-world harm precedents.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

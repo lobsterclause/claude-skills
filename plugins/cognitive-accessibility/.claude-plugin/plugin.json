@@ -1,0 +1,9 @@
+{
+  "name": "cognitive-accessibility",
+  "version": "0.1.0",
+  "description": "Audit UI, content, and interactions for cognitive accessibility \u2014 including cognitive load, plain language, consistent patterns, error prevention, memory demands, distraction, and COGA (Cognitive and Learning Disabilities Accessibility) guidance. Use this skill whenever the user needs to evaluate or improve accessibility for users with cognitive, learning, or neurological disabilities \u2014 including ADHD, dyslexia, autism, memory impairment, anxiety, brain injury, or age-related cognitive decline. Trigger on phrases like \"cognitive accessibility\", \"cognitive load\", \"plain language audit\", \"COGA\", \"accessible for ADHD\", \"accessible for dyslexia\", \"reading difficulty\", \"memory load\", \"distraction\", \"consistent UI\", \"error prevention\", \"timeout\", \"notifications\", \"session management\", \"cognitive disability\", \"neurodivergent\", \"learning disability\", \"scoring\", \"0-10 scale\", or any request to make content or UI easier to understand and use. Covers WCAG 2.2 AAA cognitive criteria, COGA supplemental guidance, and plain language standards.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

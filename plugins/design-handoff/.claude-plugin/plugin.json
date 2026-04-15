@@ -1,0 +1,9 @@
+{
+  "name": "design-handoff",
+  "version": "0.1.0",
+  "description": "Generate a comprehensive design handoff document from a vibe-coded prototype. Use this skill whenever the user has finished building or iterating on a prototype (HTML, React, or any front-end code) and is ready to hand it off to developers, stakeholders, or both. Trigger whenever the user says things like \"handoff\", \"hand off\", \"ready to ship\", \"prepare for dev\", \"document this prototype\", \"wrap this up for the team\", \"create handoff docs\", or indicates they're done building and need to communicate what they built and why. Also trigger when the user wants to demonstrate the business value of their design work, or needs to package a prototype with specs, accessibility notes, and effort metrics.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

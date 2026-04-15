@@ -1,0 +1,9 @@
+{
+  "name": "accessibility-copy",
+  "version": "0.1.0",
+  "description": "Write or audit accessible content \u2014 alt text, ARIA labels, error messages, button labels, link text, form instructions, tooltips, notifications, empty states, and plain language copy. Use this skill whenever the user asks to write or review any UI copy, microcopy, or content strings with accessibility in mind. Trigger on phrases like \"alt text\", \"accessible label\", \"screen reader\", \"plain language\", \"error message\", \"ARIA label\", \"empty state copy\", \"notification text\", \"link text\", reading level, Flesch-Kincaid, SMOG, Gunning Fog, localization, cognitive accessibility, or any request to make copy more inclusive or understandable.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

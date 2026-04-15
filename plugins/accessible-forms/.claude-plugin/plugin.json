@@ -1,0 +1,9 @@
+{
+  "name": "accessible-forms",
+  "version": "0.1.0",
+  "description": "Design, code, and audit accessible forms \u2014 including input labels, validation, error recovery, multi-step flows, autofill, input modes, date pickers, payment forms, and assistive technology compatibility. Use this skill whenever the user is building or reviewing any form, input, field, data entry UI, checkout, or form-based interaction. Trigger on phrases like \"accessible form\", \"form validation\", \"error message\", \"required field\", \"input label\", \"multi-step form\", \"form accessibility\", \"autofill\", \"date picker\", \"address form\", \"payment form\", \"form UX for screen readers\", \"checkout flow\", or any request involving checkboxes, radio buttons, selects, date pickers, file uploads, or password fields. Covers WCAG 2.2 AAA, Section 508, ARIA APG form patterns, real assistive technology behavior, and form maturity scoring.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

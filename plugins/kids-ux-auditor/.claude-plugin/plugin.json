@@ -1,0 +1,9 @@
+{
+  "name": "kids-ux-auditor",
+  "version": "0.1.0",
+  "description": "Evaluate prototypes, apps, or digital experiences for how well they work for children, with rigorous COPPA compliance assessment, dark pattern detection, and age-band motor/cognitive capability matching (0-2, 3-5, 6-8, 9-12, 13-17) with caregiver co-testing methodology. Use this skill whenever the user wants to audit a product designed for kids or used by kids \u2014 including learning apps, games, entertainment tools, or any digital experience with a child audience. Trigger on phrases like \"kids app audit\", \"children's UX\", \"is this good for kids\", \"child-safe design\", \"age-appropriate\", \"review this for children\", \"kids product review\", \"ethical kids design\", \"COPPA compliance check\", or any request to evaluate a prototype or product against children's design standards. Always use this skill for kids-focused audits \u2014 do not attempt to evaluate child UX without it.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

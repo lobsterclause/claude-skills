@@ -1,0 +1,9 @@
+{
+  "name": "playwright-accessibility-auditor",
+  "version": "0.1.0",
+  "description": "\"Test rendered pages in a real browser for accessibility \u2014 capturing multi-viewport screenshots, running axe-core scans, verifying keyboard navigation, focus indicators, zoom/reflow, dark mode, and reduced motion. Use this skill for browser-based accessibility testing, visual regression, or when you need to verify what actually renders rather than what the source says. Trigger on phrases like browser testing, playwright audit, rendered accessibility, screenshot accessibility, viewport testing, zoom testing, dark mode accessibility, visual regression, or any request to test accessibility in a real browser.\"",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

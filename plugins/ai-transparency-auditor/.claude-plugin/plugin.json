@@ -1,0 +1,9 @@
+{
+  "name": "ai-transparency-auditor",
+  "version": "0.1.0",
+  "description": "Audit AI-powered features and products for transparency, explainability, consent, bias risk, human oversight, and regulatory compliance (EU AI Act) \u2014 producing a scored report with specific fixes, bias testing methodology, model card template, and consent pattern examples. Use this skill whenever someone needs to evaluate an AI feature before shipping, check if an AI product is honest with users about what it is and how it works, audit for model bias or fairness concerns, review consent flows for AI data use, ensure human override paths exist for high-stakes AI decisions, or assess regulatory risk. Trigger on phrases like AI transparency audit, AI ethics review, is this AI feature ethical, explainability audit, AI bias check, AI consent review, does this disclose AI use, AI fairness audit, human oversight review, AI accountability, labeling AI content, EU AI Act compliance, or any request to evaluate whether an AI-powered product is honest, fair, safe, and compliant. Always use this skill \u2014 do not attempt an AI transparency audit without it.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}
