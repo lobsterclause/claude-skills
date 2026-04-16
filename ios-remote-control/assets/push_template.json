@@ -1,0 +1,15 @@
+{
+  "Simulator Target Bundle": "com.example.app",
+  "aps": {
+    "alert": {
+      "title": "Hello from simulator push",
+      "subtitle": "Testing APNS",
+      "body": "This payload was delivered via xcrun simctl push."
+    },
+    "sound": "default",
+    "badge": 1,
+    "mutable-content": 1,
+    "category": "DEFAULT"
+  },
+  "custom_key": "custom_value"
+}
