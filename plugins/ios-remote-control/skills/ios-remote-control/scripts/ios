@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# ios — dispatcher for ios-remote-control.
+#
+# Usage: ios <command> [args...]
+# Run `ios help` for the full command list.
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cmd="${1:-help}"; shift || true
+
+case "${cmd}" in
+  help|-h|--help)
+    cat <<'USAGE'
+ios — remote-control iOS simulators and devices.
+
+  Discovery
+    state                    Booted sims, foreground app, installed apps (JSON)
+    devices                  All sims + connected real devices (JSON)
+
+  Simulator lifecycle
+    boot [UDID|NAME]         Boot a sim (default: first iPhone)
+    shutdown [UDID|NAME|all] Shutdown
+    erase UDID               Reset sim to factory state
+
+  App lifecycle
+    install PATH.app         Install a .app bundle
+    launch BUNDLE_ID         Launch an app (--env KEY=VAL, -- ARG1 ARG2)
+    terminate BUNDLE_ID      Force-quit
+    uninstall BUNDLE_ID      Remove
+
+  Vision
+    screenshot [--label X]   Capture screen to session dir; Read the path
+    ui_tree [--filter TEXT]  Accessibility tree as JSON (cheaper than vision)
+
+  Interaction
+    tap X Y                  Tap at (x,y) in points
+    swipe X1 Y1 X2 Y2        Swipe gesture
+    input_text "TEXT"        Type into focused field
+    press_button HOME|LOCK|SIDE_BUTTON|SIRI|APPLE_PAY
+    deeplink URL             Open URL (custom schemes, https, mailto, etc.)
+
+  Logs & errors
+    log_tail [--bundle X]    Stream logs for N seconds (default 5)
+    log_capture              Capture to file; returns path
+    crash_logs [--bundle X]  Recent crash reports
+
+  State simulation
+    push BUNDLE PAYLOAD      Send a push notification
+    set_location LAT LON     Spoof GPS (set_location clear to reset)
+    status_bar clean|clear   Clean carrier/battery or restore defaults
+    permissions grant|revoke BUNDLE SERVICE
+
+  Real devices (Xcode 15+ required)
+    device_list              List connected real devices
+    device_install BUNDLE    Install .ipa on a device
+    device_launch BUNDLE_ID  Launch
+    device_syslog [--save]   Stream device syslog (needs pymobiledevice3)
+
+  Global flags: --udid UDID|NAME    target a specific sim/device
+USAGE
+    exit 0
+    ;;
+  *)
+    script="${HERE}/${cmd}.sh"
+    if [[ -x "${script}" ]]; then
+      exec "${script}" "$@"
+    fi
+    printf '{"ok":false,"error":"unknown command: %s","hint":"run: ios help"}\n' "${cmd}" >&2
+    exit 1
+    ;;
+esac
