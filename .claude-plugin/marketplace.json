@@ -76,6 +76,11 @@
       "source": "./plugins/contrast-checker"
     },
     {
+      "name": "ios-remote-control",
+      "description": "Remote-control iOS simulators and real devices for agentic app development — boot, install, launch, tap/swipe/type, take screenshots Claude can see, stream logs, inspect accessibility trees, simulate GPS/push/permissions, and iterate. Use this skill whenever the user wants to drive an iOS app from a terminal, debug a running app, automate iOS QA, reproduce bugs, test deep links, inspect UI state, read simulator logs or crash reports, or build/iterate on an iPhone/iPad app with Claude in the loop. Works with React Native, Expo, SwiftUI, and UIKit apps via xcrun simctl + idb + devicectl + pymobiledevice3.",
+      "source": "./plugins/ios-remote-control"
+    },
+    {
       "name": "dei-auditor",
       "description": "Audit prototypes, products, and digital experiences for DEI and inclusive design \u2014 evaluating representation patterns, language bias, user model assumptions, cultural localization, socioeconomic barriers, and systemic exclusion with concrete testing methodology and representation checklist. Use this skill whenever someone wants to evaluate how inclusive a product is, check for representation gaps, audit content or imagery for bias, review personas or user models for default assumptions, assess whether a product serves users across race, gender, age, ability, culture, socioeconomic background, or geography. Trigger on phrases like DEI audit, inclusive design review, representation audit, bias in design, is this product inclusive, diversity check, cultural sensitivity review, who are we excluding, default user assumptions, inclusive UX, gender-inclusive design, intersectionality, or any request to evaluate whether a product truly serves a diverse user base. Always use this skill \u2014 do not attempt a DEI or inclusive design audit without it.",
       "source": "./plugins/dei-auditor"
