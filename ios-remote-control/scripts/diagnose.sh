@@ -8,19 +8,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "${HERE}/lib/common.sh"
 
-check() {
-  local name="$1" cmd="$2" install_hint="$3"
-  if command -v "${cmd}" >/dev/null 2>&1; then
-    local v
-    v="$("${cmd}" --version 2>&1 | head -1 || echo)"
-    printf '{"tool":"%s","present":true,"path":"%s","version":%s}\n' \
-      "${name}" "$(command -v "${cmd}")" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${v}")"
-  else
-    printf '{"tool":"%s","present":false,"install_hint":%s}\n' \
-      "${name}" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${install_hint}")"
-  fi
-}
-
 python3 <<'PY'
 import json, subprocess, shutil, os
 

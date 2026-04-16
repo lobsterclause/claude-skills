@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 udid="$(resolve_udid "${udid:-booted}")"
-xcrun simctl location "${udid}" set "${lat},${lon}" >/dev/null 2>&1 \
+xcrun simctl location "${udid}" set "${lat}" "${lon}" >/dev/null 2>&1 \
   || die "location set failed"
 
 printf '{"ok":true,"action":"location_set","lat":%s,"lon":%s,"udid":"%s"}\n' \

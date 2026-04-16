@@ -97,18 +97,18 @@ scripts/ios help                     # full command list
 | --- | --- |
 | `log_tail [--duration N] [--bundle X] [--level L]` | Stream logs for N seconds (default 5). `--bundle com.foo` filters to one app. |
 | `log_tail --save` | Write to `<session>/logs/<ts>.log` instead of streaming. |
-| `log_capture` | Alias: `log_tail --save`. |
+| `log_capture [--bundle X]` | Same as `log_tail --save`. |
 | `crash_logs [--bundle X]` | Recent crash reports. |
 
 **Correlating actions with errors:** run `log_tail --save --duration 10 &` before a tap, then Read the saved log file after to find errors that happened during the interaction.
 
-### State simulation (Phase 2 — coming)
+### State simulation
 
 | Command | Purpose |
 | --- | --- |
-| `push PAYLOAD.json` | Send APNS push. |
-| `set_location LAT LON` | Spoof GPS. |
-| `status_bar_clean` | Clean carrier/battery/time for screenshots. |
+| `push BUNDLE_ID PAYLOAD.json` | Send APNS push. |
+| `set_location LAT LON` | Spoof GPS. `set_location clear` to reset. |
+| `status_bar clean` | Clean carrier/battery/time for screenshots. `status_bar clear` to restore. |
 | `permissions grant BUNDLE SERVICE` | Grant Photos, Camera, Location, etc. |
 
 ### Real devices

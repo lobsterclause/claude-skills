@@ -12,22 +12,22 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "${HERE}/lib/common.sh"
 
-[[ $# -lt 2 ]] && die "missing args" 'Usage: push.sh BUNDLE_ID PAYLOAD.json [--udid UDID]'
+[[ $# -lt 1 ]] && die "missing args" 'Usage: push.sh BUNDLE_ID PAYLOAD.json [--udid UDID]'
 bundle="$1"; shift
-payload_src="$1"; shift
 
 udid=""
 inline=false
-if [[ "${payload_src}" == "--inline" ]]; then
-  inline=true
-  payload_src="$1"; shift
-fi
+payload_src=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --udid) udid="$2"; shift 2 ;;
-    *) die "unknown flag: $1" ;;
+    --inline) inline=true; payload_src="$2"; shift 2 ;;
+    -*) die "unknown flag: $1" ;;
+    *) payload_src="$1"; shift ;;
   esac
 done
+
+[[ -z "${payload_src}" ]] && die "missing payload" 'Provide PAYLOAD.json or --inline JSON'
 
 udid="$(resolve_udid "${udid:-booted}")"
 
