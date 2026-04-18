@@ -61,6 +61,9 @@ fi
 case "$mode" in
   summary)
     body_file="$(mktemp)"
+    # Ensure the body file is always cleaned up, even if gh call fails or the
+    # script is interrupted. Previous version only rm'd on the happy path.
+    trap 'rm -f "$body_file"' EXIT
     {
       printf '## Cross-review — pass %s\n\n' "$pass"
       printf '_Automated review by codex + gemini. See the "Findings" collapsible for specifics._\n\n'
@@ -68,10 +71,16 @@ case "$mode" in
       cat "$findings"
       printf '\n</details>\n'
     } >"$body_file"
-    gh pr comment "$pr" --body-file "$body_file"
-    rc=$?
-    rm -f "$body_file"
-    exit "$rc"
+    # If `gh pr comment` itself fails (network blip, rate limit, PR closed
+    # mid-run, transient GitHub outage), degrade gracefully to file mode
+    # rather than failing the whole review run. The findings.md is already
+    # on disk at $findings — the user still has the record.
+    if gh pr comment "$pr" --body-file "$body_file"; then
+      exit 0
+    else
+      echo "gh pr comment failed — findings preserved at: $findings" >&2
+      exit 0
+    fi
     ;;
   inline)
     # Removed in favor of summary: 5–10× API calls for little extra signal.

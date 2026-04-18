@@ -40,10 +40,10 @@ Binary: `gemini` (`@google/gemini-cli`, npm global). Verify with `gemini --versi
 Invocation used by this skill:
 
 ```bash
-printf '%s' "<prompt>" | gemini \
+gemini \
   --approval-mode plan \
   --output-format json \
-  -p "<prompt>"
+  -p "<prompt>" </dev/null
 ```
 
 Why these flags:
@@ -51,8 +51,9 @@ Why these flags:
 - `--approval-mode plan` — read-only mode. Gemini can read files and run analysis but won't attempt edits. The alternatives are `default` (prompts on each action, breaks headless), `auto_edit` (auto-approves file edits — dangerous for a reviewer), and `yolo` (auto-approves everything — very dangerous).
 - `--output-format json` — single structured JSON blob at the end. Easier to diff across runs than the default text mode.
 - `-p <prompt>` — non-interactive mode. Without `-p`, gemini launches its TUI and blocks forever in a pipeline.
+- `</dev/null` on stdin — **important**. Gemini concatenates stdin to the `-p` value when both are present, which silently duplicates the prompt and doubles token cost. Blocking stdin with `</dev/null` prevents that. (An earlier iteration of this doc recommended piping the prompt in via stdin; that turned out to be actively wrong — don't do it.)
 
-We also pipe the prompt in via stdin (`printf '%s' ... | gemini ...`) belt-and-suspenders style. Large prompts with embedded diff stats can exceed shell argv limits; stdin is safe.
+Prompts in this skill are well under shell argv limits, so `-p` alone is fine. If you ever need to pass a prompt too large for argv, use a here-doc into stdin AND omit `-p`, not both.
 
 Flags we deliberately do not use:
 

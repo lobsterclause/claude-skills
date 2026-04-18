@@ -58,7 +58,7 @@ case "$cmd" in
   start)
     ref=""
     id=""
-    base="origin/main"
+    base=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --ref)  need_val --ref  "$#"; ref="$2";  shift 2 ;;
@@ -76,6 +76,16 @@ case "$cmd" in
     fi
     repo_root="$(git rev-parse --show-toplevel)"
     repo_name="$(basename "$repo_root")"
+
+    # Derive the default base from origin/HEAD rather than hardcoding origin/main.
+    # Repos whose default is `master` or anything non-`main` would previously
+    # silently fail (git diff returns 128, errors suppressed, warn_* collapse to
+    # false) — exactly the opposite of fail-safe. Fall through to `origin/main`
+    # only if origin/HEAD can't be resolved.
+    if [[ -z "$base" ]]; then
+      default_branch="$(git -C "$repo_root" rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+      base="origin/${default_branch:-main}"
+    fi
 
     ts="$(date +%Y%m%dT%H%M%S)"
     pid="$$"
@@ -96,11 +106,13 @@ case "$cmd" in
     fi
 
     # Size check — run inside the worktree.
-    size_files=$(git -C "$worktree" diff --name-only "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')
+    size_files=$(git -C "$worktree" diff --name-only "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ' || true)
     # grep can return non-zero on empty/rename-only diffs; tolerate under pipefail.
-    size_lines=$({ git -C "$worktree" diff --shortstat "$base"...HEAD 2>/dev/null \
+    size_lines=$(git -C "$worktree" diff --shortstat "$base"...HEAD 2>/dev/null \
       | { grep -oE '[0-9]+ insertion|[0-9]+ deletion' || true; } \
-      | awk '{s+=$1} END{print s+0}'; } 2>/dev/null || echo 0)
+      | awk '{s+=$1} END{print s+0}' || true)
+    [[ "$size_files" =~ ^[0-9]+$ ]] || size_files=0
+    [[ "$size_lines" =~ ^[0-9]+$ ]] || size_lines=0
 
     # Heuristic thresholds — tune based on experience, not precision.
     # Large PRs cost more reviewer tokens and time; warn so the caller can decide.
@@ -168,7 +180,10 @@ case "$cmd" in
       [[ -d "$root" ]] || continue
       while IFS= read -r -d '' dir; do
         git worktree remove --force "$dir" 2>/dev/null || true
-        rm -rf "$dir"
+        # `|| true` so a single rm failure (permissions, mount issue, race
+        # with another sweep) doesn't abort the loop and leave the rest
+        # uncleaned. `git worktree prune` below still runs.
+        rm -rf "$dir" || true
         removed=$((removed + 1))
       done < <(find "$root" -maxdepth 1 -type d -name 'cr-*' -mmin +"$minutes" -print0 2>/dev/null)
     done

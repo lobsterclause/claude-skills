@@ -85,6 +85,12 @@ run_with_timeout() {
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompt_file="$script_dir/../references/review_prompt.txt"
 
+# Note: review_prompt is only used by gemini. codex exec review --base <ref>
+# applies codex's own built-in review instructions (which already rank findings
+# with [P1]/[P2]/[P3] labels — equivalent to High/Medium/Low — and cover
+# correctness, security, and semantic drift). Forcing our prompt into codex
+# would require dropping --base and reconstructing the diff setup in text,
+# which is more complexity for negligible gain.
 default_prompt="Review the changes on the current branch against '$base'. \
 Focus on correctness, security, and whether the change achieves its stated intent. \
 Flag concrete issues tied to file paths and line numbers where possible. \
