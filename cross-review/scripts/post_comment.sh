@@ -17,12 +17,21 @@ mode="summary"
 findings=""
 pass="1"
 
+need_val() {
+  local flag="$1"
+  local argc="$2"
+  if [[ "$argc" -lt 2 ]]; then
+    echo "missing value for $flag" >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --pr) pr="$2"; shift 2 ;;
-    --mode) mode="$2"; shift 2 ;;
-    --findings) findings="$2"; shift 2 ;;
-    --pass) pass="$2"; shift 2 ;;
+    --pr)       need_val --pr       "$#"; pr="$2";       shift 2 ;;
+    --mode)     need_val --mode     "$#"; mode="$2";     shift 2 ;;
+    --findings) need_val --findings "$#"; findings="$2"; shift 2 ;;
+    --pass)     need_val --pass     "$#"; pass="$2";     shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done

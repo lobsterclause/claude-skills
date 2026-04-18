@@ -2,23 +2,34 @@
 # worktree.sh — manage ephemeral git worktrees for cross-review runs.
 #
 # Subcommands:
-#   start --ref <branch-or-sha> --id <slug>
-#     Creates /tmp/cr-<id>-<ts>/ (detached worktree at <ref>)
-#     Creates ~/.cross-review/runs/<repo>-<id>-<ts>/ (stable output dir)
-#     Runs a size-check and prints a warning JSON field if the diff is large.
-#     Prints one JSON line with worktree, run_dir, size, and warn.
+#   start --ref <branch-or-sha> --id <slug> [--base <branch>]
+#     Creates $HOME/.cross-review/worktrees/cr-<slug>-<ts>-<pid>/ (detached worktree at <ref>)
+#     Creates $HOME/.cross-review/runs/<repo>-<slug>-<ts>-<pid>/ (stable output dir)
+#     Runs size + secret-path checks and emits a single JSON line.
 #
 #   end --worktree <path>
 #     Tears down the worktree. Idempotent. Run dir is NOT touched.
 #
 #   sweep [--older-than-hours N]
-#     Removes stray /tmp/cr-*/ worktrees older than N hours (default 24).
-#     Best-effort: rm -rf + git worktree prune in the containing repo.
+#     Removes stray cr-*/ worktrees older than N hours (default 24) from both
+#     the canonical location and /tmp (legacy). Safe on paths with spaces.
 #
-# Run dirs (under ~/.cross-review/runs/) are NEVER auto-cleaned — they are
+# Run dirs (under $HOME/.cross-review/runs/) are NEVER auto-cleaned — they are
 # the permanent record of each review. User deletes manually if desired.
+#
+# Design notes:
+# - Worktrees live under $HOME (not /tmp) to avoid predictable-path tampering in
+#   world-writable /tmp. The skill runs as the user and has no multi-tenant need
+#   for /tmp. Legacy /tmp/cr-* are still swept for backwards compatibility.
+# - Paths include the PID ($$) so two passes started in the same second with
+#   the same --id cannot collide.
+# - Sweep uses -print0 + null-separated read; it must not word-split on paths
+#   containing spaces, since it calls `rm -rf "$dir"`.
 
 set -euo pipefail
+
+WORKTREE_ROOT="$HOME/.cross-review/worktrees"
+RUN_ROOT="$HOME/.cross-review/runs"
 
 usage() {
   cat <<EOF >&2
@@ -28,6 +39,16 @@ usage:
   $0 sweep [--older-than-hours N]
 EOF
   exit 2
+}
+
+# Guard against --flag passed without a value (last-arg crash under set -u).
+need_val() {
+  local flag="$1"
+  local argc="$2"
+  if [[ "$argc" -lt 2 ]]; then
+    echo "missing value for $flag" >&2
+    usage
+  fi
 }
 
 cmd="${1:-}"
@@ -40,9 +61,9 @@ case "$cmd" in
     base="origin/main"
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --ref) ref="$2"; shift 2 ;;
-        --id) id="$2"; shift 2 ;;
-        --base) base="$2"; shift 2 ;;
+        --ref)  need_val --ref  "$#"; ref="$2";  shift 2 ;;
+        --id)   need_val --id   "$#"; id="$2";   shift 2 ;;
+        --base) need_val --base "$#"; base="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; usage ;;
       esac
     done
@@ -57,12 +78,15 @@ case "$cmd" in
     repo_name="$(basename "$repo_root")"
 
     ts="$(date +%Y%m%dT%H%M%S)"
+    pid="$$"
     # Slugify id so it's filesystem-safe.
     slug="$(echo -n "$id" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
-    worktree="/tmp/cr-${slug}-${ts}"
-    run_dir="${HOME}/.cross-review/runs/${repo_name}-${slug}-${ts}"
+    run_name="${repo_name}-${slug}-${ts}-${pid}"
+    wt_name="cr-${slug}-${ts}-${pid}"
+    worktree="$WORKTREE_ROOT/$wt_name"
+    run_dir="$RUN_ROOT/$run_name"
 
-    mkdir -p "$run_dir/raw"
+    mkdir -p "$WORKTREE_ROOT" "$run_dir/raw"
 
     # Detached worktree so we don't take over the branch in the main checkout.
     # --force because in rare cases the ref may be "in use" elsewhere.
@@ -73,8 +97,10 @@ case "$cmd" in
 
     # Size check — run inside the worktree.
     size_files=$(git -C "$worktree" diff --name-only "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')
-    size_lines=$(git -C "$worktree" diff --shortstat "$base"...HEAD 2>/dev/null \
-      | grep -oE '[0-9]+ insertion|[0-9]+ deletion' | awk '{s+=$1} END{print s+0}')
+    # grep can return non-zero on empty/rename-only diffs; tolerate under pipefail.
+    size_lines=$({ git -C "$worktree" diff --shortstat "$base"...HEAD 2>/dev/null \
+      | { grep -oE '[0-9]+ insertion|[0-9]+ deletion' || true; } \
+      | awk '{s+=$1} END{print s+0}'; } 2>/dev/null || echo 0)
 
     # Heuristic thresholds — tune based on experience, not precision.
     # Large PRs cost more reviewer tokens and time; warn so the caller can decide.
@@ -104,7 +130,7 @@ case "$cmd" in
     worktree=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --worktree) worktree="$2"; shift 2 ;;
+        --worktree) need_val --worktree "$#"; worktree="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; usage ;;
       esac
     done
@@ -119,8 +145,6 @@ case "$cmd" in
     # Best-effort: let git do its bookkeeping first, then scrub filesystem.
     git worktree remove --force "$worktree" 2>/dev/null || true
     rm -rf "$worktree"
-    # Prune stale tracking in any repo we can locate from the worktree parent.
-    # (Worktrees may already be detached from a repo if --force was used.)
     printf '{"removed": true, "path": "%s"}\n' "$worktree"
     ;;
 
@@ -128,19 +152,25 @@ case "$cmd" in
     hours=24
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --older-than-hours) hours="$2"; shift 2 ;;
+        --older-than-hours) need_val --older-than-hours "$#"; hours="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; usage ;;
       esac
     done
 
     # BSD find (macOS) uses -mmin; that covers Linux too.
+    # Use -print0 + null-separated read to survive paths containing spaces.
+    # `rm -rf "$dir"` on a word-split token is a known data-loss footgun.
     minutes=$(( hours * 60 ))
     removed=0
-    # shellcheck disable=SC2044
-    for dir in $(find /tmp -maxdepth 1 -type d -name 'cr-*' -mmin +"$minutes" 2>/dev/null || true); do
-      git worktree remove --force "$dir" 2>/dev/null || true
-      rm -rf "$dir"
-      removed=$((removed + 1))
+    # Check both the canonical location and legacy /tmp — users upgrading from
+    # the earlier skill version may still have /tmp/cr-* leftovers.
+    for root in "$WORKTREE_ROOT" "/tmp"; do
+      [[ -d "$root" ]] || continue
+      while IFS= read -r -d '' dir; do
+        git worktree remove --force "$dir" 2>/dev/null || true
+        rm -rf "$dir"
+        removed=$((removed + 1))
+      done < <(find "$root" -maxdepth 1 -type d -name 'cr-*' -mmin +"$minutes" -print0 2>/dev/null)
     done
 
     # Prune tracking if we're inside a repo; otherwise skip.
