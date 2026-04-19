@@ -50,10 +50,23 @@ fi
 
 mkdir -p "$out"
 
+# Validate the base ref up front. Without this, `git diff --quiet` below
+# would return 128 on a missing ref — which bash treats as non-zero (same as
+# "has diff") and the script would spawn reviewers against a broken
+# comparison, wasting tokens and inviting hallucinated findings. Fail loud
+# so the caller can retry with a valid --base instead of silently wrong.
+if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+  echo "invalid or unknown base ref: $base" >&2
+  echo "  hint: try 'git fetch origin' or pass --base <ref> explicitly" >&2
+  exit 1
+fi
+
 # Empty-diff short-circuit: burning 5 min + tens of thousands of tokens on a
 # no-op branch produces nothing real (and sometimes invites hallucinated
 # findings). Reviewers also can't diff what they can't see.
-if git diff --quiet "$base"...HEAD 2>/dev/null; then
+# (Base is validated above, so `git diff --quiet` here returns 0 (no diff) or
+# 1 (has diff) cleanly, never 128.)
+if git diff --quiet "$base"...HEAD; then
   printf '{"skipped": true, "reason": "no_diff_against_base", "base": "%s"}\n' "$base" > "$out/run.meta.json"
   echo "no diff against $base — skipping reviewers" >&2
   exit 0

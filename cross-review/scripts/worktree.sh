@@ -87,6 +87,16 @@ case "$cmd" in
       base="origin/${default_branch:-main}"
     fi
 
+    # Validate the base ref exists BEFORE we create the worktree and run diff
+    # checks. Silent `|| true` pipelines below would otherwise mask a bad ref
+    # as zeros (size 0, warn_secrets false) — the skill would sail past and
+    # feed reviewers a wrong-target diff. Fail loud, fail early.
+    if ! git -C "$repo_root" rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+      echo "invalid or unknown base ref: $base" >&2
+      echo "  hint: try 'git fetch origin' or pass --base <ref> explicitly" >&2
+      exit 1
+    fi
+
     ts="$(date +%Y%m%dT%H%M%S)"
     pid="$$"
     # Slugify id so it's filesystem-safe.
@@ -106,11 +116,11 @@ case "$cmd" in
     fi
 
     # Size check — run inside the worktree.
-    size_files=$(git -C "$worktree" diff --name-only "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ' || true)
+    size_files=$(git -C "$worktree" diff --name-only "$base"...HEAD | wc -l | tr -d ' ')
     # grep can return non-zero on empty/rename-only diffs; tolerate under pipefail.
-    size_lines=$(git -C "$worktree" diff --shortstat "$base"...HEAD 2>/dev/null \
+    size_lines=$(git -C "$worktree" diff --shortstat "$base"...HEAD \
       | { grep -oE '[0-9]+ insertion|[0-9]+ deletion' || true; } \
-      | awk '{s+=$1} END{print s+0}' || true)
+      | awk '{s+=$1} END{print s+0}')
     [[ "$size_files" =~ ^[0-9]+$ ]] || size_files=0
     [[ "$size_lines" =~ ^[0-9]+$ ]] || size_lines=0
 
@@ -148,6 +158,22 @@ case "$cmd" in
     done
     [[ -n "$worktree" ]] || usage
 
+    # Bounds check: refuse to rm -rf anything outside the managed roots.
+    # Without this, `end --worktree /` or `end --worktree "$HOME"` would
+    # destroy the user's filesystem. Accept only:
+    #   - the canonical root ($WORKTREE_ROOT/cr-*)
+    #   - legacy /tmp/cr-* (for pre-v1.1 worktrees still on disk)
+    #   - /private/tmp/cr-* (how git worktree list reports paths on macOS
+    #     since /tmp is a symlink)
+    case "$worktree" in
+      "$WORKTREE_ROOT"/cr-*|/tmp/cr-*|/private/tmp/cr-*) ;;
+      *)
+        echo "refusing to remove path outside managed worktree roots: $worktree" >&2
+        echo "  expected prefix: $WORKTREE_ROOT/cr-* (or /tmp/cr-*)" >&2
+        exit 1
+        ;;
+    esac
+
     if [[ ! -d "$worktree" ]]; then
       # Already gone — idempotent success.
       echo '{"removed": false, "reason": "not-found"}'
@@ -168,6 +194,15 @@ case "$cmd" in
         *) echo "unknown arg: $1" >&2; usage ;;
       esac
     done
+
+    # Validate before feeding into `$(( hours * 60 ))`. Bash arithmetic context
+    # evaluates variable contents as expressions, which supports array indices
+    # with command substitution — e.g. `--older-than-hours 'a[$(rm -rf ~)]'`
+    # would execute arbitrary code. Integer-only regex blocks the class.
+    if ! [[ "$hours" =~ ^[0-9]+$ ]]; then
+      echo "--older-than-hours must be a non-negative integer: $hours" >&2
+      exit 2
+    fi
 
     # BSD find (macOS) uses -mmin; that covers Linux too.
     # Use -print0 + null-separated read to survive paths containing spaces.
