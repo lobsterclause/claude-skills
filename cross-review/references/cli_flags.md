@@ -64,9 +64,68 @@ Flags we deliberately do not use:
 
 Auth: gemini uses Google OAuth. First run will need an interactive browser login. After that, headless runs work.
 
+## kimi
+
+Binary: `kimi` (Moonshot's Kimi Code CLI, installed via `curl -L code.kimi.com/install.sh | bash`, which `uv tool install`s `kimi-cli`). Verify with `kimi --version`.
+
+Invocation used by this skill:
+
+```bash
+kimi \
+  --plan \
+  --print \
+  --quiet \
+  -p "<prompt-with-full-diff-inline>" </dev/null
+```
+
+**Invocation mode: single-turn, no-tools.** Unlike codex and gemini, we do *not* let kimi roam the repo with file-reading tools. Instead, the full `git diff <base>...HEAD` is embedded in the prompt and we instruct the model "do not use any tools." This is a deliberate design choice — see the rationale below.
+
+Why these flags:
+
+- `--plan` — read-only plan mode. Defense in depth; even if kimi decides to call a write tool despite the prompt instruction, it can't edit anything.
+- `--print` — non-interactive mode; exits after the single turn. Without it, kimi launches its TUI and blocks forever in a pipeline. `--print` implicitly sets `--yolo`, harmless under `--plan`.
+- `--quiet` — alias for `--print --output-format text --final-message-only`. Prints only the final assistant message.
+- `-p <prompt>` — the review prompt, with the full diff inlined. argv fits up to ~1MB on macOS (`getconf ARG_MAX`) and the wrapper caps the diff at 500K chars for safety. k2.5's 256K-token context handles anything under that.
+- `</dev/null` on stdin — prevents kimi from appending stdin to the `-p` payload (same footgun as gemini).
+
+Why single-turn no-tools (the real story):
+
+- **The adapter bug.** `kimi-k2.5` + thinking mode + multi-turn tool calls require the `openai_legacy` provider to thread `reasoning_content` between turns. It doesn't — the second tool-call turn fails with `400 — thinking is enabled but reasoning_content is missing in assistant tool call message at index 2`. This is documented in Moonshot's K2.5 tool-use compatibility notes.
+- **Why we don't just disable thinking.** We tried `--no-thinking` to sidestep the bug. It works, but you lose the reasoning quality that's the whole reason to use K2.5 as a reviewer — at that point you may as well run K2-turbo.
+- **Why single-turn is actually fine for review.** Code review is fundamentally a single-turn task: the diff IS the input. codex and gemini already handle the agentic file-roaming niche; kimi's job here is deep reasoning on the diff as given. That's complementary, not duplicative.
+- **If you ever switch to the native `api.kimi.com` provider** (via `kimi login` OAuth + Kimi Coding subscription), kimi-cli's native `type = "kimi"` adapter preserves `reasoning_content` correctly and you can drop the "no tools" instruction and enable agent-style review.
+
+Flags we deliberately do not use:
+
+- `--thinking` / `--no-thinking` — we let the config default win (thinking enabled for k2.5). The inline-diff approach avoids the tool-call bug that would otherwise force `--no-thinking`.
+- `-m/--model` — we set the default model in `~/.kimi/config.toml` once and let every invocation use it. Pin per-call only if you need to A/B between models.
+- `--yolo` (explicitly) — already implied by `--print`; no reason to add it.
+- `--agent okabe` — a specialized "okabe" built-in agent exists; we use the default because reviewer tasks don't benefit from the okabe specialization.
+
+Auth: kimi uses a TOML config file at `~/.kimi/config.toml`. For the Moonshot platform key (from [platform.moonshot.ai](https://platform.moonshot.ai)), configure an `openai_legacy` provider pointing at `https://api.moonshot.ai/v1`:
+
+```toml
+default_model = "kimi-moonshot"
+
+[models.kimi-moonshot]
+provider = "kimi-moonshot"
+model = "kimi-k2.5"
+max_context_size = 262144
+
+[providers.kimi-moonshot]
+type = "openai_legacy"
+base_url = "https://api.moonshot.ai/v1"
+api_key = "sk-..."
+```
+
+Valid model IDs on the Moonshot endpoint (as of 2026-04): `kimi-k2.5`, `kimi-k2-thinking`, `kimi-k2-thinking-turbo`, `kimi-k2-0905-preview`, `kimi-k2-turbo-preview`, `kimi-k2-0711-preview`, `moonshot-v1-{8k,32k,128k}`, `moonshot-v1-auto`, plus `-vision-preview` variants. `kimi-k2.5` (256K ctx, thinking mode default) is the best reviewer.
+
+If the user has a `code.kimi.com/coding/v1` subscription key instead of a Moonshot platform key, run `kimi login` interactively once — kimi-cli handles that provider natively (`type = "kimi"`, no manual config needed).
+
 ## Known issues and gotchas
 
-- **Both CLIs can cold-start slowly** on first run of the day (30–60s). Timeouts in the wrapper are set to 5 minutes per reviewer; if one hits that, it's usually auth or network, not actual work.
+- **All three CLIs can cold-start slowly** on first run of the day (30–60s). Timeouts in the wrapper are set to 5 minutes per reviewer; if one hits that, it's usually auth or network, not actual work.
 - **codex may emit warnings about rate limits** on the free tier; they show up in stderr and do not fail the run. The final JSONL event will still contain the review.
 - **gemini JSON output is one blob, not JSONL.** If the output looks truncated, it's probably a write-to-pipe buffering issue — check `gemini.stderr` first.
-- **Both reviewers will read files in the repo.** If the repo contains untrusted input (e.g., fixture data for a parser), be aware that this is being sent to external APIs. Not a problem for most codebases, but worth flagging for security-sensitive work.
+- **kimi will print "To resume this session: kimi -r <uuid>" at the end** of every `--print` run (to stderr). Harmless, just noise in the log. Don't confuse it with an error.
+- **All three reviewers will read files in the repo.** If the repo contains untrusted input (e.g., fixture data for a parser), be aware that this is being sent to external APIs — including Moonshot for kimi, which is a China-origin provider. Worth flagging for security-sensitive or export-controlled work.

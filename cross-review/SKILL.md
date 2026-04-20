@@ -1,16 +1,16 @@
 ---
 name: cross-review
-description: Run external AI code reviewers (codex CLI and gemini CLI) in parallel against the current branch's diff, synthesize deduped findings, auto-apply fixes, and iterate until clean. Use this skill whenever the user wants a second opinion on code, cross-review, swarm review, peer review, external review, or wants codex/gemini to look at changes before shipping — even if they don't explicitly name the CLIs. Also trigger on "have codex check this", "get a second pair of eyes", "cross-check my changes", "review before merge", "swarm review", "review this PR", or right after Claude creates a PR. Do NOT trigger for routine lint/test runs, style-only checks, or when the user wants Claude itself (not external CLIs) to review.
+description: Run external AI code reviewers (codex CLI, gemini CLI, and kimi CLI) in parallel against the current branch's diff, synthesize deduped findings, auto-apply fixes, and iterate until clean. Use this skill whenever the user wants a second opinion on code, cross-review, swarm review, peer review, external review, or wants codex/gemini/kimi to look at changes before shipping — even if they don't explicitly name the CLIs. Also trigger on "have codex check this", "get a second pair of eyes", "cross-check my changes", "review before merge", "swarm review", "review this PR", or right after Claude creates a PR. Do NOT trigger for routine lint/test runs, style-only checks, or when the user wants Claude itself (not external CLIs) to review.
 ---
 
 # cross-review
 
-Orchestrates external AI CLIs (currently `codex` and `gemini`) to review the current branch's changes, consolidates their findings, applies fixes, and re-runs until the diff is clean or an iteration budget is exhausted. The goal is to catch things a single model would miss — different reviewers have different blind spots, so their overlap is signal and their disagreements are worth reading.
+Orchestrates external AI CLIs (currently `codex`, `gemini`, and `kimi`) to review the current branch's changes, consolidates their findings, applies fixes, and re-runs until the diff is clean or an iteration budget is exhausted. The goal is to catch things a single model would miss — different reviewers have different blind spots, so their overlap is signal and their disagreements are worth reading.
 
 ## When to use this
 
 - A PR has just been created by Claude and the user wants a second opinion before merge.
-- The user asks to "cross-review", "swarm review", "get codex/gemini to look at this".
+- The user asks to "cross-review", "swarm review", "get codex/gemini/kimi to look at this".
 - The user wants an agentic review loop that applies fixes rather than just listing them.
 
 When in doubt, ask whether they want just findings or the full fix-and-iterate loop.
@@ -25,7 +25,7 @@ The skill runs in this order. Do not skip steps — each produces state the next
 bash ~/.claude/skills/cross-review/scripts/detect_reviewers.sh
 ```
 
-Prints JSON like `{"codex": true, "gemini": true}`. If none are available, stop and tell the user how to install them (`brew install codex-cli`, `npm i -g @google/gemini-cli`). Do not proceed with zero reviewers.
+Prints JSON like `{"codex": true, "gemini": true, "kimi": true}`. If none are available, stop and tell the user how to install them (`brew install codex-cli`, `npm i -g @google/gemini-cli`, `curl -L code.kimi.com/install.sh | bash`). Do not proceed with zero reviewers.
 
 ### 2. Determine review scope and prepare an isolated worktree
 
@@ -67,10 +67,10 @@ Save the JSON to `$run_dir/context.json` and `cd` into `$worktree`. Future steps
 bash ~/.claude/skills/cross-review/scripts/run_reviewers.sh \
   --base <base-branch> \
   --out "$run_dir/raw" \
-  --reviewers codex,gemini
+  --reviewers codex,gemini,kimi
 ```
 
-Runs every requested reviewer concurrently and writes raw outputs to the `out` directory. The wrapper handles the flag dialects (`codex exec review --base <branch> --full-auto` vs. `gemini -p '<prompt>' --approval-mode plan --output-format json`) and returns when all are done.
+Runs every requested reviewer concurrently and writes raw outputs to the `out` directory. The wrapper handles the flag dialects (`codex exec review --base <branch> --full-auto` vs. `gemini -p '<prompt>' --approval-mode plan --output-format json` vs. `kimi --plan --print --quiet -p '<prompt>'`) and returns when all are done.
 
 **Modes:**
 - **swarm** (default): run every reviewer the detect step found. More coverage, more tokens.
@@ -84,7 +84,7 @@ Read every file under the `raw/` directory. Do **not** shell out to a parser —
 
 - Pull out concrete issues tied to specific files/lines when possible.
 - Drop pure praise, filler, and anything not actionable.
-- Note the reviewer (codex / gemini) so the user can see agreement vs. disagreement.
+- Note the reviewer (codex / gemini / kimi) so the user can see agreement vs. disagreement.
 
 Produce a merged list at `$run_dir/findings.md` with this structure:
 
@@ -92,7 +92,7 @@ Produce a merged list at `$run_dir/findings.md` with this structure:
 # Cross-review findings — <branch> vs <base>
 
 ## Critical
-- **[file:line]** <one-line title> (sources: codex, gemini)
+- **[file:line]** <one-line title> (sources: codex, gemini, kimi)
   <why it matters, concrete fix sketch if offered>
 
 ## High
@@ -112,7 +112,7 @@ Produce a merged list at `$run_dir/findings.md` with this structure:
 - **Medium**: risky edge case, poor error handling at a boundary, unclear naming that will trip future readers.
 - **Low / nit**: style, minor phrasing, minor optimization.
 
-When two reviewers flag the same issue at different severities, take the higher one and note the disagreement.
+When multiple reviewers flag the same issue at different severities, take the highest one and note the disagreement. Convergence across all three reviewers is a very strong signal; a finding flagged by only one deserves more skepticism.
 
 ### 5. Triage and apply fixes (opt-in only)
 
@@ -202,7 +202,7 @@ Whoever invoked this skill — the user directly, or a parent agent (e.g., a `/p
 ── cross-review pass <N>/3 ──
 Verdict: CLEAN | FIXES_APPLIED | NEEDS_DECISION | BLOCKED
 Counts:  C:<n> H:<n> M:<n> L:<n>  (convergent: <n>)
-Top:     <file:line> — <one-line title> [<severity>][codex+gemini|codex|gemini]
+Top:     <file:line> — <one-line title> [<severity>][codex+gemini+kimi|codex+gemini|codex+kimi|gemini+kimi|codex|gemini|kimi]
 Record:  ~/.cross-review/runs/<repo>-<id>-<ts>/findings.md  (posted to PR: <url|—>)
 Next:    stop | re-review | ask-user | apply-fixes
 Notes:   <≤1 sentence if something non-obvious happened — reviewer disagreement, rate-limit retries, partial failure>
@@ -216,9 +216,9 @@ Notes:   <≤1 sentence if something non-obvious happened — reviewer disagreem
 - **NEEDS_DECISION** — Critical/High found but requires human judgment (design decision, scope question, semantic ambiguity). Caller must respond before the skill can continue.
 - **BLOCKED** — Cannot proceed: all reviewers failed, auth missing, iteration cap hit with findings still outstanding, same finding recurs across passes. Caller needs to investigate.
 
-**Convergent** counts findings that both codex and gemini independently flagged on the same file/area. High convergence is a strong signal the issue is real; single-reviewer findings may be style-of-the-reviewer and deserve more skepticism.
+**Convergent** counts findings that two or more reviewers independently flagged on the same file/area. High convergence is a strong signal the issue is real; single-reviewer findings may be style-of-the-reviewer and deserve more skepticism. All-three convergence (codex + gemini + kimi) is the strongest signal of all — treat those findings as near-certain to be real.
 
-**Top** is the single most important finding — Critical > convergent High > single-reviewer High. Pick one; surface the rest via the Record link.
+**Top** is the single most important finding — Critical > all-three-convergent High > two-reviewer convergent High > single-reviewer High. Pick one; surface the rest via the Record link.
 
 **Next** is what the skill intends to do (or wants the caller to do):
 
@@ -233,6 +233,7 @@ Keep the block exactly this shape — parent agents key off the field names. Any
 
 - **codex**: Uses `codex exec review --base <branch> --full-auto`. Writes review output to stderr (we merge streams with `2>&1`). `--json` mode emits reasoning/command events but does **not** flush the final review summary — use plain-text mode. `--base` and a positional `[PROMPT]` are mutually exclusive; with `--base`, codex uses its own built-in review instructions.
 - **gemini**: Uses `gemini -p '<prompt>' --approval-mode plan --output-format json`. `plan` mode is read-only (won't try to edit files). Needs an explicit review prompt (see `references/review_prompt.txt`). Auth via `gemini` interactive once to do Google OAuth, then headless works.
+- **kimi** (Moonshot's Kimi Code CLI): Uses `kimi --plan --print --quiet -p '<prompt>'`. `--plan` is read-only; `--print` is non-interactive; `--quiet` trims to just the final assistant message. Default model is `kimi-k2.5` (256K ctx, thinking mode on) — configured in `~/.kimi/config.toml`. Auth is either the Moonshot platform API key (`openai_legacy` provider against `api.moonshot.ai/v1`) or the native Kimi Coding subscription (`kimi login` OAuth). Note: kimi sends code to a China-origin provider — surface that to the user for security-sensitive repos.
 
 More detail on flags and gotchas lives in [references/cli_flags.md](references/cli_flags.md). Read it if a reviewer is behaving unexpectedly.
 
@@ -245,7 +246,7 @@ This is not auto-invoked by the harness. To make it fire automatically after eve
 ## Common failure modes
 
 - **"No diff to review"**: branch has no commits past the base. Check `git log base..HEAD` — likely on the wrong branch.
-- **Reviewer hangs**: both CLIs can hang on auth or on first-run config prompts. The wrapper has a timeout (5 min/reviewer); if it fires, surface stderr so the user can re-auth.
+- **Reviewer hangs**: all three CLIs can hang on auth or on first-run config prompts. The wrapper has a timeout (5 min/reviewer); if it fires, surface stderr so the user can re-auth.
 - **Reviewer flags a tokens-vs-hardcoded issue that's actually fine**: Vibrant Punk / NativeWind contexts use tokens that look like hex to the reviewer. Check `constants/theme.ts` before "fixing" a perceived hardcoded color.
 - **Same finding keeps coming back**: either the fix is wrong, or the reviewer has a stale mental model (e.g., you moved logic to another file and it still complains about the old location). Don't loop — stop and investigate.
 - **Iteration 3 still dirty**: structural issue. Don't push through — ask the user whether to merge with known findings or take a different approach.

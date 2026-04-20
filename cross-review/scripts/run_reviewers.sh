@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# run_reviewers.sh — run codex and/or gemini in parallel against the current diff.
+# run_reviewers.sh — run codex, gemini, and/or kimi in parallel against the current diff.
 #
 # Usage:
-#   run_reviewers.sh --base <branch> --out <dir> [--reviewers codex,gemini] [--timeout <sec>]
+#   run_reviewers.sh --base <branch> --out <dir> [--reviewers codex,gemini,kimi] [--timeout <sec>]
 #
 # Writes:
 #   <out>/codex.stdout     — codex review (stderr merged)
@@ -10,6 +10,9 @@
 #   <out>/gemini.stdout    — gemini JSON
 #   <out>/gemini.stderr
 #   <out>/gemini.meta.json
+#   <out>/kimi.stdout      — kimi review text (final assistant message)
+#   <out>/kimi.stderr
+#   <out>/kimi.meta.json
 #   <out>/run.meta.json    — overall run metadata (skipped reason, etc.)
 #
 # Exit codes:
@@ -21,7 +24,7 @@ set -uo pipefail
 
 base=""
 out=""
-reviewers="codex,gemini"
+reviewers="codex,gemini,kimi"
 timeout_s=300
 
 need_val() {
@@ -44,7 +47,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,gemini] [--timeout <sec>]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,gemini,kimi] [--timeout <sec>]" >&2
   exit 2
 fi
 
@@ -171,6 +174,61 @@ Use your file-reading tools to inspect the actual changes. Return your findings 
   return "$rc"
 }
 
+run_kimi() {
+  local start end rc
+  start=$(date +%s)
+  # kimi (Moonshot's Kimi Code CLI) against Moonshot's OpenAI-compatible endpoint.
+  #
+  # We deliberately run kimi in single-turn, no-tools mode: pipe the full diff
+  # inline and instruct the model not to call any tools. Why:
+  #   (a) kimi-k2.5's thinking mode + multi-turn tool calls requires threading
+  #       `reasoning_content` between turns, and the `openai_legacy` adapter
+  #       doesn't preserve it — the second turn fails with "thinking is enabled
+  #       but reasoning_content is missing".
+  #   (b) Single-turn with thinking-on gives better review quality than
+  #       multi-turn with thinking-off.
+  #   (c) Code review is fundamentally a single-turn task: the diff IS the
+  #       input. codex and gemini already do the agentic file-roaming; kimi
+  #       fills a different niche — deep reasoning on the diff as given.
+  #
+  # --plan: defense in depth (can't edit files even if it tried).
+  # --print: non-interactive. Implies --yolo.
+  # --quiet: final assistant message only (drops tool-trace noise).
+  # -p carries the prompt. stdin is /dev/null so kimi doesn't append stdin.
+  local diff_summary diff_full
+  diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
+  # Cap the full diff at ~500K chars to stay safely under the 1MB argv limit on
+  # macOS (getconf ARG_MAX ≈ 1MB) and well under k2.5's 256K-token context.
+  # Very large diffs get truncated with a warning in the prompt; kimi will
+  # still review what it sees.
+  diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -c 500000 || true)"
+  local full_prompt
+  full_prompt="$review_prompt
+
+Do NOT use any file-reading or shell tools. Base your review ONLY on the diff below — it is complete and self-contained for this review.
+
+Changed files (diff --stat against $base):
+$diff_summary
+
+Full diff:
+\`\`\`diff
+$diff_full
+\`\`\`
+
+Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
+
+  run_with_timeout "$timeout_s" kimi \
+    --plan \
+    --print \
+    --quiet \
+    -p "$full_prompt" \
+    >"$out/kimi.stdout" 2>"$out/kimi.stderr" </dev/null
+  rc=$?
+  end=$(date +%s)
+  printf '{"exit_code": %d, "duration_s": %d}\n' "$rc" "$((end - start))" >"$out/kimi.meta.json"
+  return "$rc"
+}
+
 pids=()
 ran=()
 
@@ -193,6 +251,15 @@ for r in "${requested[@]}"; do
         ran+=("gemini")
       else
         echo "gemini not installed — skipping" >&2
+      fi
+      ;;
+    kimi)
+      if command -v kimi >/dev/null 2>&1; then
+        run_kimi &
+        pids+=($!)
+        ran+=("kimi")
+      else
+        echo "kimi not installed — skipping" >&2
       fi
       ;;
     *)
@@ -221,6 +288,7 @@ for i in "${!pids[@]}"; do
     case "$name" in
       codex)  echo "$name: failed (see $out/codex.stdout and $out/codex.meta.json)" >&2 ;;
       gemini) echo "$name: failed (see $out/gemini.stderr and $out/gemini.meta.json)" >&2 ;;
+      kimi)   echo "$name: failed (see $out/kimi.stderr and $out/kimi.meta.json)" >&2 ;;
       *)      echo "$name: failed (see $out/$name.* )" >&2 ;;
     esac
   fi
