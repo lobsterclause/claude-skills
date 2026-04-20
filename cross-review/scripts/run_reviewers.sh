@@ -203,7 +203,7 @@ run_kimi() {
   #     codex/gemini which don't have this issue.
   # kimi reads stdin as the prompt when --print is set and no -p is given
   # (confirmed: `echo "..." | kimi --print --quiet` works).
-  local diff_summary diff_full diff_line_cap truncation_note
+  local diff_summary diff_full diff_line_cap truncation_note truncated
   diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
   # Line-based cap (not byte-based). head -c can split mid-codepoint and
   # produce invalid UTF-8; head -n respects line boundaries. 8000 lines keeps
@@ -213,10 +213,12 @@ run_kimi() {
   local total_lines
   total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
   if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
+    truncated=true
     truncation_note="
 
 [WARNING: diff truncated to first $diff_line_cap of $total_lines lines. Your review will be INCOMPLETE — the tail of the patch is not shown. Note this limitation in your findings.]"
   else
+    truncated=false
     truncation_note=""
   fi
   # Wrap the diff in an XML-ish tag rather than a markdown fence. Diffs can
@@ -245,7 +247,12 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     >"$out/kimi.stdout" 2>"$out/kimi.stderr" <<<"$full_prompt"
   rc=$?
   end=$(date +%s)
-  printf '{"exit_code": %d, "duration_s": %d}\n' "$rc" "$((end - start))" >"$out/kimi.meta.json"
+  # truncated is reported in metadata so downstream synthesizers don't treat a
+  # partial review as complete. Convergent finding from both codex and kimi
+  # itself in pass 2 of cross-reviewing this skill.
+  printf '{"exit_code": %d, "duration_s": %d, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d}\n' \
+    "$rc" "$((end - start))" "$truncated" "${total_lines:-0}" "$diff_line_cap" \
+    >"$out/kimi.meta.json"
   return "$rc"
 }
 
@@ -269,6 +276,10 @@ IFS=',' read -ra raw_requested <<<"$reviewers"
 requested=()
 seen=","
 for r in "${raw_requested[@]}"; do
+  # Strip surrounding whitespace — `--reviewers "codex, gemini"` with a space
+  # after the comma used to produce " gemini" which failed to match any case.
+  r="${r#"${r%%[![:space:]]*}"}"
+  r="${r%"${r##*[![:space:]]}"}"
   [[ -z "$r" ]] && continue
   [[ "$seen" == *",$r,"* ]] && continue
   seen="$seen$r,"

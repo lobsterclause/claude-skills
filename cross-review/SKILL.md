@@ -70,7 +70,7 @@ bash ~/.claude/skills/cross-review/scripts/run_reviewers.sh \
   --reviewers codex,gemini,kimi
 ```
 
-Runs every requested reviewer concurrently and writes raw outputs to the `out` directory. The wrapper handles the flag dialects (`codex exec review --base <branch> --full-auto` vs. `gemini -p '<prompt>' --approval-mode plan --output-format json` vs. `kimi --plan --print --quiet -p '<prompt>'`) and returns when all are done.
+Runs every requested reviewer concurrently and writes raw outputs to the `out` directory. The wrapper handles the flag dialects (`codex exec review --base <branch> --full-auto` vs. `gemini -p '<prompt>' --approval-mode plan --output-format json` vs. `kimi --plan --print --quiet` with the prompt piped via stdin) and returns when all are done.
 
 **Modes:**
 - **swarm** (default): run every reviewer the detect step found. More coverage, more tokens.
@@ -233,7 +233,7 @@ Keep the block exactly this shape — parent agents key off the field names. Any
 
 - **codex**: Uses `codex exec review --base <branch> --full-auto`. Writes review output to stderr (we merge streams with `2>&1`). `--json` mode emits reasoning/command events but does **not** flush the final review summary — use plain-text mode. `--base` and a positional `[PROMPT]` are mutually exclusive; with `--base`, codex uses its own built-in review instructions.
 - **gemini**: Uses `gemini -p '<prompt>' --approval-mode plan --output-format json`. `plan` mode is read-only (won't try to edit files). Needs an explicit review prompt (see `references/review_prompt.txt`). Auth via `gemini` interactive once to do Google OAuth, then headless works.
-- **kimi** (Moonshot's Kimi Code CLI): Uses `kimi --plan --print --quiet -p '<prompt>'`. `--plan` is read-only; `--print` is non-interactive; `--quiet` trims to just the final assistant message. Default model is `kimi-k2.5` (256K ctx, thinking mode on) — configured in `~/.kimi/config.toml`. Auth is either the Moonshot platform API key (`openai_legacy` provider against `api.moonshot.ai/v1`) or the native Kimi Coding subscription (`kimi login` OAuth). Note: kimi sends code to a China-origin provider — surface that to the user for security-sensitive repos.
+- **kimi** (Moonshot's Kimi Code CLI): Uses `kimi --plan --print --quiet` with the review prompt piped via stdin (NOT `-p`). `--plan` is read-only; `--print` is non-interactive; `--quiet` trims to just the final assistant message. Prompt goes on stdin because argv has a 128KB-per-argument limit on Linux (`MAX_ARG_STRLEN`) and argv-based prompts also leak the diff via `ps` to other local users. Default model is `kimi-k2.5` (256K ctx, thinking mode on) — configured in `~/.kimi/config.toml`. Auth is either the Moonshot platform API key (`openai_legacy` provider against `api.moonshot.ai/v1`) or the native Kimi Coding subscription (`kimi login` OAuth). Note: kimi sends code to a China-origin provider — surface that to the user for security-sensitive repos.
 
 More detail on flags and gotchas lives in [references/cli_flags.md](references/cli_flags.md). Read it if a reviewer is behaving unexpectedly.
 
