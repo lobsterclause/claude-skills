@@ -76,9 +76,9 @@
       "source": "./plugins/contrast-checker"
     },
     {
-      "name": "ios-remote-control",
-      "description": "Remote-control iOS simulators and real devices for agentic app development — boot, install, launch, tap/swipe/type, take screenshots Claude can see, stream logs, inspect accessibility trees, simulate GPS/push/permissions, and iterate. Use this skill whenever the user wants to drive an iOS app from a terminal, debug a running app, automate iOS QA, reproduce bugs, test deep links, inspect UI state, read simulator logs or crash reports, or build/iterate on an iPhone/iPad app with Claude in the loop. Works with React Native, Expo, SwiftUI, and UIKit apps via xcrun simctl + idb + devicectl + pymobiledevice3.",
-      "source": "./plugins/ios-remote-control"
+      "name": "cross-review",
+      "description": "Run external AI code reviewers (codex CLI, gemini CLI, and kimi CLI) in parallel against the current branch's diff, synthesize deduped findings, auto-apply fixes, and iterate until clean. Use this skill whenever the user wants a second opinion on code, cross-review, swarm review, peer review, external review, or wants codex/gemini/kimi to look at changes before shipping \u2014 even if they don't explicitly name the CLIs. Also trigger on \"have codex check this\", \"get a second pair of eyes\", \"cross-check my changes\", \"review before merge\", \"swarm review\", \"review this PR\", or right after Claude creates a PR. Do NOT trigger for routine lint/test runs, style-only checks, or when the user wants Claude itself (not external CLIs) to review.",
+      "source": "./plugins/cross-review"
     },
     {
       "name": "dei-auditor",
@@ -119,6 +119,16 @@
       "name": "gamification-auditor",
       "description": "Audit products for how responsibly they use gamification \u2014 scoring each of the 10 Core Drives of human motivation against ethical guardrails to detect manipulation, addiction design, and dark patterns. Includes age-specific considerations, regulatory awareness, and healthy engagement alternatives for every exploitative pattern identified.",
       "source": "./plugins/gamification-auditor"
+    },
+    {
+      "name": "gap-analysis",
+      "description": "\"Cross-reference design docs (specs, ADRs, plans), codebase, and PM state (ClickUp via MCP, GitHub issues) to find every gap \u2014 unbuilt features, ghost closures, untracked code, stale tickets, spec drift. Produces a dispatch manifest where each gap is a task block Opus hands to Haiku/Sonnet subagents to close, with files to read, numbered steps, and self-checkable acceptance criteria. Trigger on: gap analysis, implementation audit, ticket reconciliation, 'what's missing', 'where do we stand', 'what did we miss', compare planned vs built, reconcile tickets with code, detect ghost closures, generate roadmap from current state, find orphaned code, 'are our tickets accurate', 'what's left to build', drift between plan and implementation. Do NOT use for debugging, writing tests, PR reviews, refactoring, CI setup, or adding features.\"",
+      "source": "./plugins/gap-analysis"
+    },
+    {
+      "name": "ios-remote-control",
+      "description": "Remote-control iOS simulators (and real devices) for agentic app development \u2014 install apps, launch them, tap/swipe/type, take screenshots that Claude can see, stream logs, simulate push/location/permissions, and iterate. Use this skill whenever the user wants to drive an iOS app from a terminal, debug a running iOS app, automate iOS QA, reproduce iOS bugs, test deep links, inspect UI state, read simulator logs or crash reports, or build/iterate on an iPhone/iPad app with Claude in the loop \u2014 even if they don't say the word \"simulator\" (phrases like \"boot the app\", \"take a screenshot of the app\", \"why is my app crashing\", \"try my React Native / Expo / SwiftUI app\", \"open this deep link on iOS\" all trigger it). The skill gives Claude full agentic control over iPhone/iPad simulators via xcrun simctl + idb and real devices via devicectl + pymobiledevice3, with screenshots saved as files Claude can Read and JSON-structured output on every command so Claude can correlate actions with logs and errors.",
+      "source": "./plugins/ios-remote-control"
     },
     {
       "name": "keyboard-focus-auditor",
