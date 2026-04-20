@@ -98,6 +98,39 @@ run_with_timeout() {
   fi
 }
 
+# retry_reviewer: run a reviewer function once, retry once on nonzero exit
+# with a jittered 5-15s backoff. Applied only to gemini/kimi, which get
+# flaky under concurrent or quick-succession runs (rate limits, auth
+# handshake races). Codex has been reliable — don't wrap it.
+#
+# Exports CROSS_REVIEW_ATTEMPT so run_gemini / run_kimi can include it in
+# their meta output. An exported env var (vs. bash dynamic scoping on a
+# `local`) survives callees that declare their own `local attempt`, which
+# is a reasonable future refactor that would otherwise silently break the
+# retry telemetry.
+retry_reviewer() {
+  local fn="$1"
+  local name="$2"
+  export CROSS_REVIEW_ATTEMPT=1
+  "$fn"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    local backoff=$((5 + RANDOM % 11))
+    echo "$name: attempt 1 failed (rc=$rc), retrying in ${backoff}s" >&2
+    sleep "$backoff"
+    export CROSS_REVIEW_ATTEMPT=2
+    "$fn"
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+      echo "$name: attempt 2 succeeded" >&2
+    else
+      echo "$name: attempt 2 also failed (rc=$rc)" >&2
+    fi
+  fi
+  unset CROSS_REVIEW_ATTEMPT
+  return "$rc"
+}
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompt_file="$script_dir/../references/review_prompt.txt"
 
@@ -170,7 +203,8 @@ Use your file-reading tools to inspect the actual changes. Return your findings 
     >"$out/gemini.stdout" 2>"$out/gemini.stderr" </dev/null
   rc=$?
   end=$(date +%s)
-  printf '{"exit_code": %d, "duration_s": %d}\n' "$rc" "$((end - start))" >"$out/gemini.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "attempt": %d}\n' \
+    "$rc" "$((end - start))" "${CROSS_REVIEW_ATTEMPT:-1}" >"$out/gemini.meta.json"
   return "$rc"
 }
 
@@ -250,8 +284,8 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # truncated is reported in metadata so downstream synthesizers don't treat a
   # partial review as complete. Convergent finding from both codex and kimi
   # itself in pass 2 of cross-reviewing this skill.
-  printf '{"exit_code": %d, "duration_s": %d, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d}\n' \
-    "$rc" "$((end - start))" "$truncated" "${total_lines:-0}" "$diff_line_cap" \
+  printf '{"exit_code": %d, "duration_s": %d, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d}\n' \
+    "$rc" "$((end - start))" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" \
     >"$out/kimi.meta.json"
   return "$rc"
 }
@@ -286,10 +320,17 @@ for r in "${raw_requested[@]}"; do
   requested+=("$r")
 done
 
+# Stagger spawns by 2s. Launching all three reviewers at t=0 means
+# concurrent auth handshakes and simultaneous first requests against shared
+# upstream endpoints, which reliably flakes gemini/kimi. A small offset
+# lets each initial handshake settle before the next starts.
+stagger_s=2
+
 for r in "${requested[@]}"; do
   case "$r" in
     codex)
       if command -v codex >/dev/null 2>&1; then
+        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
         run_codex &
         pids+=($!)
         ran+=("codex")
@@ -299,7 +340,8 @@ for r in "${requested[@]}"; do
       ;;
     gemini)
       if command -v gemini >/dev/null 2>&1; then
-        run_gemini &
+        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        retry_reviewer run_gemini gemini &
         pids+=($!)
         ran+=("gemini")
       else
@@ -308,7 +350,8 @@ for r in "${requested[@]}"; do
       ;;
     kimi)
       if command -v kimi >/dev/null 2>&1; then
-        run_kimi &
+        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        retry_reviewer run_kimi kimi &
         pids+=($!)
         ran+=("kimi")
       else
