@@ -1,0 +1,9 @@
+{
+  "name": "gap-analysis",
+  "version": "0.1.0",
+  "description": "\"Cross-reference design docs (specs, ADRs, plans), codebase, and PM state (ClickUp via MCP, GitHub issues) to find every gap \u2014 unbuilt features, ghost closures, untracked code, stale tickets, spec drift. Produces a dispatch manifest where each gap is a task block Opus hands to Haiku/Sonnet subagents to close, with files to read, numbered steps, and self-checkable acceptance criteria. Trigger on: gap analysis, implementation audit, ticket reconciliation, 'what's missing', 'where do we stand', 'what did we miss', compare planned vs built, reconcile tickets with code, detect ghost closures, generate roadmap from current state, find orphaned code, 'are our tickets accurate', 'what's left to build', drift between plan and implementation. Do NOT use for debugging, writing tests, PR reviews, refactoring, CI setup, or adding features.\"",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

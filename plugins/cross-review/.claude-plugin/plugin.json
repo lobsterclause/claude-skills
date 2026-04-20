@@ -1,0 +1,9 @@
+{
+  "name": "cross-review",
+  "version": "0.1.0",
+  "description": "Run external AI code reviewers (codex CLI, gemini CLI, and kimi CLI) in parallel against the current branch's diff, synthesize deduped findings, auto-apply fixes, and iterate until clean. Use this skill whenever the user wants a second opinion on code, cross-review, swarm review, peer review, external review, or wants codex/gemini/kimi to look at changes before shipping \u2014 even if they don't explicitly name the CLIs. Also trigger on \"have codex check this\", \"get a second pair of eyes\", \"cross-check my changes\", \"review before merge\", \"swarm review\", \"review this PR\", or right after Claude creates a PR. Do NOT trigger for routine lint/test runs, style-only checks, or when the user wants Claude itself (not external CLIs) to review.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

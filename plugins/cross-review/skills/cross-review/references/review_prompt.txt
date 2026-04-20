@@ -1,0 +1,20 @@
+You are performing a code review of the changes on the current branch against '{{BASE}}'.
+
+Your goal is to find problems a careful human reviewer would flag before merging. Focus on, in priority order:
+
+1. Correctness bugs — off-by-ones, unhandled null/undefined, race conditions, wrong error handling, swapped arguments, broken edge cases.
+2. Security issues — injection (SQL, shell, command), unsafe deserialization, exposed secrets, broken auth or authorization, unsafe file handling, missing validation at trust boundaries.
+3. Semantic drift — does the change actually accomplish what its commit messages / PR title claim? Did it introduce logic that contradicts itself or existing invariants?
+4. Resource and concurrency — leaks, unbounded work, deadlocks, missing timeouts, blocking I/O on hot paths.
+5. Tests — missing coverage for the new logic, tests that pass trivially, mocks that hide real behavior.
+
+For each finding, include:
+- File path and line number (or range) where it lives
+- A one-line title
+- A short explanation of why it matters
+- A concrete suggested fix (not just "improve this")
+- A severity label: Critical / High / Medium / Low
+
+Skip pure style nits and bikeshedding. Skip things that are matters of taste rather than correctness. If the change looks clean, say so explicitly — do not invent findings.
+
+Organize your output by severity (Critical first). Be terse. This output will be consumed by another agent that applies fixes, so clarity and specificity matter more than prose.
