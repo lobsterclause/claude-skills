@@ -11,25 +11,24 @@ Invocation used by this skill:
 ```bash
 codex exec review \
   --base <branch> \
-  --full-auto \
-  --json \
-  "<prompt>"
+  --full-auto 2>&1
 ```
 
 Why these flags:
 
 - `exec review` — dedicated non-interactive review subcommand. No TUI, no approvals.
-- `--base <branch>` — tells codex which base to diff against. Without it, codex picks up whatever its own heuristic decides, which can be wrong in monorepos.
+- `--base <branch>` — tells codex which base to diff against. Without it, codex picks up whatever its own heuristic decides, which can be wrong in monorepos. When `--base` is set, codex uses its own built-in review instructions; a positional `[PROMPT]` is mutually exclusive with `--base` and is not passed.
 - `--full-auto` — equivalent to `-a on-request --sandbox workspace-write`. Required for headless runs: no approval prompts, writes confined to the workspace. We don't want codex editing files during review — its sandbox is a safety net, not a feature we use.
-- `--json` — JSONL event stream. Every model utterance, tool call, and final result is a discrete JSON line. The useful review content is in the final few events. We don't parse the stream in-script — the skill's agent reads the raw output and synthesizes findings itself.
+- `2>&1` — codex writes both its progress trace and the final review summary to stderr in plain-text mode; we merge streams so everything lands in `codex.stdout`.
 
 Flags we deliberately do not use:
 
 - `--dangerously-bypass-approvals-and-sandbox` — skips all safety. Only for externally-sandboxed CI, which isn't our case.
 - `-m/--model` — we let codex pick its default. Pin a model only if results become inconsistent across runs.
 - `--commit <sha>` / `--uncommitted` — we always want branch-vs-base for cross-review, not commit-scoped.
+- `--json` — JSONL event stream; omits the final review summary in `exec review` mode (only emits reasoning/command events). Plain-text + stream-merge is the only reliable way to capture the review.
 
-**Important gotcha**: `codex exec review --base <branch>` and a positional `[PROMPT]` are **mutually exclusive** — passing both fails with `the argument '--base <BRANCH>' cannot be used with '[PROMPT]'`. When `--base` is supplied, codex uses its own built-in review instructions; any custom prompt is dropped. If you need custom review instructions for codex, you have to omit `--base` and describe the branch-vs-base setup inside the prompt itself.
+**Important gotcha**: `codex exec review --base <branch>` and a positional `[PROMPT]` are **mutually exclusive** — passing both fails with `the argument '--base <BRANCH>' cannot be used with '[PROMPT]'`. If you need custom review instructions for codex, you have to omit `--base` and describe the branch-vs-base setup inside the prompt itself.
 
 Auth: codex uses its own login (`codex login`). If the first run hangs on auth, that's almost always it. Re-run `codex login` interactively once, then headless runs work.
 
@@ -75,7 +74,7 @@ kimi \
   --plan \
   --print \
   --quiet \
-  -p "<prompt-with-full-diff-inline>" </dev/null
+  <<<"<prompt-with-full-diff-inline>"
 ```
 
 **Invocation mode: single-turn, no-tools.** Unlike codex and gemini, we do *not* let kimi roam the repo with file-reading tools. Instead, the full `git diff <base>...HEAD` is embedded in the prompt and we instruct the model "do not use any tools." This is a deliberate design choice — see the rationale below.
@@ -85,8 +84,7 @@ Why these flags:
 - `--plan` — read-only plan mode. Defense in depth; even if kimi decides to call a write tool despite the prompt instruction, it can't edit anything.
 - `--print` — non-interactive mode; exits after the single turn. Without it, kimi launches its TUI and blocks forever in a pipeline. `--print` implicitly sets `--yolo`, harmless under `--plan`.
 - `--quiet` — alias for `--print --output-format text --final-message-only`. Prints only the final assistant message.
-- `-p <prompt>` — the review prompt, with the full diff inlined. argv fits up to ~1MB on macOS (`getconf ARG_MAX`) and the wrapper caps the diff at 500K chars for safety. k2.5's 256K-token context handles anything under that.
-- `</dev/null` on stdin — prevents kimi from appending stdin to the `-p` payload (same footgun as gemini).
+- **stdin** (via here-string) carries the prompt. **Do not** use `-p` — argv has a hard 128KB-per-argument limit on Linux (`MAX_ARG_STRLEN`), which the inlined diff can easily exceed; argv-based prompts also expose the full diff via `ps` to other users on the machine. kimi reads stdin as the prompt when `--print` is set and no `-p` is given. The wrapper caps the diff at 8000 lines (well under k2.5's 256K-token context) and injects a truncation warning into the prompt when exceeded.
 
 Why single-turn no-tools (the real story):
 

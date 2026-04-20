@@ -194,26 +194,47 @@ run_kimi() {
   # --plan: defense in depth (can't edit files even if it tried).
   # --print: non-interactive. Implies --yolo.
   # --quiet: final assistant message only (drops tool-trace noise).
-  # -p carries the prompt. stdin is /dev/null so kimi doesn't append stdin.
-  local diff_summary diff_full
+  # Prompt is piped via stdin, NOT argv. Reasons:
+  #   - Linux MAX_ARG_STRLEN is 128KB per argument; argv-based prompts would
+  #     crash with E2BIG on any diff larger than that (macOS tolerates ~1MB,
+  #     which hid the bug in smoke tests).
+  #   - Putting the full diff in argv also exposes it via `ps` to other local
+  #     users for the duration of the kimi run — a privacy regression vs.
+  #     codex/gemini which don't have this issue.
+  # kimi reads stdin as the prompt when --print is set and no -p is given
+  # (confirmed: `echo "..." | kimi --print --quiet` works).
+  local diff_summary diff_full diff_line_cap truncation_note
   diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
-  # Cap the full diff at ~500K chars to stay safely under the 1MB argv limit on
-  # macOS (getconf ARG_MAX ≈ 1MB) and well under k2.5's 256K-token context.
-  # Very large diffs get truncated with a warning in the prompt; kimi will
-  # still review what it sees.
-  diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -c 500000 || true)"
+  # Line-based cap (not byte-based). head -c can split mid-codepoint and
+  # produce invalid UTF-8; head -n respects line boundaries. 8000 lines keeps
+  # us well under k2.5's 256K-token context even for verbose diffs.
+  diff_line_cap=8000
+  diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -n "$diff_line_cap" || true)"
+  local total_lines
+  total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
+    truncation_note="
+
+[WARNING: diff truncated to first $diff_line_cap of $total_lines lines. Your review will be INCOMPLETE — the tail of the patch is not shown. Note this limitation in your findings.]"
+  else
+    truncation_note=""
+  fi
+  # Wrap the diff in an XML-ish tag rather than a markdown fence. Diffs can
+  # legitimately contain triple-backtick lines (e.g. doc changes that add a
+  # fenced code block), which close the fence prematurely and corrupt the
+  # prompt. <diff>...</diff> has no such collision surface.
   local full_prompt
   full_prompt="$review_prompt
 
-Do NOT use any file-reading or shell tools. Base your review ONLY on the diff below — it is complete and self-contained for this review.
+Do NOT use any file-reading or shell tools. Base your review ONLY on the diff below.${truncation_note}
 
 Changed files (diff --stat against $base):
 $diff_summary
 
 Full diff:
-\`\`\`diff
+<diff>
 $diff_full
-\`\`\`
+</diff>
 
 Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
 
@@ -221,8 +242,7 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     --plan \
     --print \
     --quiet \
-    -p "$full_prompt" \
-    >"$out/kimi.stdout" 2>"$out/kimi.stderr" </dev/null
+    >"$out/kimi.stdout" 2>"$out/kimi.stderr" <<<"$full_prompt"
   rc=$?
   end=$(date +%s)
   printf '{"exit_code": %d, "duration_s": %d}\n' "$rc" "$((end - start))" >"$out/kimi.meta.json"
@@ -232,7 +252,29 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
 pids=()
 ran=()
 
-IFS=',' read -ra requested <<<"$reviewers"
+# Clean up background reviewers on interrupt. Without this, Ctrl+C on the
+# orchestrator exits the parent shell but leaves codex/gemini/kimi orphaned,
+# burning tokens against APIs nobody is reading any more.
+cleanup_pids() {
+  [[ ${#pids[@]} -gt 0 ]] || return 0
+  kill "${pids[@]}" 2>/dev/null || true
+}
+trap cleanup_pids EXIT INT TERM
+
+IFS=',' read -ra raw_requested <<<"$reviewers"
+# Dedup. Without this, `--reviewers codex,codex` spawns two processes writing
+# to the same $out/codex.* files concurrently, producing interleaved garbage.
+# Bash 3.2 (macOS default /bin/bash) lacks associative arrays — use a
+# delimited string instead.
+requested=()
+seen=","
+for r in "${raw_requested[@]}"; do
+  [[ -z "$r" ]] && continue
+  [[ "$seen" == *",$r,"* ]] && continue
+  seen="$seen$r,"
+  requested+=("$r")
+done
+
 for r in "${requested[@]}"; do
   case "$r" in
     codex)
