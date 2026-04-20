@@ -103,20 +103,22 @@ run_with_timeout() {
 # flaky under concurrent or quick-succession runs (rate limits, auth
 # handshake races). Codex has been reliable — don't wrap it.
 #
-# The `attempt` local is visible to the called function via bash dynamic
-# scoping; run_gemini / run_kimi include it in their meta output so the
-# synthesizer can see which reviews needed a retry.
+# Exports CROSS_REVIEW_ATTEMPT so run_gemini / run_kimi can include it in
+# their meta output. An exported env var (vs. bash dynamic scoping on a
+# `local`) survives callees that declare their own `local attempt`, which
+# is a reasonable future refactor that would otherwise silently break the
+# retry telemetry.
 retry_reviewer() {
   local fn="$1"
   local name="$2"
-  local attempt=1
+  export CROSS_REVIEW_ATTEMPT=1
   "$fn"
   local rc=$?
   if [[ $rc -ne 0 ]]; then
     local backoff=$((5 + RANDOM % 11))
     echo "$name: attempt 1 failed (rc=$rc), retrying in ${backoff}s" >&2
     sleep "$backoff"
-    attempt=2
+    export CROSS_REVIEW_ATTEMPT=2
     "$fn"
     rc=$?
     if [[ $rc -eq 0 ]]; then
@@ -125,6 +127,7 @@ retry_reviewer() {
       echo "$name: attempt 2 also failed (rc=$rc)" >&2
     fi
   fi
+  unset CROSS_REVIEW_ATTEMPT
   return "$rc"
 }
 
@@ -201,7 +204,7 @@ Use your file-reading tools to inspect the actual changes. Return your findings 
   rc=$?
   end=$(date +%s)
   printf '{"exit_code": %d, "duration_s": %d, "attempt": %d}\n' \
-    "$rc" "$((end - start))" "${attempt:-1}" >"$out/gemini.meta.json"
+    "$rc" "$((end - start))" "${CROSS_REVIEW_ATTEMPT:-1}" >"$out/gemini.meta.json"
   return "$rc"
 }
 
@@ -282,7 +285,7 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # partial review as complete. Convergent finding from both codex and kimi
   # itself in pass 2 of cross-reviewing this skill.
   printf '{"exit_code": %d, "duration_s": %d, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d}\n' \
-    "$rc" "$((end - start))" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${attempt:-1}" \
+    "$rc" "$((end - start))" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" \
     >"$out/kimi.meta.json"
   return "$rc"
 }
