@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# run_reviewers.sh — run codex and/or gemini in parallel against the current diff.
+# run_reviewers.sh — run codex, gemini, and/or kimi in parallel against the current diff.
 #
 # Usage:
-#   run_reviewers.sh --base <branch> --out <dir> [--reviewers codex,gemini] [--timeout <sec>]
+#   run_reviewers.sh --base <branch> --out <dir> [--reviewers codex,gemini,kimi] [--timeout <sec>]
 #
 # Writes:
 #   <out>/codex.stdout     — codex review (stderr merged)
@@ -10,6 +10,9 @@
 #   <out>/gemini.stdout    — gemini JSON
 #   <out>/gemini.stderr
 #   <out>/gemini.meta.json
+#   <out>/kimi.stdout      — kimi review text (final assistant message)
+#   <out>/kimi.stderr
+#   <out>/kimi.meta.json
 #   <out>/run.meta.json    — overall run metadata (skipped reason, etc.)
 #
 # Exit codes:
@@ -21,7 +24,7 @@ set -uo pipefail
 
 base=""
 out=""
-reviewers="codex,gemini"
+reviewers="codex,gemini,kimi"
 timeout_s=300
 
 need_val() {
@@ -44,7 +47,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,gemini] [--timeout <sec>]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,gemini,kimi] [--timeout <sec>]" >&2
   exit 2
 fi
 
@@ -93,6 +96,39 @@ run_with_timeout() {
   else
     "$@"
   fi
+}
+
+# retry_reviewer: run a reviewer function once, retry once on nonzero exit
+# with a jittered 5-15s backoff. Applied only to gemini/kimi, which get
+# flaky under concurrent or quick-succession runs (rate limits, auth
+# handshake races). Codex has been reliable — don't wrap it.
+#
+# Exports CROSS_REVIEW_ATTEMPT so run_gemini / run_kimi can include it in
+# their meta output. An exported env var (vs. bash dynamic scoping on a
+# `local`) survives callees that declare their own `local attempt`, which
+# is a reasonable future refactor that would otherwise silently break the
+# retry telemetry.
+retry_reviewer() {
+  local fn="$1"
+  local name="$2"
+  export CROSS_REVIEW_ATTEMPT=1
+  "$fn"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    local backoff=$((5 + RANDOM % 11))
+    echo "$name: attempt 1 failed (rc=$rc), retrying in ${backoff}s" >&2
+    sleep "$backoff"
+    export CROSS_REVIEW_ATTEMPT=2
+    "$fn"
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+      echo "$name: attempt 2 succeeded" >&2
+    else
+      echo "$name: attempt 2 also failed (rc=$rc)" >&2
+    fi
+  fi
+  unset CROSS_REVIEW_ATTEMPT
+  return "$rc"
 }
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -167,18 +203,134 @@ Use your file-reading tools to inspect the actual changes. Return your findings 
     >"$out/gemini.stdout" 2>"$out/gemini.stderr" </dev/null
   rc=$?
   end=$(date +%s)
-  printf '{"exit_code": %d, "duration_s": %d}\n' "$rc" "$((end - start))" >"$out/gemini.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "attempt": %d}\n' \
+    "$rc" "$((end - start))" "${CROSS_REVIEW_ATTEMPT:-1}" >"$out/gemini.meta.json"
+  return "$rc"
+}
+
+run_kimi() {
+  local start end rc
+  start=$(date +%s)
+  # kimi (Moonshot's Kimi Code CLI) against Moonshot's OpenAI-compatible endpoint.
+  #
+  # We deliberately run kimi in single-turn, no-tools mode: pipe the full diff
+  # inline and instruct the model not to call any tools. Why:
+  #   (a) kimi-k2.5's thinking mode + multi-turn tool calls requires threading
+  #       `reasoning_content` between turns, and the `openai_legacy` adapter
+  #       doesn't preserve it — the second turn fails with "thinking is enabled
+  #       but reasoning_content is missing".
+  #   (b) Single-turn with thinking-on gives better review quality than
+  #       multi-turn with thinking-off.
+  #   (c) Code review is fundamentally a single-turn task: the diff IS the
+  #       input. codex and gemini already do the agentic file-roaming; kimi
+  #       fills a different niche — deep reasoning on the diff as given.
+  #
+  # --plan: defense in depth (can't edit files even if it tried).
+  # --print: non-interactive. Implies --yolo.
+  # --quiet: final assistant message only (drops tool-trace noise).
+  # Prompt is piped via stdin, NOT argv. Reasons:
+  #   - Linux MAX_ARG_STRLEN is 128KB per argument; argv-based prompts would
+  #     crash with E2BIG on any diff larger than that (macOS tolerates ~1MB,
+  #     which hid the bug in smoke tests).
+  #   - Putting the full diff in argv also exposes it via `ps` to other local
+  #     users for the duration of the kimi run — a privacy regression vs.
+  #     codex/gemini which don't have this issue.
+  # kimi reads stdin as the prompt when --print is set and no -p is given
+  # (confirmed: `echo "..." | kimi --print --quiet` works).
+  local diff_summary diff_full diff_line_cap truncation_note truncated
+  diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
+  # Line-based cap (not byte-based). head -c can split mid-codepoint and
+  # produce invalid UTF-8; head -n respects line boundaries. 8000 lines keeps
+  # us well under k2.5's 256K-token context even for verbose diffs.
+  diff_line_cap=8000
+  diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -n "$diff_line_cap" || true)"
+  local total_lines
+  total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
+    truncated=true
+    truncation_note="
+
+[WARNING: diff truncated to first $diff_line_cap of $total_lines lines. Your review will be INCOMPLETE — the tail of the patch is not shown. Note this limitation in your findings.]"
+  else
+    truncated=false
+    truncation_note=""
+  fi
+  # Wrap the diff in an XML-ish tag rather than a markdown fence. Diffs can
+  # legitimately contain triple-backtick lines (e.g. doc changes that add a
+  # fenced code block), which close the fence prematurely and corrupt the
+  # prompt. <diff>...</diff> has no such collision surface.
+  local full_prompt
+  full_prompt="$review_prompt
+
+Do NOT use any file-reading or shell tools. Base your review ONLY on the diff below.${truncation_note}
+
+Changed files (diff --stat against $base):
+$diff_summary
+
+Full diff:
+<diff>
+$diff_full
+</diff>
+
+Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
+
+  run_with_timeout "$timeout_s" kimi \
+    --plan \
+    --print \
+    --quiet \
+    >"$out/kimi.stdout" 2>"$out/kimi.stderr" <<<"$full_prompt"
+  rc=$?
+  end=$(date +%s)
+  # truncated is reported in metadata so downstream synthesizers don't treat a
+  # partial review as complete. Convergent finding from both codex and kimi
+  # itself in pass 2 of cross-reviewing this skill.
+  printf '{"exit_code": %d, "duration_s": %d, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d}\n' \
+    "$rc" "$((end - start))" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" \
+    >"$out/kimi.meta.json"
   return "$rc"
 }
 
 pids=()
 ran=()
 
-IFS=',' read -ra requested <<<"$reviewers"
+# Clean up background reviewers on interrupt. Without this, Ctrl+C on the
+# orchestrator exits the parent shell but leaves codex/gemini/kimi orphaned,
+# burning tokens against APIs nobody is reading any more.
+cleanup_pids() {
+  [[ ${#pids[@]} -gt 0 ]] || return 0
+  kill "${pids[@]}" 2>/dev/null || true
+}
+trap cleanup_pids EXIT INT TERM
+
+IFS=',' read -ra raw_requested <<<"$reviewers"
+# Dedup. Without this, `--reviewers codex,codex` spawns two processes writing
+# to the same $out/codex.* files concurrently, producing interleaved garbage.
+# Bash 3.2 (macOS default /bin/bash) lacks associative arrays — use a
+# delimited string instead.
+requested=()
+seen=","
+for r in "${raw_requested[@]}"; do
+  # Strip surrounding whitespace — `--reviewers "codex, gemini"` with a space
+  # after the comma used to produce " gemini" which failed to match any case.
+  r="${r#"${r%%[![:space:]]*}"}"
+  r="${r%"${r##*[![:space:]]}"}"
+  [[ -z "$r" ]] && continue
+  [[ "$seen" == *",$r,"* ]] && continue
+  seen="$seen$r,"
+  requested+=("$r")
+done
+
+# Stagger spawns by 2s. Launching all three reviewers at t=0 means
+# concurrent auth handshakes and simultaneous first requests against shared
+# upstream endpoints, which reliably flakes gemini/kimi. A small offset
+# lets each initial handshake settle before the next starts.
+stagger_s=2
+
 for r in "${requested[@]}"; do
   case "$r" in
     codex)
       if command -v codex >/dev/null 2>&1; then
+        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
         run_codex &
         pids+=($!)
         ran+=("codex")
@@ -188,11 +340,22 @@ for r in "${requested[@]}"; do
       ;;
     gemini)
       if command -v gemini >/dev/null 2>&1; then
-        run_gemini &
+        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        retry_reviewer run_gemini gemini &
         pids+=($!)
         ran+=("gemini")
       else
         echo "gemini not installed — skipping" >&2
+      fi
+      ;;
+    kimi)
+      if command -v kimi >/dev/null 2>&1; then
+        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        retry_reviewer run_kimi kimi &
+        pids+=($!)
+        ran+=("kimi")
+      else
+        echo "kimi not installed — skipping" >&2
       fi
       ;;
     *)
@@ -221,6 +384,7 @@ for i in "${!pids[@]}"; do
     case "$name" in
       codex)  echo "$name: failed (see $out/codex.stdout and $out/codex.meta.json)" >&2 ;;
       gemini) echo "$name: failed (see $out/gemini.stderr and $out/gemini.meta.json)" >&2 ;;
+      kimi)   echo "$name: failed (see $out/kimi.stderr and $out/kimi.meta.json)" >&2 ;;
       *)      echo "$name: failed (see $out/$name.* )" >&2 ;;
     esac
   fi
