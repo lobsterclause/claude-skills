@@ -1,0 +1,9 @@
+{
+  "name": "ios-remote-control",
+  "version": "0.1.0",
+  "description": "Remote-control iOS simulators (and real devices) for agentic app development \u2014 install apps, launch them, tap/swipe/type, take screenshots that Claude can see, stream logs, simulate push/location/permissions, and iterate. Use this skill whenever the user wants to drive an iOS app from a terminal, debug a running iOS app, automate iOS QA, reproduce iOS bugs, test deep links, inspect UI state, read simulator logs or crash reports, or build/iterate on an iPhone/iPad app with Claude in the loop \u2014 even if they don't say the word \"simulator\" (phrases like \"boot the app\", \"take a screenshot of the app\", \"why is my app crashing\", \"try my React Native / Expo / SwiftUI app\", \"open this deep link on iOS\" all trigger it). The skill gives Claude full agentic control over iPhone/iPad simulators via xcrun simctl + idb and real devices via devicectl + pymobiledevice3, with screenshots saved as files Claude can Read and JSON-structured output on every command so Claude can correlate actions with logs and errors.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

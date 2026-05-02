@@ -1,0 +1,29 @@
+{
+  "skill_name": "cross-review",
+  "evals": [
+    {
+      "id": 1,
+      "name": "clean-change",
+      "prompt": "Cross-review the current branch against main — small change to src/formatCurrency.ts that adds an optional locale param with a sensible default.",
+      "expected_output": "No Critical or High findings. Reviewers should not invent issues. Change is backward-compatible, defaults to prior behavior.",
+      "fixture": "/tmp/cross-review-eval/fixture-1-clean",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "obvious-bug",
+      "prompt": "Cross-review the current branch against main — adds src/getInitials.ts which builds initials from a full name.",
+      "expected_output": "At least one reviewer should flag: (a) parts[1] undefined when fullName is single-word, (b) parts[0][0] on empty string, (c) no uppercasing despite jsdoc promising uppercase output. Severity Critical or High.",
+      "fixture": "/tmp/cross-review-eval/fixture-2-obvious-bug",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "subtle-bug",
+      "prompt": "Cross-review the current branch against main — refactor of src/rateLimiter.ts that switches from explicit null/undefined check to || operator.",
+      "expected_output": "At least one reviewer should flag that `|| 5000` changes semantics: a userSetting of 0 (documented as 'disables rate limiting') now gets replaced with 5000. Correct fix is `?? 5000`. This is the high-value case — a subtle semantic regression that a casual reviewer might miss.",
+      "fixture": "/tmp/cross-review-eval/fixture-3-subtle-bug",
+      "files": []
+    }
+  ]
+}
