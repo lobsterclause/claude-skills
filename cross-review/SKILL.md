@@ -27,6 +27,18 @@ bash ~/.claude/skills/cross-review/scripts/detect_reviewers.sh
 
 Prints JSON like `{"codex": true, "gemini": true, "kimi": true}`. If none are available, stop and tell the user how to install them (`brew install codex-cli`, `npm i -g @google/gemini-cli`, `curl -L code.kimi.com/install.sh | bash`). Do not proceed with zero reviewers.
 
+### 1.5 Pre-run health check (recent runlog)
+
+Before spending tokens on a fresh round, glance at the last 10 runs to see if any reviewer is currently degraded. The analyzer surfaces only what's actionable — silent in the common case.
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/analyze_runlog.sh --recent 10 --mode warn
+```
+
+If a warning prints (e.g. *"WARN: gemini timed out 35% of last 10 runs — consider --timeout-gemini 800"*), surface it to the user and ask whether to apply the suggested override for this run. Do not auto-apply — surface-and-confirm only. If no warning, proceed silently.
+
+The analyzer has a separate `--mode report` that prints a full health snapshot; that's surfaced via `/cross-review --self-check`, not on every run.
+
 ### 2. Determine review scope and prepare an isolated worktree
 
 Figure out what to review:
@@ -113,6 +125,15 @@ Produce a merged list at `$run_dir/findings.md` with this structure:
 - **Low / nit**: style, minor phrasing, minor optimization.
 
 When multiple reviewers flag the same issue at different severities, take the highest one and note the disagreement. Convergence across all three reviewers is a very strong signal; a finding flagged by only one deserves more skepticism.
+
+**Apply per-reviewer priors from `references/reviewer_profiles.json` when triaging:**
+
+- A finding tagged `skip_unless_convergent` for that reviewer's severity should be dropped if no other reviewer flagged the same area. Codex P3 nits and kimi Low/nit findings are the typical examples.
+- A finding tagged `high_precision` (codex P1 today) should rank as near-certain real even if solo.
+- `trust_if_convergent` means: keep when 2+ reviewers agree on it; downgrade or move to "verify" when solo.
+- When two reviewers disagree on severity, break the tie with `synthesis_weight` (higher weight wins).
+
+These priors live in `reviewer_profiles.json` — read once at synthesis time, edit there (not inline) when tuning. The analyzer's `--mode report` will eventually suggest edits to these values based on observed convergence and precision rates.
 
 ### 5. Triage and apply fixes (opt-in only)
 
@@ -229,6 +250,28 @@ Notes:   <≤1 sentence if something non-obvious happened — reviewer disagreem
 
 Keep the block exactly this shape — parent agents key off the field names. Anything else (longer analysis, reviewer prose) goes in `findings.md`, not in the report block.
 
+### 9.5 Append runlog entry
+
+After the report block — and before worktree teardown — append a structured JSONL entry to `~/.claude/skills/cross-review/runlog.jsonl`. This is what the Phase 1.5 pre-run check and `/cross-review --self-check` read; without it, the self-improvement loop has no data.
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/append_runlog.sh \
+  --run-dir "$run_dir" \
+  --project "$(basename "$(git -C "$worktree" rev-parse --show-toplevel)")" \
+  --base "$base" \
+  --pr "${pr:-"-"}" \
+  --pass "$N" \
+  --verdict "<CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED>" \
+  --convergent "<n>" \
+  --top "<file:line — title [severity][sources]>" \
+  --diff-files "<n>" --diff-lines "<n>" \
+  --notes "<≤1 sentence on anything non-obvious>"
+```
+
+The script reads each `$run_dir/<reviewer>.meta.json` to fill in per-reviewer telemetry — duration, exit code, timed_out, output_bytes, attempt — so you only pass the high-level verdict and one-line summary. Pass `-` for `--pr` on branch-only runs (no GitHub PR).
+
+Append once per pass (not once per multi-pass run). The runlog is JSONL: one line per pass, append-only, safe under concurrent splitstream rounds.
+
 ## Reviewer-specific notes
 
 - **codex**: Uses `codex exec review --base <branch> --full-auto`. Writes review output to stderr (we merge streams with `2>&1`). `--json` mode emits reasoning/command events but does **not** flush the final review summary — use plain-text mode. `--base` and a positional `[PROMPT]` are mutually exclusive; with `--base`, codex uses its own built-in review instructions.
@@ -246,10 +289,32 @@ This is not auto-invoked by the harness. To make it fire automatically after eve
 ## Common failure modes
 
 - **"No diff to review"**: branch has no commits past the base. Check `git log base..HEAD` — likely on the wrong branch.
-- **Reviewer hangs**: all three CLIs can hang on auth or on first-run config prompts. The wrapper has a timeout (5 min/reviewer); if it fires, surface stderr so the user can re-auth.
+- **Reviewer hangs**: all three CLIs can hang on auth or on first-run config prompts. The wrapper has a per-reviewer timeout (codex 300s, gemini/kimi 600s by default — see `references/reviewer_profiles.json`); if it fires, surface stderr so the user can re-auth. Timeouts are no longer retried (a reviewer that used its budget will use it again on retry — that's a tuning signal, not a transient failure). If the same reviewer keeps timing out, the analyzer's `--mode warn` will surface a suggested bump on the next run.
 - **Reviewer flags a tokens-vs-hardcoded issue that's actually fine**: Vibrant Punk / NativeWind contexts use tokens that look like hex to the reviewer. Check `constants/theme.ts` before "fixing" a perceived hardcoded color.
 - **Same finding keeps coming back**: either the fix is wrong, or the reviewer has a stale mental model (e.g., you moved logic to another file and it still complains about the old location). Don't loop — stop and investigate.
 - **Iteration 3 still dirty**: structural issue. Don't push through — ask the user whether to merge with known findings or take a different approach.
+
+## Self-check mode
+
+When invoked as `/cross-review --self-check`, skip the review pipeline and emit a health snapshot of the reviewer fleet:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/analyze_runlog.sh --recent 20 --mode report
+```
+
+The report shows per-reviewer reliability %, ok/timeout/empty/failed counts, p50/p95 duration, current timeout budget, and a list of suggested edits to `references/reviewer_profiles.json` (e.g. "bump gemini.timeout_s from 600 → 800 because timeout rate 25% over window"). Suggestions never apply themselves — the user (or Claude) edits the profile file with eyes on, the same way splitstream's pre-flight table needs explicit approval.
+
+Use it: weekly, after a noticeably degraded round, before changing reviewer profiles, or when investigating "why did cross-review miss X?"
+
+## Per-reviewer behavioral profiles
+
+`references/reviewer_profiles.json` is the canonical source for per-reviewer config: timeout, retry policy, severity priors, synthesis weight, specialization. Three places read it:
+
+- The wrapper (`run_reviewers.sh`) sources `timeout_s` and `retry_policy` from it. CLI flags override.
+- The synthesis step (4) consults `severity_priors` and `synthesis_weight` when ranking findings. See "Apply per-reviewer priors..." in step 4.
+- The analyzer (`analyze_runlog.sh`) reads the current `timeout_s` to suggest tuning bumps.
+
+When tuning a reviewer's behavior — e.g. "kimi nits are wasting time, downweight them" — edit `reviewer_profiles.json`, not the wrapper or SKILL.md prose. Centralizing the config keeps the self-improvement loop honest: the analyzer's suggestions land in the same file humans edit by hand.
 
 ## What this skill does not do
 

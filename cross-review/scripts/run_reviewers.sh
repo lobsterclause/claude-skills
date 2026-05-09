@@ -2,7 +2,14 @@
 # run_reviewers.sh — run codex, gemini, and/or kimi in parallel against the current diff.
 #
 # Usage:
-#   run_reviewers.sh --base <branch> --out <dir> [--reviewers codex,gemini,kimi] [--timeout <sec>]
+#   run_reviewers.sh --base <branch> --out <dir> [--reviewers codex,gemini,kimi]
+#                    [--timeout <sec>]
+#                    [--timeout-codex <sec>] [--timeout-gemini <sec>] [--timeout-kimi <sec>]
+#
+# Per-reviewer timeouts override the global --timeout. Codex tends to either
+# return fast or fail fast; gemini/kimi do deep reasoning and need more headroom.
+# Default policy: codex=300, gemini=600, kimi=600. The previous 300s blanket cap
+# truncated dense-logic diffs (see PR #1985 postmortem).
 #
 # Writes:
 #   <out>/codex.stdout     — codex review (stderr merged)
@@ -25,7 +32,13 @@ set -uo pipefail
 base=""
 out=""
 reviewers="codex,gemini,kimi"
-timeout_s=300
+# Global default: 600s. Codex tightens to 300s below since it returns fast or
+# fails fast. Gemini/kimi keep 600s — the dense-logic diff in PR #1985
+# (postmortem in plans/the-miss-on-pr-eager-pond.md) blew through 300s on both.
+timeout_s=600
+timeout_codex=""
+timeout_gemini=""
+timeout_kimi=""
 
 need_val() {
   local flag="$1"
@@ -38,18 +51,42 @@ need_val() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base)      need_val --base      "$#"; base="$2";      shift 2 ;;
-    --out)       need_val --out       "$#"; out="$2";       shift 2 ;;
-    --reviewers) need_val --reviewers "$#"; reviewers="$2"; shift 2 ;;
-    --timeout)   need_val --timeout   "$#"; timeout_s="$2"; shift 2 ;;
+    --base)            need_val --base            "$#"; base="$2";            shift 2 ;;
+    --out)             need_val --out             "$#"; out="$2";             shift 2 ;;
+    --reviewers)       need_val --reviewers       "$#"; reviewers="$2";       shift 2 ;;
+    --timeout)         need_val --timeout         "$#"; timeout_s="$2";       shift 2 ;;
+    --timeout-codex)   need_val --timeout-codex   "$#"; timeout_codex="$2";   shift 2 ;;
+    --timeout-gemini)  need_val --timeout-gemini  "$#"; timeout_gemini="$2";  shift 2 ;;
+    --timeout-kimi)    need_val --timeout-kimi    "$#"; timeout_kimi="$2";    shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,gemini,kimi] [--timeout <sec>]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,gemini,kimi] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-gemini <sec>] [--timeout-kimi <sec>]" >&2
   exit 2
 fi
+
+# Per-reviewer timeouts: source from references/reviewer_profiles.json when
+# available (canonical config — see Phase 2.5 of the postmortem plan), fall
+# back to sensible defaults otherwise. CLI --timeout-<reviewer> flags always
+# win. The global --timeout flag is honored only when a profile timeout is
+# absent AND no per-reviewer flag is set.
+profile_file="$(cd "$(dirname "$0")/.." && pwd)/references/reviewer_profiles.json"
+profile_timeout() {
+  # Usage: profile_timeout <reviewer>; prints the timeout_s from the profile,
+  # or empty string if jq/file/key absent.
+  local r="$1"
+  [[ -f "$profile_file" ]] || { echo ""; return; }
+  command -v jq >/dev/null 2>&1 || { echo ""; return; }
+  jq -r --arg r "$r" '.[$r].timeout_s // empty' "$profile_file" 2>/dev/null
+}
+codex_default="$(profile_timeout codex)"
+gemini_default="$(profile_timeout gemini)"
+kimi_default="$(profile_timeout kimi)"
+codex_timeout="${timeout_codex:-${codex_default:-$(( timeout_s < 300 ? timeout_s : 300 ))}}"
+gemini_timeout="${timeout_gemini:-${gemini_default:-$timeout_s}}"
+kimi_timeout="${timeout_kimi:-${kimi_default:-$timeout_s}}"
 
 mkdir -p "$out"
 
@@ -103,6 +140,13 @@ run_with_timeout() {
 # flaky under concurrent or quick-succession runs (rate limits, auth
 # handshake races). Codex has been reliable — don't wrap it.
 #
+# Timeout (rc=124, the convention used by both `timeout` and `gtimeout`) is
+# explicitly NOT retried. A reviewer that just used its full budget of
+# reasoning tokens will use the same budget on attempt 2 and time out again,
+# which only doubles the cost. PR #1985 postmortem caught this — the cure
+# for "needs more time" is a longer per-reviewer timeout, not a retry. True
+# transient failures (rc=1, network errors) still retry.
+#
 # Exports CROSS_REVIEW_ATTEMPT so run_gemini / run_kimi can include it in
 # their meta output. An exported env var (vs. bash dynamic scoping on a
 # `local`) survives callees that declare their own `local attempt`, which
@@ -114,7 +158,7 @@ retry_reviewer() {
   export CROSS_REVIEW_ATTEMPT=1
   "$fn"
   local rc=$?
-  if [[ $rc -ne 0 ]]; then
+  if [[ $rc -ne 0 && $rc -ne 124 ]]; then
     local backoff=$((5 + RANDOM % 11))
     echo "$name: attempt 1 failed (rc=$rc), retrying in ${backoff}s" >&2
     sleep "$backoff"
@@ -126,9 +170,23 @@ retry_reviewer() {
     else
       echo "$name: attempt 2 also failed (rc=$rc)" >&2
     fi
+  elif [[ $rc -eq 124 ]]; then
+    echo "$name: attempt 1 timed out (rc=124), not retrying — bump --timeout-$name if this recurs" >&2
   fi
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
+}
+
+# Helper: compute output bytes for a reviewer's primary stdout file. Used in
+# meta.json so the runlog can distinguish "ran but produced nothing" (silent
+# fail) from "ran and produced findings".
+output_bytes_of() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    wc -c <"$f" | tr -d ' '
+  else
+    echo 0
+  fi
 }
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -164,13 +222,18 @@ run_codex() {
   # Plain-text mode flushes the review after the "codex" marker; we merge
   # stderr→stdout (2>&1) because codex writes progress trace AND the final
   # review to stderr while stdout is empty in this mode.
-  run_with_timeout "$timeout_s" codex exec review \
+  run_with_timeout "$codex_timeout" codex exec review \
     --base "$base" \
     --full-auto \
     >"$out/codex.stdout" 2>&1
   rc=$?
   end=$(date +%s)
-  printf '{"exit_code": %d, "duration_s": %d}\n' "$rc" "$((end - start))" >"$out/codex.meta.json"
+  local timed_out="false"
+  [[ $rc -eq 124 ]] && timed_out="true"
+  local bytes
+  bytes=$(output_bytes_of "$out/codex.stdout")
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" >"$out/codex.meta.json"
   # IMPORTANT: return $rc so the caller's `wait "$pid"` sees the real exit code.
   # Previous version ended with `printf` whose success (exit 0) masked every
   # upstream reviewer failure.
@@ -196,15 +259,19 @@ $diff_summary
 
 Use your file-reading tools to inspect the actual changes. Return your findings as prose, organized by severity."
 
-  run_with_timeout "$timeout_s" gemini \
+  run_with_timeout "$gemini_timeout" gemini \
     --approval-mode plan \
     --output-format json \
     -p "$full_prompt" \
     >"$out/gemini.stdout" 2>"$out/gemini.stderr" </dev/null
   rc=$?
   end=$(date +%s)
-  printf '{"exit_code": %d, "duration_s": %d, "attempt": %d}\n' \
-    "$rc" "$((end - start))" "${CROSS_REVIEW_ATTEMPT:-1}" >"$out/gemini.meta.json"
+  local timed_out="false"
+  [[ $rc -eq 124 ]] && timed_out="true"
+  local bytes
+  bytes=$(output_bytes_of "$out/gemini.stdout")
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$gemini_timeout" >"$out/gemini.meta.json"
   return "$rc"
 }
 
@@ -274,7 +341,7 @@ $diff_full
 
 Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
 
-  run_with_timeout "$timeout_s" kimi \
+  run_with_timeout "$kimi_timeout" kimi \
     --plan \
     --print \
     --quiet \
@@ -284,8 +351,12 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # truncated is reported in metadata so downstream synthesizers don't treat a
   # partial review as complete. Convergent finding from both codex and kimi
   # itself in pass 2 of cross-reviewing this skill.
-  printf '{"exit_code": %d, "duration_s": %d, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d}\n' \
-    "$rc" "$((end - start))" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" \
+  local timed_out="false"
+  [[ $rc -eq 124 ]] && timed_out="true"
+  local bytes
+  bytes=$(output_bytes_of "$out/kimi.stdout")
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_timeout" \
     >"$out/kimi.meta.json"
   return "$rc"
 }
