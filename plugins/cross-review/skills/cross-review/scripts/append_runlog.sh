@@ -89,10 +89,17 @@ reviewer_obj() {
   # Pass through the meta fields verbatim. The wrapper guarantees:
   # exit_code, duration_s, timed_out, output_bytes, attempt, timeout_budget_s
   # (and reviewer-specific extras like truncated for kimi).
-  jq -c '. + {status: (if .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
-                       elif .timed_out == true then "timed_out"
+  #
+  # Status precedence: timed_out FIRST so that timeouts which exit 0 (some
+  # `timeout` implementations do depending on signal handling) don't get
+  # misclassified as "ok". || fallback handles malformed meta.json (OOM,
+  # kill mid-write, garbage); we prefer "failed" telemetry over silently
+  # dropping the entire pass when the final --argjson rejects empty input.
+  jq -c '. + {status: (if .timed_out == true then "timed_out"
+                       elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
                        elif .exit_code == 0 then "empty"
-                       else "failed" end)}' "$meta"
+                       else "failed" end)}' "$meta" 2>/dev/null \
+    || echo '{"status":"failed","reason":"meta_unparseable"}'
 }
 
 codex_json=$(reviewer_obj codex)
@@ -132,6 +139,20 @@ entry=$(jq -nc \
     notes: (if $notes == "" then null else $notes end)
   }')
 
-# JSONL — one line, append-only, safe under concurrent runs.
-printf '%s\n' "$entry" >>"$runlog"
+# JSONL — one line, append-only. Wrap in flock to make it splitstream-safe:
+# POSIX guarantees write() atomicity below PIPE_BUF (4KB Linux, 512B macOS).
+# Our entries are ~500-800B and growing; on macOS they're already at the
+# atomicity boundary, and concurrent splitstream rounds writing simultaneously
+# could interleave. flock costs ~5 lines and removes the risk.
+# `flock` is GNU/Linux native; macOS Homebrew users get it via `brew install
+# util-linux` (or use `shlock`/`lockfile`). Fall back to bare append if flock
+# is missing — preserves correctness on platforms without it.
+if command -v flock >/dev/null 2>&1; then
+  (
+    flock -x 200
+    printf '%s\n' "$entry" >>"$runlog"
+  ) 200>"$runlog.lock"
+else
+  printf '%s\n' "$entry" >>"$runlog"
+fi
 echo "appended runlog entry: ts=$ts pr=$pr pass=$pass verdict=$verdict" >&2

@@ -32,10 +32,21 @@ recent=20
 mode="warn"
 quiet=0
 
+need_val() {
+  # set -u + missing flag value crashes with raw "$2: unbound variable" instead
+  # of a usage hint. Check argc before consuming the next positional.
+  local flag="$1"
+  local argc="$2"
+  if [[ "$argc" -lt 2 ]]; then
+    echo "missing value for $flag" >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --recent) recent="$2"; shift 2 ;;
-    --mode)   mode="$2";   shift 2 ;;
+    --recent) need_val --recent "$#"; recent="$2"; shift 2 ;;
+    --mode)   need_val --mode   "$#"; mode="$2";   shift 2 ;;
     --quiet)  quiet=1;     shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -86,7 +97,7 @@ analyze_reviewer() {
     | ($attempts | map(.duration_s // 0) | sort) as $durs
     | ($durs | length) as $dn
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
-    | (if $dn == 0 then 0 else $durs[((($dn - 1) * 0.95) | floor)] end) as $p95
+    | (if $dn == 0 then 0 else $durs[($dn * 0.95 | floor) | (if . >= $dn then $dn - 1 else . end)] end) as $p95
     | ($attempts | map(.timeout_budget_s // 0) | max // 0) as $cur_to
     | {
         reviewer: $r,

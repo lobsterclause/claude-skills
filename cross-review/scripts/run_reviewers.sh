@@ -32,10 +32,13 @@ set -uo pipefail
 base=""
 out=""
 reviewers="codex,gemini,kimi"
-# Global default: 600s. Codex tightens to 300s below since it returns fast or
-# fails fast. Gemini/kimi keep 600s — the dense-logic diff in PR #1985
+# Global timeout default: 600s. Codex tightens to 300s below since it returns
+# fast or fails fast. Gemini/kimi keep 600s — the dense-logic diff in PR #1985
 # (postmortem in plans/the-miss-on-pr-eager-pond.md) blew through 300s on both.
-timeout_s=600
+# Track explicitness so CLI flags can override profile values: a user passing
+# `--timeout 30` for a smoke run must beat the profile's 600s default.
+timeout_s_default=600
+timeout_s=""           # set when --timeout is explicitly passed
 timeout_codex=""
 timeout_gemini=""
 timeout_kimi=""
@@ -67,11 +70,14 @@ if [[ -z "$base" || -z "$out" ]]; then
   exit 2
 fi
 
-# Per-reviewer timeouts: source from references/reviewer_profiles.json when
-# available (canonical config — see Phase 2.5 of the postmortem plan), fall
-# back to sensible defaults otherwise. CLI --timeout-<reviewer> flags always
-# win. The global --timeout flag is honored only when a profile timeout is
-# absent AND no per-reviewer flag is set.
+# Per-reviewer timeout precedence (CLI > config > built-in default):
+#   1. --timeout-<reviewer>      (per-reviewer CLI flag, explicit)
+#   2. --timeout                 (global CLI flag, explicit)
+#   3. references/reviewer_profiles.json `.timeout_s`
+#   4. timeout_s_default (with codex tightened to 300s)
+# This matches standard Unix conventions — explicit CLI always wins. The
+# previous order put profile above --timeout, which silently broke
+# `--timeout 30` smoke runs (caught by codex review on PR #10).
 profile_file="$(cd "$(dirname "$0")/.." && pwd)/references/reviewer_profiles.json"
 profile_timeout() {
   # Usage: profile_timeout <reviewer>; prints the timeout_s from the profile,
@@ -81,12 +87,12 @@ profile_timeout() {
   command -v jq >/dev/null 2>&1 || { echo ""; return; }
   jq -r --arg r "$r" '.[$r].timeout_s // empty' "$profile_file" 2>/dev/null
 }
-codex_default="$(profile_timeout codex)"
-gemini_default="$(profile_timeout gemini)"
-kimi_default="$(profile_timeout kimi)"
-codex_timeout="${timeout_codex:-${codex_default:-$(( timeout_s < 300 ? timeout_s : 300 ))}}"
-gemini_timeout="${timeout_gemini:-${gemini_default:-$timeout_s}}"
-kimi_timeout="${timeout_kimi:-${kimi_default:-$timeout_s}}"
+codex_profile="$(profile_timeout codex)"
+gemini_profile="$(profile_timeout gemini)"
+kimi_profile="$(profile_timeout kimi)"
+codex_timeout="${timeout_codex:-${timeout_s:-${codex_profile:-$(( timeout_s_default < 300 ? timeout_s_default : 300 ))}}}"
+gemini_timeout="${timeout_gemini:-${timeout_s:-${gemini_profile:-$timeout_s_default}}}"
+kimi_timeout="${timeout_kimi:-${timeout_s:-${kimi_profile:-$timeout_s_default}}}"
 
 mkdir -p "$out"
 
