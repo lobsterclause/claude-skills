@@ -257,6 +257,9 @@ After the report block — and before worktree teardown — append a structured 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/append_runlog.sh \
   --run-dir "$run_dir" \
+  # ↑ The script auto-resolves $run_dir/raw/<reviewer>.meta.json (canonical
+  # location, written by run_reviewers.sh step 3) and falls back to
+  # $run_dir/<reviewer>.meta.json. Either path works.
   --project "$(basename "$(git -C "$worktree" rev-parse --show-toplevel)")" \
   --base "$base" \
   --pr "${pr:-"-"}" \

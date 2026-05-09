@@ -81,8 +81,19 @@ runlog="$(cd "$(dirname "$0")/.." && pwd)/runlog.jsonl"
 # about coverage.
 reviewer_obj() {
   local name="$1"
-  local meta="$run_dir/$name.meta.json"
-  if [[ ! -f "$meta" ]]; then
+  # The wrapper writes meta to $run_dir/raw/<reviewer>.meta.json (step 3 of
+  # SKILL.md passes --out "$run_dir/raw"), but earlier docs incorrectly
+  # told callers to pass --run-dir "$run_dir" here, which silently
+  # classified every reviewer as "skipped" and lost all telemetry.
+  # Caught by codex on pass-3 self-review of PR #10. Try $run_dir/raw
+  # first (the canonical location), fall back to $run_dir for callers
+  # who already point directly at the raw dir.
+  local meta=""
+  if [[ -f "$run_dir/raw/$name.meta.json" ]]; then
+    meta="$run_dir/raw/$name.meta.json"
+  elif [[ -f "$run_dir/$name.meta.json" ]]; then
+    meta="$run_dir/$name.meta.json"
+  else
     echo '{"status":"skipped"}'
     return
   fi
