@@ -1,0 +1,9 @@
+{
+  "name": "codemap",
+  "version": "0.1.0",
+  "description": "Materialize a single markdown architecture overview (packages, entry points, cross-package dependency graph, external-dep highlights, ownership pointers) for a TS/JS monorepo to docs/architecture/codemap.md. Gives cold-start subagents one cheap-to-read file instead of crawling the tree. Deterministic, idempotent, ~10s on a 250K-LOC monorepo. Re-uses the impact plugin's dep-graph backend if installed; falls back to git ls-files + grep.",
+  "author": {
+    "name": "lobsterclause",
+    "url": "https://github.com/lobsterclause/claude-skills"
+  }
+}
