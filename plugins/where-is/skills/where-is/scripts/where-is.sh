@@ -124,8 +124,12 @@ case "$kind" in
       # Pre-escape ripgrep regex metacharacters in the symbol name so JS/TS
       # symbols like `useQuery$` or `Foo[Bar]` don't break the def_re.
       safe_sym=$(printf '%s' "$normalized" | sed 's/[].*+?^${}()|[\\]/\\&/g')
+      # Word boundary that handles trailing `$` / non-word identifier chars.
+      # `\b` after `$` fails because `$` is non-word; use an explicit
+      # not-an-identifier-char-or-end-of-line guard instead.
+      wb='([^A-Za-z0-9_$]|$)'
       # Prefer "class Foo" / "function Foo" / "const Foo" / "export ... Foo" definitions.
-      def_re="(class|function|const|let|var|interface|type|enum)[[:space:]]+${safe_sym}\\b|export[[:space:]]+(default[[:space:]]+)?(class|function|const|let|var|interface|type|enum)[[:space:]]+${safe_sym}\\b"
+      def_re="(class|function|const|let|var|interface|type|enum)[[:space:]]+${safe_sym}${wb}|export[[:space:]]+(default[[:space:]]+)?(class|function|const|let|var|interface|type|enum)[[:space:]]+${safe_sym}${wb}"
       rg_hits=$(rg "${rg_args[@]+"${rg_args[@]}"}" -e "$def_re" "$root" 2>/dev/null | head -n 20 || true)
       if [ -z "$rg_hits" ]; then
         rg_hits=$(rg "${rg_args[@]+"${rg_args[@]}"}" --fixed-strings -e "$normalized" "$root" 2>/dev/null | head -n 20 || true)
@@ -147,7 +151,7 @@ case "$kind" in
             }
             return best?best.name:"(root)";
           }
-          let s=""; process.stdin.on("data",c=>s+=c);
+          process.stdin.setEncoding("utf8"); let s=""; process.stdin.on("data",c=>s+=c);
           process.stdin.on("end",()=>{
             const out=[];
             for (const line of s.split("\n")) {
@@ -205,12 +209,36 @@ case "$kind" in
     fi
 
     ag_args=(--pattern "$normalized" --lang tsx)
-    raw=$("$AG" "${ag_args[@]}" "$root" 2>/dev/null || true)
+    # Honor --include-tests by default-excluding test files (matches what the
+    # ripgrep fallback does). ast-grep doesn't have a built-in test-exclusion
+    # flag, so we filter after the fact.
+    # Resolve --package to a workspace dir (same path as concept_search.sh).
+    ag_search_root="$root"
+    if [ -n "$pkg_filter" ] && command -v python3 >/dev/null 2>&1; then
+      pkg_dir=$(printf '%s' "$layout" | WHEREIS_PKG="$pkg_filter" python3 -c '
+import json, os, sys
+try: d=json.loads(sys.stdin.read())
+except Exception: sys.exit(0)
+name=os.environ.get("WHEREIS_PKG","")
+for p in (d.get("packages") or []):
+  if p.get("name")==name and p.get("dir"):
+    print(p["dir"]); break
+' 2>/dev/null || true)
+      if [ -n "$pkg_dir" ] && [ -d "$root/$pkg_dir" ]; then
+        ag_search_root="$root/$pkg_dir"
+      fi
+    fi
+    raw=$("$AG" "${ag_args[@]}" "$ag_search_root" 2>/dev/null || true)
+    if [ "$include_tests" != "true" ] && [ -n "$raw" ]; then
+      raw=$(printf '%s\n' "$raw" | grep -Ev '\.(test|spec)\.[tj]sx?:|(/|^)__tests__/' || true)
+    fi
 
     if [ "$json" = "true" ]; then
       emit_json_head
-      esc=$(printf '%s' "$raw" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')
-      printf '"route":"ast-grep","matches":"%s"}\n' "$esc"
+      # Use the json_encode helper so tabs/newlines/control chars round-trip
+      # safely; previous sed|awk pipeline left control chars unescaped.
+      matches_json=$(json_encode "$raw")
+      printf '"route":"ast-grep","matches":%s}\n' "$matches_json"
     else
       echo "== Pattern: $normalized =="
       echo "ROUTE: ast-grep"
@@ -233,7 +261,7 @@ case "$kind" in
         files_json=$(printf '%s' "$files" | node -e '
           const layout=JSON.parse(process.argv[1]);
           function pkgOf(file){let best=null;for(const p of (layout.packages||[])){if(p.dir==="."||!p.dir)continue;if(file===p.dir||file.startsWith(p.dir+"/")){if(!best||p.dir.length>best.dir.length)best=p;}}return best?best.name:"(root)";}
-          let s="";process.stdin.on("data",c=>s+=c);
+          process.stdin.setEncoding("utf8");let s="";process.stdin.on("data",c=>s+=c);
           process.stdin.on("end",()=>{
             const out=s.split("\n").filter(Boolean).map(f=>({file:f,package:pkgOf(f)}));
             process.stdout.write(JSON.stringify(out));
@@ -271,7 +299,7 @@ case "$kind" in
         hits_json=$(printf '%s' "$hits" | node -e '
           const layout=JSON.parse(process.argv[1]);
           function pkgOf(file){let best=null;for(const p of (layout.packages||[])){if(p.dir==="."||!p.dir)continue;if(file===p.dir||file.startsWith(p.dir+"/")){if(!best||p.dir.length>best.dir.length)best=p;}}return best?best.name:"(root)";}
-          let s="";process.stdin.on("data",c=>s+=c);
+          process.stdin.setEncoding("utf8");let s="";process.stdin.on("data",c=>s+=c);
           process.stdin.on("end",()=>{
             const out=[];
             for (const line of s.split("\n")) {

@@ -31,6 +31,10 @@ glob_to_regex() {
   printf '%s' "$1" | awk '
     {
       s=$0
+      # Escape ERE metacharacters BEFORE glob substitutions so paths
+      # containing `+`, `(`, `)`, `{`, `}`, `|`, `^`, `$` round-trip safely.
+      # (Brackets and dots stay; * and ? get rewritten below.)
+      gsub(/[+(){}|^$]/, "\\\\&", s)
       gsub(/\./, "\\.", s)
       gsub(/\*\*/, "@@DSTAR@@", s)   # placeholder for **
       gsub(/\*/, "[^/]*", s)
@@ -57,7 +61,7 @@ list_files() {
     find "$root" \
       -type d \( -name node_modules -o -name .git -o -name dist -o -name build -o -name .next -o -name coverage \) -prune \
       -o -type f -print \
-      | sed "s|^$root/||"
+      | sed "s#^$root/##"
   fi
 }
 

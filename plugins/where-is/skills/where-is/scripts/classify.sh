@@ -20,16 +20,33 @@ q="${q%"${q##*[![:space:]]}"}"
 kind=""
 normalized="$q"
 
-# --- 1. path ---------------------------------------------------------------
-# Slash, glob char, or known code extension.
+# --- 1. symbol -------------------------------------------------------------
+# Single identifier, optionally Class/method form (Serena name_path style).
+# Run this BEFORE the path check so `Class/method` is classified as symbol,
+# not path. The pattern is restrictive (no spaces, no globs, no dots) so it
+# only matches identifier-shaped strings.
 case "$q" in
-  */*|*\**|*\?*|*\[*)
-    kind="path" ;;
-  *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.json|*.md|*.yml|*.yaml|*.css|*.scss|*.html)
-    kind="path" ;;
+  *' '*) : ;;  # spaces -> not a symbol
+  *)
+    if printf '%s' "$q" | grep -Eq '^[A-Za-z_$][A-Za-z0-9_$]*(/[A-Za-z_$][A-Za-z0-9_$]*)*$'; then
+      kind="symbol"
+    fi
+    ;;
 esac
 
-# --- 2. pattern ------------------------------------------------------------
+# --- 2. path ---------------------------------------------------------------
+# Slash, glob char, or known code extension. Only fires if the string didn't
+# already qualify as a symbol — so `Class/method` stays a symbol.
+if [ -z "$kind" ]; then
+  case "$q" in
+    */*|*\**|*\?*|*\[*)
+      kind="path" ;;
+    *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.json|*.md|*.yml|*.yaml|*.css|*.scss|*.html)
+      kind="path" ;;
+  esac
+fi
+
+# --- 3. pattern ------------------------------------------------------------
 # ast-grep style markers: parens, angle-brackets in code-ish form, $$$, =>.
 if [ -z "$kind" ]; then
   case "$q" in
@@ -42,20 +59,6 @@ if [ -z "$kind" ]; then
       *'('*|*'<'*) kind="pattern" ;;
     esac
   fi
-fi
-
-# --- 3. symbol -------------------------------------------------------------
-# Single identifier, optionally Class/method form. No spaces.
-if [ -z "$kind" ]; then
-  case "$q" in
-    *' '*) : ;;  # spaces -> not a symbol
-    *)
-      # Must start with letter/_/$, may contain alnum/_/$, optional /Name suffix.
-      if printf '%s' "$q" | grep -Eq '^[A-Za-z_$][A-Za-z0-9_$]*(/[A-Za-z_$][A-Za-z0-9_$]*)*$'; then
-        kind="symbol"
-      fi
-      ;;
-  esac
 fi
 
 # --- 4. concept (fallback) -------------------------------------------------

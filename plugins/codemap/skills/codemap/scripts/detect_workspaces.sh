@@ -73,7 +73,7 @@ json_escape() {
 
 # --- workspace pattern collection ------------------------------------------
 
-patterns_file="$(mktemp -t codemap_pat.XXXXXX).$$"
+patterns_file="$(mktemp -t codemap_pat.XXXXXX)"
 trap 'rm -f "$patterns_file"' EXIT
 
 kind="single"
@@ -122,7 +122,7 @@ fi
 
 # --- expand patterns to package directories --------------------------------
 
-pkg_dirs_file="$(mktemp -t codemap_dirs.XXXXXX).$$"
+pkg_dirs_file="$(mktemp -t codemap_dirs.XXXXXX)"
 trap 'rm -f "$patterns_file" "$pkg_dirs_file"' EXIT
 
 if [ "$kind" = "single" ]; then

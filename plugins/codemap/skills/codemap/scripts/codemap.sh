@@ -33,6 +33,12 @@ while [ $# -gt 0 ]; do
     --refresh) refresh="--refresh";;
     --no-external) no_external=1;;
     --max-external)
+      # Guard `shift` so it doesn't abort under `set -e` when --max-external
+      # is the last arg with no value.
+      if [ $# -lt 2 ]; then
+        echo "codemap.sh: --max-external requires a non-negative integer (none given)" >&2
+        exit 2
+      fi
       shift
       _v="${1:-10}"
       case "$_v" in
@@ -163,6 +169,10 @@ def resolve_entry(pdir, pkg):
         if isinstance(v,str) and v:
             return v
     exp=pkg.get("exports")
+    # `"exports": "./dist/index.js"` is a valid (and common) shorthand for the
+    # `.` subpath. Handle the string form before falling through to dict.
+    if isinstance(exp,str) and exp:
+        return exp
     if isinstance(exp,dict):
         dot=exp.get(".")
         if isinstance(dot,str): return dot
