@@ -1,0 +1,9 @@
+{
+  "name": "repomix-handoff",
+  "version": "0.1.0",
+  "description": "Produce a bounded, token-budgeted codebase snapshot suitable for handing off to external AI reviewers (codex CLI, gemini CLI, kimi CLI). Wraps Repomix and adds PR-scoped slicing, path/language filtering, token-budget enforcement, and per-reviewer output presets. Use this skill whenever the user wants to prepare, pack, bundle, or share a slice of the repo with an external AI — phrases like \"prepare a snapshot for codex\", \"pack the repo for review\", \"bundle this for kimi\", \"handoff to gemini\", \"context-budget the repo\", \"share this with another AI\". Also trigger when cross-review needs a scoped input bundle for a one-shot reviewer.",
+  "author": {
+    "name": "lobsterclause",
+    "url": "https://github.com/lobsterclause/claude-skills"
+  }
+}
