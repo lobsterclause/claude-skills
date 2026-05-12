@@ -109,18 +109,24 @@ else
     done
     if [ "${#EXPANDED[@]}" -gt 0 ]; then
       # Normalize once (collapse a/../b → b) on the final list — much cheaper than
-      # forking python per import. Falls through silently if python3 is missing.
+      # forking python per import. Read line-by-line into a bash 3.2-safe array;
+      # never use unquoted $(...) inside an array assignment — paths with spaces
+      # would fragment (cross-review pass 2, gemini).
       if command -v python3 >/dev/null 2>&1; then
-        # shellcheck disable=SC2207
-        EXPANDED=( $(printf '%s\n' "${EXPANDED[@]}" \
-          | python3 -c 'import os,sys
+        NORMALIZED=()
+        while IFS= read -r line; do
+          [ -n "$line" ] && NORMALIZED+=("$line")
+        done < <(printf '%s\n' "${EXPANDED[@]}" | python3 -c 'import os,sys
 seen=set()
 for p in (l.rstrip() for l in sys.stdin):
     n=os.path.normpath(p)
     if n not in seen:
-        seen.add(n); print(n)') )
+        seen.add(n); print(n)')
+        EXPANDED=("${NORMALIZED[@]+"${NORMALIZED[@]}"}")
       fi
-      INCLUDES+=("${EXPANDED[@]}")
+      if [ "${#EXPANDED[@]}" -gt 0 ]; then
+        INCLUDES+=("${EXPANDED[@]}")
+      fi
     fi
   fi
 fi

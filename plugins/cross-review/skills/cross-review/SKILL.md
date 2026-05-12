@@ -78,7 +78,9 @@ Save the JSON to `$run_dir/context.json` and `cd` into `$worktree`. Future steps
 
 ### 2.5. (Optional) Bound the input with `repomix-handoff`
 
-For large diffs (`warn_large_diff: true`), or when a reviewer has a tighter context window than the diff allows, hand off through the sibling `repomix-handoff` skill to produce a token-budgeted, reviewer-shaped snapshot **before** dispatching to the CLIs. This is a sibling skill, not a hard dependency — if `repomix-handoff` is not installed or `repomix` is missing, fall back to raw-diff mode (current default) and continue.
+For large diffs (`warn_large_diff: true`), or when a reviewer has a tighter context window than the diff allows, you may want to feed a token-budgeted snapshot to the CLIs instead of letting them ingest the full raw diff. This is **not** wired into `run_reviewers.sh` — the wrapper always reads the raw diff. To use a snapshot, you (the model) must produce it here and then **explicitly** include its contents in the reviewer prompt you build.
+
+This is a sibling skill, not a hard dependency. If `repomix-handoff` is missing, skip this step and continue with the default raw-diff flow.
 
 ```bash
 # Detect availability — exits 0 if the sibling skill + repomix are both installed
@@ -93,7 +95,9 @@ if [ -x ~/.claude/skills/repomix-handoff/scripts/detect_repomix.sh ] && \
 fi
 ```
 
-When snapshots are present, `run_reviewers.sh` will detect them at `$run_dir/snapshot-<reviewer>.*` and feed each reviewer its bounded snapshot instead of the raw diff. Behavior is automatic — no extra flags. The reviewer presets in `repomix-handoff` already bake in safe defaults:
+If you produce snapshots, **you must explicitly include each snapshot's contents in the reviewer prompt you build** — `run_reviewers.sh` will not pick them up automatically. For codex/gemini/kimi today, that means reading `$run_dir/snapshot-<reviewer>.*` into the prompt body before invoking the wrapper (or feeding via the reviewer's native file-input flag where supported; see `references/cli_flags.md`).
+
+The reviewer presets in `repomix-handoff` already bake in safe defaults:
 
 | Reviewer | Style | Max tokens |
 |---|---|---|
@@ -103,6 +107,8 @@ When snapshots are present, `run_reviewers.sh` will detect them at `$run_dir/sna
 | claude  | XML      | 200k |
 
 **Skip this step** if `warn_secrets: true` is still unresolved — bound or unbound, packed snapshots still contain whatever you pack.
+
+> **Future work:** a `--snapshot-dir` flag on `run_reviewers.sh` that auto-injects per-reviewer snapshots would close this manual gap. Tracked separately, not on this PR.
 
 ### 2.6. (Optional) Enrich the reviewer prompt with `/impact` and `ast-grep scan`
 

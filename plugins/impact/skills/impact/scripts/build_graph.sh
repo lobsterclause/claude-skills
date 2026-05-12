@@ -69,19 +69,23 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 detect_json=$("$script_dir/detect_tools.sh")
 preferred=$(printf '%s' "$detect_json" | sed -n 's/.*"preferred": *"\([^"]*\)".*/\1/p')
 
-# Resolve binary command as an array so paths with spaces and the `npx --no-install`
-# fallback both round-trip correctly.
+# Resolve binary command as an array. Sets the global RESOLVED_BIN_CMD; callers
+# should copy it before the next resolve_bin call.
+#
+# Why a global out var instead of `eval`-by-name: an eval like
+# `eval "$outvar=(\"$x\")"` evaluates command substitution inside the
+# double-quoted string at eval time, so a $repo_root containing $(...) would
+# actually execute. Caught by cross-review pass 2 (gemini).
+RESOLVED_BIN_CMD=()
 resolve_bin() {
-  # Usage: resolve_bin <name> <out_array_name>
-  # Sets the named array to the argv that should invoke the tool.
   local name="$1"
-  local outvar="$2"
+  RESOLVED_BIN_CMD=()
   if [ -x "$repo_root/node_modules/.bin/$name" ]; then
-    eval "$outvar=(\"$repo_root/node_modules/.bin/$name\")"
+    RESOLVED_BIN_CMD=("$repo_root/node_modules/.bin/$name")
   elif command -v "$name" >/dev/null 2>&1; then
-    eval "$outvar=(\"$name\")"
+    RESOLVED_BIN_CMD=("$name")
   else
-    eval "$outvar=(npx --no-install \"$name\")"
+    RESOLVED_BIN_CMD=(npx --no-install "$name")
   fi
 }
 
@@ -93,15 +97,16 @@ fi
 tmp_raw="$cache_dir/graph.raw.json"
 
 build_with_depcruise() {
-  local bin_cmd
-  resolve_bin depcruise bin_cmd
+  resolve_bin depcruise
+  local bin_cmd=("${RESOLVED_BIN_CMD[@]}")
   # depcruise emits {modules: [{source, dependencies: [{resolved, ...}], ...}]}
   # We restrict to source extensions and skip node_modules.
+  # `${arr[@]+...}` guards against `set -u` crashing on an empty `ts_flag` (bash 3.2 / macOS default).
   ( cd "$repo_root" && \
     "${bin_cmd[@]}" --output-type json \
       --exclude '(^|/)(node_modules|dist|build|\.next|coverage|\.impact-cache)(/|$)' \
       --include-only '\.(m?j|t)sx?$' \
-      "${ts_flag[@]}" \
+      ${ts_flag[@]+"${ts_flag[@]}"} \
       . > "$tmp_raw" 2>/dev/null )
 
   # Convert to normalized adjacency via node one-liner (node always available if depcruise is)
@@ -120,13 +125,13 @@ build_with_depcruise() {
 }
 
 build_with_madge() {
-  local bin_cmd
-  resolve_bin madge bin_cmd
+  resolve_bin madge
+  local bin_cmd=("${RESOLVED_BIN_CMD[@]}")
   ( cd "$repo_root" && \
     "${bin_cmd[@]}" --json \
       --extensions ts,tsx,js,jsx,mjs,cjs \
       --exclude '(^|/)(node_modules|dist|build|\.next|coverage|\.impact-cache)(/|$)' \
-      "${ts_flag[@]}" \
+      ${ts_flag[@]+"${ts_flag[@]}"} \
       . > "$tmp_raw" 2>/dev/null )
 
   # madge output is already an adjacency map of relative paths -> [deps]
