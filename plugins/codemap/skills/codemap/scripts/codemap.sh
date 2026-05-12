@@ -32,7 +32,17 @@ while [ $# -gt 0 ]; do
     --root) shift; root="${1:-}";;
     --refresh) refresh="--refresh";;
     --no-external) no_external=1;;
-    --max-external) shift; max_external="${1:-10}";;
+    --max-external)
+      shift
+      _v="${1:-10}"
+      case "$_v" in
+        ''|*[!0-9]*)
+          echo "codemap.sh: --max-external requires a non-negative integer (got: $_v)" >&2
+          exit 2
+          ;;
+      esac
+      max_external="$_v"
+      ;;
     -h|--help)
       sed -n '2,12p' "$0"
       exit 0
@@ -76,10 +86,11 @@ fi
 
 # --- temp files (PID-suffixed) --------------------------------------------
 
-tmp_ws="$(mktemp -t codemap_ws.XXXXXX).$$"
-tmp_edges="$(mktemp -t codemap_edges.XXXXXX).$$"
-tmp_model="$(mktemp -t codemap_model.XXXXXX).$$"
-tmp_md="$(mktemp -t codemap_md.XXXXXX).$$"
+# mktemp already produces a unique path; the .$$ suffix is redundant.
+tmp_ws="$(mktemp -t codemap_ws.XXXXXX)"
+tmp_edges="$(mktemp -t codemap_edges.XXXXXX)"
+tmp_model="$(mktemp -t codemap_model.XXXXXX)"
+tmp_md="$(mktemp -t codemap_md.XXXXXX)"
 cleanup() { rm -f "$tmp_ws" "$tmp_edges" "$tmp_model" "$tmp_md"; }
 trap cleanup EXIT INT TERM
 
@@ -167,11 +178,17 @@ def resolve_entry(pdir, pkg):
             return cand
     return ""
 
+# Workspace package names — filtered out of the External-dep highlights so
+# internal monorepo deps don't taint a section documented as third-party.
+INTERNAL_PKG_NAMES = {p.get("name") for p in (ws.get("packages") or []) if p.get("name")}
+
 def top_external(pkg, n):
     deps=pkg.get("dependencies") or {}
     if not isinstance(deps,dict): return []
     # Sorted alphabetically for determinism (no version-based ranking).
-    return sorted(deps.keys())[:n]
+    # Exclude workspace packages — those are internal deps, not third-party.
+    external = [d for d in deps.keys() if d not in INTERNAL_PKG_NAMES]
+    return sorted(external)[:n]
 
 pkgs_out=[]
 total_files=0

@@ -15,9 +15,9 @@ set -euo pipefail
 
 repo_root="${1:?repo_root required}"
 workspace_json="${2:?workspace_json required}"
-refresh=""
+refresh_args=()
 if [ "${3:-}" = "--refresh" ]; then
-  refresh="--refresh"
+  refresh_args=(--refresh)
 fi
 
 have_jq() { command -v jq >/dev/null 2>&1; }
@@ -40,9 +40,23 @@ PY
   fi
 }
 
-pkgs_file="$(mktemp -t codemap_pkgs.XXXXXX).$$"
-edges_file="$(mktemp -t codemap_edges.XXXXXX).$$"
-trap 'rm -f "$pkgs_file" "$edges_file"' EXIT
+# Temp files cleaned up by a single trap — multiple `trap '...' EXIT` lines
+# overwrite each other rather than chaining, so set one cleanup function up
+# front and add file vars as they're created.
+pkgs_file=""
+edges_file=""
+names_pattern_file=""
+files_list=""
+cleanup() {
+  [ -n "$pkgs_file" ] && rm -f "$pkgs_file"
+  [ -n "$edges_file" ] && rm -f "$edges_file"
+  [ -n "$names_pattern_file" ] && rm -f "$names_pattern_file"
+  [ -n "$files_list" ] && rm -f "$files_list"
+}
+trap cleanup EXIT INT TERM
+
+pkgs_file="$(mktemp -t codemap_pkgs.XXXXXX)"
+edges_file="$(mktemp -t codemap_edges.XXXXXX)"
 
 extract_pkgs > "$pkgs_file" || true
 if [ ! -s "$pkgs_file" ]; then
@@ -51,8 +65,7 @@ fi
 
 # Build a name list for grep filtering. Only scoped (@) or non-relative names
 # matter — relative imports never cross package boundaries on the npm side.
-names_pattern_file="$(mktemp -t codemap_pat.XXXXXX).$$"
-trap 'rm -f "$pkgs_file" "$edges_file" "$names_pattern_file"' EXIT
+names_pattern_file="$(mktemp -t codemap_pat.XXXXXX)"
 awk -F'\t' '{print $1}' "$pkgs_file" > "$names_pattern_file"
 
 # --- option 1: impact plugin -----------------------------------------------
@@ -60,7 +73,7 @@ awk -F'\t' '{print $1}' "$pkgs_file" > "$names_pattern_file"
 impact_script="$HOME/.claude/skills/impact/scripts/build_graph.sh"
 graph_json=""
 if [ -x "$impact_script" ]; then
-  if graph_json=$(IMPACT_REPO_ROOT="$repo_root" "$impact_script" $refresh 2>/dev/null); then
+  if graph_json=$(IMPACT_REPO_ROOT="$repo_root" "$impact_script" "${refresh_args[@]+"${refresh_args[@]}"}" 2>/dev/null); then
     if [ -f "$graph_json" ]; then
       # Roll file-level edges up to package-level using python or jq.
       if have_py; then
@@ -110,8 +123,7 @@ if ! command -v git >/dev/null 2>&1; then
   exit 0
 fi
 
-files_list="$(mktemp -t codemap_files.XXXXXX).$$"
-trap 'rm -f "$pkgs_file" "$edges_file" "$names_pattern_file" "$files_list"' EXIT
+files_list="$(mktemp -t codemap_files.XXXXXX)"
 
 git ls-files -- '*.ts' '*.tsx' '*.js' '*.jsx' '*.mjs' '*.cjs' 2>/dev/null \
   | grep -v -E '(^|/)(node_modules|dist|build|\.next|coverage)(/|$)' \

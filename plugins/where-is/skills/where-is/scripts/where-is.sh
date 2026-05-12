@@ -85,11 +85,24 @@ classify_pkg() {
   ' "$layout" "$file"
 }
 
+# Safely JSON-encode a string. Uses python3 json.dumps so newlines, tabs,
+# control chars, and backslashes round-trip correctly. Returns a quoted JSON
+# string (including its surrounding quotes).
+json_encode() {
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+  else
+    # Best-effort sed fallback for systems without python3. Covers the common
+    # cases; control chars will produce invalid JSON. Document the requirement.
+    printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  fi
+}
+
 emit_json_head() {
-  printf '{"kind":"%s","query":"%s","normalized":"%s",' \
-    "$kind" \
-    "$(printf '%s' "$query" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
-    "$(printf '%s' "$normalized" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  printf '{"kind":%s,"query":%s,"normalized":%s,' \
+    "$(json_encode "$kind")" \
+    "$(json_encode "$query")" \
+    "$(json_encode "$normalized")"
 }
 
 # --- dispatch --------------------------------------------------------------
@@ -108,8 +121,11 @@ case "$kind" in
       if [ "$include_tests" != "true" ]; then
         rg_args+=(--glob '!*.test.*' --glob '!*.spec.*' --glob '!__tests__/**')
       fi
+      # Pre-escape ripgrep regex metacharacters in the symbol name so JS/TS
+      # symbols like `useQuery$` or `Foo[Bar]` don't break the def_re.
+      safe_sym=$(printf '%s' "$normalized" | sed 's/[].*+?^${}()|[\\]/\\&/g')
       # Prefer "class Foo" / "function Foo" / "const Foo" / "export ... Foo" definitions.
-      def_re="(class|function|const|let|var|interface|type|enum)[[:space:]]+${normalized}\\b|export[[:space:]]+(default[[:space:]]+)?(class|function|const|let|var|interface|type|enum)[[:space:]]+${normalized}\\b"
+      def_re="(class|function|const|let|var|interface|type|enum)[[:space:]]+${safe_sym}\\b|export[[:space:]]+(default[[:space:]]+)?(class|function|const|let|var|interface|type|enum)[[:space:]]+${safe_sym}\\b"
       rg_hits=$(rg "${rg_args[@]+"${rg_args[@]}"}" -e "$def_re" "$root" 2>/dev/null | head -n 20 || true)
       if [ -z "$rg_hits" ]; then
         rg_hits=$(rg "${rg_args[@]+"${rg_args[@]}"}" --fixed-strings -e "$normalized" "$root" 2>/dev/null | head -n 20 || true)
@@ -145,8 +161,10 @@ case "$kind" in
         ' "$layout")
       fi
       emit_json_head
-      printf '"route":"serena-mcp","next_actions":[{"tool":"mcp__serena__find_symbol","args":{"name_path":"%s","include_body":false}},{"tool":"mcp__serena__find_referencing_symbols","args":{"name_path":"%s"}}],"fallback_hits":%s}\n' \
-        "$normalized" "$normalized" "$hits_json"
+      # Safely JSON-encode $normalized for the next_actions payload (was raw).
+      name_path_json=$(json_encode "$normalized")
+      printf '"route":"serena-mcp","next_actions":[{"tool":"mcp__serena__find_symbol","args":{"name_path":%s,"include_body":false}},{"tool":"mcp__serena__find_referencing_symbols","args":{"name_path":%s}}],"fallback_hits":%s}\n' \
+        "$name_path_json" "$name_path_json" "$hits_json"
     else
       echo "== Symbol: $normalized =="
       echo "ROUTE: Serena MCP (call from this conversation)"
@@ -177,9 +195,12 @@ case "$kind" in
 
     if [ -z "$AG" ]; then
       echo "WARN: ast-grep not installed; falling back to ripgrep (pattern matching will be approximate)" >&2
-      bash "$script_dir/concept_search.sh" "$normalized" \
-        ${include_tests:+$([ "$include_tests" = "true" ] && echo --include-tests)} \
-        ${pkg_filter:+--package "$pkg_filter"}
+      # Build args as an array — unquoted $(...) / ${var:+...} word-splits and
+      # glob-expands, which would let `--package "*"` enumerate files in cwd.
+      cs_args=()
+      [ "$include_tests" = "true" ] && cs_args+=(--include-tests)
+      [ -n "$pkg_filter" ] && cs_args+=(--package "$pkg_filter")
+      bash "$script_dir/concept_search.sh" "$normalized" "${cs_args[@]+"${cs_args[@]}"}"
       exit 0
     fi
 
@@ -202,8 +223,9 @@ case "$kind" in
     ;;
 
   path)
-    files=$(bash "$script_dir/fs_walk.sh" "$normalized" \
-      $([ "$include_tests" = "true" ] && echo --include-tests))
+    fw_args=()
+    [ "$include_tests" = "true" ] && fw_args+=(--include-tests)
+    files=$(bash "$script_dir/fs_walk.sh" "$normalized" "${fw_args[@]+"${fw_args[@]}"}")
 
     if [ "$json" = "true" ]; then
       files_json="[]"
@@ -237,9 +259,11 @@ case "$kind" in
     ;;
 
   concept)
-    hits=$(bash "$script_dir/concept_search.sh" "$normalized" \
-      $([ "$include_tests" = "true" ] && echo --include-tests) \
-      $([ -n "$pkg_filter" ] && printf -- '--package %s' "$pkg_filter"))
+    # Build args as an array — see pattern-mode fix above for rationale.
+    cs_args=()
+    [ "$include_tests" = "true" ] && cs_args+=(--include-tests)
+    [ -n "$pkg_filter" ] && cs_args+=(--package "$pkg_filter")
+    hits=$(bash "$script_dir/concept_search.sh" "$normalized" "${cs_args[@]+"${cs_args[@]}"}")
 
     if [ "$json" = "true" ]; then
       hits_json="[]"

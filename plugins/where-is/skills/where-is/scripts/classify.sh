@@ -63,6 +63,14 @@ if [ -z "$kind" ]; then
   kind="concept"
 fi
 
-# JSON escape (basic — backslashes and double-quotes).
-esc=$(printf '%s' "$normalized" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '{"kind":"%s","normalized":"%s"}\n' "$kind" "$esc"
+# Serialize via python3 so control chars (newlines, tabs) and quoted content
+# round-trip safely. Sed-only escaping produces invalid JSON for those.
+if command -v python3 >/dev/null 2>&1; then
+  KIND="$kind" NORM="$normalized" python3 -c '
+import json, os
+print(json.dumps({"kind": os.environ["KIND"], "normalized": os.environ["NORM"]}))
+'
+else
+  esc=$(printf '%s' "$normalized" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '{"kind":"%s","normalized":"%s"}\n' "$kind" "$esc"
+fi

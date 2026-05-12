@@ -55,14 +55,53 @@ fi
 # Smart-case literal-ish search; let the user pass regex if they really want.
 rg_args+=(--smart-case --fixed-strings)
 
+# Resolve --package <name> to the package's actual directory so we can scope
+# the rg search root instead of grepping the path string (which silently
+# returned 0 results for scoped packages like @scope/core whose dir is just
+# `packages/core`).
+search_root="$root"
 if [ -n "$pkg_filter" ]; then
-  # Best-effort: limit to common workspace dirs containing the package name.
-  rg "${rg_args[@]+"${rg_args[@]}"}" -- "$phrase" "$root" 2>/dev/null \
-    | grep -F "$pkg_filter" \
-    | head -n 30 \
-    || true
-else
-  rg "${rg_args[@]+"${rg_args[@]}"}" -- "$phrase" "$root" 2>/dev/null \
-    | head -n 30 \
-    || true
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  layout="$(WHEREIS_REPO_ROOT="$root" bash "$script_dir/detect_layout.sh" 2>/dev/null || echo '{"packages":[]}')"
+  pkg_dir=""
+  if command -v python3 >/dev/null 2>&1; then
+    pkg_dir=$(printf '%s' "$layout" | python3 -c '
+import json, sys, os
+try:
+  d = json.loads(sys.stdin.read())
+except Exception:
+  sys.exit(0)
+name = os.environ.get("WHEREIS_PKG", "")
+for p in (d.get("packages") or []):
+  if p.get("name") == name and p.get("dir"):
+    print(p["dir"]); sys.exit(0)
+' 2>/dev/null) || pkg_dir=""
+    export WHEREIS_PKG="$pkg_filter"
+    pkg_dir=$(printf '%s' "$layout" | WHEREIS_PKG="$pkg_filter" python3 -c '
+import json, sys, os
+try:
+  d = json.loads(sys.stdin.read())
+except Exception:
+  sys.exit(0)
+name = os.environ.get("WHEREIS_PKG", "")
+for p in (d.get("packages") or []):
+  if p.get("name") == name and p.get("dir"):
+    print(p["dir"]); break
+' 2>/dev/null || true)
+  fi
+  if [ -n "$pkg_dir" ] && [ -d "$root/$pkg_dir" ]; then
+    search_root="$root/$pkg_dir"
+  else
+    # Couldn't resolve; warn and fall back to the old path-string filter (lossy).
+    echo "WARN: --package '$pkg_filter' didn't resolve to a workspace dir; falling back to path-string filter" >&2
+    rg "${rg_args[@]+"${rg_args[@]}"}" -- "$phrase" "$root" 2>/dev/null \
+      | grep -F "$pkg_filter" \
+      | head -n 30 \
+      || true
+    exit 0
+  fi
 fi
+
+rg "${rg_args[@]+"${rg_args[@]}"}" -- "$phrase" "$search_root" 2>/dev/null \
+  | head -n 30 \
+  || true

@@ -25,14 +25,16 @@ root="${WHEREIS_REPO_ROOT:-$(pwd)}"
 
 # Convert simple glob to grep regex (escape dots, ** -> .*, * -> [^/]*, ? -> .)
 # Uses awk to avoid macOS sed's bracket-class parsing quirks.
+# Note: `\1` in awk strings is the literal character `1`, not a control char,
+# so we use an unambiguous text sentinel that can't appear in normal globs.
 glob_to_regex() {
   printf '%s' "$1" | awk '
     {
       s=$0
       gsub(/\./, "\\.", s)
-      gsub(/\*\*/, "\1", s)        # placeholder for **
+      gsub(/\*\*/, "@@DSTAR@@", s)   # placeholder for **
       gsub(/\*/, "[^/]*", s)
-      gsub(/\1/, ".*", s)
+      gsub(/@@DSTAR@@/, ".*", s)
       gsub(/\?/, ".", s)
       print s
     }
@@ -50,19 +52,18 @@ list_files() {
   if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
     git -C "$root" ls-files
   else
-    find "$root" -type f \
-      -not -path '*/node_modules/*' \
-      -not -path '*/.git/*' \
-      -not -path '*/dist/*' \
-      -not -path '*/build/*' \
-      -not -path '*/.next/*' \
-      -not -path '*/coverage/*' \
+    # -prune skips traversing matched dirs entirely; -not -path only filters
+    # output, so find still walks node_modules contents (huge I/O on big repos).
+    find "$root" \
+      -type d \( -name node_modules -o -name .git -o -name dist -o -name build -o -name .next -o -name coverage \) -prune \
+      -o -type f -print \
       | sed "s|^$root/||"
   fi
 }
 
+# `--` ends-of-options on grep so paths starting with `-` aren't read as flags.
 list_files \
-  | grep -E "$re" 2>/dev/null \
+  | grep -E -- "$re" 2>/dev/null \
   | grep -Ev '(^|/)(node_modules|dist|build|\.next|coverage)(/|$)' \
   | { if [ "$include_tests" = "true" ]; then cat; else grep -Ev '\.(test|spec)\.[tj]sx?$' | grep -Ev '(^|/)__tests__/'; fi; } \
   || true
