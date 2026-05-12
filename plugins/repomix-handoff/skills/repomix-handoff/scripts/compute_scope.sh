@@ -131,7 +131,9 @@ for p in (l.rstrip() for l in sys.stdin):
   fi
 fi
 
-if [ -n "$LANGS" ] && [ "$MODE" = "pr" ] && [ "${#INCLUDES[@]}" -gt 0 ]; then
+# Apply --lang filter in BOTH modes (pr + paths). Previously gated to pr-only,
+# which silently ignored the user's filter when they passed --paths.
+if [ -n "$LANGS" ] && [ "${#INCLUDES[@]}" -gt 0 ]; then
   IFS=',' read -r -a _exts <<< "$LANGS"
   FILTERED=()
   for f in "${INCLUDES[@]}"; do

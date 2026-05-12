@@ -94,7 +94,9 @@ if [ -f "$repo_root/tsconfig.json" ]; then
   ts_flag=(--ts-config "$repo_root/tsconfig.json")
 fi
 
-tmp_raw="$cache_dir/graph.raw.json"
+# PID-suffix the intermediate so concurrent invocations don't clobber each other.
+tmp_raw="$cache_dir/graph.raw.$$.json"
+trap 'rm -f "$tmp_raw"' EXIT
 
 build_with_depcruise() {
   resolve_bin depcruise

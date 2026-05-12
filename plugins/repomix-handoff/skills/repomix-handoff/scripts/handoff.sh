@@ -65,8 +65,8 @@ case "$STYLE" in
   *) echo "handoff.sh: unknown --style '$STYLE'" >&2; exit 2 ;;
 esac
 
-# Default output path.
-ts="$(date +%Y%m%d-%H%M%S)"
+# Default output path. Use mktemp instead of a predictable /tmp filename so a
+# malicious symlink at the expected path can't redirect our write (CWE-377).
 ext="md"
 case "$STYLE" in
   xml) ext="xml" ;;
@@ -74,7 +74,12 @@ case "$STYLE" in
   plain) ext="txt" ;;
   markdown) ext="md" ;;
 esac
-OUTPUT="${OUTPUT:-/tmp/repomix-handoff-${ts}.${ext}}"
+if [ -z "${OUTPUT:-}" ]; then
+  # macOS mktemp doesn't honor `--suffix`; do a rename after creation.
+  _tmp="$(mktemp -t repomix-handoff.XXXXXXXX)" || { echo "handoff.sh: mktemp failed" >&2; exit 9; }
+  OUTPUT="${_tmp}.${ext}"
+  mv "$_tmp" "$OUTPUT"
+fi
 
 # 1. Detect repomix.
 detect_json="$("$SCRIPT_DIR/detect_repomix.sh")"

@@ -112,10 +112,12 @@ report_json=$(node -e '
   for (const e of entries) {
     const n = norm(e);
     if (!known.has(n)) missing.push(e);
+    // BFS with an index pointer instead of Array.shift() — shift() is O(N) and
+    // makes the whole traversal O(N²) on wide graphs.
     const q = [n];
     const seen = new Set([n]);
-    while (q.length) {
-      const cur = q.shift();
+    for (let head = 0; head < q.length; head++) {
+      const cur = q[head];
       for (const parent of (rev.get(cur) || [])) {
         if (!seen.has(parent)) {
           seen.add(parent);
@@ -255,7 +257,8 @@ fi
   if [ -z "$tests" ]; then
     echo "  (none found — possible coverage gap)"
   else
-    printf '  %s\n' $tests
+    # Quote $tests so paths with spaces don't word-split; use sed to indent.
+    printf '%s\n' "$tests" | sed 's/^/  /'
   fi
   echo
   echo "== Caveats =="

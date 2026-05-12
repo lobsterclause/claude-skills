@@ -13,8 +13,12 @@ set -euo pipefail
 
 repo_root="${IMPACT_REPO_ROOT:-$(pwd)}"
 
-# Slurp stdin
-mapfile -t impacted < <(cat)
+# Slurp stdin. Use `while IFS= read -r` not `mapfile` — `mapfile` isn't in macOS
+# default bash 3.2, and the rest of this skill keeps to bash 3.2-safe idioms.
+impacted=()
+while IFS= read -r line; do
+  [ -n "$line" ] && impacted+=("$line")
+done
 
 if [ "${#impacted[@]}" -eq 0 ]; then
   exit 0
