@@ -1,0 +1,9 @@
+{
+  "name": "impact",
+  "version": "0.1.0",
+  "description": "Given a changed file (explicit path, git diff, or staged changes), compute the reverse-dependency closure plus matching test files in a TypeScript/JavaScript monorepo using madge or dependency-cruiser. Returns a structured report of what a change probably affects, grouped by package, so Claude can skip Explore-subagent calls when asking 'what does this break' or 'what tests should I run'.",
+  "author": {
+    "name": "lobsterclause",
+    "url": "https://github.com/lobsterclause/claude-skills"
+  }
+}

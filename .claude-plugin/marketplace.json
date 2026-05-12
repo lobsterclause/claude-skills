@@ -126,6 +126,11 @@
       "source": "./plugins/gap-analysis"
     },
     {
+      "name": "impact",
+      "description": "Compute the reverse-dependency closure of one or more changed TypeScript/JavaScript files — what other files transitively import them, plus the test files that should be re-run — using madge and/or dependency-cruiser. Use whenever the user asks 'what does this change affect', 'what files depend on X', 'what tests should I run after editing Y', 'impact of this change', 'what breaks if I touch this', 'blast radius of this edit', or right before committing/pushing a non-trivial TS/JS change so Claude can decide which files to read and which test files to run. Also triggers on 'find consumers of this module', 'who imports this', 'what's downstream of this file'. Works on monorepos (auto-detects pnpm/yarn workspaces) and respects tsconfig path aliases. Do NOT trigger for single-symbol lookups (use Serena `find_symbol` / `find_referencing_symbols` instead — those return symbol-level edges, this returns file-level edges). Do NOT trigger for non-code changes (docs-only, asset-only). Do NOT trigger to find a definition — that's also Serena's job.",
+      "source": "./plugins/impact"
+    },
+    {
       "name": "ios-remote-control",
       "description": "Remote-control iOS simulators (and real devices) for agentic app development \u2014 install apps, launch them, tap/swipe/type, take screenshots that Claude can see, stream logs, simulate push/location/permissions, and iterate. Use this skill whenever the user wants to drive an iOS app from a terminal, debug a running iOS app, automate iOS QA, reproduce iOS bugs, test deep links, inspect UI state, read simulator logs or crash reports, or build/iterate on an iPhone/iPad app with Claude in the loop \u2014 even if they don't say the word \"simulator\" (phrases like \"boot the app\", \"take a screenshot of the app\", \"why is my app crashing\", \"try my React Native / Expo / SwiftUI app\", \"open this deep link on iOS\" all trigger it). The skill gives Claude full agentic control over iPhone/iPad simulators via xcrun simctl + idb and real devices via devicectl + pymobiledevice3, with screenshots saved as files Claude can Read and JSON-structured output on every command so Claude can correlate actions with logs and errors.",
       "source": "./plugins/ios-remote-control"
@@ -169,6 +174,11 @@
       "name": "privacy-first-auditor",
       "description": "Audit prototypes, products, features, or design patterns against the 8 Principles of Privacy-First Design to surface trust failures, data overreach, and consent dark patterns \u2014 and produce a scored report with specific fixes. Use this skill whenever someone wants to evaluate a product for privacy compliance, data ethics, consent UX, or trust-building design. Trigger on phrases like \"privacy audit\", \"privacy review\", \"data ethics\", \"GDPR check\", \"consent patterns\", \"is this privacy-first\", \"privacy by design\", \"trust audit\", \"data collection review\", \"privacy score\", \"are we collecting too much\", \"does this respect user privacy\", or any request to evaluate how a product handles personal data. Always use this skill \u2014 do not attempt a privacy design audit without it.",
       "source": "./plugins/privacy-first-auditor"
+    },
+    {
+      "name": "repomix-handoff",
+      "description": "Produce a bounded, token-budgeted codebase snapshot for handing off to external AI reviewers (codex CLI, gemini CLI, kimi CLI). Wraps Repomix and adds PR-scoped slicing, path/language filtering, token-budget enforcement, and per-reviewer output presets. Use this skill whenever the user wants to prepare a snapshot for codex, pack the repo for review, bundle this for kimi, handoff to gemini, context-budget the repo, share this with another AI, or whenever cross-review needs a scoped input bundle for a one-shot reviewer.",
+      "source": "./plugins/repomix-handoff"
     },
     {
       "name": "screen-reader-scripting",

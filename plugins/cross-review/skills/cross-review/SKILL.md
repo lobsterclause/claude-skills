@@ -52,6 +52,21 @@ The script prints a single JSON line with:
 - `warn_secrets` — true if any changed path matches secret-like patterns (`.env`, `credentials`, `.pem`, `id_rsa`, keystores, etc.)
 - `risky_files` — comma-separated list of the offenders (first 5)
 
+**Pre-flight repo-state check.** Before dispatching reviewers, refuse to run on a dirty tree:
+
+```bash
+if git ls-files -u | grep -q . ; then
+  echo "Working tree has unresolved merge conflicts. Resolve them or stash, then re-run." >&2
+  exit 2
+fi
+if [ -n "$(git diff --check 2>/dev/null)" ]; then
+  echo "Working tree has whitespace/conflict markers. Inspect with 'git diff --check' first." >&2
+  exit 2
+fi
+```
+
+Reviewers shown a half-resolved state will hallucinate confidently about the broken hunks.
+
 **Before proceeding, check both warnings:**
 
 - **On `warn_large_diff: true`**, stop and confirm with the user. Reviewers scale linearly with diff size; a big PR can easily cost 100k+ tokens per reviewer. Offer options: proceed anyway, narrow the scope to specific files via a custom prompt, or skip the run.
@@ -60,6 +75,58 @@ The script prints a single JSON line with:
 If either warning fires, do **not** proceed silently. A skill that quietly sends sensitive content or bleeds tokens is worse than one that asks.
 
 Save the JSON to `$run_dir/context.json` and `cd` into `$worktree`. Future steps use `$run_dir` for outputs and `$worktree` as cwd.
+
+### 2.5. (Optional) Bound the input with `repomix-handoff`
+
+For large diffs (`warn_large_diff: true`), or when a reviewer has a tighter context window than the diff allows, hand off through the sibling `repomix-handoff` skill to produce a token-budgeted, reviewer-shaped snapshot **before** dispatching to the CLIs. This is a sibling skill, not a hard dependency — if `repomix-handoff` is not installed or `repomix` is missing, fall back to raw-diff mode (current default) and continue.
+
+```bash
+# Detect availability — exits 0 if the sibling skill + repomix are both installed
+if [ -x ~/.claude/skills/repomix-handoff/scripts/detect_repomix.sh ] && \
+   ~/.claude/skills/repomix-handoff/scripts/detect_repomix.sh | grep -q '"available": true'; then
+  # Per-reviewer snapshot (picks style + token budget that each CLI handles best)
+  for r in codex gemini kimi; do
+    bash ~/.claude/skills/repomix-handoff/scripts/handoff.sh \
+      --reviewer "$r" \
+      --output "$run_dir/snapshot-$r.${EXT:-md}" >/dev/null
+  done
+fi
+```
+
+When snapshots are present, `run_reviewers.sh` will detect them at `$run_dir/snapshot-<reviewer>.*` and feed each reviewer its bounded snapshot instead of the raw diff. Behavior is automatic — no extra flags. The reviewer presets in `repomix-handoff` already bake in safe defaults:
+
+| Reviewer | Style | Max tokens |
+|---|---|---|
+| codex   | XML      | 160k |
+| gemini  | Markdown | 1M   |
+| kimi    | Markdown | 200k |
+| claude  | XML      | 200k |
+
+**Skip this step** if `warn_secrets: true` is still unresolved — bound or unbound, packed snapshots still contain whatever you pack.
+
+### 2.6. (Optional) Enrich the reviewer prompt with `/impact` and `ast-grep scan`
+
+Reviewers do better when they know what's affected and which project-specific rules already exist. Both checks are sibling skills / tools — degrade gracefully if missing.
+
+**`/impact` — blast radius:** runs reverse-dep analysis to list affected files + recommended test files. Append to `$run_dir/context.md` so reviewers see it.
+
+```bash
+if [ -x ~/.claude/skills/impact/scripts/impact.sh ]; then
+  bash ~/.claude/skills/impact/scripts/impact.sh --base "$base_branch" --json \
+    > "$run_dir/impact.json" 2>/dev/null || true
+fi
+```
+
+**`ast-grep scan` — project rules:** if the target repo has `sgconfig.yml` at its root, run a scan over the diff and surface findings. Catches violations of repo-specific architectural rules (e.g. "do not write to `memory_items` outside `FirestoreMemoryClient`") that reviewers wouldn't know to look for.
+
+```bash
+if [ -f "$worktree/sgconfig.yml" ] && command -v ast-grep >/dev/null; then
+  ( cd "$worktree" && ast-grep scan --json=stream 2>/dev/null ) \
+    > "$run_dir/sgscan.jsonl" || true
+fi
+```
+
+When either file exists, include a short summary in the reviewer prompt's preamble (e.g. "ast-grep flagged 3 violations of `no-direct-memory-items-write` in this diff — review whether they're justified"). Do **not** dump full JSON into the prompt; summarize.
 
 ### 3. Run reviewers in parallel
 
