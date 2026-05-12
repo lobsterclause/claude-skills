@@ -51,4 +51,13 @@ else
   preferred="none"
 fi
 
-printf '{"madge": %s, "depcruiser": %s, "preferred": "%s"}\n' "$madge" "$depcruiser" "$preferred"
+# Emit via python3 for safe JSON (booleans + enum string — low risk here but keep
+# escaping consistent with the rest of the skill suite).
+python3 - "$madge" "$depcruiser" "$preferred" <<'PY'
+import json, sys
+print(json.dumps({
+  "madge": sys.argv[1] == "true",
+  "depcruiser": sys.argv[2] == "true",
+  "preferred": sys.argv[3],
+}))
+PY

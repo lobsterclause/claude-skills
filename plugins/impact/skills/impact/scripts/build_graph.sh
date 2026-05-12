@@ -69,39 +69,39 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 detect_json=$("$script_dir/detect_tools.sh")
 preferred=$(printf '%s' "$detect_json" | sed -n 's/.*"preferred": *"\([^"]*\)".*/\1/p')
 
-# Resolve binary command (prefers local node_modules)
+# Resolve binary command as an array so paths with spaces and the `npx --no-install`
+# fallback both round-trip correctly.
 resolve_bin() {
+  # Usage: resolve_bin <name> <out_array_name>
+  # Sets the named array to the argv that should invoke the tool.
   local name="$1"
+  local outvar="$2"
   if [ -x "$repo_root/node_modules/.bin/$name" ]; then
-    echo "$repo_root/node_modules/.bin/$name"
+    eval "$outvar=(\"$repo_root/node_modules/.bin/$name\")"
   elif command -v "$name" >/dev/null 2>&1; then
-    command -v "$name"
+    eval "$outvar=(\"$name\")"
   else
-    echo "npx --no-install $name"
+    eval "$outvar=(npx --no-install \"$name\")"
   fi
 }
 
-ts_flag=""
+ts_flag=()
 if [ -f "$repo_root/tsconfig.json" ]; then
-  ts_flag="--ts-config $repo_root/tsconfig.json"
+  ts_flag=(--ts-config "$repo_root/tsconfig.json")
 fi
 
 tmp_raw="$cache_dir/graph.raw.json"
 
 build_with_depcruise() {
-  local bin
-  bin=$(resolve_bin depcruise)
+  local bin_cmd
+  resolve_bin depcruise bin_cmd
   # depcruise emits {modules: [{source, dependencies: [{resolved, ...}], ...}]}
   # We restrict to source extensions and skip node_modules.
-  local cfg=""
-  if [ -f "$repo_root/.dependency-cruiser.cjs" ] || [ -f "$repo_root/.dependency-cruiser.js" ] || [ -f "$repo_root/.dependency-cruiser.json" ]; then
-    cfg=""
-  fi
   ( cd "$repo_root" && \
-    $bin --output-type json \
+    "${bin_cmd[@]}" --output-type json \
       --exclude '(^|/)(node_modules|dist|build|\.next|coverage|\.impact-cache)(/|$)' \
       --include-only '\.(m?j|t)sx?$' \
-      $ts_flag $cfg \
+      "${ts_flag[@]}" \
       . > "$tmp_raw" 2>/dev/null )
 
   # Convert to normalized adjacency via node one-liner (node always available if depcruise is)
@@ -120,13 +120,13 @@ build_with_depcruise() {
 }
 
 build_with_madge() {
-  local bin
-  bin=$(resolve_bin madge)
+  local bin_cmd
+  resolve_bin madge bin_cmd
   ( cd "$repo_root" && \
-    $bin --json \
+    "${bin_cmd[@]}" --json \
       --extensions ts,tsx,js,jsx,mjs,cjs \
       --exclude '(^|/)(node_modules|dist|build|\.next|coverage|\.impact-cache)(/|$)' \
-      $ts_flag \
+      "${ts_flag[@]}" \
       . > "$tmp_raw" 2>/dev/null )
 
   # madge output is already an adjacency map of relative paths -> [deps]

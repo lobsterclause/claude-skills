@@ -95,10 +95,10 @@ else
           *) continue ;;
         esac
         for ext in "" ".ts" ".tsx" ".js" ".jsx" ".py" "/index.ts" "/index.tsx" "/index.js"; do
+          # `[ -f ... ]` resolves unnormalized paths like `a/../b/c.ts` natively;
+          # no need to shell out to python per import. The final EXPANDED list is
+          # deduped + normalized in one pass below.
           cand="$base/${imp}${ext}"
-          if command -v python3 >/dev/null 2>&1; then
-            cand="$(python3 -c 'import os,sys; print(os.path.normpath(sys.argv[1]))' "$cand" 2>/dev/null || echo "$cand")"
-          fi
           if [ -f "$cand" ]; then
             EXPANDED+=("$cand")
             break
@@ -108,6 +108,18 @@ else
                  | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/")
     done
     if [ "${#EXPANDED[@]}" -gt 0 ]; then
+      # Normalize once (collapse a/../b → b) on the final list — much cheaper than
+      # forking python per import. Falls through silently if python3 is missing.
+      if command -v python3 >/dev/null 2>&1; then
+        # shellcheck disable=SC2207
+        EXPANDED=( $(printf '%s\n' "${EXPANDED[@]}" \
+          | python3 -c 'import os,sys
+seen=set()
+for p in (l.rstrip() for l in sys.stdin):
+    n=os.path.normpath(p)
+    if n not in seen:
+        seen.add(n); print(n)') )
+      fi
       INCLUDES+=("${EXPANDED[@]}")
     fi
   fi

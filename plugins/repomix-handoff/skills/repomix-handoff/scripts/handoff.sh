@@ -168,82 +168,85 @@ trimmed=()
 trim_iterations=0
 MAX_TRIM_ITERATIONS=10
 
-# Priority order for trimming (lowest priority first — drop these first).
-# We approximate by pattern-matching paths.
-TRIM_PATTERNS_ORDER=(
-  '\.md$'
-  '\.json$'
-  '\.d\.ts$'
-  '\.css$'
-  '\.scss$'
-  '\.yaml$'
-  '\.yml$'
-  '\.html$'
-)
-
-# Build a working list from the current include set.
+# Build a single priority-ordered drop list upfront. Each iteration drops a
+# whole batch (all files at the next priority level) instead of one file,
+# so we don't burn 10 re-packs to shed a few KB of markdown.
+#
+# Priority order (lowest priority first — drop these first):
+#   1. *.md   2. *.json   3. *.d.ts   4. *.css   5. *.scss
+#   6. *.yaml 7. *.yml    8. *.html
+# After those exhaust, drop largest non-source files (never .ts/.tsx/.py/.js/.jsx).
 work_csv="$include_csv"
 
-while [ "$token_count" -gt "$MAX_TOKENS" ] && [ "$trim_iterations" -lt "$MAX_TRIM_ITERATIONS" ]; do
-  trim_iterations=$((trim_iterations + 1))
-  dropped_one=0
-  for pat in "${TRIM_PATTERNS_ORDER[@]}"; do
-    # Pop the LAST file in work_csv matching pat.
-    drop="$(python3 - "$work_csv" "$pat" <<'PY'
-import sys, re
+# Emit batches of file paths in drop-priority order, one batch per line,
+# comma-separated. Last batch is the size-sorted non-source fallback.
+DROP_BATCHES="$(python3 - "$work_csv" <<'PY'
+import os, sys, re
 files = [f for f in sys.argv[1].split(",") if f]
-pat = re.compile(sys.argv[2])
-for f in reversed(files):
-    if pat.search(f):
-        print(f)
-        break
+patterns = [r'\.md$', r'\.json$', r'\.d\.ts$', r'\.css$', r'\.scss$',
+            r'\.yaml$', r'\.yml$', r'\.html$']
+batches = []
+remaining = list(files)
+for p in patterns:
+    rx = re.compile(p)
+    batch = [f for f in remaining if rx.search(f)]
+    if batch:
+        batches.append(batch)
+        remaining = [f for f in remaining if f not in set(batch)]
+# Fallback: largest non-source files, one per batch so we re-pack between drops.
+src_exts = (".ts", ".tsx", ".py", ".js", ".jsx")
+non_src = [f for f in remaining if os.path.isfile(f) and not f.endswith(src_exts)]
+non_src.sort(key=lambda f: os.path.getsize(f), reverse=True)
+for f in non_src:
+    batches.append([f])
+for b in batches:
+    print(",".join(b))
 PY
 )"
-    if [ -n "$drop" ]; then
-      trimmed+=("$drop")
-      work_csv="$(python3 - "$work_csv" "$drop" <<'PY'
-import sys
-files = [f for f in sys.argv[1].split(",") if f and f != sys.argv[2]]
-print(",".join(files))
-PY
-)"
-      dropped_one=1
-      break
-    fi
-  done
 
-  if [ "$dropped_one" -eq 0 ]; then
-    # No more low-priority files; drop the largest non-source file.
-    drop="$(python3 - "$work_csv" <<'PY'
-import sys, os
-files = [f for f in sys.argv[1].split(",") if f and os.path.isfile(f)]
-files.sort(key=lambda f: os.path.getsize(f), reverse=True)
-# Skip the source-code crown jewels: never auto-drop .ts/.tsx/.py/.js/.jsx source unless those are all that remain.
-for f in files:
-    if not f.endswith((".ts",".tsx",".py",".js",".jsx")):
-        print(f); sys.exit(0)
-if files:
-    print(files[0])
-PY
-)"
-    if [ -z "$drop" ]; then
-      echo "handoff.sh: cannot trim further; ${token_count} tokens exceeds budget ${MAX_TOKENS} but no droppable files remain." >&2
-      break
-    fi
-    trimmed+=("$drop")
-    work_csv="$(python3 - "$work_csv" "$drop" <<'PY'
+# Convert the multi-line blob to a bash array, one batch per element.
+batches=()
+while IFS= read -r line; do
+  [ -n "$line" ] && batches+=("$line")
+done <<< "$DROP_BATCHES"
+
+next_batch=0
+while [ "$token_count" -gt "$MAX_TOKENS" ] && [ "$trim_iterations" -lt "$MAX_TRIM_ITERATIONS" ]; do
+  if [ "$next_batch" -ge "${#batches[@]}" ]; then
+    echo "handoff.sh: cannot trim further; ${token_count} tokens exceeds budget ${MAX_TOKENS} but no droppable files remain." >&2
+    break
+  fi
+  trim_iterations=$((trim_iterations + 1))
+
+  # Drop this batch from work_csv and record what we dropped.
+  drop_csv="${batches[$next_batch]}"
+  next_batch=$((next_batch + 1))
+
+  result="$(python3 - "$work_csv" "$drop_csv" <<'PY'
 import sys
-files = [f for f in sys.argv[1].split(",") if f and f != sys.argv[2]]
-print(",".join(files))
+work = [f for f in sys.argv[1].split(",") if f]
+drop = set(f for f in sys.argv[2].split(",") if f)
+kept = [f for f in work if f not in drop]
+print(",".join(kept))
+print("|".join(sorted(drop)))
 PY
 )"
+  work_csv="$(printf '%s\n' "$result" | sed -n '1p')"
+  dropped_blob="$(printf '%s\n' "$result" | sed -n '2p')"
+  if [ -n "$dropped_blob" ]; then
+    while IFS= read -r d; do
+      [ -n "$d" ] && trimmed+=("$d")
+    done < <(printf '%s\n' "$dropped_blob" | tr '|' '\n')
   fi
 
-  # Re-pack with reduced include set.
-  "${REPOMIX[@]}" --style "$STYLE" --output "$OUTPUT" --include "$work_csv" --ignore "$exclude_csv" >/dev/null 2>&1 || {
-    echo "handoff.sh: repomix repack failed during trimming" >&2
-    break
-  }
+  # Re-pack with reduced include set. Surface repomix failures — don't silently
+  # ship a stale snapshot with a wrong token count.
+  if ! "${REPOMIX[@]}" --style "$STYLE" --output "$OUTPUT" \
+        --include "$work_csv" --ignore "$exclude_csv" >/dev/null 2>&1; then
+    echo "handoff.sh: repomix repack failed during trimming (iteration $trim_iterations, after dropping ${#trimmed[@]} files)" >&2
+    echo "  retry without trimming: ${REPOMIX[*]} --style $STYLE --output $OUTPUT --include $work_csv" >&2
+    exit 8
+  fi
   token_count="$("$SCRIPT_DIR/count_tokens.sh" "$OUTPUT" 2>/dev/null | tr -dc '0-9')"
   token_count="${token_count:-0}"
 done
