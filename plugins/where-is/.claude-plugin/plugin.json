@@ -1,0 +1,9 @@
+{
+  "name": "where-is",
+  "version": "0.1.0",
+  "description": "Answer 'where is X', 'who uses X', 'what file handles X' questions on TypeScript/JavaScript monorepos by classifying the query (symbol / structural-pattern / path-glob / broad-concept) and routing it to the right tool — Serena MCP for symbols, ast-grep for AST patterns, git ls-files for path globs, ripgrep for concepts. Replaces 5-10 Explore-subagent calls per question with one structured answer grouped by workspace package.",
+  "author": {
+    "name": "lobsterclause",
+    "url": "https://github.com/lobsterclause/claude-skills"
+  }
+}

@@ -71,6 +71,11 @@
       "source": "./plugins/cognitive-accessibility"
     },
     {
+      "name": "codemap",
+      "description": "Materialize a single markdown architecture overview of a TS/JS monorepo to docs/architecture/codemap.md (or a custom path) — workspace packages, entry points, cross-package dependency graph, external-dep highlights, and ownership pointers. Use whenever the user asks to \"generate a codemap\", \"create an architecture overview\", \"make a codemap\", \"refresh codemap\", \"what packages are in this repo\", \"show me the monorepo structure\", \"what depends on what\", \"package dependency graph\", \"give me a top-down view of the architecture\", or when a new subagent is launching cold and needs orientation before crawling. Do NOT trigger for single-file impact analysis (use /impact). Do NOT trigger for single-symbol lookups (use /where-is or Serena find_symbol). Do NOT trigger for non-code repos.",
+      "source": "./plugins/codemap"
+    },
+    {
       "name": "contrast-checker",
       "description": "Calculate and evaluate color contrast ratios for accessibility compliance. Use this skill whenever the user provides color values (hex, RGB, HSL, CSS named colors) and wants to check contrast, find accessible color alternatives, audit a palette, or understand WCAG contrast requirements. Trigger on phrases like \"contrast ratio\", \"color contrast\", \"check these colors\", \"does this pass WCAG\", \"accessible color\", \"contrast checker\", \"what's the contrast between\", \"fix my contrast\", \"find a color that passes\", \"dark mode contrast\", \"color blind\", \"deuteranopia\", \"protanopia\", or any mention of 1.4.3, 1.4.6, 1.4.11, or APCA. Also trigger when the user shares a color palette and asks if it's accessible, or when reviewing design tokens for accessibility. Always show the math, not just pass/fail.",
       "source": "./plugins/contrast-checker"
@@ -199,6 +204,11 @@
       "name": "wcag-compliance-auditor",
       "description": "\"Systematically audit against all WCAG 2.2 success criteria with severity ratings, effort estimates, and business impact narratives. Use this skill for criterion-level compliance audits, conformance declarations, or VPAT preparation. Trigger on phrases like WCAG compliance audit, WCAG 2.2 audit, criterion-by-criterion, conformance level, compliance report, Section 508 audit, or any request for detailed standards-based accessibility assessment.\"",
       "source": "./plugins/wcag-compliance-auditor"
+    },
+    {
+      "name": "where-is",
+      "description": "Locate code in a TypeScript/JavaScript monorepo by routing the query to the right tool — Serena MCP for symbols, ast-grep for structural patterns, git ls-files for path/glob lookups, ripgrep for broad concepts. Use whenever the user asks \"where is X defined\", \"where does X live\", \"what file is X in\", \"who uses X\", \"who calls X\", \"who imports X\", \"find consumers of X\", \"what file handles auth / login / chat / memory / X\", \"show me X in the code\", \"find X\", \"what's in <path>\", \"what does this directory do\". Also trigger on slash-command form `/where-is <query>`. Auto-classifies the query: PascalCase/camelCase identifier → symbol mode (Serena); strings like `useEffect(`, `useState<`, `as any` → pattern mode (ast-grep); paths with `/` or extensions or globs → path mode (git ls-files / fs walk); 3+-word natural-language phrases → concept mode (ripgrep). Returns results grouped by workspace package with file:line citations. Do NOT trigger for editing/refactoring requests, general programming questions, or when the user has pasted code and is asking about its behavior. Do NOT trigger for \"what does this change affect\" — that's the impact skill's job.",
+      "source": "./plugins/where-is"
     }
   ]
 }
