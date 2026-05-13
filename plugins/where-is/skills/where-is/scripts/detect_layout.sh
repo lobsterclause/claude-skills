@@ -30,7 +30,18 @@ if command -v node >/dev/null 2>&1; then
     const globs = [];
     const txt = readText(path.join(root, "pnpm-workspace.yaml"));
     if (txt) {
-      for (const m of txt.matchAll(/-\s+["\x27]?([^"\x27\n#]+)["\x27]?/g)) globs.push(m[1].trim());
+      // Only extract list items under the "packages:" block so we do not
+      // accidentally pick up other YAML keys list entries (gemini M).
+      let inPackages = false;
+      for (const rawLine of txt.split("\n")) {
+        if (/^packages:/.test(rawLine)) { inPackages = true; continue; }
+        if (/^[A-Za-z]/.test(rawLine)) { inPackages = false; continue; }
+        if (!inPackages) continue;
+        // Strip inline `# comments` (codex P3) before parsing the glob.
+        const line = rawLine.replace(/\s+#.*$/, "");
+        const m = line.match(/^[\s]*-\s+["\x27]?([^"\x27\n]+?)["\x27]?\s*$/);
+        if (m) globs.push(m[1].trim());
+      }
     }
     const rootPj = readJson(path.join(root, "package.json"));
     if (rootPj) {

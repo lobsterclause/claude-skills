@@ -51,8 +51,26 @@ if [ -n "$kind_override" ]; then
   normalized="$query"
 else
   classification=$(bash "$script_dir/classify.sh" "$query")
-  kind=$(printf '%s' "$classification" | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')
-  normalized=$(printf '%s' "$classification" | sed -n 's/.*"normalized":"\([^"]*\)".*/\1/p')
+  # Parse via python3 when available — classify.sh now emits python-style
+  # spaced JSON (`{"kind": "..."}`) which the old sed regex (`"kind":"..."` with
+  # no space) missed entirely, dropping every classification back to "concept".
+  if command -v python3 >/dev/null 2>&1; then
+    parsed=$(printf '%s' "$classification" | CLS_FALLBACK_KIND="concept" python3 -c '
+import json, os, sys
+try:
+  d = json.loads(sys.stdin.read())
+except Exception:
+  d = {}
+print(d.get("kind", os.environ.get("CLS_FALLBACK_KIND", "concept")))
+print(d.get("normalized", ""))
+' 2>/dev/null || true)
+    kind=$(printf '%s\n' "$parsed" | sed -n '1p')
+    normalized=$(printf '%s\n' "$parsed" | sed -n '2p')
+  else
+    # Fall back to a tolerant sed that accepts optional whitespace around `:`.
+    kind=$(printf '%s' "$classification" | sed -n 's/.*"kind"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    normalized=$(printf '%s' "$classification" | sed -n 's/.*"normalized"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  fi
 fi
 [ -z "$kind" ] && kind="concept"
 [ -z "$normalized" ] && normalized="$query"
@@ -65,7 +83,9 @@ layout=$(bash "$script_dir/detect_layout.sh" "$root" 2>/dev/null || echo '{"work
 
 classify_pkg() {
   # Given a file path, print the workspace package name it belongs to.
-  # Reads $layout from the enclosing scope.
+  # Reads $layout and $root from the enclosing scope. Strips an absolute $root
+  # prefix off `file` before comparing — ripgrep was producing absolute paths
+  # against relative workspace dirs, so every hit ended up labeled "(root)".
   local file="$1"
   if ! command -v node >/dev/null 2>&1; then
     echo "(root)"
@@ -73,7 +93,9 @@ classify_pkg() {
   fi
   node -e '
     const layout = JSON.parse(process.argv[1]);
-    const file = process.argv[2];
+    let file = process.argv[2];
+    const root = process.argv[3] || "";
+    if (root && file.startsWith(root + "/")) file = file.slice(root.length + 1);
     let best = null;
     for (const p of (layout.packages || [])) {
       if (p.dir === ".") continue;
@@ -82,7 +104,7 @@ classify_pkg() {
       }
     }
     process.stdout.write(best ? best.name : "(root)");
-  ' "$layout" "$file"
+  ' "$layout" "$file" "$root"
 }
 
 # Safely JSON-encode a string. Uses python3 json.dumps so newlines, tabs,
@@ -141,7 +163,11 @@ case "$kind" in
       if [ -n "$rg_hits" ] && command -v node >/dev/null 2>&1; then
         hits_json=$(printf '%s' "$rg_hits" | node -e '
           const layout = JSON.parse(process.argv[1]);
+          const root = process.argv[2] || "";
           function pkgOf(file) {
+            // rg emits absolute paths when invoked with abs root; strip the
+            // prefix so comparisons against relative workspace dirs work.
+            if (root && file.startsWith(root + "/")) file = file.slice(root.length + 1);
             let best=null;
             for (const p of (layout.packages||[])) {
               if (p.dir==="."||!p.dir) continue;
@@ -162,7 +188,7 @@ case "$kind" in
             }
             process.stdout.write(JSON.stringify(out));
           });
-        ' "$layout")
+        ' "$layout" "$root")
       fi
       emit_json_head
       # Safely JSON-encode $normalized for the next_actions payload (was raw).
@@ -209,9 +235,13 @@ case "$kind" in
     fi
 
     ag_args=(--pattern "$normalized" --lang tsx)
-    # Honor --include-tests by default-excluding test files (matches what the
-    # ripgrep fallback does). ast-grep doesn't have a built-in test-exclusion
-    # flag, so we filter after the fact.
+    # ast-grep's native --globs flag (singular flag, list values, gitignore
+    # semantics with leading `!` to exclude) is the canonical way to exclude
+    # test files. Earlier attempt used --ignore which doesn't exist as a glob
+    # flag in ast-grep.
+    if [ "$include_tests" != "true" ]; then
+      ag_args+=(--globs '!*.test.*' --globs '!*.spec.*' --globs '!**/__tests__/**')
+    fi
     # Resolve --package to a workspace dir (same path as concept_search.sh).
     ag_search_root="$root"
     if [ -n "$pkg_filter" ] && command -v python3 >/dev/null 2>&1; then
@@ -229,9 +259,6 @@ for p in (d.get("packages") or []):
       fi
     fi
     raw=$("$AG" "${ag_args[@]}" "$ag_search_root" 2>/dev/null || true)
-    if [ "$include_tests" != "true" ] && [ -n "$raw" ]; then
-      raw=$(printf '%s\n' "$raw" | grep -Ev '\.(test|spec)\.[tj]sx?:|(/|^)__tests__/' || true)
-    fi
 
     if [ "$json" = "true" ]; then
       emit_json_head
@@ -298,7 +325,10 @@ for p in (d.get("packages") or []):
       if [ -n "$hits" ] && command -v node >/dev/null 2>&1; then
         hits_json=$(printf '%s' "$hits" | node -e '
           const layout=JSON.parse(process.argv[1]);
-          function pkgOf(file){let best=null;for(const p of (layout.packages||[])){if(p.dir==="."||!p.dir)continue;if(file===p.dir||file.startsWith(p.dir+"/")){if(!best||p.dir.length>best.dir.length)best=p;}}return best?best.name:"(root)";}
+          const root=process.argv[2]||"";
+          // rg result paths are absolute (search root was $root/$pkg or $root);
+          // strip the prefix before classifying against relative workspace dirs.
+          function pkgOf(file){if(root&&file.startsWith(root+"/"))file=file.slice(root.length+1);let best=null;for(const p of (layout.packages||[])){if(p.dir==="."||!p.dir)continue;if(file===p.dir||file.startsWith(p.dir+"/")){if(!best||p.dir.length>best.dir.length)best=p;}}return best?best.name:"(root)";}
           process.stdin.setEncoding("utf8");let s="";process.stdin.on("data",c=>s+=c);
           process.stdin.on("end",()=>{
             const out=[];
@@ -310,7 +340,7 @@ for p in (d.get("packages") or []):
             }
             process.stdout.write(JSON.stringify(out));
           });
-        ' "$layout")
+        ' "$layout" "$root")
       fi
       emit_json_head
       printf '"route":"ripgrep","hits":%s}\n' "$hits_json"

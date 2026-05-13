@@ -81,11 +81,15 @@ kind="single"
 if [ -f "$repo_root/pnpm-workspace.yaml" ]; then
   kind="pnpm"
   # Naive YAML parse: lines starting with "- " under a "packages:" key.
+  # Strip `# ...` inline comments first — common in pnpm-workspace.yaml,
+  # otherwise the comment text gets folded into the glob pattern and no
+  # workspace dirs match (codex pass-3 finding).
   awk '
     /^packages:/ {flag=1; next}
     /^[a-zA-Z]/ {flag=0}
     flag && /^[[:space:]]*-[[:space:]]*/ {
       gsub(/^[[:space:]]*-[[:space:]]*/, "")
+      gsub(/[[:space:]]+#.*$/, "")
       gsub(/^["'\'']|["'\'']$/, "")
       gsub(/[[:space:]]+$/, "")
       if (length($0)) print
