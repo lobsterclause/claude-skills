@@ -39,7 +39,7 @@ rg_args=(
   --line-number
   --no-heading
   --color=never
-  --type-add 'tsj:*.{ts,tsx,js,jsx,mjs,cjs}'
+  --type-add 'tsj:*.ts,*.tsx,*.js,*.jsx,*.mjs,*.cjs'
   -t tsj
   --max-count 5
   --glob '!node_modules'

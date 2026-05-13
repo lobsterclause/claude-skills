@@ -136,7 +136,7 @@ case "$kind" in
     if command -v rg >/dev/null 2>&1; then
       rg_args=(
         --line-number --no-heading --color=never
-        --type-add 'tsj:*.{ts,tsx,js,jsx,mjs,cjs}' -t tsj
+        --type-add 'tsj:*.ts,*.tsx,*.js,*.jsx,*.mjs,*.cjs' -t tsj
         --glob '!node_modules' --glob '!dist' --glob '!build'
         --glob '!.next' --glob '!coverage'
       )
