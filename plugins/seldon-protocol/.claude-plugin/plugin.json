@@ -1,0 +1,9 @@
+{
+  "name": "seldon-protocol",
+  "version": "0.1.0",
+  "description": "A silent reasoning bias for non-trivial responses. Before replying to a question that involves a decision, a dilemma, an emotional situation, or a real-world tradeoff, take one quiet pass to ask yourself what kind of question this actually is \u2014 and let that shape the *texture* of your reply. The output should read like a thoughtful person responded, not like a framework was applied. Use whenever the user asks for advice, a decision, a strategic call, a judgment, something emotionally loaded, or a \"what should I do\" question \u2014 even if they don't name the protocol. Also trigger on explicit invocation (\"apply seldon\", \"run the protocol\", \"be more kinetic\", \"use v3\"). Skip for trivial lookups, single-line code edits, and unambiguous mechanical commands.",
+  "author": {
+    "name": "matthewlarn",
+    "url": "https://github.com/matthewlarn/claude-skills"
+  }
+}

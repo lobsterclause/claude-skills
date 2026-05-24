@@ -1,0 +1,36 @@
+{
+  "skill_name": "seldon-protocol",
+  "_note": "Silent-mode skill — the protocol is internal reasoning bias only. Outputs should be indistinguishable from a thoughtful default Claude response. Evals here are stored prompts; quality is judged qualitatively (does it read like a thoughtful person responded), not by structural assertions about engine labels or diagnostic blocks (those should never appear in user-facing output unless the user explicitly asks).",
+  "evals": [
+    {
+      "id": 1,
+      "name": "trivial-lookup",
+      "prompt": "what's the capital of australia"
+    },
+    {
+      "id": 2,
+      "name": "well-specified-code",
+      "prompt": "write me a python function that returns the nth fibonacci number iteratively"
+    },
+    {
+      "id": 3,
+      "name": "tactical-fire",
+      "prompt": "production database is down, customers can't log in, what do i check first??"
+    },
+    {
+      "id": 4,
+      "name": "emotional-pain",
+      "prompt": "i've been crying all morning. my partner and i had a huge fight last night and i'm not sure we're going to make it through this one. i don't know what to do"
+    },
+    {
+      "id": 5,
+      "name": "irreversible-decision",
+      "prompt": "i have a job offer that pays 40% more but the company seems unstable and i have a kid on the way. what do i do?"
+    },
+    {
+      "id": 6,
+      "name": "explicit-protocol-question",
+      "prompt": "which engine should i be using for this — i'm trying to figure out whether to refactor or rewrite a legacy auth service"
+    }
+  ]
+}
