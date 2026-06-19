@@ -77,7 +77,7 @@ if [[ "$n_entries" -eq 0 ]]; then
 fi
 
 # Per-reviewer aggregation.
-# For each reviewer in {codex, gemini, kimi}, compute:
+# For each reviewer in {codex, antigravity, gemini-pro, kimi}, compute:
 #   total: number of times the reviewer was attempted (status != "skipped")
 #   ok: status == "ok"
 #   timed_out: status == "timed_out"
@@ -116,9 +116,15 @@ analyze_reviewer() {
   '
 }
 
-codex_stats=$(analyze_reviewer codex)
-gemini_stats=$(analyze_reviewer gemini)
-kimi_stats=$(analyze_reviewer kimi)
+# Reviewer fleet. antigravity + gemini-pro both ride the agy CLI (Gemini Flash
+# and Pro laps respectively); codex and kimi are independent providers. Keep
+# this list in sync with run_reviewers.sh's default --reviewers. Bash 3.2 (macOS
+# /bin/bash) has no associative arrays — use a parallel indexed array of stats.
+REVIEWERS=(codex antigravity gemini-pro kimi)
+reviewer_stats=()
+for _r in "${REVIEWERS[@]}"; do
+  reviewer_stats+=("$(analyze_reviewer "$_r")")
+done
 
 # Suggest timeout bump if p95 is within 10% of current budget OR timeout rate >20%.
 suggest_timeout_bump() {
@@ -150,11 +156,7 @@ emit_warning() {
 
 case "$mode" in
   warn)
-    out=$({
-      emit_warning "$codex_stats"
-      emit_warning "$gemini_stats"
-      emit_warning "$kimi_stats"
-    })
+    out=$(for stats in "${reviewer_stats[@]}"; do emit_warning "$stats"; done)
     if [[ -n "$out" ]]; then
       echo "── cross-review pre-run check (last $n_entries runs) ──"
       echo "$out"
@@ -165,7 +167,7 @@ case "$mode" in
     ;;
   report)
     echo "── cross-review reviewer health (last $n_entries runs) ──"
-    for stats in "$codex_stats" "$gemini_stats" "$kimi_stats"; do
+    for stats in "${reviewer_stats[@]}"; do
       echo "$stats" | jq -r '
         if .total == 0 then "  \(.reviewer): no data in window"
         else
@@ -175,12 +177,8 @@ case "$mode" in
     echo ""
     echo "── tuning suggestions ──"
     suggestions=$({
-      suggest_timeout_bump "$codex_stats"
-      suggest_timeout_bump "$gemini_stats"
-      suggest_timeout_bump "$kimi_stats"
-      emit_warning "$codex_stats"
-      emit_warning "$gemini_stats"
-      emit_warning "$kimi_stats"
+      for stats in "${reviewer_stats[@]}"; do suggest_timeout_bump "$stats"; done
+      for stats in "${reviewer_stats[@]}"; do emit_warning "$stats"; done
     } | sort -u)
     if [[ -n "$suggestions" ]]; then
       echo "$suggestions"

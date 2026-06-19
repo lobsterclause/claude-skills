@@ -66,7 +66,7 @@ case "$mode" in
     trap 'rm -f "$body_file"' EXIT
     {
       printf '## Cross-review — pass %s\n\n' "$pass"
-      printf '_Automated review by codex + gemini. See the "Findings" collapsible for specifics._\n\n'
+      printf '_Automated review by codex + antigravity + gemini-pro + kimi. See the "Findings" collapsible for specifics._\n\n'
       printf '<details><summary>Findings</summary>\n\n'
       cat "$findings"
       printf '\n</details>\n'
