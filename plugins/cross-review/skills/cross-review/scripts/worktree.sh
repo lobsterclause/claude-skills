@@ -131,8 +131,9 @@ case "$cmd" in
       warn_large=true
     fi
 
-    # Secret-path detection. The diff is sent to two external APIs (codex, gemini);
-    # even rotated secrets should not leave the user's machine without consent.
+    # Secret-path detection. The diff is sent to multiple external providers
+    # (OpenAI/codex, Google/agy, Moonshot/kimi); even rotated secrets should not
+    # leave the user's machine without consent.
     # Pattern match on changed filenames, not diff content — path-based is cheap,
     # false-positive-tolerant, and catches the cases that matter most.
     secret_pattern='\.env($|\.|/)|\.envrc|credentials|[Ss]ecret|\.pem$|\.key$|\.p12$|\.pfx$|id_rsa|id_ed25519|\.keystore|\.jks'
