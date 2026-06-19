@@ -27,10 +27,15 @@ gemini_pro=false
 kimi=false
 
 has codex && codex=true
-# Both Gemini reviewers ride the same agy binary.
+# Both Gemini reviewers ride the same agy binary — but `agy --model` silently
+# falls back to Flash on an unrecognized model string. So only report gemini-pro
+# (the Pro lap) available if `agy models` actually lists a Gemini 3.1 Pro entry;
+# otherwise a rename would make us run a 2nd Flash while claiming it was Pro.
 if has agy; then
   antigravity=true
-  gemini_pro=true
+  if agy models 2>/dev/null | grep -qi 'Gemini 3.1 Pro'; then
+    gemini_pro=true
+  fi
 fi
 has kimi && kimi=true
 

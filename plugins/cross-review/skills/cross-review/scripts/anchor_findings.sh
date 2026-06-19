@@ -60,21 +60,34 @@ fi
 awk_prog="$tmp_dir/match.awk"
 cat > "$awk_prog" <<'AWK'
 function normDiff(s){ s=substr(s,2); gsub(/^[ \t]+|[ \t]+$/,"",s); gsub(/[ \t]+/," ",s); return s }
-function normSnip(s){ gsub(/^[+\- ]/,"",s); gsub(/^[ \t]+|[ \t]+$/,"",s); gsub(/[ \t]+/," ",s); return s }
+# normSnip must NOT strip a leading +/-/space: the snippet is raw code, so a line
+# whose body legitimately starts with + or - (e.g. `++i`, `-x`) must compare equal
+# to normDiff's output, which only strips the single diff-column char. Stripping
+# here broke that alignment (anchor bug b3).
+function normSnip(s){ gsub(/^[ \t]+|[ \t]+$/,"",s); gsub(/[ \t]+/," ",s); return s }
 BEGIN{
+  target = ENVIRON["TARGET"]   # via env, not -v, so backslashes in paths survive
   # load snippet (non-blank normalised lines)
   sn=0
   while ((getline line < snipfile) > 0){ c=normSnip(line); if(c!="") sp[++sn]=c }
-  nn=0; on=0; intarget=0
+  nn=0; on=0; intarget=0; old_path=""; new_path=""
 }
-# new-file path header marks the start of a file's hunks
-/^\+\+\+ /{
-  p=$0; sub(/^\+\+\+ [ab]\//,"",p); sub(/^\+\+\+ /,"",p); sub(/\t.*$/,"",p)
-  intarget = (p==target)
+# File headers are anchored to ` a/`, ` b/`, or ` /dev/null` so that diff CONTENT
+# lines whose code starts with `+++`/`---` (after git's column marker) cannot be
+# mistaken for headers (anchor bug b1). We track BOTH old and new paths so a
+# deleted file (new path `/dev/null`) still matches on its old path (bug b2).
+/^--- ([ab]\/|\/dev\/null)/{
+  p=$0; sub(/^--- /,"",p); sub(/\t.*$/,"",p)
+  if(p=="/dev/null"){ old_path="" } else { sub(/^[ab]\//,"",p); old_path=p }
   next
 }
-/^--- /{ next }
-/^diff --git /{ intarget=0; next }
+/^\+\+\+ ([ab]\/|\/dev\/null)/{
+  p=$0; sub(/^\+\+\+ /,"",p); sub(/\t.*$/,"",p)
+  if(p=="/dev/null"){ new_path="" } else { sub(/^[ab]\//,"",p); new_path=p }
+  intarget = ((new_path!="" && new_path==target) || (old_path!="" && old_path==target))
+  next
+}
+/^diff --git /{ intarget=0; old_path=""; new_path=""; next }
 /^@@ /{
   if(intarget){
     # @@ -oldStart[,oldCount] +newStart[,newCount] @@
@@ -116,7 +129,7 @@ while IFS= read -r f; do
   printf '%s' "$(jq -r '.snippet // ""' <<<"$f")" > "$tmp_dir/snip.txt"
   res="unresolved"; start=0; end=0; side="none"
   if [[ -n "$file" && -s "$tmp_dir/snip.txt" ]]; then
-    read -r res start end side < <(awk -v target="$file" -v snipfile="$tmp_dir/snip.txt" -f "$awk_prog" "$diff_path")
+    read -r res start end side < <(TARGET="$file" awk -v snipfile="$tmp_dir/snip.txt" -f "$awk_prog" "$diff_path")
   fi
   resolved=false; [[ "$res" == "resolved" ]] && resolved=true
   jq -c \

@@ -106,11 +106,11 @@ fi
 # Helpers — all read via file-args/pipe, never stdin redirect.
 count_valid() { # count_valid <file...> -> number of parseable JSON entries
   [[ $# -eq 0 ]] && { echo 0; return; }
-  cat "$@" 2>/dev/null | jq -c -R 'fromjson? // empty' | jq -s 'length'
+  cat -- "$@" 2>/dev/null | jq -c -R 'fromjson? // empty' | jq -s 'length'
 }
 count_raw() { # count_raw <file...> -> number of non-blank lines
   [[ $# -eq 0 ]] && { echo 0; return; }
-  cat "$@" 2>/dev/null | grep -c '[^[:space:]]' || true
+  cat -- "$@" 2>/dev/null | grep -c '[^[:space:]]' || true
 }
 
 existing_valid=0
@@ -137,7 +137,7 @@ merge_inputs=()
 [[ -f "$into" ]] && merge_inputs+=("$into")
 merge_inputs+=("${sources[@]}")
 
-cat "${merge_inputs[@]}" 2>/dev/null \
+cat -- "${merge_inputs[@]}" 2>/dev/null \
   | jq -c -R 'fromjson? // empty' \
   | jq -s -c 'unique | sort_by(.ts // "") | .[]' > "$merged_tmp"
 

@@ -60,36 +60,60 @@ keep_all() {
 n_findings="$(jq '.findings | length' "$findings")"
 [[ "${n_findings:-0}" -eq 0 ]] && keep_all "no findings to check"
 
-# Resolve the diff.
+# Resolve the diff. In --base mode, SCOPE it to just the files the findings
+# reference: this keeps the prompt small (avoids the ARG_MAX/E2BIG class, bug b4)
+# and stops the model drifting onto unrelated diff content / inventing its own
+# findings (the no-op contract failure, G1). A finding pointing at a file that
+# isn't in the scoped diff simply can't be disproven → kept (recall-safe).
 diff_path="$tmp_dir/diff.txt"
 if [[ -n "$diff_file" ]]; then
   [[ -f "$diff_file" ]] || keep_all "diff file not found (fail-safe)"
-  cat "$diff_file" > "$diff_path"
+  cat -- "$diff_file" > "$diff_path"
 elif [[ -n "$base" ]]; then
-  ( cd "$repo" && git diff "$base"...HEAD ) > "$diff_path" 2>/dev/null || keep_all "git diff failed (fail-safe)"
+  # Resolve the repo TOPLEVEL: finding `file` paths are repo-root-relative, but a
+  # git pathspec is relative to CWD — running the diff anywhere but the root made
+  # the scoped diff silently empty (→ fail-safe keep). Anchor against the root.
+  repo_root="$(cd "$repo" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)"
+  [[ -z "$repo_root" ]] && repo_root="$repo"
+  # unique, non-empty file paths from the findings. while-read (not mapfile,
+  # which is bash 4+; macOS /bin/bash is 3.2) to stay portable.
+  fc_files=()
+  while IFS= read -r _f; do [[ -n "$_f" ]] && fc_files+=("$_f"); done \
+    < <(jq -r '.findings[].file // empty' "$findings" | sort -u)
+  if [[ ${#fc_files[@]} -gt 0 ]]; then
+    ( cd "$repo_root" && git diff "$base"...HEAD -- "${fc_files[@]}" ) > "$diff_path" 2>/dev/null || keep_all "git diff failed (fail-safe)"
+  else
+    ( cd "$repo_root" && git diff "$base"...HEAD ) > "$diff_path" 2>/dev/null || keep_all "git diff failed (fail-safe)"
+  fi
 else
   echo "factcheck: provide --base or --diff" >&2; exit 2
 fi
 [[ -s "$diff_path" ]] || keep_all "empty diff (fail-safe)"
 
-# Build the findings block (one compact line per finding; snippet flattened).
-findings_block="$(jq -r '
+# Defuse prompt-injection: an untrusted patch can embed a literal </diff> to
+# escape the fence and inject instructions (gemini-pro finding "inj"). Break the
+# closing tag so it can't terminate the <diff>…</diff> wrapper in the prompt.
+sed 's#</diff>#<\/ diff>#g' "$diff_path" > "$diff_path.safe" && mv "$diff_path.safe" "$diff_path"
+
+# Build the findings block (one compact line per finding; snippet flattened) and
+# write it to a file. Both the block and the diff are spliced into the prompt by
+# awk reading them as FILES (getline), never as env vars or argv — env/argv are
+# capped by ARG_MAX and blow up on large diffs (bug b4).
+find_path="$tmp_dir/findings_block.txt"
+jq -r '
   .findings[] |
   "[\(.id)] \(.file):\(.line) — \(.claim)\n    snippet: \((.snippet // "") | gsub("\n";" / "))"
-' "$findings")"
+' "$findings" > "$find_path"
 
 prompt_file="$(cd "$(dirname "$0")/.." && pwd)/references/factcheck_prompt.txt"
 [[ -f "$prompt_file" ]] || keep_all "factcheck_prompt.txt missing (fail-safe)"
-template="$(cat "$prompt_file")"
 
-# Substitute placeholders. Use awk to splice large bodies (avoids bash ${//} blowups).
 prompt="$tmp_dir/prompt.txt"
-DIFF_BODY="$(cat "$diff_path")" FIND_BODY="$findings_block" awk '
-  { line=$0
-    if (line ~ /\{\{DIFF\}\}/)     { print ENVIRON["DIFF_BODY"]; next }
-    if (line ~ /\{\{FINDINGS\}\}/) { print ENVIRON["FIND_BODY"]; next }
-    print line }
-' <<<"$template" > "$prompt"
+awk -v diff_file="$diff_path" -v find_file="$find_path" '
+  /\{\{DIFF\}\}/     { while ((getline l < diff_file) > 0) print l; close(diff_file); next }
+  /\{\{FINDINGS\}\}/ { while ((getline l < find_file) > 0) print l; close(find_file); next }
+  { print }
+' "$prompt_file" > "$prompt"
 
 # Timeout shim.
 TIMEOUT_BIN=""
@@ -101,9 +125,12 @@ raw="$tmp_dir/raw.txt"
 case "$reviewer" in
   agy)
     command -v agy >/dev/null 2>&1 || keep_all "agy not installed (fail-safe)"
-    # Diff-only: the prompt embeds the diff and instructs no tools. --sandbox as backstop.
+    # Pass the prompt by FILE PATH, not argv: `-p "$(cat prompt)"` puts the whole
+    # diff on the command line and hits MAX_ARG_STRLEN (~128KB) on large diffs
+    # (bug b4). agy can read the file itself (--sandbox still permits reads).
     run_to "$timeout_s" agy --model "$model" --sandbox --print-timeout "${timeout_s}s" \
-      -p "$(cat "$prompt")" >"$raw" 2>"$tmp_dir/err.txt" </dev/null || keep_all "agy factcheck failed/timed out (fail-safe)"
+      -p "Read the file at $prompt and follow its instructions EXACTLY. It contains your full fact-check instructions, a code diff, and a list of findings. Output ONLY the JSON block it specifies — nothing else." \
+      >"$raw" 2>"$tmp_dir/err.txt" </dev/null || keep_all "agy factcheck failed/timed out (fail-safe)"
     ;;
   kimi)
     command -v kimi >/dev/null 2>&1 || keep_all "kimi not installed (fail-safe)"
@@ -126,6 +153,17 @@ extract_drop() {
 drop_json="$(extract_drop)"
 [[ -z "$drop_json" ]] && drop_json='{"drop":[]}'
 
+# Contract check (G1): the model must drop only ids we supplied. Count how many
+# returned ids actually exist in the finding set. If it returned ids but NONE
+# match, it ignored the contract (e.g. invented its own f1.. ids) — surface that
+# loudly instead of silently keeping everything and looking like a clean pass.
+valid_ids="$(jq -c '[.findings[].id]' "$findings")"
+returned_n="$(printf '%s' "$drop_json" | jq '.drop | length')"
+matched_n="$(printf '%s' "$drop_json" | jq --argjson ids "$valid_ids" '[.drop[] | select(.id as $i | $ids | index($i))] | length')"
+if [[ "${returned_n:-0}" -gt 0 && "${matched_n:-0}" -eq 0 ]]; then
+  echo "factcheck: WARNING — model returned $returned_n drop id(s), 0 of which match the supplied findings; it ignored the contract. Keeping all findings (no reliable veto this pass)." >&2
+fi
+
 # Annotate findings: matched id -> drop with reason; otherwise keep.
 jq --argjson fc "$drop_json" --arg reviewer "$reviewer" --arg model "$model" '
   ($fc.drop // []) as $d
@@ -136,11 +174,14 @@ jq --argjson fc "$drop_json" --arg reviewer "$reviewer" --arg model "$model" '
           then {verdict:"drop", reason: ($hit.reason // "disproven by diff")}
           else {verdict:"keep", reason: null} end)
     )
-  | .factcheck_meta = {reviewer: $reviewer, model: $model, ran: true}
+  | .factcheck_meta = {reviewer: $reviewer, model: $model, ran: true,
+                       returned_ids: ($fc.drop | length), matched_ids: ([.findings[] | select(.factcheck.verdict=="drop")] | length)}
 ' "$findings" > "$out"
 
-# Preserve the raw transcript next to the output for audit.
-cp "$raw" "${out%.json}.factcheck-raw.txt" 2>/dev/null || true
+# Preserve the raw transcript next to the output for audit. Build the name
+# robustly (a non-.json --out would otherwise drop a hidden .factcheck-raw.txt).
+raw_sidecar="$(dirname "$out")/$(basename "$out" .json).factcheck-raw.txt"
+cp "$raw" "$raw_sidecar" 2>/dev/null || true
 
 dropped_n="$(jq '[.findings[] | select(.factcheck.verdict=="drop")] | length' "$out")"
 echo "factcheck: dropped $dropped_n/$n_findings finding(s) as diff-disproven (reviewer=$reviewer)" >&2

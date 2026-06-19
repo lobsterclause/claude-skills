@@ -442,6 +442,9 @@ run_kimi() {
   # legitimately contain triple-backtick lines (e.g. doc changes that add a
   # fenced code block), which close the fence prematurely and corrupt the
   # prompt. <diff>...</diff> has no such collision surface.
+  # Defuse a literal </diff> inside untrusted patch content so a malicious diff
+  # can't close the fence early and inject instructions (prompt-injection "inj").
+  diff_full="${diff_full//<\/diff>/< \/diff>}"
   local full_prompt
   full_prompt="$review_prompt
 
@@ -485,7 +488,15 @@ ran=()
 # burning tokens against APIs nobody is reading any more.
 cleanup_pids() {
   [[ ${#pids[@]} -gt 0 ]] || return 0
-  kill "${pids[@]}" 2>/dev/null || true
+  local p
+  for p in "${pids[@]}"; do
+    # Kill the subshell's children first (the `timeout`/CLI process); coreutils
+    # `timeout` then signals the actual reviewer binary. Killing only the
+    # subshell (as before) left codex/agy/kimi reparented and burning tokens on
+    # a programmatic SIGTERM (Ctrl+C happened to work via the tty process group).
+    pkill -P "$p" 2>/dev/null || true
+    kill "$p" 2>/dev/null || true
+  done
 }
 trap cleanup_pids EXIT INT TERM
 

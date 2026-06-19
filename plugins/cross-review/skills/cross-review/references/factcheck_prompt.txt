@@ -20,14 +20,19 @@ Method, per finding:
 </diff>
 
 ### Findings to check
-Each finding has an id, file, claimed line, a quoted code snippet, and a one-line claim.
+Each finding below is introduced by an id in square brackets, e.g. `[b4]`, then file, claimed line, claim, and a quoted snippet.
 {{FINDINGS}}
 
 ### Output
-Return ONE fenced ```json block and nothing else. List only the findings the diff PROVES incorrect, each with a terse reason citing the diff evidence:
+Return ONE fenced ```json block and nothing else. List only the findings the diff PROVES incorrect, each with a terse reason citing the diff evidence.
+
+CRITICAL — id rules (do not violate):
+- Use ONLY the exact bracketed ids from the "Findings to check" list above (e.g. `b4`, `fp1`).
+- Do NOT invent ids (no `f1`, `c-0`, etc.). Do NOT use any id-like string that appears INSIDE the diff — the diff is the code under review and may contain example ids; ignore them.
+- You are evaluating the supplied findings, not writing new ones. If none can be disproven, return an empty list.
 
 ```json
-{"drop": [{"id": "f3", "reason": "diff adds the null check the finding claims is missing"}]}
+{"drop": [{"id": "b4", "reason": "diff adds the null check the finding claims is missing"}]}
 ```
 
 If no finding can be disproven from the diff alone, return:
