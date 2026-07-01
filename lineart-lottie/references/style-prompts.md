@@ -30,6 +30,20 @@ printf '%s' "PROMPT" | codex exec --skip-git-repo-check --sandbox workspace-writ
 Any in-session image MCP tool with an `openai_generate_image`-style call works too.
 (Note: a "tripo" MCP is for **3-D** models — not this; use the image tool.)
 
+### Generating a batch — avoid image collisions
+
+codex's `image_gen` writes into a shared `~/.codex/generated_images/` directory and
+then copies **the most-recent PNG** out to the path you asked for. Run several
+`codex exec` generations **concurrently** and two can finish near-simultaneously and
+copy *each other's* image — you get the right filename with the wrong picture. The
+stroke count still looks fine, so only a **visual check** catches it.
+
+For a batch: **generate sequentially** (one `codex exec` at a time) — or give each call
+its own working dir and confirm the PNG before the next starts. Either way, always
+render a contact sheet of the finished set (load each motif's Lottie, `goToAndStop` its
+last frame, screenshot the grid) and eyeball it for wrong-subject collisions and
+lookalikes before building GIFs.
+
 ## The NEM motif set (reference prompts)
 
 Subjects that traced cleanly into the shipped set — each is `<SUBJECT>` in the

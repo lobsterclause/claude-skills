@@ -69,9 +69,11 @@ Produces a Lottie whose stroke **draws on** (trim path `ty:"tm"`, 0→100% over 
 ```bash
 node scripts/preview.mjs --out work/preview.html work/lottie/*.json
 open work/preview.html          # or screenshot it to review
+# --loop full        loop the WHOLE timeline (redraw every cycle) instead of the default
+#                    draw-once-then-breathe; --stagger <ms> and --bg <hex> also available
 ```
 
-A self-contained page: each motif draws on once (staggered), then loops the idle segment **seamlessly** — the exact pattern a real host uses. Review timing, tint legibility, and loop-seam smoothness here before shipping.
+A self-contained page: each motif draws on once (staggered), then loops the idle segment **seamlessly** — the exact pattern a real host uses. Pass `--loop full` to instead loop the entire timeline so the draw-on repeats each cycle (good for a lively gallery). Review timing, tint legibility, and loop-seam smoothness here before shipping.
 
 ## Stage 5 — export a looping GIF (optional, for sharing)
 
