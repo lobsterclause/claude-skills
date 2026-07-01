@@ -1,0 +1,9 @@
+{
+  "name": "lineart-lottie",
+  "version": "0.1.0",
+  "description": "Generate on-brand single-line \"line-art\" Lottie animations end-to-end \u2014 image-gen a line-art raster, centerline-vectorize it into one continuous stroke, author a Lottie that draws itself on then settles into a seamless breathing loop, preview it, and optionally export a looping GIF. Use this skill whenever the user wants a hand-drawn / line-art / single-line motion mark, an animated icon or empty-state illustration, a Lottie/Bodymovin animation from an image or a described motif, a draw-on \"self-drawing\" SVG animation, or a set of matching animated motifs in a house style \u2014 even if they don't say \"Lottie\" (phrases like \"animate this line drawing\", \"make a self-drawing heart\", \"turn this sketch into an animation\", \"an animated empty-state illustration\", \"matching animated icons in our style\", \"vectorize this and animate it drawing on\", \"export it as a looping gif\" all trigger it). The skill covers the whole pipeline: generate \u2192 centerline-trace (skeletonize + single-line route-ordering) \u2192 Lottie authoring (trim-path draw-on + breath loop + markers, solid or per-persona tint) \u2192 HTML preview \u2192 GIF. Do NOT trigger for generic video editing, 3D/model generation, or when the user already has a finished Lottie and only wants it embedded.",
+  "author": {
+    "name": "lobsterclause",
+    "url": "https://github.com/lobsterclause/claude-skills"
+  }
+}
