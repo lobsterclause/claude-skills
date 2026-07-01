@@ -25,6 +25,10 @@ const bg = arg("--bg", "#faf7f4");
 // "breath" (default): draw on once, then loop only the idle breath segment.
 // "full": loop the entire timeline, so the draw-on repeats every cycle.
 const loopMode = arg("--loop", "breath");
+if (loopMode !== "breath" && loopMode !== "full") {
+  console.error(`preview: --loop must be "breath" or "full" (got "${loopMode}")`);
+  process.exit(2);
+}
 const files = process.argv
   .slice(2)
   .filter((a) => a.endsWith(".json") && !a.startsWith("--"));
