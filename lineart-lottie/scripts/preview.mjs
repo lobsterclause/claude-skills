@@ -22,6 +22,13 @@ function arg(flag, def) {
 const out = arg("--out", "preview.html");
 const stagger = Number(arg("--stagger", 90));
 const bg = arg("--bg", "#faf7f4");
+// "breath" (default): draw on once, then loop only the idle breath segment.
+// "full": loop the entire timeline, so the draw-on repeats every cycle.
+const loopMode = arg("--loop", "breath");
+if (loopMode !== "breath" && loopMode !== "full") {
+  console.error(`preview: --loop must be "breath" or "full" (got "${loopMode}")`);
+  process.exit(2);
+}
 const files = process.argv
   .slice(2)
   .filter((a) => a.endsWith(".json") && !a.startsWith("--"));
@@ -54,12 +61,12 @@ h1{font-size:18px;margin-bottom:4px}.sub{font-size:12px;color:#8a807a;margin-bot
 .replay{display:block;margin:5px auto 0;font-size:11px;color:#9a8f88;background:none;border:none;cursor:pointer}
 </style></head><body>
 <h1>lineart-lottie preview</h1>
-<div class="sub">Draw-on once, then <b>seamless breath loop</b>. Rendered with lottie-web.</div>
+<div class="sub">${loopMode === "full" ? "Whole timeline <b>looping</b> — redraws every cycle" : "Draw-on once, then <b>seamless breath loop</b>"}. Rendered with lottie-web.</div>
 <div class="row">${tiles}</div>
 <script src="${LOTTIE_CDN}"></script>
 <script>window.D=${JSON.stringify(data)};</script>
 <script>
-const anims={};let seq=0;
+const anims={};let seq=0;const MODE=${JSON.stringify(loopMode)};
 function mount(el){
   const name=el.dataset.n;
   const d=JSON.parse(window.D[name]);
@@ -67,9 +74,13 @@ function mount(el){
   const idle=((d.markers||[]).find(m=>m.cm==='idle')||{}).tm||0;
   const a=lottie.loadAnimation({container:el,renderer:'svg',loop:false,autoplay:false,animationData:d});
   let looping=false;
-  function start(){ looping=false; a.loop=false; a.playSegments([0,OP],true); }
+  function start(){
+    looping=false;
+    a.loop = MODE==='full';                 // full => lottie-web loops the whole timeline natively
+    a.playSegments([0,OP],true);            // draw-on from the start
+  }
   a.addEventListener('DOMLoaded',()=>{ setTimeout(start, (seq++)*${stagger}); });
-  a.addEventListener('complete',()=>{ if(looping)return; looping=true; a.loop=true; a.playSegments([idle,OP],true); });
+  a.addEventListener('complete',()=>{ if(MODE==='full'||looping)return; looping=true; a.loop=true; a.playSegments([idle,OP],true); });
   anims[name]={a,start};
 }
 document.querySelectorAll('.anim').forEach(mount);
