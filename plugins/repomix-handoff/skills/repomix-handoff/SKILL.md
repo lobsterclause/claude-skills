@@ -64,11 +64,12 @@ This is a **sibling** of `cross-review`, not a dependency. `cross-review` still 
 ./scripts/handoff.sh --reviewer codex --dry-run
 ```
 
-The script prints a JSON summary on stdout:
+The script prints a JSON summary on stdout (exit codes: 0 ok, 1 runtime failure,
+2 usage, 3 over budget after trim exhaustion — the JSON is still emitted):
 
 ```json
 {
-  "output": "/tmp/repomix-handoff-20260512-063906.md",
+  "output": "/tmp/repomix-handoff.k3XmQ2ab/handoff.md",
   "style": "markdown",
   "reviewer": "gemini",
   "max_tokens": 1000000,

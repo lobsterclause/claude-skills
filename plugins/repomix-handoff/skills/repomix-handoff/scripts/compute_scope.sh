@@ -10,6 +10,8 @@
 #   --expand-imports               Expand seed set 1 hop via static imports (best-effort).
 #
 # Output (stdout): JSON {"include": [...], "exclude": [...], "seed_count": N, "mode": "pr|paths"}
+#
+# Exit codes: 0 ok, 1 runtime failure (e.g. not a git repo), 2 usage.
 set -eu
 
 PATHS=""
@@ -19,13 +21,19 @@ INCLUDE_TESTS=0
 BASE_REF="origin/main"
 EXPAND_IMPORTS=0
 
+# Bounds-check before `shift 2`: a value-taking flag as the last arg would make
+# `shift 2` fail silently under `set -e` with no diagnostic (issue #12).
+need_val() {
+  [ "$2" -ge 2 ] || { echo "compute_scope.sh: $1 requires a value" >&2; exit 2; }
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --paths) PATHS="$2"; shift 2 ;;
-    --lang) LANGS="$2"; shift 2 ;;
-    --exclude) EXTRA_EXCLUDE="$2"; shift 2 ;;
+    --paths) need_val "$1" $#; PATHS="$2"; shift 2 ;;
+    --lang) need_val "$1" $#; LANGS="$2"; shift 2 ;;
+    --exclude) need_val "$1" $#; EXTRA_EXCLUDE="$2"; shift 2 ;;
     --include-tests) INCLUDE_TESTS=1; shift ;;
-    --base) BASE_REF="$2"; shift 2 ;;
+    --base) need_val "$1" $#; BASE_REF="$2"; shift 2 ;;
     --expand-imports) EXPAND_IMPORTS=1; shift ;;
     *) echo "compute_scope.sh: unknown flag $1" >&2; exit 2 ;;
   esac
@@ -52,7 +60,13 @@ fi
 if [ -n "$EXTRA_EXCLUDE" ]; then
   IFS=',' read -r -a _user_ex <<< "$EXTRA_EXCLUDE"
   for g in "${_user_ex[@]}"; do
-    [ -n "$g" ] && DEFAULT_EXCLUDES+=("$g")
+    [ -n "$g" ] || continue
+    # Defense-in-depth: reject traversal patterns — an exclude glob should
+    # describe paths inside the repo, never climb out of it (issue #12 medium).
+    case "$g" in
+      *..*) echo "compute_scope.sh: --exclude pattern must not contain '..' (got: $g)" >&2; exit 2 ;;
+    esac
+    DEFAULT_EXCLUDES+=("$g")
   done
 fi
 
@@ -70,7 +84,7 @@ if [ -n "$PATHS" ]; then
 else
   if ! git rev-parse --git-dir >/dev/null 2>&1; then
     echo "compute_scope.sh: not inside a git repo and no --paths provided" >&2
-    exit 3
+    exit 1
   fi
   merge_base="$(git merge-base HEAD "$BASE_REF" 2>/dev/null || true)"
   if [ -z "$merge_base" ]; then
@@ -112,17 +126,31 @@ else
       # forking python per import. Read line-by-line into a bash 3.2-safe array;
       # never use unquoted $(...) inside an array assignment — paths with spaces
       # would fragment (cross-review pass 2, gemini).
+      # Containment (issue #12 medium): drop any expanded import whose realpath
+      # escapes the repo root — `import "../../outside"` must not pull files
+      # from outside the repo into the snapshot (symlinks included).
       if command -v python3 >/dev/null 2>&1; then
         NORMALIZED=()
         while IFS= read -r line; do
           [ -n "$line" ] && NORMALIZED+=("$line")
         done < <(printf '%s\n' "${EXPANDED[@]}" | python3 -c 'import os,sys
+root=os.path.realpath(os.getcwd())
 seen=set()
-for p in (l.rstrip() for l in sys.stdin):
+for p in (l.rstrip("\n") for l in sys.stdin):
+    if not p: continue
     n=os.path.normpath(p)
+    r=os.path.realpath(n)
+    if r != root and not r.startswith(root + os.sep):
+        continue
     if n not in seen:
         seen.add(n); print(n)')
         EXPANDED=("${NORMALIZED[@]+"${NORMALIZED[@]}"}")
+      else
+        # Fail-closed (kimi, PR #24 pass 2): without python3 the containment
+        # check above cannot run, and un-normalized `a/../../..` expansions
+        # must NOT reach the include list. Imports are enrichment — drop them.
+        echo "compute_scope.sh: python3 unavailable — skipping import expansion (containment check requires it)" >&2
+        EXPANDED=()
       fi
       if [ "${#EXPANDED[@]}" -gt 0 ]; then
         INCLUDES+=("${EXPANDED[@]}")
@@ -154,19 +182,25 @@ if [ "${#INCLUDES[@]}" -gt 0 ]; then
   INCLUDES=("${DEDUPED[@]}")
 fi
 
-# Build JSON safely via python.
-inc_lines=""
-exc_lines=""
-if [ "${#INCLUDES[@]}" -gt 0 ]; then
-  inc_lines="$(printf '%s\n' "${INCLUDES[@]}")"
-fi
-exc_lines="$(printf '%s\n' "${DEFAULT_EXCLUDES[@]}")"
+# Build JSON safely via python. The include/exclude lists travel through temp
+# files, NOT env vars — a huge PR's file list in a single env var counts
+# against the same ~128KB/ARG_MAX exec limits as argv (issue #12 design high).
+_inc_tmp="$(mktemp "${TMPDIR:-/tmp}/compute-scope-inc.XXXXXXXX")"
+_exc_tmp="$(mktemp "${TMPDIR:-/tmp}/compute-scope-exc.XXXXXXXX")"
+trap 'rm -f "$_inc_tmp" "$_exc_tmp"' EXIT
 
-INC_BLOB="$inc_lines" EXC_BLOB="$exc_lines" MODE="$MODE" SEED_COUNT="$SEED_COUNT" \
-python3 - <<'PY'
-import json, os
-inc = [l for l in os.environ.get("INC_BLOB","").splitlines() if l]
-exc = [l for l in os.environ.get("EXC_BLOB","").splitlines() if l]
+if [ "${#INCLUDES[@]}" -gt 0 ]; then
+  printf '%s\n' "${INCLUDES[@]}" > "$_inc_tmp"
+fi
+printf '%s\n' "${DEFAULT_EXCLUDES[@]}" > "$_exc_tmp"
+
+MODE="$MODE" SEED_COUNT="$SEED_COUNT" \
+python3 - "$_inc_tmp" "$_exc_tmp" <<'PY'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    inc = [l for l in f.read().splitlines() if l]
+with open(sys.argv[2], encoding="utf-8") as f:
+    exc = [l for l in f.read().splitlines() if l]
 print(json.dumps({
   "mode": os.environ["MODE"],
   "seed_count": int(os.environ["SEED_COUNT"]),
