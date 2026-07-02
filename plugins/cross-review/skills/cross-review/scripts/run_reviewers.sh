@@ -343,6 +343,8 @@ retry_reviewer() {
     rc=$?
     if [[ $rc -eq 0 ]]; then
       echo "$name: attempt 2 succeeded" >&2
+    elif [[ $rc -eq 124 || $rc -eq 137 ]]; then
+      echo "$name: attempt 2 timed out (rc=$rc)" >&2
     else
       echo "$name: attempt 2 also failed (rc=$rc)" >&2
     fi

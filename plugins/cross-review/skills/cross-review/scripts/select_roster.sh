@@ -196,12 +196,17 @@ draw_picks() {
 }
 
 selected="$(draw_picks "$fast_max")"
-# --fast can filter the ENTIRE pool (kimi+deepseek convergent finding, PR #18
-# pass 3): fall back to an unfiltered draw rather than shipping a roster below
-# the ≥3 floor — a slow rotation pick beats a missing one.
-if [[ -z "$selected" && "$fast_max" -gt 0 ]]; then
-  echo "  note: --fast filtered every candidate — redrawing without the speed filter" >&2
-  selected="$(draw_picks 0)"
+# --fast can filter the pool below what the roster needs (kimi+deepseek
+# convergent, PR #18 pass 3; partial-filter case codex P2, pass 4): the floor
+# check counts what was actually drawn, not just emptiness — with a missing
+# baseline, a partially-filtered draw can be non-empty yet still leave the
+# roster under 3. A slow rotation pick beats a missing one.
+if [[ "$fast_max" -gt 0 ]]; then
+  sel_n="$(printf '%s\n' "$selected" | grep -c '^.' || true)"
+  if (( ${#BASELINES[@]} + sel_n < 3 )); then
+    echo "  note: --fast left the roster below the 3-reviewer floor (${#BASELINES[@]} baselines + $sel_n picks) — redrawing without the speed filter" >&2
+    selected="$(draw_picks 0)"
+  fi
 fi
 
 # --- assemble ------------------------------------------------------------------
