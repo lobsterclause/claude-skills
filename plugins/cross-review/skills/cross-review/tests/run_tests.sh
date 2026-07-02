@@ -124,6 +124,20 @@ rc=$?
 assert_eq "reasonless drops reject with exit 2" "$rc" "2"
 assert_contains "gate names the offending findings" "$(cat "$T/gate.err")" "g1, g2"
 [ ! -s "$GATELOG" ] && ok "nothing appended on gate rejection" || bad "runlog written despite gate rejection"
+cat >"$T/nonstring-findings.json" <<'EOF'
+{"findings":[
+ {"id":"g4","file":"a.sh","line":4,"claim":"w","sources":["glm"],"factcheck":{"verdict":"drop","reason":{"oops":"object"}}}
+]}
+EOF
+CROSS_REVIEW_RUNLOG="$GATELOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" --findings "$T/nonstring-findings.json" >/dev/null 2>&1
+assert_eq "non-string reason counts as reasonless (exit 2)" "$?" "2"
+printf 'not json\n' >"$T/garbage-findings.json"
+CROSS_REVIEW_RUNLOG="$GATELOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" --findings "$T/garbage-findings.json" >/dev/null 2>&1
+assert_eq "malformed findings JSON rejects (exit 2)" "$?" "2"
 cat >"$T/good-findings.json" <<'EOF'
 {"findings":[
  {"id":"g3","file":"a.sh","line":3,"claim":"z","sources":["codex"],"factcheck":{"verdict":"drop","reason":"falsified: coreutils timeout -k exits 137; call sites treat 124||137 as timed_out"}}

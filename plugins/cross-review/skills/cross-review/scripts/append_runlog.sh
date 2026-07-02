@@ -92,10 +92,18 @@ fi
 # remember the discipline (see feedback_convergent_not_correct: claims get
 # falsified AND confirmed by 5-second smoke tests — record which happened).
 if [[ -n "$findings_file" && -f "$findings_file" ]]; then
-  reasonless="$(jq -r '[(.findings // [])[]
+  # Fail-closed on BOTH lanes (codex+deepseek convergent P2, PR #25 pass 1):
+  # a non-string reason (malformed LLM output: object/array) counts as
+  # reasonless rather than crashing gsub, and a jq failure (malformed JSON)
+  # rejects the append instead of silently bypassing the gate.
+  if ! reasonless="$(jq -r '[(.findings // [])[]
       | select((.factcheck.verdict // "") == "drop")
-      | select(((.factcheck.reason // "") | gsub("\\s"; "")) == "")
-      | (.id // .file // "?")] | join(", ")' "$findings_file" 2>/dev/null)"
+      | select(((.factcheck.reason // "")
+          | if type == "string" then gsub("\\s"; "") else "" end) == "")
+      | (.id // .file // "?")] | join(", ")' "$findings_file" 2>&1)"; then
+    echo "append_runlog: could not validate --findings file (malformed JSON?): $reasonless" >&2
+    exit 2
+  fi
   if [[ -n "$reasonless" ]]; then
     echo "append_runlog: dropped finding(s) without recorded evidence: $reasonless" >&2
     echo "  record WHY each was falsified in factcheck.reason (smoke test output, call-site citation), then re-run" >&2
