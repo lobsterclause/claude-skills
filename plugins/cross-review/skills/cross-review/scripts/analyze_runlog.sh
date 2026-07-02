@@ -94,6 +94,7 @@ analyze_reviewer() {
     | ($attempts | map(select(.status == "timed_out")) | length) as $to
     | ($attempts | map(select(.status == "empty"))     | length) as $empty
     | ($attempts | map(select(.status == "failed"))    | length) as $failed
+    | ($attempts | map(select(.status == "quota"))     | length) as $quota
     | ($attempts | map(.duration_s // 0) | sort) as $durs
     | ($durs | length) as $dn
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
@@ -106,6 +107,7 @@ analyze_reviewer() {
         timed_out: $to,
         empty: $empty,
         failed: $failed,
+        quota: $quota,
         reliability: (if $total == 0 then null else (($ok * 100) / $total | floor) end),
         timeout_rate: (if $total == 0 then null else (($to * 100) / $total | floor) end),
         empty_rate:   (if $total == 0 then null else (($empty * 100) / $total | floor) end),
@@ -117,10 +119,11 @@ analyze_reviewer() {
 }
 
 # Reviewer fleet. antigravity + gemini-pro both ride the agy CLI (Gemini Flash
-# and Pro laps respectively); codex and kimi are independent providers. Keep
-# this list in sync with run_reviewers.sh's default --reviewers. Bash 3.2 (macOS
-# /bin/bash) has no associative arrays — use a parallel indexed array of stats.
-REVIEWERS=(codex antigravity gemini-pro kimi)
+# and Pro laps respectively); codex, kimi, and the OpenRouter pool (glm,
+# deepseek, mimo, minimax, fugu, north, nemotron) are independent providers.
+# Keep in sync with run_reviewers.sh's dispatch and leaderboard.sh. Bash 3.2
+# (macOS /bin/bash) has no associative arrays — use a parallel indexed array.
+REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax fugu north nemotron)
 reviewer_stats=()
 for _r in "${REVIEWERS[@]}"; do
   reviewer_stats+=("$(analyze_reviewer "$_r")")
@@ -139,17 +142,21 @@ suggest_timeout_bump() {
   '
 }
 
-# Warning thresholds.
+# Warning thresholds. Quota outranks the generic warnings: it has a specific
+# remedy (wait for the reset / rely on the OpenRouter fallback), and its
+# failures would otherwise masquerade as a reliability problem worth "tuning".
 emit_warning() {
   local stats="$1"
   echo "$stats" | jq -r '
     if .total < 3 then empty   # not enough data
+    elif (.quota // 0) > 0 then
+      "  WARN: \(.reviewer) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). No fallback by policy; roster rotation covers the gap"
     elif .timeout_rate > 30 then
       "  WARN: \(.reviewer) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — consider --timeout-\(.reviewer) \(.current_timeout_budget_s + 200)"
     elif .empty_rate > 40 then
-      "  WARN: \(.reviewer) empty-output rate \(.empty_rate)% over last \(.total) runs — likely auth/wrapper issue, not a timeout fix"
+      "  WARN: \(.reviewer) empty-output rate \(.empty_rate)% over last \(.total) runs — quota or auth, not a timeout fix: check failure_kind in meta.json and the .agy.log tail (Individual quota → wait/fallback; otherwise re-run `agy login`)"
     elif .reliability != null and .reliability < 60 then
-      "  WARN: \(.reviewer) reliability \(.reliability)% over last \(.total) runs (ok=\(.ok), timeout=\(.timed_out), empty=\(.empty), failed=\(.failed))"
+      "  WARN: \(.reviewer) reliability \(.reliability)% over last \(.total) runs (ok=\(.ok), timeout=\(.timed_out), empty=\(.empty), failed=\(.failed), quota=\(.quota // 0))"
     else empty end
   '
 }
@@ -171,7 +178,7 @@ case "$mode" in
       echo "$stats" | jq -r '
         if .total == 0 then "  \(.reviewer): no data in window"
         else
-          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s"
+          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  quota=\(.quota // 0)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s"
         end'
     done
     echo ""

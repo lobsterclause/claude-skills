@@ -17,4 +17,6 @@ For each finding, include:
 
 Skip pure style nits and bikeshedding. Skip things that are matters of taste rather than correctness. If the change looks clean, say so explicitly — do not invent findings.
 
+Review from the diff and source. Do NOT launch the project's heavyweight build/render/GUI toolchain (e.g. Blender, game engines, full project builds, device simulators) inside your sandbox — they frequently crash or hang there and waste the run; reason from the code instead. Lightweight CLI checks (python, node, a linter, a single unit test) to confirm one specific claim are fine.
+
 Organize your output by severity (Critical first). Be terse. This output will be consumed by another agent that applies fixes, so clarity and specificity matter more than prose.

@@ -1,16 +1,22 @@
 ---
 name: cross-review
-description: Run external AI code reviewers (codex CLI, gemini CLI, and kimi CLI) in parallel against the current branch's diff, synthesize deduped findings, auto-apply fixes, and iterate until clean. Use this skill whenever the user wants a second opinion on code, cross-review, swarm review, peer review, external review, or wants codex/gemini/kimi to look at changes before shipping — even if they don't explicitly name the CLIs. Also trigger on "have codex check this", "get a second pair of eyes", "cross-check my changes", "review before merge", "swarm review", "review this PR", or right after Claude creates a PR. Do NOT trigger for routine lint/test runs, style-only checks, or when the user wants Claude itself (not external CLIs) to review.
+description: Run external AI code reviewers in parallel against the current branch's diff, synthesize deduped findings, auto-apply fixes, and iterate until clean. codex and kimi are fixed baselines; the rest of each round's roster (Gemini via agy, plus GLM/DeepSeek/MiMo/MiniMax/Fugu/North/Nemotron via OpenRouter) rotates via a leaderboard-weighted random draw — every round has ≥3 reviewers. Use this skill whenever the user wants a second opinion on code, cross-review, swarm review, peer review, external review, or wants codex/antigravity/gemini/kimi/glm to look at changes before shipping — even if they don't explicitly name the CLIs. Also trigger on "have codex check this", "get a second pair of eyes", "cross-check my changes", "review before merge", "swarm review", "review this PR", or right after Claude creates a PR. Do NOT trigger for routine lint/test runs, style-only checks, or when the user wants Claude itself (not external CLIs) to review.
 ---
 
 # cross-review
 
-Orchestrates external AI CLIs (currently `codex`, `gemini`, and `kimi`) to review the current branch's changes, consolidates their findings, applies fixes, and re-runs until the diff is clean or an iteration budget is exhausted. The goal is to catch things a single model would miss — different reviewers have different blind spots, so their overlap is signal and their disagreements are worth reading.
+Orchestrates a rotating fleet of external AI reviewers to review the current branch's changes, consolidates their findings, applies fixes, and re-runs until the diff is clean or an iteration budget is exhausted. The goal is to catch things a single model would miss — different reviewers have different blind spots, so their overlap is signal and their disagreements are worth reading.
+
+**The fleet (baselines + rotation):** `codex` (OpenAI) and `kimi` (Moonshot) are **fixed baselines — on every round**. The rest of the roster rotates per round via `select_roster.sh`: a weighted random draw over `antigravity` (agy / Gemini 3.5 Flash, fast lap), `gemini-pro` (agy / Gemini 3.1 Pro, deep lap), and the OpenRouter pool — `glm` (GLM 5.2, Zhipu), `deepseek` (DeepSeek V4 Flash), `mimo` (Xiaomi MiMo v2.5), `minimax` (MiniMax M3), `fugu` (Sakana Fugu Ultra, experimental), `north` (Cohere North Mini Code, free tier), `nemotron` (NVIDIA Nemotron 3 Ultra, free tier). Draw weights come from the `leaderboard.sh` score, with an exploration bonus for under-sampled reviewers. **Every round has at least 3 reviewers.** See "Leaderboard & rotation" below.
+
+**On the Gemini fleet:** `antigravity` and `gemini-pro` are both Google-Gemini reviewers running through the **same** `agy` (Antigravity) CLI, differing only by `--model` (Flash High vs. Pro High). The `agy` CLI replaced the standalone `gemini` CLI, which stopped serving consumer requests on **2026-06-18**. Because they share a provider, treat Flash↔Pro agreement as **one** provider's vote, not two independent ones. They also **share one Google "Individual quota"** (resets on a ~2-day cadence) — when it's exhausted, agy exits 0 with empty stdout in seconds and only the `.agy.log` says why; the wrapper detects this (`failure_kind: "quota_exhausted"` + an `agy.quota_exhausted` sentinel that short-circuits the sibling lap).
+
+**No first-party fallbacks (policy, 2026-07-01):** codex, the Gemini laps, and any Claude reviewer are **never** routed through OpenRouter. A failed agy lap drops out of the round honestly; rotation covers the gap next round and the leaderboard down-weights it until it recovers. The OpenRouter pool reviewers require an OpenRouter key: `$OPENROUTER_API_KEY` env var or `~/.config/openrouter/key`.
 
 ## When to use this
 
 - A PR has just been created by Claude and the user wants a second opinion before merge.
-- The user asks to "cross-review", "swarm review", "get codex/gemini/kimi to look at this".
+- The user asks to "cross-review", "swarm review", "get codex/antigravity/gemini/kimi to look at this".
 - The user wants an agentic review loop that applies fixes rather than just listing them.
 
 When in doubt, ask whether they want just findings or the full fix-and-iterate loop.
@@ -25,7 +31,14 @@ The skill runs in this order. Do not skip steps — each produces state the next
 bash ~/.claude/skills/cross-review/scripts/detect_reviewers.sh
 ```
 
-Prints JSON like `{"codex": true, "gemini": true, "kimi": true}`. If none are available, stop and tell the user how to install them (`brew install codex-cli`, `npm i -g @google/gemini-cli`, `curl -L code.kimi.com/install.sh | bash`). Do not proceed with zero reviewers.
+Prints JSON like `{"codex": true, "antigravity": true, "gemini-pro": true, "kimi": true, "glm": true, "deepseek": true, "mimo": true, "minimax": true, "fugu": true, "north": true, "nemotron": true, "openrouter": true}`. Note that `antigravity` and `gemini-pro` both track the **single `agy` binary**, and the seven OpenRouter-pool reviewers all track the **single `openrouter` condition** (key + curl). If none are available, stop and tell the user how to install them:
+
+- codex: `brew install codex-cli`
+- antigravity + gemini-pro (both via `agy`): `curl -fsSL https://antigravity.google/cli/install.sh | bash`, then `agy login` once
+- kimi: `curl -L code.kimi.com/install.sh | bash`
+- OpenRouter pool (glm/deepseek/mimo/minimax/fugu/north/nemotron): create a key at openrouter.ai, then `export OPENROUTER_API_KEY=...` or `mkdir -p ~/.config/openrouter && (umask 077; printf '%s\n' 'sk-or-...' > ~/.config/openrouter/key)`
+
+Do not proceed with zero reviewers. (The standalone `gemini` CLI is no longer used — it was retired in the 2026-06-18 Gemini-CLI consumer sunset; both Gemini reviewers now run on `agy`.)
 
 ### 1.5 Pre-run health check (recent runlog)
 
@@ -35,7 +48,7 @@ Before spending tokens on a fresh round, glance at the last 10 runs to see if an
 bash ~/.claude/skills/cross-review/scripts/analyze_runlog.sh --recent 10 --mode warn
 ```
 
-If a warning prints (e.g. *"WARN: gemini timed out 35% of last 10 runs — consider --timeout-gemini 800"*), surface it to the user and ask whether to apply the suggested override for this run. Do not auto-apply — surface-and-confirm only. If no warning, proceed silently.
+If a warning prints (e.g. *"WARN: gemini-pro timed out 35% of last 10 runs — consider --timeout-gemini-pro 1100"*), surface it to the user and ask whether to apply the suggested override for this run. Do not auto-apply — surface-and-confirm only. If no warning, proceed silently.
 
 The analyzer has a separate `--mode report` that prints a full health snapshot; that's surfaced via `/cross-review --self-check`, not on every run.
 
@@ -64,28 +77,114 @@ The script prints a single JSON line with:
 - `warn_secrets` — true if any changed path matches secret-like patterns (`.env`, `credentials`, `.pem`, `id_rsa`, keystores, etc.)
 - `risky_files` — comma-separated list of the offenders (first 5)
 
+**Pre-flight repo-state check.** Before dispatching reviewers, refuse to run on a dirty tree:
+
+```bash
+if git ls-files -u | grep -q . ; then
+  echo "Working tree has unresolved merge conflicts. Resolve them or stash, then re-run." >&2
+  exit 2
+fi
+if [ -n "$(git diff --check 2>/dev/null)" ]; then
+  echo "Working tree has whitespace/conflict markers. Inspect with 'git diff --check' first." >&2
+  exit 2
+fi
+```
+
+Reviewers shown a half-resolved state will hallucinate confidently about the broken hunks.
+
 **Before proceeding, check both warnings:**
 
 - **On `warn_large_diff: true`**, stop and confirm with the user. Reviewers scale linearly with diff size; a big PR can easily cost 100k+ tokens per reviewer. Offer options: proceed anyway, narrow the scope to specific files via a custom prompt, or skip the run.
-- **On `warn_secrets: true`**, show the flagged paths to the user and get explicit consent before sending the diff. Both reviewers ingest the full diff — even rotated-and-removed secrets would leave the machine. Path-based detection is a conservative first line; false positives (a file legitimately named `secret-sauce.md`) are fine, the user will wave them through.
+- **On `warn_secrets: true`**, show the flagged paths to the user and get explicit consent before sending the diff. All reviewers ingest the full diff (across three providers — OpenAI, Google, Moonshot) — even rotated-and-removed secrets would leave the machine. Path-based detection is a conservative first line; false positives (a file legitimately named `secret-sauce.md`) are fine, the user will wave them through.
 
 If either warning fires, do **not** proceed silently. A skill that quietly sends sensitive content or bleeds tokens is worse than one that asks.
 
 Save the JSON to `$run_dir/context.json` and `cd` into `$worktree`. Future steps use `$run_dir` for outputs and `$worktree` as cwd.
 
-### 3. Run reviewers in parallel
+### 2.5. (Optional) Bound the input with `repomix-handoff`
+
+For large diffs (`warn_large_diff: true`), or when a reviewer has a tighter context window than the diff allows, you may want to feed a token-budgeted snapshot to the CLIs instead of letting them ingest the full raw diff. This is **not** wired into `run_reviewers.sh` — the wrapper always reads the raw diff. To use a snapshot, you (the model) must produce it here and then **explicitly** include its contents in the reviewer prompt you build.
+
+This is a sibling skill, not a hard dependency. If `repomix-handoff` is missing, skip this step and continue with the default raw-diff flow.
+
+```bash
+# Detect availability — exits 0 if the sibling skill + repomix are both installed
+if [ -x ~/.claude/skills/repomix-handoff/scripts/detect_repomix.sh ] && \
+   ~/.claude/skills/repomix-handoff/scripts/detect_repomix.sh | grep -q '"available": true'; then
+  # Per-reviewer snapshot (picks style + token budget that each CLI handles
+  # best) — loop over THIS ROUND'S roster, not the full fleet
+  for r in $(echo "$roster" | tr ',' ' '); do
+    bash ~/.claude/skills/repomix-handoff/scripts/handoff.sh \
+      --reviewer "$r" \
+      --output "$run_dir/snapshot-$r.${EXT:-md}" >/dev/null
+  done
+fi
+```
+
+If you produce snapshots, **you must explicitly include each snapshot's contents in the reviewer prompt you build** — `run_reviewers.sh` will not pick them up automatically. For codex/antigravity/gemini-pro/kimi today, that means reading `$run_dir/snapshot-<reviewer>.*` into the prompt body before invoking the wrapper (or feeding via the reviewer's native file-input flag where supported; see `references/cli_flags.md`).
+
+The reviewer presets in `repomix-handoff` already bake in safe defaults (if it lacks the `antigravity`/`gemini-pro` keys, fall back to its `gemini` preset — same Google-Gemini context budget):
+
+| Reviewer | Style | Max tokens |
+|---|---|---|
+| codex       | XML      | 160k |
+| antigravity | Markdown | 1M   |
+| gemini-pro  | Markdown | 1M   |
+| kimi        | Markdown | 200k |
+| OpenRouter pool (glm/deepseek/mimo/minimax/fugu/north/nemotron) | Markdown | 160k |
+| claude      | XML      | 200k |
+
+**Skip this step** if `warn_secrets: true` is still unresolved — bound or unbound, packed snapshots still contain whatever you pack.
+
+> **Future work:** a `--snapshot-dir` flag on `run_reviewers.sh` that auto-injects per-reviewer snapshots would close this manual gap. Tracked separately, not on this PR.
+
+### 2.6. (Optional) Enrich the reviewer prompt with `/impact` and `ast-grep scan`
+
+Reviewers do better when they know what's affected and which project-specific rules already exist. Both checks are sibling skills / tools — degrade gracefully if missing.
+
+**`/impact` — blast radius:** runs reverse-dep analysis to list affected files + recommended test files. Append to `$run_dir/context.md` so reviewers see it.
+
+```bash
+if [ -x ~/.claude/skills/impact/scripts/impact.sh ]; then
+  bash ~/.claude/skills/impact/scripts/impact.sh --base "$base_branch" --json \
+    > "$run_dir/impact.json" 2>/dev/null || true
+fi
+```
+
+**`ast-grep scan` — project rules:** if the target repo has `sgconfig.yml` at its root, run a scan over the diff and surface findings. Catches violations of repo-specific architectural rules (e.g. "do not write to `memory_items` outside `FirestoreMemoryClient`") that reviewers wouldn't know to look for.
+
+```bash
+if [ -f "$worktree/sgconfig.yml" ] && command -v ast-grep >/dev/null; then
+  ( cd "$worktree" && ast-grep scan --json=stream 2>/dev/null ) \
+    > "$run_dir/sgscan.jsonl" || true
+fi
+```
+
+When either file exists, include a short summary in the reviewer prompt's preamble (e.g. "ast-grep flagged 3 violations of `no-direct-memory-items-write` in this diff — review whether they're justified"). Do **not** dump full JSON into the prompt; summarize.
+
+### 3. Pick the roster and run reviewers in parallel
 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/run_reviewers.sh \
   --base <base-branch> \
-  --out "$run_dir/raw" \
-  --reviewers codex,gemini,kimi
+  --out "$run_dir/raw"
 ```
 
-Runs every requested reviewer concurrently and writes raw outputs to the `out` directory. The wrapper handles the flag dialects (`codex exec review --base <branch> --full-auto` vs. `gemini -p '<prompt>' --approval-mode plan --output-format json` vs. `kimi --plan --print --quiet` with the prompt piped via stdin) and returns when all are done.
+**With no `--reviewers` flag, the wrapper asks `select_roster.sh` for this round's roster**: codex + kimi (fixed baselines) plus a leaderboard-weighted random draw from the rotation pool (default 2 picks, always ≥3 reviewers total). The chosen roster and each candidate's weight are echoed to stderr — surface the roster line to the user. Pass `--reviewers <comma-list>` only when the user asks for specific reviewers or for the full fleet.
+
+The wrapper handles the flag dialects:
+
+- `codex exec review --base <branch> --full-auto`
+- `agy --model "Gemini 3.5 Flash (High)" --sandbox -p '<prompt>'` — the **antigravity** reviewer (fast lap)
+- `agy --model "Gemini 3.1 Pro (High)" --sandbox -p '<prompt>'` — the **gemini-pro** reviewer (deep lap; same `agy` binary, different model)
+- `kimi --plan --print --quiet` with the prompt piped via stdin
+- `curl` against the OpenRouter chat-completions API with the diff inlined (8000-line cap, like kimi) — the whole rotation pool: **glm** (`z-ai/glm-5.2`), **deepseek** (`deepseek/deepseek-v4-flash`), **mimo** (`xiaomi/mimo-v2.5`), **minimax** (`minimax/minimax-m3`), **fugu** (`sakana/fugu-ultra`), **north** (`cohere/north-mini-code:free`), **nemotron** (`nvidia/nemotron-3-ultra-550b-a55b:free`)
+
+Outputs land at `<reviewer>.{stdout,stderr,meta.json}` (OpenRouter reviewers also write `request.json`/`response.json` for audit); each `meta.json` carries `model` and `cli` fields — and, for the agy laps, a `failure_kind` field (`quota_exhausted` | `agy_panic` | `empty_output` | null). There are **no fallback runs**: a failed lap's meta says why it failed and that's the record. The wrapper returns when all are done.
 
 **Modes:**
-- **swarm** (default): run every reviewer the detect step found. More coverage, more tokens.
+- **rotation** (default): baselines + weighted draw, as above.
+- **swarm**: `--reviewers` with every reviewer the detect step found. Maximum coverage, maximum tokens — for release-critical reviews.
 - **solo**: run just one (the fastest available). Useful when the user wants a quick sniff test.
 
 The wrapper logs timing and exit codes per reviewer. If one fails, continue with the rest — a partial review is still useful. If all fail, stop and surface the errors.
@@ -96,7 +195,7 @@ Read every file under the `raw/` directory. Do **not** shell out to a parser —
 
 - Pull out concrete issues tied to specific files/lines when possible.
 - Drop pure praise, filler, and anything not actionable.
-- Note the reviewer (codex / gemini / kimi) so the user can see agreement vs. disagreement.
+- Note the reviewer (codex / antigravity / gemini-pro / kimi / glm) so the user can see agreement vs. disagreement.
 
 Produce a merged list at `$run_dir/findings.md` with this structure:
 
@@ -104,7 +203,7 @@ Produce a merged list at `$run_dir/findings.md` with this structure:
 # Cross-review findings — <branch> vs <base>
 
 ## Critical
-- **[file:line]** <one-line title> (sources: codex, gemini, kimi)
+- **[file:line]** <one-line title> (sources: codex, antigravity, gemini-pro, kimi)
   <why it matters, concrete fix sketch if offered>
 
 ## High
@@ -124,16 +223,61 @@ Produce a merged list at `$run_dir/findings.md` with this structure:
 - **Medium**: risky edge case, poor error handling at a boundary, unclear naming that will trip future readers.
 - **Low / nit**: style, minor phrasing, minor optimization.
 
-When multiple reviewers flag the same issue at different severities, take the highest one and note the disagreement. Convergence across all three reviewers is a very strong signal; a finding flagged by only one deserves more skepticism.
+When multiple reviewers flag the same issue at different severities, take the highest one and note the disagreement. Convergence across providers is a very strong signal; a finding flagged by only one deserves more skepticism.
+
+**Provider independence matters more than reviewer count.** `antigravity` and `gemini-pro` are the same provider (Google/Gemini, both via `agy`) — if only those two agree, that's effectively *one* independent vote, not two. Every profile in `reviewer_profiles.json` carries an explicit `provider` field (openai, google, moonshot, zhipu, deepseek, xiaomi, minimax, sakana, cohere, nvidia) — count convergence by distinct providers, not reviewer names. Weight a codex+gemini-pro+kimi agreement far above an antigravity+gemini-pro agreement even though both are "two reviewers." Routing wrinkle: the OpenRouter pool rides one router but each model is its own provider vote — OpenRouter is a router, not a provider. See `reviewer_profiles.json` `_synthesis_rules.provider_independence`.
 
 **Apply per-reviewer priors from `references/reviewer_profiles.json` when triaging:**
 
-- A finding tagged `skip_unless_convergent` for that reviewer's severity should be dropped if no other reviewer flagged the same area. Codex P3 nits and kimi Low/nit findings are the typical examples.
+- A finding tagged `skip_unless_convergent` for that reviewer's severity should be dropped if no other reviewer flagged the same area. Codex P3 nits and kimi Low/nit findings are the typical examples. (For "convergent" here, prefer a *different-provider* corroboration — antigravity backing gemini-pro doesn't lift a `skip_unless_convergent` finding much, since they're one provider.)
 - A finding tagged `high_precision` (codex P1 today) should rank as near-certain real even if solo.
 - `trust_if_convergent` means: keep when 2+ reviewers agree on it; downgrade or move to "verify" when solo.
 - When two reviewers disagree on severity, break the tie with `synthesis_weight` (higher weight wins).
 
 These priors live in `reviewer_profiles.json` — read once at synthesis time, edit there (not inline) when tuning. The analyzer's `--mode report` will eventually suggest edits to these values based on observed convergence and precision rates.
+
+**Also emit a structured `findings.json` sidecar** next to `findings.md` — this is what the step 4.5 verification gate consumes. One object per finding:
+
+```json
+{
+  "base": "<base-ref>", "head": "HEAD",
+  "findings": [
+    { "id": "f1", "severity": "Critical|High|Medium|Low",
+      "file": "path/relative/to/repo", "line": 42,
+      "snippet": "the exact offending line(s) the reviewer quoted, verbatim",
+      "claim": "one-line statement of what is wrong",
+      "sources": ["codex", "gemini-pro"], "suggested_fix": "optional" }
+  ]
+}
+```
+
+The `snippet` field is load-bearing: it is what the anchor pass matches against the diff and what the fact-check pass falsifies. When a reviewer didn't quote the offending code, pull the line from the diff yourself; if you genuinely can't, leave `snippet` empty (that finding simply won't be anchorable).
+
+### 4.5 Verify findings — anchor + fact-check (recommended; required before auto-fix)
+
+Two cheap passes that raise precision before any fix touches the tree. Lifted from open-code-review (see `docs/investigation-cr-ocr-ideas.md`). Run them in order on the `findings.json` from step 4:
+
+**(a) Anchor — deterministic, no tokens.** Re-derive each finding's line by matching its `snippet` against the actual diff hunks:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/anchor_findings.sh \
+  --findings "$run_dir/findings.json" --base <base-branch> --repo "$worktree" \
+  --out "$run_dir/findings.anchored.json"
+```
+
+Each finding gains `anchor: {resolved, start_line, end_line, side}`; resolved findings get their `line` corrected. A finding with `anchor.resolved=false` (snippet found nowhere in the diff) is a strong **hallucinated-location** signal — mark it "⚠ unanchored" in `findings.md` and **do not auto-fix it without human confirmation**. Don't auto-drop it: a reviewer may legitimately cite an unchanged neighbouring line.
+
+**(b) Fact-check — falsify-only LLM pass.** A cheap, diff-only reviewer removes findings the diff itself *disproves*:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/factcheck_findings.sh \
+  --findings "$run_dir/findings.anchored.json" --base <base-branch> --repo "$worktree" \
+  --reviewer agy --out "$run_dir/findings.verified.json"
+```
+
+Each finding gains `factcheck: {verdict: "keep"|"drop", reason}`. The pass can **only drop a finding the diff actively contradicts** — it never invents findings and keeps anything it merely can't confirm (recall-safe by design; `references/factcheck_prompt.txt`). It is **fail-safe**: any error/timeout/unparseable response keeps every finding. When agy fails or returns empty (quota/panic/auth), the script automatically retries once via `deepseek/deepseek-v4-flash` on OpenRouter before the keep-all fail-safe — so the veto survives agy outages. (DeepSeek Flash, not OR-hosted Gemini: first-party models are never routed through OpenRouter by policy.) `--reviewer openrouter` also works to skip agy entirely. Exclude `verdict:"drop"` findings from the auto-fix triage and note them (struck through, with the veto reason) in `findings.md` and the record.
+
+This gate is **cheap** (anchor is free; fact-check is one Flash-tier call) and most valuable exactly when auto-fix is opted in. Skip it only for a quick report-only sniff test. The `convergent` count and `Top` in the report block (step 9) should reflect the post-verification set.
 
 ### 5. Triage and apply fixes (opt-in only)
 
@@ -141,12 +285,12 @@ These priors live in `reviewer_profiles.json` — read once at synthesis time, e
 
 This default exists because (a) the fix loop has far less production exposure than the detection phase, (b) a wrong auto-fix commit on the user's branch is hard to undo cleanly, and (c) reviewers sometimes flag things that are not actually bugs (see the RewardCard PR where `hardcoded Colors.dark` was intentional). When in doubt, the cheaper path is to report and let the user decide.
 
-**When auto-fix is opted in:**
+**When auto-fix is opted in:** first run the step 4.5 verification gate if you haven't. Triage operates on the **verified** set — `factcheck.verdict:"drop"` findings are excluded outright, and `anchor.resolved:false` findings are held for human confirmation rather than auto-fixed.
 
 Triage policy: fix Critical and High findings where the reviewer's suggested fix is unambiguous; surface Medium for the user; ignore Low/nits unless asked.
 
 For each fix:
-1. Read the relevant files to understand the real context — don't trust the reviewer's line numbers blindly; the diff may have shifted them.
+1. Read the relevant files to understand the real context. The anchor pass already corrected `line` to the real hunk line (`anchor.start_line`) — trust that over the reviewer's original claim, and treat any still-unanchored finding as suspect.
 2. If the suggested fix depends on a design decision (e.g., "should this be null-coalesced or throw?", "should this be a union type or an enum?"), stop and ask the user. Don't guess on semantics — the point of opt-in auto-fix is to handle the mechanical cases, not make product decisions.
 3. Apply the change.
 4. Run local checks if cheap: `pnpm lint` on touched packages, relevant unit tests. Don't run the full suite between every fix — batch and run once at the end of the pass.
@@ -160,7 +304,7 @@ fix: address cross-review findings (pass <N>)
 
 - <terse summary of what changed>
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -223,7 +367,7 @@ Whoever invoked this skill — the user directly, or a parent agent (e.g., a `/p
 ── cross-review pass <N>/3 ──
 Verdict: CLEAN | FIXES_APPLIED | NEEDS_DECISION | BLOCKED
 Counts:  C:<n> H:<n> M:<n> L:<n>  (convergent: <n>)
-Top:     <file:line> — <one-line title> [<severity>][codex+gemini+kimi|codex+gemini|codex+kimi|gemini+kimi|codex|gemini|kimi]
+Top:     <file:line> — <one-line title> [<severity>][sources, e.g. codex+gemini-pro+kimi | codex+antigravity | gemini-pro | kimi]
 Record:  ~/.cross-review/runs/<repo>-<id>-<ts>/findings.md  (posted to PR: <url|—>)
 Next:    stop | re-review | ask-user | apply-fixes
 Notes:   <≤1 sentence if something non-obvious happened — reviewer disagreement, rate-limit retries, partial failure>
@@ -237,9 +381,9 @@ Notes:   <≤1 sentence if something non-obvious happened — reviewer disagreem
 - **NEEDS_DECISION** — Critical/High found but requires human judgment (design decision, scope question, semantic ambiguity). Caller must respond before the skill can continue.
 - **BLOCKED** — Cannot proceed: all reviewers failed, auth missing, iteration cap hit with findings still outstanding, same finding recurs across passes. Caller needs to investigate.
 
-**Convergent** counts findings that two or more reviewers independently flagged on the same file/area. High convergence is a strong signal the issue is real; single-reviewer findings may be style-of-the-reviewer and deserve more skepticism. All-three convergence (codex + gemini + kimi) is the strongest signal of all — treat those findings as near-certain to be real.
+**Convergent** counts findings that two or more reviewers independently flagged on the same file/area — but weight by *provider*, not raw reviewer count (each profile's `provider` field is the truth). Agreement between `antigravity` and `gemini-pro` alone is one provider agreeing with itself, so discount it toward single-reviewer skepticism. Three-plus distinct-provider convergence (e.g. codex + a Gemini lap + kimi, or codex + kimi + a rotation pick) is the strongest signal of all — treat those findings as near-certain to be real.
 
-**Top** is the single most important finding — Critical > all-three-convergent High > two-reviewer convergent High > single-reviewer High. Pick one; surface the rest via the Record link.
+**Top** is the single most important finding — Critical > all-provider-convergent High > two-provider convergent High > single-reviewer High. Pick one; surface the rest via the Record link.
 
 **Next** is what the skill intends to do (or wants the caller to do):
 
@@ -268,17 +412,22 @@ bash ~/.claude/skills/cross-review/scripts/append_runlog.sh \
   --convergent "<n>" \
   --top "<file:line — title [severity][sources]>" \
   --diff-files "<n>" --diff-lines "<n>" \
-  --notes "<≤1 sentence on anything non-obvious>"
+  --notes "<≤1 sentence on anything non-obvious>" \
+  --findings "$run_dir/findings.verified.json"
 ```
 
 The script reads each `$run_dir/<reviewer>.meta.json` to fill in per-reviewer telemetry — duration, exit code, timed_out, output_bytes, attempt — so you only pass the high-level verdict and one-line summary. Pass `-` for `--pr` on branch-only runs (no GitHub PR).
+
+**Always pass `--findings` with the most-verified findings JSON you have** (post-anchor, post-factcheck). It enriches each reviewer's entry with `findings_total` / `findings_convergent` / `findings_dropped` — the quality signals `leaderboard.sh` scores on. Skipping it starves the leaderboard: that reviewer's run scores on reliability alone.
 
 Append once per pass (not once per multi-pass run). The runlog is JSONL: one line per pass, append-only, safe under concurrent splitstream rounds.
 
 ## Reviewer-specific notes
 
 - **codex**: Uses `codex exec review --base <branch> --full-auto`. Writes review output to stderr (we merge streams with `2>&1`). `--json` mode emits reasoning/command events but does **not** flush the final review summary — use plain-text mode. `--base` and a positional `[PROMPT]` are mutually exclusive; with `--base`, codex uses its own built-in review instructions.
-- **gemini**: Uses `gemini -p '<prompt>' --approval-mode plan --output-format json`. `plan` mode is read-only (won't try to edit files). Needs an explicit review prompt (see `references/review_prompt.txt`). Auth via `gemini` interactive once to do Google OAuth, then headless works.
+- **antigravity** (Gemini 3.5 Flash, fast lap): Uses `agy --model "Gemini 3.5 Flash (High)" --sandbox -p '<prompt>'`. `--sandbox` plus a "do not edit" prompt instruction keeps it read-only. Needs an explicit review prompt (see `references/review_prompt.txt`). Replaces the retired standalone `gemini` CLI. **Gotcha:** `agy --model` accepts only the exact `agy models` display string and **silently falls back to Flash** on a typo — never errors. Auth: `agy login` once (Google OAuth). **Empty output has two causes, not one**: check `failure_kind` in the meta.json — `quota_exhausted` (shared Google "Individual quota", 429, ~2-day reset; agy exits 0 with empty stdout in ~5s and only the `.agy.log` says why) means the lap is benched until the reset, while `empty_output` usually means expired auth (`agy login`). Don't re-auth for a quota problem. No fallback by policy — the lap just drops out of the round.
+- **gemini-pro** (Gemini 3.1 Pro, deep lap): Same `agy` binary, just `--model "Gemini 3.1 Pro (High)"` and a longer default timeout (900s). Pro reasons deeper and slower; for tiny diffs the Flash lap alone is often enough. Migrated off the standalone `gemini` CLI in the 2026-06-18 sunset. **Known upstream bug (agy ≤1.0.15):** a SIGSEGV panic in agy's `RunCommandHandler` — exit 2, ~20–45s, empty output, `panic: runtime error` in the `.agy.log`. Hits the Pro lap far more than Flash (Pro roams files/commands harder). Flaky, not deterministic: the wrapper retries agy once, then the lap drops out (no fallback).
+- **OpenRouter pool** (glm / deepseek / mimo / minimax / fugu / north / nemotron): No CLI — the wrapper `curl`s the OpenRouter chat-completions API with the diff inlined (8000-line cap, `<diff>` fencing and injection defusal identical to kimi). All seven require `$OPENROUTER_API_KEY` or `~/.config/openrouter/key`. Each is its own provider vote: Zhipu, DeepSeek, Xiaomi, MiniMax, Sakana, Cohere, NVIDIA. Provenance caveats: glm/deepseek/mimo/minimax are China-origin providers, fugu is Japan (Sakana), north is Canada (Cohere), nemotron is US (NVIDIA) — all routed through OpenRouter (US); surface for security-sensitive repos, same as the kimi caveat. `north` and `nemotron` are `:free` OpenRouter routes — zero marginal cost, but free routes can be rate-limited and may have different data-retention terms than paid. `fugu` is an explicit experimental trial seat — promote or cut on leaderboard data after ~10 sampled runs.
 - **kimi** (Moonshot's Kimi Code CLI): Uses `kimi --plan --print --quiet` with the review prompt piped via stdin (NOT `-p`). `--plan` is read-only; `--print` is non-interactive; `--quiet` trims to just the final assistant message. Prompt goes on stdin because argv has a 128KB-per-argument limit on Linux (`MAX_ARG_STRLEN`) and argv-based prompts also leak the diff via `ps` to other local users. Default model is `kimi-k2.5` (256K ctx, thinking mode on) — configured in `~/.kimi/config.toml`. Auth is either the Moonshot platform API key (`openai_legacy` provider against `api.moonshot.ai/v1`) or the native Kimi Coding subscription (`kimi login` OAuth). Note: kimi sends code to a China-origin provider — surface that to the user for security-sensitive repos.
 
 More detail on flags and gotchas lives in [references/cli_flags.md](references/cli_flags.md). Read it if a reviewer is behaving unexpectedly.
@@ -292,22 +441,64 @@ This is not auto-invoked by the harness. To make it fire automatically after eve
 ## Common failure modes
 
 - **"No diff to review"**: branch has no commits past the base. Check `git log base..HEAD` — likely on the wrong branch.
-- **Reviewer hangs**: all three CLIs can hang on auth or on first-run config prompts. The wrapper has a per-reviewer timeout (codex 300s, gemini/kimi 600s by default — see `references/reviewer_profiles.json`); if it fires, surface stderr so the user can re-auth. Timeouts are no longer retried (a reviewer that used its budget will use it again on retry — that's a tuning signal, not a transient failure). If the same reviewer keeps timing out, the analyzer's `--mode warn` will surface a suggested bump on the next run.
+- **Gemini laps both empty in ~5s**: the shared Google "Individual quota" is exhausted (429). The wrapper stamps `failure_kind: "quota_exhausted"` + the reset ETA in meta.json and writes an `agy.quota_exhausted` sentinel so the sibling lap and the factcheck pass skip agy. Both laps drop out until the quota resets (~2-day cadence) — no fallback by policy; report that honestly rather than re-running, and let rotation fill the roster. Do NOT `agy login` for this — it's not an auth problem. (The selector also down-weights a lap whose latest run was a quota failure.)
+- **gemini-pro exits 2 in ~30s with empty output**: agy's SIGSEGV panic (upstream bug, `panic: runtime error` in the `.agy.log`). The wrapper retries agy once, then the lap drops out. If it recurs across runs, check for a newer agy release.
+- **`agy models` hangs for minutes**: agy ignores SIGTERM while stuck in its quota-retry network loop. `select_roster.sh` guards this with a 6h-TTL cache + `timeout -k 5 15` hard-kill; if you probe agy manually, use the same.
+- **Reviewer hangs**: any CLI can hang on auth or on first-run config prompts. The wrapper has a per-reviewer timeout (codex 300s, antigravity/kimi/OpenRouter-pool 600s, gemini-pro 900s by default — see `references/reviewer_profiles.json`); if it fires, surface stderr so the user can re-auth. For the two `agy` reviewers, a hang is most often the shared `agy` auth — `agy login` once fixes both. Timeouts are not retried (a reviewer that used its budget will use it again on retry — that's a tuning signal, not a transient failure). If the same reviewer keeps timing out, the analyzer's `--mode warn` will surface a suggested bump on the next run.
 - **Reviewer flags a tokens-vs-hardcoded issue that's actually fine**: Vibrant Punk / NativeWind contexts use tokens that look like hex to the reviewer. Check `constants/theme.ts` before "fixing" a perceived hardcoded color.
 - **Same finding keeps coming back**: either the fix is wrong, or the reviewer has a stale mental model (e.g., you moved logic to another file and it still complains about the old location). Don't loop — stop and investigate.
 - **Iteration 3 still dirty**: structural issue. Don't push through — ask the user whether to merge with known findings or take a different approach.
 
+## Leaderboard & rotation
+
+Two scripts turn the runlog into a self-tuning roster:
+
+**`leaderboard.sh`** scores every reviewer from the last 40 structured runlog entries:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/leaderboard.sh              # human table
+bash ~/.claude/skills/cross-review/scripts/leaderboard.sh --mode json  # for the selector
+```
+
+`score = 45% reliability + 35% cross-provider convergence + 20% fact-check survival`. Reviewers with telemetry but no findings data score `reliability × 0.75`; never-run reviewers get a rookie prior of 50 (optimistic initialization, so new models get drawn and earn real data). The convergence/survival signals come from `append_runlog.sh --findings` — which is why step 9.5 says to always pass it. Known limitation: convergence rewards agreeing with the crowd, so a reviewer that uniquely finds real bugs scores low until corroborated — read a low-signal reviewer's actual findings before cutting it.
+
+**`select_roster.sh`** draws each round's roster:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/select_roster.sh            # → "codex,kimi,<pick>,<pick>"
+bash ~/.claude/skills/cross-review/scripts/select_roster.sh --extras 3 --json  # more picks + decision record
+```
+
+codex + kimi are fixed baselines; `--extras` (default 2) rotation picks are drawn without replacement, weighted by `max(score, 15) × (1 + 0.5/√(attempts+1))` — exploit the leaderboard, explore the under-sampled, never starve anyone. A reviewer whose latest run was a quota failure gets its weight ×0.1 (benched but occasionally probed so recovery is noticed). The roster is always ≥3; a missing baseline raises the draw count. `run_reviewers.sh` calls this automatically when `--reviewers` is omitted.
+
+**Reading the leaderboard over time:** rookies enter at 50 and converge to their real score within ~10 sampled runs. Promote a consistently top-scoring rotation member to more frequent duty by raising its `synthesis_weight`/priors in `reviewer_profiles.json`; cut a consistent bottom-dweller by removing it from the pool in `select_roster.sh` and `run_reviewers.sh`. `fugu` is explicitly on a trial seat — decide after ~10 samples.
+
 ## Self-check mode
 
-When invoked as `/cross-review --self-check`, skip the review pipeline and emit a health snapshot of the reviewer fleet:
+When invoked as `/cross-review --self-check`, skip the review pipeline and emit a health snapshot of the reviewer fleet, plus the current leaderboard:
 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/analyze_runlog.sh --recent 20 --mode report
+bash ~/.claude/skills/cross-review/scripts/leaderboard.sh
 ```
 
-The report shows per-reviewer reliability %, ok/timeout/empty/failed counts, p50/p95 duration, current timeout budget, and a list of suggested edits to `references/reviewer_profiles.json` (e.g. "bump gemini.timeout_s from 600 → 800 because timeout rate 25% over window"). Suggestions never apply themselves — the user (or Claude) edits the profile file with eyes on, the same way splitstream's pre-flight table needs explicit approval.
+The report shows per-reviewer reliability %, ok/timeout/empty/failed counts, p50/p95 duration, current timeout budget, and a list of suggested edits to `references/reviewer_profiles.json` (e.g. "bump gemini-pro.timeout_s from 900 → 1100 because timeout rate 25% over window"). Suggestions never apply themselves — the user (or Claude) edits the profile file with eyes on, the same way splitstream's pre-flight table needs explicit approval.
 
 Use it: weekly, after a noticeably degraded round, before changing reviewer profiles, or when investigating "why did cross-review miss X?"
+
+## Importing / consolidating runlogs
+
+The runlog lives at `$skill_dir/runlog.jsonl` — a path relative to wherever the skill is installed. So the repo copy, the `~/.claude/skills` install, and the plugin cache each keep their **own** history, and a reinstall or sync starts from an empty log. To fold an old or sibling runlog into the current one without losing telemetry:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/import_runlog.sh \
+  --from <old-runlog.jsonl | dir-containing-one> \
+  [--from <another> ...] \
+  [--into <dest runlog.jsonl>]   # defaults to this skill's runlog
+  [--dry-run]
+```
+
+The merge is **idempotent** (exact-object dedup — re-importing the same source adds nothing), JSON-validated (non-JSON lines are counted and skipped, not written), chronologically sorted by `ts` (legacy entries without `ts` sort to the front), and written atomically under `flock`. Always safe to run before `--self-check` after a reinstall: `import_runlog.sh --from ~/.claude/skills/cross-review/runlog.jsonl --dry-run` shows what would be pulled in. This is the supported way to preserve history when syncing the skill between the repo and an install.
 
 ## Per-reviewer behavioral profiles
 

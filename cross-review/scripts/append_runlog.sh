@@ -9,7 +9,8 @@
 # Usage:
 #   append_runlog.sh \
 #     --run-dir <path>             # produced by worktree.sh start; contains
-#                                  # codex.meta.json, gemini.meta.json, etc.
+#                                  # codex.meta.json, antigravity.meta.json,
+#                                  # gemini-pro.meta.json, kimi.meta.json, etc.
 #     --project <name>
 #     --base <branch>
 #     --pr <number|->              # use - for no PR (branch-only run)
@@ -20,6 +21,13 @@
 #     [--diff-files <n>]
 #     [--diff-lines <n>]
 #     [--notes "<one-liner>"]
+#     [--findings <findings.verified.json>]
+#       When given, each reviewer entry is enriched with findings_total /
+#       findings_convergent / findings_dropped, computed from the findings'
+#       `sources` arrays and `factcheck` verdicts. "Convergent" = the finding's
+#       sources span MORE THAN ONE provider (per the provider map below) — the
+#       cross-provider precision proxy leaderboard.sh scores on. Pass the most
+#       verified findings file you have (post-anchor, post-factcheck).
 #
 # Schema is documented in plans/the-miss-on-pr-eager-pond.md (Phase 2).
 # Additive — old hand-curated entries in the runlog remain valid.
@@ -37,6 +45,7 @@ top=""
 diff_files=""
 diff_lines=""
 notes=""
+findings_file=""
 
 need_val() {
   if [[ "$2" -lt 2 ]]; then
@@ -58,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --diff-files) need_val "$1" "$#"; diff_files="$2"; shift 2 ;;
     --diff-lines) need_val "$1" "$#"; diff_lines="$2"; shift 2 ;;
     --notes)      need_val "$1" "$#"; notes="$2";      shift 2 ;;
+    --findings)   need_val "$1" "$#"; findings_file="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -103,19 +113,65 @@ reviewer_obj() {
   #
   # Status precedence: timed_out FIRST so that timeouts which exit 0 (some
   # `timeout` implementations do depending on signal handling) don't get
-  # misclassified as "ok". || fallback handles malformed meta.json (OOM,
-  # kill mid-write, garbage); we prefer "failed" telemetry over silently
-  # dropping the entire pass when the final --argjson rejects empty input.
+  # misclassified as "ok". "quota" next: the agy laps stamp
+  # failure_kind=quota_exhausted when the shared Gemini Individual quota is
+  # the cause — that's a wait-for-reset condition, not a timeout/auth issue,
+  # and the analyzer warns on it differently. || fallback handles malformed
+  # meta.json (OOM, kill mid-write, garbage); we prefer "failed" telemetry
+  # over silently dropping the entire pass when the final --argjson rejects
+  # empty input.
   jq -c '. + {status: (if .timed_out == true then "timed_out"
+                       elif .failure_kind == "quota_exhausted" then "quota"
                        elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
                        elif .exit_code == 0 then "empty"
                        else "failed" end)}' "$meta" 2>/dev/null \
     || echo '{"status":"failed","reason":"meta_unparseable"}'
 }
 
-codex_json=$(reviewer_obj codex)
-gemini_json=$(reviewer_obj gemini)
-kimi_json=$(reviewer_obj kimi)
+# enrich_with_findings <reviewer> <reviewer_json> — add findings_total /
+# findings_convergent / findings_dropped from the --findings file. Convergence
+# is judged per PROVIDER (an antigravity+gemini-pro-only finding is one
+# provider agreeing with itself — not convergent). No-op without --findings,
+# for skipped reviewers, or on unreadable findings JSON.
+enrich_with_findings() {
+  local name="$1" rjson="$2"
+  if [[ -z "$findings_file" || ! -f "$findings_file" ]]; then
+    printf '%s' "$rjson"
+    return
+  fi
+  if [[ "$(printf '%s' "$rjson" | jq -r '.status // empty')" == "skipped" ]]; then
+    printf '%s' "$rjson"
+    return
+  fi
+  local counts
+  counts="$(jq -c --arg r "$name" '
+    ({"codex":"openai","antigravity":"google","gemini-pro":"google",
+      "kimi":"moonshot","glm":"zhipu","deepseek":"deepseek","mimo":"xiaomi",
+      "minimax":"minimax","fugu":"sakana","north":"cohere","nemotron":"nvidia"}) as $prov
+    | [(.findings // [])[] | select((.sources // []) | index($r))] as $mine
+    | { findings_total: ($mine | length),
+        findings_convergent: ($mine | map(select(
+            ((.sources // []) | map($prov[.] // .) | unique | length) > 1)) | length),
+        findings_dropped: ($mine | map(select(.factcheck.verdict == "drop")) | length) }
+  ' "$findings_file" 2>/dev/null)"
+  if [[ -n "$counts" ]]; then
+    printf '%s' "$rjson" | jq -c --argjson c "$counts" '. + $c' 2>/dev/null || printf '%s' "$rjson"
+  else
+    printf '%s' "$rjson"
+  fi
+}
+
+codex_json=$(enrich_with_findings codex "$(reviewer_obj codex)")
+antigravity_json=$(enrich_with_findings antigravity "$(reviewer_obj antigravity)")
+gemini_pro_json=$(enrich_with_findings gemini-pro "$(reviewer_obj gemini-pro)")
+kimi_json=$(enrich_with_findings kimi "$(reviewer_obj kimi)")
+glm_json=$(enrich_with_findings glm "$(reviewer_obj glm)")
+deepseek_json=$(enrich_with_findings deepseek "$(reviewer_obj deepseek)")
+mimo_json=$(enrich_with_findings mimo "$(reviewer_obj mimo)")
+minimax_json=$(enrich_with_findings minimax "$(reviewer_obj minimax)")
+fugu_json=$(enrich_with_findings fugu "$(reviewer_obj fugu)")
+north_json=$(enrich_with_findings north "$(reviewer_obj north)")
+nemotron_json=$(enrich_with_findings nemotron "$(reviewer_obj nemotron)")
 
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -132,8 +188,16 @@ entry=$(jq -nc \
   --arg diff_files "${diff_files:-}" \
   --arg diff_lines "${diff_lines:-}" \
   --argjson codex "$codex_json" \
-  --argjson gemini "$gemini_json" \
+  --argjson antigravity "$antigravity_json" \
+  --argjson gemini_pro "$gemini_pro_json" \
   --argjson kimi "$kimi_json" \
+  --argjson glm "$glm_json" \
+  --argjson deepseek "$deepseek_json" \
+  --argjson mimo "$mimo_json" \
+  --argjson minimax "$minimax_json" \
+  --argjson fugu "$fugu_json" \
+  --argjson north "$north_json" \
+  --argjson nemotron "$nemotron_json" \
   '{
     ts: $ts,
     project: $project,
@@ -143,7 +207,8 @@ entry=$(jq -nc \
     diff_size: (if $diff_files == "" and $diff_lines == "" then null
                 else {files: ($diff_files | tonumber? // null),
                       lines: ($diff_lines | tonumber? // null)} end),
-    reviewers: {codex: $codex, gemini: $gemini, kimi: $kimi},
+    reviewers: {codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, glm: $glm,
+                deepseek: $deepseek, mimo: $mimo, minimax: $minimax, fugu: $fugu, north: $north, nemotron: $nemotron},
     convergent_count: $convergent,
     verdict: $verdict,
     top_finding: (if $top == "" then null else $top end),
