@@ -33,7 +33,7 @@
 #                   (rookies pass — unknown speed is worth one probe). For
 #                   quick loops and incremental re-review passes.
 #
-# stdout: comma-separated roster, e.g. "codex,kimi,gemini-pro,fugu"
+# stdout: comma-separated roster, e.g. "codex,kimi,gemini-pro,minimax"
 # stderr: the decision detail (weights, exclusions) for the log.
 
 set -uo pipefail
