@@ -36,7 +36,10 @@ glob_to_regex() {
       # safely. Backslash goes FIRST so it does not double-escape the
       # backslashes added by later substitutions.
       # (Brackets and dots stay; * and ? get rewritten below.)
-      gsub(/\\/, "\\\\\\\\", s)
+      # Empirically verified: replacement "\\\\" emits TWO backslashes in the
+      # output (the correct ERE escape for one literal backslash); the prior
+      # 8-backslash form emitted FOUR (kat, PR #23 pass 1).
+      gsub(/\\/, "\\\\", s)
       gsub(/[+(){}|^$]/, "\\\\&", s)
       gsub(/\./, "\\.", s)
       # `**/` means "zero or more directory levels" — translate to `(.*/)?`

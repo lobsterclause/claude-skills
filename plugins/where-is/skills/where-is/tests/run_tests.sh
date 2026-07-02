@@ -83,6 +83,13 @@ out="$(WHEREIS_REPO_ROOT="$F" bash "$S/fs_walk.sh" 'a+b(c).ts')"
 assert_eq "metachar filename matches literally" "$out" "a+b(c).ts"
 out="$(WHEREIS_REPO_ROOT="$F" bash "$S/fs_walk.sh" '**/*.ts')"
 assert_contains "leading **/ matches root-level file" "$out" "a+b(c).ts"
+# [pin: PR #23 pass 1 (kat) — the old 8-backslash awk replacement emitted a
+# regex requiring TWO literal backslashes, so paths containing one never matched.
+# Filename and glob both carry ONE literal backslash.]
+printf 'x\n' > "$F/src/back\\slash.ts"
+out="$(WHEREIS_REPO_ROOT="$F" bash "$S/fs_walk.sh" 'src/back\slash.ts')"
+assert_contains "glob with literal backslash matches its file" "$out" "back\\slash.ts"
+rm -f "$F/src/back\\slash.ts"
 
 echo "── where-is.sh (usage guards) ──"
 # [pin: issue #14 item 14 — valueless flags used to die silently via set -e]
@@ -152,9 +159,23 @@ if [ "$spawns" -le 3 ]; then
 else
   bad "3 result lines cost <=3 node spawns (got $spawns)"
 fi
-out="$(WHEREIS_REPO_ROOT="$WS" bash "$S/where-is.sh" --kind concept 'alphaThing' 2>/dev/null)"
-assert_contains "concept mode labels package a hit" "$out" "[@fix/a]"
-assert_contains "concept mode labels package b hit" "$out" "[@fix/b]"
+# Deterministic: force the grep fallback (no rg in XBIN) so this passes
+# identically on machines with and without ripgrep (codex P2, PR #23 pass 1).
+out="$(PATH="$XBIN" WHEREIS_REPO_ROOT="$WS" bash "$S/where-is.sh" --kind concept 'alphaThing' 2>/dev/null)"
+assert_contains "concept mode labels package a hit (grep fallback)" "$out" "[@fix/a]"
+assert_contains "concept mode labels package b hit (grep fallback)" "$out" "[@fix/b]"
+# If a real ripgrep binary exists, pin the rg lane too — the comma-joined
+# --type-add glob used to match NOTHING under real rg (codex P2 + the
+# repeated---type-add fix, PR #23 pass 1).
+RG_BIN="$(type -P rg 2>/dev/null || true)"
+if [ -n "$RG_BIN" ]; then
+  ln -sf "$RG_BIN" "$XBIN/rg"
+  out="$(PATH="$XBIN" WHEREIS_REPO_ROOT="$WS" bash "$S/where-is.sh" --kind concept 'alphaThing' 2>/dev/null)"
+  assert_contains "concept mode via real rg finds hits" "$out" "[@fix/a]"
+  rm -f "$XBIN/rg"
+else
+  echo "  note: no real rg binary — rg-lane concept test skipped"
+fi
 
 echo "── detect_layout.sh (Nx enumeration) ──"
 # [pin: issue #14 item 4 — kind=nx used to report an empty packages list]

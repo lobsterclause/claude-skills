@@ -39,7 +39,16 @@ rg_args=(
   --line-number
   --no-heading
   --color=never
-  --type-add 'tsj:*.ts,*.tsx,*.js,*.jsx,*.mjs,*.cjs'
+  # One glob per --type-add: a comma inside a single glob is LITERAL in
+  # ripgrep's globset (matches filenames containing commas), so the old
+  # comma-joined form matched nothing and the rg path returned (no hits)
+  # on every concept query (codex P2, PR #23 pass 1).
+  --type-add 'tsj:*.ts'
+  --type-add 'tsj:*.tsx'
+  --type-add 'tsj:*.js'
+  --type-add 'tsj:*.jsx'
+  --type-add 'tsj:*.mjs'
+  --type-add 'tsj:*.cjs'
   -t tsj
   --max-count 5
   --glob '!node_modules'

@@ -81,7 +81,11 @@ if [ -x "$impact_script" ]; then
     if [ -f "$graph_json" ]; then
       # Roll file-level edges up to package-level using python or jq.
       if have_py; then
-        python3 - "$graph_json" "$pkgs_file" > "$edges_file" <<'PY' || true
+        # No `|| true` here: surface a rollup crash instead of masking it
+        # (kimi, PR #23 pass 1). Python's stderr is NOT suppressed, and on
+        # failure we degrade to an explicitly-empty edges file rather than
+        # leaving a half-written one behind.
+        if ! python3 - "$graph_json" "$pkgs_file" > "$edges_file" <<'PY' 
 import json,sys,os
 g=json.load(open(sys.argv[1]))
 pkgs=[]
@@ -108,6 +112,10 @@ for src, deps in (g.get("files") or {}).items():
 for (a,b),c in sorted(counts.items()):
   print(json.dumps({"from":a,"to":b,"count":c}))
 PY
+        then
+          echo "build_pkg_graph: package-edge rollup failed — continuing without dependency edges" >&2
+          : > "$edges_file"
+        fi
         if [ -s "$edges_file" ]; then
           cat "$edges_file"
           exit 0

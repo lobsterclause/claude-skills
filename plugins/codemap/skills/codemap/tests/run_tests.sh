@@ -145,6 +145,21 @@ bash "$S/codemap.sh" --max-external >/dev/null 2>&1; assert_eq "--max-external w
 bash "$S/codemap.sh" --max-external abc >/dev/null 2>&1; assert_eq "--max-external non-integer exits 2" "$?" "2"
 bash "$S/codemap.sh" --bogus >/dev/null 2>&1;        assert_eq "unknown flag exits 2" "$?" "2"
 
+
+echo "── build_pkg_graph.sh (python rollup failure degrades loudly) ──"
+# [pin: PR #23 pass 1 (kimi) — `|| true` used to mask a python crash as
+# empty-edges success with zero stderr signal]
+PYFAIL="$T/pyfail"; mkdir -p "$PYFAIL"
+printf '#!/bin/sh\nexit 1\n' > "$PYFAIL/python3"; chmod +x "$PYFAIL/python3"
+# Fake HOME carrying an impact build_graph.sh shim so the rollup path is
+# actually reached (build_pkg_graph resolves it via $HOME/.claude/skills/…).
+FAKEHOME="$T/pyfail-home"; mkdir -p "$FAKEHOME/.claude/skills/impact/scripts"
+printf '{"edges":[]}\n' > "$FAKEHOME/graph.json"
+printf '#!/bin/sh\necho %s\n' "$FAKEHOME/graph.json" > "$FAKEHOME/.claude/skills/impact/scripts/build_graph.sh"
+chmod +x "$FAKEHOME/.claude/skills/impact/scripts/build_graph.sh"
+err="$(HOME="$FAKEHOME" PATH="$PYFAIL:$PATH" bash "$S/build_pkg_graph.sh" "$G" "$WSJ" 2>&1 >/dev/null)" || true
+assert_contains "python rollup failure is surfaced on stderr" "$err" "rollup failed"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
