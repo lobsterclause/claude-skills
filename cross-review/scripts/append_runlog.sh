@@ -100,8 +100,11 @@ if [[ -n "$findings_file" && -f "$findings_file" ]]; then
       | select((.factcheck.verdict // "") == "drop")
       | select(((.factcheck.reason // "")
           | if type == "string" then gsub("\\s"; "") else "" end) == "")
-      | (.id // .file // "?")] | join(", ")' "$findings_file" 2>&1)"; then
-    echo "append_runlog: could not validate --findings file (malformed JSON?): $reasonless" >&2
+      | (.id // .file // "?")] | join(", ")' "$findings_file" 2>/dev/null)"; then
+    # Diagnostic from a separate jq syntax check — mixing stderr into the
+    # capture could false-trip the gate on benign warnings (deepseek,
+    # PR #25 pass 2).
+    echo "append_runlog: could not validate --findings file: $(jq -e . "$findings_file" 2>&1 >/dev/null | head -2)" >&2
     exit 2
   fi
   if [[ -n "$reasonless" ]]; then
