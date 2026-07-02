@@ -224,6 +224,17 @@ assert_eq "all 300 files in scope" "$n_inc" "300"
 assert_contains "last file's content packed" "$(cat "$T/big.md")" "FILE_299_MARKER"
 
 echo
+echo "── handoff.sh (--max-tokens validation) ──"
+# [pin: PR #24 pass 1 (kimi) — negative/non-numeric budgets corrupted trim math]
+set +e
+bash "$S/handoff.sh" --max-tokens -5 >/dev/null 2>&1;  rc1=$?
+bash "$S/handoff.sh" --max-tokens abc >/dev/null 2>&1; rc2=$?
+bash "$S/handoff.sh" --max-tokens 0 >/dev/null 2>&1;   rc3=$?
+set -e
+assert_eq "--max-tokens -5 exits 2" "$rc1" "2"
+assert_eq "--max-tokens abc exits 2" "$rc2" "2"
+assert_eq "--max-tokens 0 exits 2" "$rc3" "2"
+
 echo "repomix-handoff tests: $PASS ok, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

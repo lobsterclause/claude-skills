@@ -77,6 +77,12 @@ case "${REVIEWER}" in
   *) echo "handoff.sh: unknown --reviewer '${REVIEWER}' (codex|gemini|kimi|claude)" >&2; exit 2 ;;
 esac
 
+# Usage-error on a non-positive-integer budget (kimi, PR #24 pass 1): a
+# negative or non-numeric value would silently corrupt the trim-loop math.
+case "$MAX_TOKENS" in
+  ''|0|*[!0-9]*) echo "handoff.sh: --max-tokens must be a positive integer (got: '$MAX_TOKENS')" >&2; exit 2 ;;
+esac
+
 # Validate style.
 case "$STYLE" in
   markdown|xml|plain|json) ;;

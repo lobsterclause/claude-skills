@@ -118,7 +118,9 @@ fi
 # PID-suffix the intermediates so concurrent invocations don't clobber each other.
 tmp_raw="$cache_dir/graph.raw.$$.json"
 tool_err="$cache_dir/graph.stderr.$$.log"
-graph_tmp="$graph_file.tmp.$$"
+# $$ alone can collide across PID-namespace resets in containers (kimi,
+# PR #24 pass 1) — RANDOM makes concurrent same-PID writers diverge.
+graph_tmp="$graph_file.tmp.$$.$RANDOM"
 trap 'rm -f "$tmp_raw" "$tool_err" "$graph_tmp"' EXIT
 
 # Shared node converter epilogue: write to a PID-suffixed tmp in the same dir,
