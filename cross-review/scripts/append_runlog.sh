@@ -149,7 +149,8 @@ enrich_with_findings() {
   counts="$(jq -c --arg r "$name" '
     ({"codex":"openai","antigravity":"google","gemini-pro":"google",
       "kimi":"moonshot","glm":"zhipu","deepseek":"deepseek","mimo":"xiaomi",
-      "minimax":"minimax","fugu":"sakana","north":"cohere","nemotron":"nvidia"}) as $prov
+      "minimax":"minimax","qwen":"alibaba","devstral":"mistral",
+      "laguna":"poolside","kat":"kuaishou","north":"cohere","nemotron":"nvidia"}) as $prov
     | [(.findings // [])[] | select((.sources // []) | index($r))] as $mine
     | { findings_total: ($mine | length),
         findings_convergent: ($mine | map(select(
@@ -171,7 +172,10 @@ glm_json=$(enrich_with_findings glm "$(reviewer_obj glm)")
 deepseek_json=$(enrich_with_findings deepseek "$(reviewer_obj deepseek)")
 mimo_json=$(enrich_with_findings mimo "$(reviewer_obj mimo)")
 minimax_json=$(enrich_with_findings minimax "$(reviewer_obj minimax)")
-fugu_json=$(enrich_with_findings fugu "$(reviewer_obj fugu)")
+qwen_json=$(enrich_with_findings qwen "$(reviewer_obj qwen)")
+devstral_json=$(enrich_with_findings devstral "$(reviewer_obj devstral)")
+laguna_json=$(enrich_with_findings laguna "$(reviewer_obj laguna)")
+kat_json=$(enrich_with_findings kat "$(reviewer_obj kat)")
 north_json=$(enrich_with_findings north "$(reviewer_obj north)")
 nemotron_json=$(enrich_with_findings nemotron "$(reviewer_obj nemotron)")
 
@@ -197,7 +201,10 @@ entry=$(jq -nc \
   --argjson deepseek "$deepseek_json" \
   --argjson mimo "$mimo_json" \
   --argjson minimax "$minimax_json" \
-  --argjson fugu "$fugu_json" \
+  --argjson qwen "$qwen_json" \
+  --argjson devstral "$devstral_json" \
+  --argjson laguna "$laguna_json" \
+  --argjson kat "$kat_json" \
   --argjson north "$north_json" \
   --argjson nemotron "$nemotron_json" \
   '{
@@ -210,7 +217,8 @@ entry=$(jq -nc \
                 else {files: ($diff_files | tonumber? // null),
                       lines: ($diff_lines | tonumber? // null)} end),
     reviewers: {codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, glm: $glm,
-                deepseek: $deepseek, mimo: $mimo, minimax: $minimax, fugu: $fugu, north: $north, nemotron: $nemotron},
+                deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
+                devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron},
     convergent_count: $convergent,
     verdict: $verdict,
     top_finding: (if $top == "" then null else $top end),

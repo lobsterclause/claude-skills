@@ -143,6 +143,77 @@
     "notes": "MiniMax M3 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (MiniMax), routed through OpenRouter (US) — surface both for security-sensitive repos."
   },
 
+  "qwen": {
+    "timeout_s": 600,
+    "provider": "alibaba",
+    "cli": "openrouter",
+    "model": "qwen/qwen3-coder-next",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "specialization": "single-turn diff reasoning; independent provider vote (Alibaba). Rotation-pool member.",
+    "notes": "Qwen3 Coder Next via OpenRouter ($0.11/M in, $0.80/M out; code-specialized MoE). Added 2026-07-02 filling fugu's seat, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Alibaba), routed through OpenRouter (US) — surface both for security-sensitive repos."
+  },
+
+  "devstral": {
+    "timeout_s": 600,
+    "provider": "mistral",
+    "cli": "openrouter",
+    "model": "mistralai/devstral-2512",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "specialization": "single-turn diff reasoning; independent provider vote (Mistral). Rotation-pool member.",
+    "notes": "Devstral 2 via OpenRouter ($0.40/M in, $2/M out; Mistral's agentic-coding model). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. France-origin provider (Mistral), routed through OpenRouter (US)."
+  },
+
+  "laguna": {
+    "timeout_s": 600,
+    "provider": "poolside",
+    "cli": "openrouter",
+    "model": "poolside/laguna-m.1",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "specialization": "single-turn diff reasoning; independent provider vote (Poolside). Rotation-pool member.",
+    "notes": "Poolside Laguna M.1 via OpenRouter ($0.20/M in, $0.40/M out; code-only lab; a :free route also exists but paid chosen for rate-limit reliability). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. US-origin provider (Poolside), routed through OpenRouter (US)."
+  },
+
+  "kat": {
+    "timeout_s": 600,
+    "provider": "kuaishou",
+    "cli": "openrouter",
+    "model": "kwaipilot/kat-coder-pro-v2",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "specialization": "single-turn diff reasoning; independent provider vote (Kuaishou). Rotation-pool member.",
+    "notes": "KAT-Coder-Pro V2 via OpenRouter ($0.30/M in, $1.20/M out; Kuaishou's enterprise coding model). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Kuaishou), routed through OpenRouter (US) — surface both for security-sensitive repos."
+  },
 
   "north": {
     "timeout_s": 600,

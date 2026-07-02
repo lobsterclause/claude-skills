@@ -63,7 +63,7 @@ runlog="${CROSS_REVIEW_RUNLOG:-$skill_dir/runlog.jsonl}"
 profile_file="$skill_dir/references/reviewer_profiles.json"
 
 # Full fleet — keep in sync with run_reviewers.sh dispatch and analyze_runlog.sh.
-REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax north nemotron)
+REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax qwen devstral laguna kat north nemotron)
 
 structured=""
 if [[ -f "$runlog" ]]; then
@@ -85,6 +85,10 @@ provider_of() {
       deepseek) p="deepseek" ;;
       mimo) p="xiaomi" ;;
       minimax) p="minimax" ;;
+      qwen) p="alibaba" ;;
+      devstral) p="mistral" ;;
+      laguna) p="poolside" ;;
+      kat) p="kuaishou" ;;
       north) p="cohere" ;;
       nemotron) p="nvidia" ;;
       *) p="unknown" ;;
