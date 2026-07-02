@@ -152,7 +152,12 @@ emit_warning() {
     elif (.quota // 0) > 0 then
       "  WARN: \(.reviewer) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). No fallback by policy; roster rotation covers the gap"
     elif .timeout_rate > 30 then
-      "  WARN: \(.reviewer) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — consider --timeout-\(.reviewer) \(.current_timeout_budget_s + 200)"
+      (if (["codex","antigravity","gemini-pro","kimi","glm"] | index(.reviewer)) != null
+       then "  WARN: \(.reviewer) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — consider --timeout-\(.reviewer) \(.current_timeout_budget_s + 200)"
+       # Only 5 reviewers have per-reviewer CLI flags; suggesting a nonexistent
+       # --timeout-<r> made the next run exit 2 (fugu finding, PR #18 pass 1).
+       else "  WARN: \(.reviewer) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — bump its timeout_s in reviewer_profiles.json (or pass global --timeout for a one-off)"
+       end)
     elif .empty_rate > 40 then
       "  WARN: \(.reviewer) empty-output rate \(.empty_rate)% over last \(.total) runs — quota or auth, not a timeout fix: check failure_kind in meta.json and the .agy.log tail (Individual quota → wait/fallback; otherwise re-run `agy login`)"
     elif .reliability != null and .reliability < 60 then

@@ -144,11 +144,13 @@ openrouter_factcheck() {
   local or_model="$1" key
   key="$(openrouter_key)" || return 1
   command -v curl >/dev/null 2>&1 || return 1
-  local body="$tmp_dir/or_body.json" resp="$tmp_dir/or_resp.json"
+  local body="$tmp_dir/or_body.json" resp="$tmp_dir/or_resp.json" auth="$tmp_dir/curl-auth"
   jq -n --rawfile p "$prompt" --arg m "$or_model" \
     '{model: $m, messages: [{role: "user", content: $p}], stream: false}' >"$body" || return 1
+  # Key via 0600 --config file, never argv (ps-visible). tmp_dir is trap-cleaned.
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$key" >"$auth" )
   curl -sS --max-time "$timeout_s" \
-    -H "Authorization: Bearer $key" \
+    --config "$auth" \
     -H "Content-Type: application/json" \
     -H "X-Title: cross-review-factcheck" \
     -d @"$body" \
@@ -166,7 +168,10 @@ case "$reviewer" in
     # Pass the prompt by FILE PATH, not argv: `-p "$(cat prompt)"` puts the whole
     # diff on the command line and hits MAX_ARG_STRLEN (~128KB) on large diffs
     # (bug b4). agy can read the file itself (--sandbox still permits reads).
-    run_to "$timeout_s" agy --model "$model" --sandbox --print-timeout "${timeout_s}s" \
+    # --print-timeout runs 15s under the wrapper cap so agy flushes instead of
+    # being hard-killed mid-write — mirrors run_agy_reviewer (fugu, PR #18 p1).
+    agy_pt="${timeout_s}s"; [[ "$timeout_s" -gt 30 ]] && agy_pt="$((timeout_s - 15))s"
+    run_to "$timeout_s" agy --model "$model" --sandbox --print-timeout "$agy_pt" \
       -p "Read the file at $prompt and follow its instructions EXACTLY. It contains your full fact-check instructions, a code diff, and a list of findings. Output ONLY the JSON block it specifies — nothing else." \
       >"$raw" 2>"$tmp_dir/err.txt" </dev/null || true
     # agy fails empty on quota exhaustion / panics / expired auth (empty stdout,

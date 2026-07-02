@@ -64,9 +64,24 @@ case "$mode" in
     # Ensure the body file is always cleaned up, even if gh call fails or the
     # script is interrupted. Previous version only rm'd on the happy path.
     trap 'rm -f "$body_file"' EXIT
+    # Derive the roster from the run dir's meta files — under rotation the
+    # fleet varies per round, so a hardcoded list is frequently wrong (fugu
+    # finding, PR #18 pass 1). findings.md lives at $run_dir/findings.md and
+    # the wrapper writes $run_dir/raw/<reviewer>.meta.json per reviewer ran.
+    roster_line=""
+    raw_dir="$(dirname "$findings")/raw"
+    if [[ -d "$raw_dir" ]]; then
+      for m in "$raw_dir"/*.meta.json; do
+        [[ -f "$m" ]] || continue
+        n="$(basename "$m" .meta.json)"
+        [[ "$n" == *.agy-failed ]] && continue
+        roster_line="${roster_line:+$roster_line + }$n"
+      done
+    fi
+    [[ -z "$roster_line" ]] && roster_line="external reviewers"
     {
       printf '## Cross-review — pass %s\n\n' "$pass"
-      printf '_Automated review by codex + antigravity + gemini-pro + kimi. See the "Findings" collapsible for specifics._\n\n'
+      printf '_Automated review by %s. See the "Findings" collapsible for specifics._\n\n' "$roster_line"
       printf '<details><summary>Findings</summary>\n\n'
       cat "$findings"
       printf '\n</details>\n'

@@ -22,6 +22,14 @@
 
 set -euo pipefail
 
+# Same PATH guard as run_reviewers.sh / select_roster.sh: without it, `has agy`
+# succeeds via the direct ~/.local/bin fallback below but the bare `agy models`
+# probe fails (127) and gemini-pro false-negatives — detection disagreeing with
+# execution. codex+fugu convergent finding, PR #18 pass 1.
+if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+  PATH="$HOME/.local/bin:$PATH"
+fi
+
 has() {
   command -v "$1" >/dev/null 2>&1 && return 0
   # Antigravity's installer drops `agy` in $HOME/.local/bin, which is often not

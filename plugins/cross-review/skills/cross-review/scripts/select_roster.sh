@@ -85,7 +85,10 @@ if command -v agy >/dev/null 2>&1; then
   models_cache="$cache_dir/agy_models.txt"
   mkdir -p "$cache_dir"
   if [[ ! -s "$models_cache" || -n "$(find "$models_cache" -mmin +360 2>/dev/null)" ]]; then
-    rm -f "$models_cache.tmp"
+    # PID-suffixed temp: concurrent selector runs (splitstream rounds) would
+    # interleave writes into a shared .tmp before the atomic mv (kimi finding,
+    # PR #18 pass 1).
+    models_tmp="$models_cache.tmp.$$"
     TIMEOUT_BIN=""
     command -v timeout  >/dev/null 2>&1 && TIMEOUT_BIN="timeout"
     [[ -z "$TIMEOUT_BIN" ]] && command -v gtimeout >/dev/null 2>&1 && TIMEOUT_BIN="gtimeout"
@@ -93,9 +96,9 @@ if command -v agy >/dev/null 2>&1; then
       # -k 5: agy ignores SIGTERM while stuck in its quota-retry network loop
       # (observed 2026-07-01: a plain 15s timeout never fired and the probe
       # hung for minutes) — escalate to SIGKILL 5s after TERM.
-      "$TIMEOUT_BIN" -k 5 15 agy models >"$models_cache.tmp" 2>/dev/null && mv "$models_cache.tmp" "$models_cache" || rm -f "$models_cache.tmp"
+      "$TIMEOUT_BIN" -k 5 15 agy models >"$models_tmp" 2>/dev/null && mv "$models_tmp" "$models_cache" || rm -f "$models_tmp"
     else
-      agy models >"$models_cache.tmp" 2>/dev/null && mv "$models_cache.tmp" "$models_cache" || rm -f "$models_cache.tmp"
+      agy models >"$models_tmp" 2>/dev/null && mv "$models_tmp" "$models_cache" || rm -f "$models_tmp"
     fi
   fi
   if [[ -s "$models_cache" ]]; then

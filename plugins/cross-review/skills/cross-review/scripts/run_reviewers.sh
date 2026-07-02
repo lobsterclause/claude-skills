@@ -75,9 +75,11 @@
 #   <out>/<or>.meta.json         stdout/stderr/meta plus request.json and
 #                                response.json for audit
 #   <out>/agy.quota_exhausted  — sentinel: agy hit the shared Individual quota
-#                                this run (contains the reset ETA); the sibling
-#                                lap + retries skip agy (no fallback — the lap
-#                                drops out of the round)
+#                                this run (contains the reset ETA). Spares
+#                                retries and any lap that starts AFTER detection
+#                                (~5s in); the concurrent sibling usually burns
+#                                its own doomed call first (2s stagger). No
+#                                fallback — the lap drops out of the round.
 #   <out>/run.meta.json        — overall run metadata (skipped reason, etc.)
 #
 # meta.json extras: agy laps carry `failure_kind` (quota_exhausted | agy_panic |
@@ -503,14 +505,20 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   rm -f "$prompt_tmp"
 
   local resp_file="$out/${slug}.response.json"
+  # The Authorization header goes through a 0600 curl --config file, NOT argv:
+  # argv is world-visible via `ps` for the duration of the call (same rationale
+  # as the kimi stdin-prompt rule). Kimi cross-review finding, PR #18 pass 1.
+  local auth_file="$out/.${slug}.curl-auth.$$"
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$key" >"$auth_file" )
   curl -sS --max-time "$timeout_budget" \
-    -H "Authorization: Bearer $key" \
+    --config "$auth_file" \
     -H "Content-Type: application/json" \
     -H "X-Title: cross-review" \
     -d @"$body_file" \
     https://openrouter.ai/api/v1/chat/completions \
     >"$resp_file" 2>"$out/${slug}.stderr"
   rc=$?
+  rm -f "$auth_file"
   # curl exits 28 on --max-time; normalize to 124 so meta.timed_out and the
   # retry policy treat it exactly like a coreutils timeout.
   [[ $rc -eq 28 ]] && rc=124
@@ -631,7 +639,12 @@ Use your file-reading tools to inspect the actual changes. Do NOT edit, write, o
   local failure_kind="" quota_resets_in=""
   local agy_log="$out/${slug}.agy.log"
   if [[ $rc -eq 0 && "$bytes" -eq 0 || $rc -ne 0 ]]; then
-    if [[ "$bytes" -eq 0 && -f "$agy_log" ]] && grep -q 'Individual quota reached' "$agy_log" 2>/dev/null; then
+    # Quota is checked on ANY failure, not just empty output: a nonzero-exit
+    # run with partial output whose real cause is quota must still classify
+    # and write the sentinel (nemotron finding, PR #18 pass 1). Successful
+    # runs (rc=0, bytes>0) never reach this block, so stray intermittent 429
+    # lines in a good run's log can't misclassify it.
+    if [[ -f "$agy_log" ]] && grep -q 'Individual quota reached' "$agy_log" 2>/dev/null; then
       failure_kind="quota_exhausted"
       quota_resets_in="$(grep -o 'Resets in [0-9hms]*' "$agy_log" 2>/dev/null | tail -1 | sed 's/Resets in //')"
       printf 'resets in %s (observed by %s at %s)\n' "${quota_resets_in:-unknown}" "$slug" "$(date '+%Y-%m-%dT%H:%M:%S')" >"$out/agy.quota_exhausted"
