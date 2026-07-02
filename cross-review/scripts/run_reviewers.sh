@@ -269,23 +269,35 @@ if git diff --quiet "$base"...HEAD; then
 fi
 
 # Timeout shim: macOS has no `timeout` by default. `gtimeout` ships with
-# coreutils (brew install coreutils). Pick whichever is present; otherwise
-# warn loudly — a stalled auth flow can hang the whole review forever.
+# coreutils (brew install coreutils). Pick whichever is on PATH — and when
+# PATH doesn't have it, probe the standard homebrew install locations before
+# giving up: background/cron shells often run with a PATH that lacks
+# /opt/homebrew/bin, and on 2026-07-01 that silently ran EVERY reviewer
+# unbounded (kimi went 42min against a 600s budget; only the never-read
+# warning below knew why).
 TIMEOUT_BIN=""
 if command -v timeout >/dev/null 2>&1; then
   TIMEOUT_BIN="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_BIN="gtimeout"
 else
-  echo "warning: neither 'timeout' nor 'gtimeout' is available — reviewers will run unbounded. Install coreutils (brew install coreutils) to enable the ${timeout_s}s cutoff." >&2
+  for _tb in /opt/homebrew/bin/gtimeout /usr/local/bin/gtimeout /opt/homebrew/bin/timeout /usr/local/bin/timeout; do
+    [[ -x "$_tb" ]] && { TIMEOUT_BIN="$_tb"; break; }
+  done
+fi
+if [[ -z "$TIMEOUT_BIN" ]]; then
+  echo "warning: neither 'timeout' nor 'gtimeout' is available (checked PATH + homebrew paths) — reviewers will run unbounded. Install coreutils (brew install coreutils) to enable the ${timeout_s_default}s cutoff." >&2
 fi
 
 run_with_timeout() {
   # Usage: run_with_timeout <secs> <cmd...>
   # Runs cmd with timeout if available; otherwise just exec.
+  # -k 10: several reviewer CLIs (agy observed; wedged node CLIs generally)
+  # ignore SIGTERM — without KILL escalation a wedged reviewer hangs the
+  # subshell forever and the round never closes.
   local secs="$1"; shift
   if [[ -n "$TIMEOUT_BIN" ]]; then
-    "$TIMEOUT_BIN" "$secs" "$@"
+    "$TIMEOUT_BIN" -k 10 "$secs" "$@"
   else
     "$@"
   fi
@@ -757,7 +769,18 @@ $diff_full
 
 Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
 
-  run_with_timeout "$kimi_timeout" kimi \
+  # kimi-k2.5 thinking mode scales hard with diff size: ~84s p50 on small
+  # diffs, but 32-43 min OBSERVED on ~4k-line diffs (2026-07-01, PR #18).
+  # Scale the budget rather than truncate the input — quality first; the
+  # speed-aware roster draw and incremental re-reviews keep big-diff rounds
+  # rare. Empirical rate ≈500s per 1000 diff lines beyond the first 1000.
+  local kimi_budget="$kimi_timeout"
+  if [[ "${total_lines:-0}" -gt 1000 ]]; then
+    kimi_budget=$(( kimi_timeout + 500 * ( (total_lines - 1000) / 1000 + 1 ) ))
+    [[ "$kimi_budget" -gt 3000 ]] && kimi_budget=3000
+    echo "kimi: ${total_lines}-line diff — budget scaled ${kimi_timeout}s → ${kimi_budget}s" >&2
+  fi
+  run_with_timeout "$kimi_budget" kimi \
     --plan \
     --print \
     --quiet \
@@ -772,7 +795,7 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   local bytes
   bytes=$(output_bytes_of "$out/kimi.stdout")
   printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_timeout" \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_budget" \
     >"$out/kimi.meta.json"
   return "$rc"
 }

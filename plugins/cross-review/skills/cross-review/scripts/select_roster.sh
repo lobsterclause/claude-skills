@@ -8,24 +8,30 @@
 #     (agy Gemini laps + the OpenRouter fleet), so we're not paying for every
 #     provider on every run but every provider keeps earning leaderboard data.
 #
-# Weighting (exploit + explore, bandit-style):
-#   weight = max(score, 15) * (1 + 0.5 / sqrt(attempts + 1))
+# Weighting (exploit + explore + speed, bandit-style):
+#   weight = max(score, 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240)
 #     - score comes from leaderboard.sh (rookies get an optimistic 50, so new
 #       models are drawn early and earn real data)
 #     - the sqrt term is an exploration bonus that decays as a reviewer
 #       accumulates runs
 #     - the floor (15) keeps a slumping reviewer from starving forever
+#     - the p50 divisor makes latency shape WHO IS DRAWN, never how findings
+#       are scored — quality weighting at synthesis is latency-free (Gabriel's
+#       speed-without-quality-loss constraint, 2026-07-01)
 #   If a reviewer's LATEST attempt in the window was a quota failure, its
 #   weight is multiplied by 0.1 — quota outages last ~2 days, so keep it
 #   mostly benched but give it an occasional probe so recovery is noticed.
 #
 # Usage:
-#   select_roster.sh [--extras <n>] [--seed <n>] [--json]
+#   select_roster.sh [--extras <n>] [--seed <n>] [--json] [--fast]
 #     --extras <n>  rotation picks beyond the baselines (default 2; auto-raised
 #                   to keep the roster at ≥3 if a baseline is missing)
 #     --seed <n>    deterministic draw (tests); default seeds from $RANDOM
 #     --json        emit the full decision record as JSON on stdout instead of
 #                   the comma list (comma list then goes to stderr)
+#     --fast        drop pool candidates whose recent p50 exceeds 180s
+#                   (rookies pass — unknown speed is worth one probe). For
+#                   quick loops and incremental re-review passes.
 #
 # stdout: comma-separated roster, e.g. "codex,kimi,gemini-pro,fugu"
 # stderr: the decision detail (weights, exclusions) for the log.
@@ -35,6 +41,7 @@ set -uo pipefail
 extras=2
 seed=""
 emit_json=0
+fast_max=0
 
 need_val() {
   if [[ "$2" -lt 2 ]]; then
@@ -48,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --extras) need_val "$1" "$#"; extras="$2"; shift 2 ;;
     --seed)   need_val "$1" "$#"; seed="$2";   shift 2 ;;
     --json)   emit_json=1; shift ;;
+    --fast)   fast_max=180; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -92,14 +100,21 @@ if command -v agy >/dev/null 2>&1; then
     TIMEOUT_BIN=""
     command -v timeout  >/dev/null 2>&1 && TIMEOUT_BIN="timeout"
     [[ -z "$TIMEOUT_BIN" ]] && command -v gtimeout >/dev/null 2>&1 && TIMEOUT_BIN="gtimeout"
+    if [[ -z "$TIMEOUT_BIN" ]]; then
+      # Background/cron PATHs often lack homebrew — probe standard locations.
+      for _tb in /opt/homebrew/bin/gtimeout /usr/local/bin/gtimeout; do
+        if [[ -x "$_tb" ]]; then TIMEOUT_BIN="$_tb"; break; fi
+      done
+    fi
     if [[ -n "$TIMEOUT_BIN" ]]; then
       # -k 5: agy ignores SIGTERM while stuck in its quota-retry network loop
       # (observed 2026-07-01: a plain 15s timeout never fired and the probe
       # hung for minutes) — escalate to SIGKILL 5s after TERM.
       "$TIMEOUT_BIN" -k 5 15 agy models >"$models_tmp" 2>/dev/null && mv "$models_tmp" "$models_cache" || rm -f "$models_tmp"
-    else
-      agy models >"$models_tmp" 2>/dev/null && mv "$models_tmp" "$models_cache" || rm -f "$models_tmp"
     fi
+    # No timeout binary anywhere → do NOT probe unbounded (an unhealthy agy
+    # can hang for minutes and block every review at roster selection —
+    # codex P2, PR #18 pass 2). Fall through to the assume-Pro path below.
   fi
   if [[ -s "$models_cache" ]]; then
     grep -qi 'Gemini 3.1 Pro' "$models_cache" && POOL+=(gemini-pro)
@@ -130,27 +145,34 @@ weight_lines=""
 for r in "${POOL[@]}"; do
   line="$(printf '%s' "$lb_json" | jq -r --arg r "$r" '
     (map(select(.reviewer == $r)) | first) as $s
-    | if $s == null then "\($r) 50 0 never_run"
-      else "\($r) \($s.score) \($s.attempts) \($s.latest_status)"
+    | if $s == null then "\($r) 50 0 never_run 0"
+      else "\($r) \($s.score) \($s.attempts) \($s.latest_status) \($s.p50_duration_s // 0)"
       end
   ')"
   weight_lines="$weight_lines$line"$'\n'
 done
 
 # --- weighted sample without replacement (awk: proper float math, seedable) ---
-selected="$(printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" '
+selected="$(printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v fastmax="$fast_max" '
   BEGIN { srand(seed) }
   NF >= 4 {
+    p50 = (NF >= 5 ? $5 + 0 : 0)
+    if (fastmax > 0 && p50 > fastmax) {
+      printf "  candidate %-12s SKIPPED (--fast: p50 %ss > %ss)\n", $1, p50, fastmax > "/dev/stderr"
+      next
+    }
     n++
     name[n] = $1
     score = $2 + 0
     attempts = $3 + 0
     latest = $4
-    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1))
+    # exploit * explore / latency — latency shapes the draw, never the
+    # synthesis-time weighting of findings.
+    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240)
     if (latest == "quota") w *= 0.1
     weight[n] = w
     total += w
-    printf "  candidate %-12s score=%-4s attempts=%-3s latest=%-10s weight=%.1f\n", $1, $2, $3, $4, w > "/dev/stderr"
+    printf "  candidate %-12s score=%-4s attempts=%-3s latest=%-10s p50=%-5ss weight=%.1f\n", $1, $2, $3, $4, p50, w > "/dev/stderr"
   }
   END {
     for (pick = 0; pick < k && total > 0.0001; pick++) {

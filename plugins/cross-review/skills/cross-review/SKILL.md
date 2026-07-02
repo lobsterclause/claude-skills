@@ -187,6 +187,16 @@ Outputs land at `<reviewer>.{stdout,stderr,meta.json}` (OpenRouter reviewers als
 - **swarm**: `--reviewers` with every reviewer the detect step found. Maximum coverage, maximum tokens — for release-critical reviews.
 - **solo**: run just one (the fastest available). Useful when the user wants a quick sniff test.
 
+**Round deadline + trailing reviewers (speed without quality loss).** A round should return in **~10 minutes**. Some reviewers legitimately need far longer on large diffs — kimi-k2.5's thinking mode runs ~500s per 1,000 diff lines (observed: 43 min on a 4.6k-line diff), and some OpenRouter models stream slowly on 300KB prompts. Do NOT block the round on them and do NOT truncate their input. Instead:
+
+1. Before dispatching, estimate each roster member's duration: leaderboard `p50_duration_s`, plus kimi's size scaling (`~84s + 500s × diff_klines`).
+2. Any reviewer predicted well past the deadline becomes **trailing**: dispatch it as a *separate* background `run_reviewers.sh --reviewers <r>` call into the same `$run_dir/raw`, and run the main round without it.
+3. Synthesize, verify, and post the pass on time from the delivered reviews, noting `<r> trailing` in the report block and PR comment.
+4. When the trailing reviewer lands, read its output; if it adds real findings, post a short addendum comment and fold them into the next pass's triage. Its meta is on disk, so the runlog entry for the pass can be appended after it lands (or note it as trailing).
+5. On large diffs, add one extra fast rotation pick (`--extras 3`) so breadth compensates while depth trails.
+
+The principle (Gabriel, 2026-07-01): **latency shapes scheduling — who is drawn, what trails — never the quality bar.** Baselines stay on every round, verification gates always run, no reviewer's input gets silently truncated.
+
 The wrapper logs timing and exit codes per reviewer. If one fails, continue with the rest — a partial review is still useful. If all fail, stop and surface the errors.
 
 ### 4. Synthesize findings
@@ -311,7 +321,9 @@ EOF
 
 ### 6. Re-review loop
 
-After committing, re-run steps 3–5 against the new HEAD. Keep iterating until any of:
+After committing, re-run steps 3–5 — but **incrementally**: pass the *previous pass's HEAD* as `--base` so reviewers see only the fix commits, and include the prior pass's findings table in the prompt preamble with the ask "verify each fix landed; scan only these new hunks for regressions." A re-pass is answering a narrow question, not re-finding everything — this cuts pass-2+ from ~30 minutes to single digits on large PRs (and it's why big-diff first passes are the only slow case). Use `select_roster.sh --fast` for re-pass rotation picks. Run the full-diff review only when the fixes were structural enough to invalidate the original review's context.
+
+Keep iterating until any of:
 
 - No Critical or High findings remain.
 - **Iteration cap: 3 passes.** If the reviewers are still finding Critical/High on pass 3, stop and hand to the user — something structural is wrong and more passes won't fix it.
@@ -469,7 +481,7 @@ bash ~/.claude/skills/cross-review/scripts/select_roster.sh            # → "co
 bash ~/.claude/skills/cross-review/scripts/select_roster.sh --extras 3 --json  # more picks + decision record
 ```
 
-codex + kimi are fixed baselines; `--extras` (default 2) rotation picks are drawn without replacement, weighted by `max(score, 15) × (1 + 0.5/√(attempts+1))` — exploit the leaderboard, explore the under-sampled, never starve anyone. A reviewer whose latest run was a quota failure gets its weight ×0.1 (benched but occasionally probed so recovery is noticed). The roster is always ≥3; a missing baseline raises the draw count. `run_reviewers.sh` calls this automatically when `--reviewers` is omitted.
+codex + kimi are fixed baselines; `--extras` (default 2) rotation picks are drawn without replacement, weighted by `max(score, 15) × (1 + 0.5/√(attempts+1)) / (1 + p50/240)` — exploit the leaderboard, explore the under-sampled, prefer the fast, never starve anyone. **Latency only shapes the draw** — at synthesis time a slow reviewer's findings weigh exactly the same. A reviewer whose latest run was a quota failure gets its weight ×0.1 (benched but occasionally probed so recovery is noticed). `--fast` drops candidates with recent p50 > 180s entirely (rookies pass) — use it for re-passes and quick loops. The roster is always ≥3; a missing baseline raises the draw count. `run_reviewers.sh` calls this automatically when `--reviewers` is omitted.
 
 **Reading the leaderboard over time:** rookies enter at 50 and converge to their real score within ~10 sampled runs. Promote a consistently top-scoring rotation member to more frequent duty by raising its `synthesis_weight`/priors in `reviewer_profiles.json`; cut a consistent bottom-dweller by removing it from the pool in `select_roster.sh` and `run_reviewers.sh`. `fugu` is explicitly on a trial seat — decide after ~10 samples.
 

@@ -106,6 +106,9 @@ score_reviewer() {
     | ($scored | map(.findings_dropped    // 0) | add // 0) as $dropped
     | (if $n == 0 then null else ($ok / $n) end) as $rel
     | (if $n == 0 then "never_run" else ($attempts | last | .status) end) as $latest
+    | ($attempts | map(.duration_s // 0) | sort) as $durs
+    | ($durs | length) as $dn
+    | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
     | (if $n == 0 then 50
        elif $findings > 0 then
          (100 * (0.45 * $rel
@@ -123,6 +126,7 @@ score_reviewer() {
         convergent: $convergent,
         dropped: $dropped,
         latest_status: $latest,
+        p50_duration_s: $p50,
         rookie: ($n == 0),
         score: $score }
   '
@@ -142,7 +146,7 @@ case "$mode" in
     echo "── cross-review leaderboard (window: last $recent structured runs) ──"
     printf '%s' "$rows" | jq -s -r '
       sort_by(-.score) | to_entries[] |
-      "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  last: \(.value.latest_status)"
+      "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)"
     '
     echo "──"
     echo "  score = 45% reliability + 35% cross-provider convergence + 20% fact-check survival"

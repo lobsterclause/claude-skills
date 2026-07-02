@@ -48,11 +48,37 @@ openrouter=false
 has codex && codex=true
 # Both Gemini reviewers ride the same agy binary — but `agy --model` silently
 # falls back to Flash on an unrecognized model string. So only report gemini-pro
-# (the Pro lap) available if `agy models` actually lists a Gemini 3.1 Pro entry;
-# otherwise a rename would make us run a 2nd Flash while claiming it was Pro.
+# (the Pro lap) available if `agy models` actually lists a Gemini 3.1 Pro entry.
+# The probe MUST be bounded and cached: an unhealthy agy (quota/auth) can hang
+# `agy models` for minutes and it ignores SIGTERM (codex P2, PR #18 pass 2).
+# Shares select_roster.sh's 6h cache; with no timeout binary available the
+# probe is skipped and Pro is assumed available (matches execution — the
+# wrapper pins the exact model string either way).
 if has agy; then
   antigravity=true
-  if agy models 2>/dev/null | grep -qi 'Gemini 3.1 Pro'; then
+  models_cache="$HOME/.cross-review/cache/agy_models.txt"
+  if [[ ! -s "$models_cache" || -n "$(find "$models_cache" -mmin +360 2>/dev/null)" ]]; then
+    TIMEOUT_BIN=""
+    command -v timeout  >/dev/null 2>&1 && TIMEOUT_BIN="timeout"
+    if [[ -z "$TIMEOUT_BIN" ]] && command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; fi
+    if [[ -z "$TIMEOUT_BIN" ]]; then
+      for _tb in /opt/homebrew/bin/gtimeout /usr/local/bin/gtimeout; do
+        if [[ -x "$_tb" ]]; then TIMEOUT_BIN="$_tb"; break; fi
+      done
+    fi
+    if [[ -n "$TIMEOUT_BIN" ]]; then
+      mkdir -p "$(dirname "$models_cache")"
+      models_tmp="$models_cache.tmp.$$"
+      if "$TIMEOUT_BIN" -k 5 15 agy models >"$models_tmp" 2>/dev/null; then
+        mv "$models_tmp" "$models_cache"
+      else
+        rm -f "$models_tmp"
+      fi
+    fi
+  fi
+  if [[ -s "$models_cache" ]]; then
+    if grep -qi 'Gemini 3.1 Pro' "$models_cache"; then gemini_pro=true; fi
+  else
     gemini_pro=true
   fi
 fi
