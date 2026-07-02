@@ -232,11 +232,17 @@ set +e
 DR2="$(bash "$S/handoff.sh" --base "$BASE_BRANCH" --dry-run 2>/dev/null)"; rc=$?
 set -e
 assert_eq "dry-run with repo config exits 0" "$rc" "0"
-MERGED_CFG="$(printf '%s' "$DR2" | jq -r '.config // empty' 2>/dev/null)"
-if [ -n "$MERGED_CFG" ] && jq -e '.ignore.customPatterns | index("src/secret-*.ts")' "$MERGED_CFG" >/dev/null 2>&1; then
+# python3, not jq — the suite's documented deps are git+python3 only
+# (codex, PR #24 pass 3).
+if printf '%s' "$DR2" | python3 -c '
+import json, sys
+dr = json.load(sys.stdin)
+cfg = json.load(open(dr["config"]))
+sys.exit(0 if "src/secret-*.ts" in cfg["ignore"]["customPatterns"] else 1)
+' 2>/dev/null; then
   ok "repo config ignore pattern merged into generated config"
 else
-  bad "repo config ignores were dropped (codex P2 regression; cfg: ${MERGED_CFG:-none})"
+  bad "repo config ignores were dropped (codex P2 regression)"
 fi
 rm -f repomix.config.json
 
