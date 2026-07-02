@@ -206,9 +206,10 @@ cat >/dev/null 2>&1 || true
 i=0; while [ $i -lt 3000 ]; do printf 'wait wait wait wait wait wait wait wait '; i=$((i+1)); done
 SHIM
 chmod +x "$T/bin/kimi"
-set +e
-bash "$S/run_reviewers.sh" --base main --out "$T/o5" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1
-set -e
+# NOTE: this suite deliberately runs WITHOUT set -e (naked expected-fail
+# calls throughout) — do not flip it on here; a stray `set -e` mid-file
+# aborted the suite at the next nonzero exit (caught pre-merge, PR #26).
+bash "$S/run_reviewers.sh" --base main --out "$T/o5" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1 || true
 assert_eq "degenerate output stamps failure_kind" \
   "$(jq -r '.failure_kind' "$T/o5/kimi.meta.json")" "degenerate_output"
 assert_eq "degenerate output classifies exit 5" \
