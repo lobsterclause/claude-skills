@@ -40,7 +40,11 @@ printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export OPENROUTER_API_KEY="sk-or-test-shim"   # lights the OR pool; never called
-export HOME_CACHE_NOTE="selector cache goes to real \$HOME/.cross-review/cache"
+# Sandbox HOME: the selector caches `agy models` output under
+# $HOME/.cross-review/cache with a 6h TTL — running tests against the real
+# HOME would poison real roster draws with the shim's list (codex P2, PR #19).
+export HOME="$T/home"
+mkdir -p "$HOME"
 
 # ── Fixture runlog ────────────────────────────────────────────────────────────
 # codex: 2 ok runs, findings 3+1=4, convergent 1, dropped 0 → score 74
@@ -104,6 +108,10 @@ assert_eq "same-provider agreement NOT convergent (agy laps)" \
   "$(jq -r '.reviewers.antigravity.findings_convergent' <<<"$ENTRY")" "0"
 
 echo "── select_roster.sh (determinism, floor, --fast fallback) ──"
+# select_roster.sh doesn't read CROSS_REVIEW_RUNLOG itself — it shells out to
+# leaderboard.sh, which inherits the exported var and reads the fixture. The
+# --fast test below proves the plumbing: its filter only triggers on the
+# fixture's p50 values. (minimax flagged this as broken on PR #19; it isn't.)
 R1="$(CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 99 2>/dev/null)"
 R2="$(CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 99 2>/dev/null)"
 assert_eq "seeded draw is deterministic" "$R1" "$R2"
