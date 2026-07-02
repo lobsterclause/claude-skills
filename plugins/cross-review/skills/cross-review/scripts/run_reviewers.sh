@@ -424,6 +424,25 @@ output_bytes_of() {
   fi
 }
 
+# output_degenerate <file> — detect pathological repetition (a model stuck in
+# a token loop: glm produced 145KB of "wait wait wait…" with exit 0 on PR #25
+# pass 3, and the leaderboard counted it as a reliable run). Detector: gzip
+# compression ratio. Calibration against 2026-07-02's real outputs: the
+# degenerate file compressed 69:1; every healthy output — including codex's
+# 182KB structured session logs — sat at 2:1–3:1. Threshold 15:1 leaves ~5×
+# margin on both sides. Only meaningful past 512 bytes (header amortization);
+# no gzip on PATH → not degenerate (detector is best-effort, never a gate on
+# healthy runs).
+output_degenerate() {
+  local f="$1" raw comp
+  command -v gzip >/dev/null 2>&1 || return 1
+  raw=$(output_bytes_of "$f")
+  [[ "$raw" -ge 512 ]] || return 1
+  comp=$(gzip -c "$f" 2>/dev/null | wc -c | tr -d ' ')
+  [[ "${comp:-0}" -gt 0 ]] || return 1
+  [[ $(( comp * 15 )) -lt "$raw" ]]
+}
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompt_file="$script_dir/../references/review_prompt.txt"
 
@@ -488,8 +507,14 @@ run_codex() {
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
   local bytes
   bytes=$(output_bytes_of "$out/codex.stdout")
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" >"$out/codex.meta.json"
+  local fk_json="null"
+  if [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/codex.stdout"; then
+    echo "codex: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
+    fk_json='"degenerate_output"'
+    rc=5
+  fi
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" "$fk_json" >"$out/codex.meta.json"
   # IMPORTANT: return $rc so the caller's `wait "$pid"` sees the real exit code.
   # Previous version ended with `printf` whose success (exit 0) masked every
   # upstream reviewer failure.
@@ -613,8 +638,14 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # rc=0 with empty content is still a failure (filtered/refused/odd response)
   # — rc=5 keeps it out of any_ok and lets retry_reviewer take one more swing.
   [[ $rc -eq 0 && "$bytes" -eq 0 ]] && rc=5
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "openrouter"}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" >"$out/${slug}.meta.json"
+  local fk_json="null"
+  if [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/${slug}.stdout"; then
+    echo "$slug: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
+    fk_json='"degenerate_output"'
+    rc=5
+  fi
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "openrouter", "failure_kind": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" >"$out/${slug}.meta.json"
   return "$rc"
 }
 
@@ -740,6 +771,12 @@ Use your file-reading tools to inspect the actual changes. Do NOT edit, write, o
       failure_kind="empty_output"
       rc=5
     fi
+  elif output_degenerate "$out/${slug}.stdout"; then
+    # rc=0 with content that is a repetition loop — same class as glm's
+    # PR #25 pass-3 output; do not let it count as a reliable run.
+    echo "$slug: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
+    failure_kind="degenerate_output"
+    rc=5
   fi
   local fk_json="null" qr_json="null"
   [[ -n "$failure_kind" ]] && fk_json="\"$failure_kind\""
@@ -873,8 +910,14 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
   local bytes
   bytes=$(output_bytes_of "$out/kimi.stdout")
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_budget" \
+  local fk_json="null"
+  if [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/kimi.stdout"; then
+    echo "kimi: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
+    fk_json='"degenerate_output"'
+    rc=5
+  fi
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d, "failure_kind": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_budget" "$fk_json" \
     >"$out/kimi.meta.json"
   return "$rc"
 }
