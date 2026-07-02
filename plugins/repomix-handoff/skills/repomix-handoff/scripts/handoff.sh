@@ -9,12 +9,24 @@
 #   --style markdown|xml|plain|json  Output format (default: markdown).
 #   --max-tokens N             Token budget (default: 120000).
 #   --reviewer codex|gemini|kimi|claude   Preset (overrides --style + --max-tokens).
-#   --output PATH              Output file (default: /tmp/repomix-handoff-<ts>.<ext>).
+#   --output PATH              Output file (default: under a private mktemp -d dir).
 #   --base REF                 Base ref for PR-scoped diff (default: origin/main).
 #   --expand-imports           Expand seed set 1 hop via static imports.
 #   --dry-run                  Print the computed scope and command, don't run.
 #
 # Side effects: writes snapshot to --output. Prints a JSON summary on stdout.
+#
+# The include/exclude lists are handed to repomix via a generated --config file
+# (JSON arrays), never via --include/--ignore CSV argv — thousands of paths in
+# one argv string hit the ~128KB per-arg OS limit (E2BIG), and `,`/`|` are
+# legal filename characters (issue #12).
+#
+# Exit codes:
+#   0  ok, snapshot within budget
+#   1  runtime failure (repomix missing/failed, mktemp failed, empty output)
+#   2  usage error
+#   3  snapshot still exceeds --max-tokens after trim exhaustion
+#      (the summary JSON is still emitted on stdout with within_budget:false)
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,17 +43,23 @@ BASE_REF="origin/main"
 EXPAND_IMPORTS=0
 DRY_RUN=0
 
+# Bounds-check before `shift 2`: a value-taking flag as the last arg would make
+# `shift 2` fail silently under `set -e` with no diagnostic (issue #12).
+need_val() {
+  [ "$2" -ge 2 ] || { echo "handoff.sh: $1 requires a value" >&2; exit 2; }
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --paths) PATHS="$2"; shift 2 ;;
-    --lang) LANGS="$2"; shift 2 ;;
-    --exclude) EXTRA_EXCLUDE="$2"; shift 2 ;;
+    --paths) need_val "$1" $#; PATHS="$2"; shift 2 ;;
+    --lang) need_val "$1" $#; LANGS="$2"; shift 2 ;;
+    --exclude) need_val "$1" $#; EXTRA_EXCLUDE="$2"; shift 2 ;;
     --include-tests) INCLUDE_TESTS=1; shift ;;
-    --style) STYLE="$2"; shift 2 ;;
-    --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
-    --reviewer) REVIEWER="$2"; shift 2 ;;
-    --output) OUTPUT="$2"; shift 2 ;;
-    --base) BASE_REF="$2"; shift 2 ;;
+    --style) need_val "$1" $#; STYLE="$2"; shift 2 ;;
+    --max-tokens) need_val "$1" $#; MAX_TOKENS="$2"; shift 2 ;;
+    --reviewer) need_val "$1" $#; REVIEWER="$2"; shift 2 ;;
+    --output) need_val "$1" $#; OUTPUT="$2"; shift 2 ;;
+    --base) need_val "$1" $#; BASE_REF="$2"; shift 2 ;;
     --expand-imports) EXPAND_IMPORTS=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
@@ -65,8 +83,7 @@ case "$STYLE" in
   *) echo "handoff.sh: unknown --style '$STYLE'" >&2; exit 2 ;;
 esac
 
-# Default output path. Use mktemp instead of a predictable /tmp filename so a
-# malicious symlink at the expected path can't redirect our write (CWE-377).
+# Default output path.
 ext="md"
 case "$STYLE" in
   xml) ext="xml" ;;
@@ -75,11 +92,24 @@ case "$STYLE" in
   markdown) ext="md" ;;
 esac
 if [ -z "${OUTPUT:-}" ]; then
-  # macOS mktemp doesn't honor `--suffix`; do a rename after creation.
-  _tmp="$(mktemp -t repomix-handoff.XXXXXXXX)" || { echo "handoff.sh: mktemp failed" >&2; exit 9; }
-  OUTPUT="${_tmp}.${ext}"
-  mv "$_tmp" "$OUTPUT"
+  # A private mktemp -d directory (0700) closes the CWE-377 TOCTOU window the
+  # old mktemp+mv two-step left open: nothing can pre-place a symlink at a
+  # path inside a directory only we can write (issue #12 medium). NOTE: the
+  # once-suggested `mktemp -t "name.XXXXXXXX.md"` was smoke-tested and
+  # falsified on macOS — BSD mktemp does not substitute embedded X runs.
+  _outdir="$(mktemp -d "${TMPDIR:-/tmp}/repomix-handoff.XXXXXXXX")" \
+    || { echo "handoff.sh: mktemp failed" >&2; exit 1; }
+  OUTPUT="$_outdir/handoff.${ext}"
 fi
+
+# Private scratch dir for all inter-process lists (newline-delimited) and the
+# generated repomix config. Kept on --dry-run so the printed command remains
+# runnable; removed otherwise.
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/repomix-handoff-work.XXXXXXXX")" \
+  || { echo "handoff.sh: mktemp failed" >&2; exit 1; }
+KEEP_WORK=0
+cleanup() { [ "$KEEP_WORK" -eq 1 ] || rm -rf "$WORK_DIR"; }
+trap cleanup EXIT
 
 # 1. Detect repomix.
 detect_json="$("$SCRIPT_DIR/detect_repomix.sh")"
@@ -96,7 +126,7 @@ Install one of:
 
 Then rerun this command.
 MSG
-  exit 4
+  exit 1
 fi
 
 # 2. Compute scope.
@@ -108,68 +138,106 @@ SCOPE_ARGS=()
 [ "$EXPAND_IMPORTS" -eq 1 ] && SCOPE_ARGS+=(--expand-imports)
 SCOPE_ARGS+=(--base "$BASE_REF")
 
-scope_json="$("$SCRIPT_DIR/compute_scope.sh" "${SCOPE_ARGS[@]}")"
+"$SCRIPT_DIR/compute_scope.sh" "${SCOPE_ARGS[@]}" > "$WORK_DIR/scope.json"
 
-include_count="$(printf '%s' "$scope_json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["include"]))')"
+# Extract include/exclude as newline-delimited list files, with explicit
+# validation of the extraction itself (issue #12 low: include_csv validation).
+python3 - "$WORK_DIR/scope.json" "$WORK_DIR/include.txt" "$WORK_DIR/exclude.txt" <<'PY' \
+  || { echo "handoff.sh: failed to parse compute_scope.sh output" >&2; exit 1; }
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    scope = json.load(f)
+inc = scope["include"]
+exc = scope["exclude"]
+if not isinstance(inc, list) or not isinstance(exc, list):
+    raise SystemExit("scope include/exclude are not lists")
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    f.write("".join(p + "\n" for p in inc if p))
+with open(sys.argv[3], "w", encoding="utf-8") as f:
+    f.write("".join(p + "\n" for p in exc if p))
+PY
+
+include_count="$(awk 'NF' "$WORK_DIR/include.txt" | wc -l | tr -d ' ')"
 if [ "$include_count" -eq 0 ]; then
   echo "handoff.sh: computed scope is empty (no changed files vs ${BASE_REF}, and no --paths)." >&2
   echo "Try: --paths <dir> or --base <ref> with a different base." >&2
-  exit 5
+  exit 1
 fi
 
-include_csv="$(printf '%s' "$scope_json" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["include"]))')"
-exclude_csv="$(printf '%s' "$scope_json" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["exclude"]))')"
-
-# 3. Build repomix invocation.
+# 3. Build repomix invocation. Include/ignore go through a generated config
+# file — JSON arrays have no delimiter or argv-length problems.
 if [ "$via" = "global" ]; then
   REPOMIX=(repomix)
 else
   REPOMIX=(npx --yes repomix)
 fi
 
-REPOMIX_ARGS=(
-  --style "$STYLE"
-  --output "$OUTPUT"
-  --include "$include_csv"
-  --ignore "$exclude_csv"
-)
+CONFIG_FILE="$WORK_DIR/repomix.config.json"
+
+# write_repomix_config <include-list-file> — regenerates $CONFIG_FILE.
+write_repomix_config() {
+  python3 - "$1" "$WORK_DIR/exclude.txt" "$CONFIG_FILE" <<'PY'
+import json, sys
+def lines(p):
+    with open(p, encoding="utf-8") as f:
+        return [l for l in f.read().splitlines() if l]
+cfg = {"include": lines(sys.argv[1]), "ignore": {"customPatterns": lines(sys.argv[2])}}
+with open(sys.argv[3], "w", encoding="utf-8") as f:
+    json.dump(cfg, f)
+PY
+}
+
+# The working include set for trimming, newline-delimited.
+cp "$WORK_DIR/include.txt" "$WORK_DIR/work.txt"
+: > "$WORK_DIR/trimmed.txt"
+write_repomix_config "$WORK_DIR/work.txt"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  CMD_STR="${REPOMIX[*]} ${REPOMIX_ARGS[*]}"
+  KEEP_WORK=1
+  CMD_STR="${REPOMIX[*]} --config $CONFIG_FILE --style $STYLE --output $OUTPUT"
   OUTPUT="$OUTPUT" STYLE="$STYLE" MAX_TOKENS="$MAX_TOKENS" \
-    REVIEWER="${REVIEWER:-default}" CMD_STR="$CMD_STR" SCOPE_JSON="$scope_json" \
-    python3 - <<'PY'
-import json, os
+    REVIEWER="${REVIEWER:-default}" CMD_STR="$CMD_STR" CONFIG_FILE="$CONFIG_FILE" \
+    python3 - "$WORK_DIR/scope.json" <<'PY'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    scope = json.load(f)
 print(json.dumps({
   "dry_run": True,
   "output": os.environ["OUTPUT"],
   "style": os.environ["STYLE"],
   "max_tokens": int(os.environ["MAX_TOKENS"]),
   "reviewer": os.environ["REVIEWER"],
-  "scope": json.loads(os.environ["SCOPE_JSON"]),
+  "scope": scope,
+  "config": os.environ["CONFIG_FILE"],
   "command": os.environ["CMD_STR"],
 }, indent=2))
 PY
   exit 0
 fi
 
-# 4. Run repomix.
-"${REPOMIX[@]}" "${REPOMIX_ARGS[@]}" >/dev/null 2>&1 || {
-  echo "handoff.sh: repomix invocation failed. Re-run with verbose flags to debug:" >&2
-  echo "  ${REPOMIX[*]} ${REPOMIX_ARGS[*]}" >&2
-  exit 6
+# run_repomix — pack the current work set into $OUTPUT.
+run_repomix() {
+  "${REPOMIX[@]}" --config "$CONFIG_FILE" --style "$STYLE" --output "$OUTPUT" \
+    >/dev/null 2>"$WORK_DIR/repomix.stderr"
 }
+
+# 4. Run repomix.
+if ! run_repomix; then
+  echo "handoff.sh: repomix invocation failed:" >&2
+  cat "$WORK_DIR/repomix.stderr" >&2
+  echo "  re-run manually: ${REPOMIX[*]} --config $CONFIG_FILE --style $STYLE --output $OUTPUT" >&2
+  exit 1
+fi
 
 if [ ! -s "$OUTPUT" ]; then
   echo "handoff.sh: repomix produced no output at $OUTPUT" >&2
-  exit 7
+  exit 1
 fi
 
 # 5. Token-budget enforcement.
 token_count="$("$SCRIPT_DIR/count_tokens.sh" "$OUTPUT" 2>/dev/null | tr -dc '0-9')"
 token_count="${token_count:-0}"
 
-trimmed=()
 trim_iterations=0
 MAX_TRIM_ITERATIONS=10
 
@@ -181,13 +249,13 @@ MAX_TRIM_ITERATIONS=10
 #   1. *.md   2. *.json   3. *.d.ts   4. *.css   5. *.scss
 #   6. *.yaml 7. *.yml    8. *.html
 # After those exhaust, drop largest non-source files (never .ts/.tsx/.py/.js/.jsx).
-work_csv="$include_csv"
-
-# Emit batches of file paths in drop-priority order, one batch per line,
-# comma-separated. Last batch is the size-sorted non-source fallback.
-DROP_BATCHES="$(python3 - "$work_csv" <<'PY'
-import os, sys, re
-files = [f for f in sys.argv[1].split(",") if f]
+# Batches land as newline-delimited files under $WORK_DIR/batches/ — never
+# comma/pipe-joined strings (issue #12: `,` and `|` are legal in filenames).
+mkdir -p "$WORK_DIR/batches"
+python3 - "$WORK_DIR/work.txt" "$WORK_DIR/batches" <<'PY'
+import os, re, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    files = [l for l in f.read().splitlines() if l]
 patterns = [r'\.md$', r'\.json$', r'\.d\.ts$', r'\.css$', r'\.scss$',
             r'\.yaml$', r'\.yml$', r'\.html$']
 batches = []
@@ -204,70 +272,66 @@ non_src = [f for f in remaining if os.path.isfile(f) and not f.endswith(src_exts
 non_src.sort(key=lambda f: os.path.getsize(f), reverse=True)
 for f in non_src:
     batches.append([f])
-for b in batches:
-    print(",".join(b))
+for i, b in enumerate(batches):
+    with open(os.path.join(sys.argv[2], "batch_%04d" % i), "w", encoding="utf-8") as out:
+        out.write("".join(f + "\n" for f in b))
 PY
-)"
 
-# Convert the multi-line blob to a bash array, one batch per element.
-batches=()
-while IFS= read -r line; do
-  [ -n "$line" ] && batches+=("$line")
-done <<< "$DROP_BATCHES"
+batch_files=()
+while IFS= read -r bf; do
+  [ -n "$bf" ] && batch_files+=("$bf")
+done < <(find "$WORK_DIR/batches" -type f -name 'batch_*' 2>/dev/null | LC_ALL=C sort)
 
 next_batch=0
 while [ "$token_count" -gt "$MAX_TOKENS" ] && [ "$trim_iterations" -lt "$MAX_TRIM_ITERATIONS" ]; do
-  if [ "$next_batch" -ge "${#batches[@]}" ]; then
+  if [ "$next_batch" -ge "${#batch_files[@]}" ]; then
     echo "handoff.sh: cannot trim further; ${token_count} tokens exceeds budget ${MAX_TOKENS} but no droppable files remain." >&2
     break
   fi
   trim_iterations=$((trim_iterations + 1))
 
-  # Drop this batch from work_csv and record what we dropped.
-  drop_csv="${batches[$next_batch]}"
+  # Drop this batch from work.txt and record what we dropped.
+  drop_file="${batch_files[$next_batch]}"
   next_batch=$((next_batch + 1))
 
-  result="$(python3 - "$work_csv" "$drop_csv" <<'PY'
+  python3 - "$WORK_DIR/work.txt" "$drop_file" "$WORK_DIR/trimmed.txt" <<'PY'
 import sys
-work = [f for f in sys.argv[1].split(",") if f]
-drop = set(f for f in sys.argv[2].split(",") if f)
+def lines(p):
+    with open(p, encoding="utf-8") as f:
+        return [l for l in f.read().splitlines() if l]
+work = lines(sys.argv[1])
+drop = set(lines(sys.argv[2]))
 kept = [f for f in work if f not in drop]
-print(",".join(kept))
-print("|".join(sorted(drop)))
+with open(sys.argv[1] + ".new", "w", encoding="utf-8") as f:
+    f.write("".join(x + "\n" for x in kept))
+with open(sys.argv[3], "a", encoding="utf-8") as f:
+    f.write("".join(x + "\n" for x in sorted(drop)))
 PY
-)"
-  work_csv="$(printf '%s\n' "$result" | sed -n '1p')"
-  dropped_blob="$(printf '%s\n' "$result" | sed -n '2p')"
-  if [ -n "$dropped_blob" ]; then
-    while IFS= read -r d; do
-      [ -n "$d" ] && trimmed+=("$d")
-    done < <(printf '%s\n' "$dropped_blob" | tr '|' '\n')
-  fi
+  mv "$WORK_DIR/work.txt.new" "$WORK_DIR/work.txt"
 
   # Re-pack with reduced include set. Surface repomix failures — don't silently
   # ship a stale snapshot with a wrong token count.
-  if ! "${REPOMIX[@]}" --style "$STYLE" --output "$OUTPUT" \
-        --include "$work_csv" --ignore "$exclude_csv" >/dev/null 2>&1; then
-    echo "handoff.sh: repomix repack failed during trimming (iteration $trim_iterations, after dropping ${#trimmed[@]} files)" >&2
-    echo "  retry without trimming: ${REPOMIX[*]} --style $STYLE --output $OUTPUT --include $work_csv" >&2
-    exit 8
+  write_repomix_config "$WORK_DIR/work.txt"
+  if ! run_repomix; then
+    dropped_count="$(awk 'NF' "$WORK_DIR/trimmed.txt" | wc -l | tr -d ' ')"
+    echo "handoff.sh: repomix repack failed during trimming (iteration $trim_iterations, after dropping ${dropped_count} files):" >&2
+    cat "$WORK_DIR/repomix.stderr" >&2
+    exit 1
   fi
   token_count="$("$SCRIPT_DIR/count_tokens.sh" "$OUTPUT" 2>/dev/null | tr -dc '0-9')"
   token_count="${token_count:-0}"
 done
 
 # 6. Emit summary JSON on stdout.
-TRIMMED_BLOB="$(printf '%s\n' "${trimmed[@]:-}")"
-
 OUTPUT="$OUTPUT" STYLE="$STYLE" REVIEWER="${REVIEWER:-default}" \
-  MAX_TOKENS="$MAX_TOKENS" TOKEN_COUNT="$token_count" \
-  TRIM_ITER="$trim_iterations" WORK_CSV="$work_csv" TRIMMED_BLOB="$TRIMMED_BLOB" \
-  python3 - <<'PY'
-import json, os
+  MAX_TOKENS="$MAX_TOKENS" TOKEN_COUNT="$token_count" TRIM_ITER="$trim_iterations" \
+  python3 - "$WORK_DIR/work.txt" "$WORK_DIR/trimmed.txt" <<'PY'
+import json, os, sys
+def lines(p):
+    with open(p, encoding="utf-8") as f:
+        return [l for l in f.read().splitlines() if l]
 mt = int(os.environ["MAX_TOKENS"])
 tc = int(os.environ.get("TOKEN_COUNT") or 0)
-inc = [f for f in os.environ["WORK_CSV"].split(",") if f]
-trimmed = [l for l in os.environ.get("TRIMMED_BLOB","").splitlines() if l]
 print(json.dumps({
   "output": os.environ["OUTPUT"],
   "style": os.environ["STYLE"],
@@ -275,8 +339,15 @@ print(json.dumps({
   "max_tokens": mt,
   "token_count": tc,
   "within_budget": tc <= mt,
-  "files_included": inc,
-  "files_trimmed": trimmed,
+  "files_included": lines(sys.argv[1]),
+  "files_trimmed": lines(sys.argv[2]),
   "trim_iterations": int(os.environ["TRIM_ITER"]),
 }, indent=2))
 PY
+
+# Callers checking only the exit code must not mistake an over-budget snapshot
+# for success (issue #12 high). The JSON above still carries the details.
+if [ "$token_count" -gt "$MAX_TOKENS" ]; then
+  echo "handoff.sh: snapshot exceeds token budget (${token_count} > ${MAX_TOKENS}) after trim exhaustion" >&2
+  exit 3
+fi
