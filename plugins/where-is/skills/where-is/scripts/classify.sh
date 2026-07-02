@@ -74,6 +74,9 @@ import json, os
 print(json.dumps({"kind": os.environ["KIND"], "normalized": os.environ["NORM"]}))
 '
 else
-  esc=$(printf '%s' "$normalized" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  # Strip control chars first (lossy, but raw control chars inside a JSON
+  # string are invalid JSON — the sed-only fallback used to emit them as-is),
+  # then escape backslashes and quotes.
+  esc=$(printf '%s' "$normalized" | LC_ALL=C tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
   printf '{"kind":"%s","normalized":"%s"}\n' "$kind" "$esc"
 fi

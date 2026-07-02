@@ -24,10 +24,22 @@ query=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --kind) kind_override="${2:-}"; shift 2 ;;
+    --kind)
+      # Guard the value: with `set -e`, a bare `shift 2` on a valueless last
+      # flag kills the script with a silent status-1 instead of a usage error.
+      if [ $# -lt 2 ]; then
+        echo "where-is.sh: --kind requires a value (symbol|pattern|path|concept)" >&2
+        exit 2
+      fi
+      kind_override="$2"; shift 2 ;;
     --json) json="true"; shift ;;
     --include-tests) include_tests="true"; shift ;;
-    --package) pkg_filter="${2:-}"; shift 2 ;;
+    --package)
+      if [ $# -lt 2 ]; then
+        echo "where-is.sh: --package requires a package name" >&2
+        exit 2
+      fi
+      pkg_filter="$2"; shift 2 ;;
     -h|--help)
       sed -n '2,12p' "$0"; exit 0 ;;
     --) shift; query="${1:-}"; shift || true ;;
@@ -81,30 +93,51 @@ layout=$(bash "$script_dir/detect_layout.sh" "$root" 2>/dev/null || echo '{"work
 
 # --- helpers ---------------------------------------------------------------
 
-classify_pkg() {
-  # Given a file path, print the workspace package name it belongs to.
-  # Reads $layout and $root from the enclosing scope. Strips an absolute $root
-  # prefix off `file` before comparing — ripgrep was producing absolute paths
-  # against relative workspace dirs, so every hit ended up labeled "(root)".
-  local file="$1"
+annotate_lines() {
+  # Read result lines on stdin and emit each prefixed with `  [pkg] `, where
+  # pkg is the workspace package the line's file belongs to. Single node
+  # invocation for the whole batch — the old per-line classify_pkg spawned a
+  # fresh `node -e` per result (30 hits ~= 1.5-2.5s of interpreter startup).
+  # Mode "hits" parses `file:line:snippet` lines; mode "files" treats each
+  # line as a bare path. Strips an absolute $root prefix off files before
+  # comparing — ripgrep produces absolute paths against relative workspace
+  # dirs, so every hit used to end up labeled "(root)".
+  local mode="$1"
   if ! command -v node >/dev/null 2>&1; then
-    echo "(root)"
+    # Match the old no-node classify_pkg fallback: label everything "(root)".
+    sed 's/^/  [(root)] /'
     return
   fi
   node -e '
     const layout = JSON.parse(process.argv[1]);
-    let file = process.argv[2];
-    const root = process.argv[3] || "";
-    if (root && file.startsWith(root + "/")) file = file.slice(root.length + 1);
-    let best = null;
-    for (const p of (layout.packages || [])) {
-      if (p.dir === ".") continue;
-      if (file === p.dir || file.startsWith(p.dir + "/")) {
-        if (!best || p.dir.length > best.dir.length) best = p;
+    const root = process.argv[2] || "";
+    const mode = process.argv[3] || "hits";
+    function pkgOf(file) {
+      if (root && file.startsWith(root + "/")) file = file.slice(root.length + 1);
+      let best = null;
+      for (const p of (layout.packages || [])) {
+        if (p.dir === "." || !p.dir) continue;
+        if (file === p.dir || file.startsWith(p.dir + "/")) {
+          if (!best || p.dir.length > best.dir.length) best = p;
+        }
       }
+      return best ? best.name : "(root)";
     }
-    process.stdout.write(best ? best.name : "(root)");
-  ' "$layout" "$file" "$root"
+    process.stdin.setEncoding("utf8"); let s = ""; process.stdin.on("data", c => s += c);
+    process.stdin.on("end", () => {
+      const out = [];
+      for (const line of s.split("\n")) {
+        if (!line) continue;
+        let file = line;
+        if (mode === "hits") {
+          const m = line.match(/^(.+?):\d+:/);
+          file = m ? m[1] : line.split(":")[0];
+        }
+        out.push("  [" + pkgOf(file) + "] " + line);
+      }
+      process.stdout.write(out.length ? out.join("\n") + "\n" : "");
+    });
+  ' "$layout" "$root" "$mode"
 }
 
 # Safely JSON-encode a string. Uses python3 json.dumps so newlines, tabs,
@@ -114,9 +147,10 @@ json_encode() {
   if command -v python3 >/dev/null 2>&1; then
     printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
   else
-    # Best-effort sed fallback for systems without python3. Covers the common
-    # cases; control chars will produce invalid JSON. Document the requirement.
-    printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    # Best-effort fallback for systems without python3: strip control chars
+    # (lossy, but keeps the JSON valid — raw control chars inside a string
+    # are invalid JSON), then escape backslashes and quotes.
+    printf '"%s"' "$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')"
   fi
 }
 
@@ -205,11 +239,7 @@ case "$kind" in
       if [ -z "$rg_hits" ]; then
         echo "  (no fallback hits — call Serena MCP tools above)"
       else
-        printf '%s\n' "$rg_hits" | while IFS= read -r line; do
-          file=$(printf '%s' "$line" | sed -n 's/^\([^:]*\):.*/\1/p')
-          pkg=$(classify_pkg "$file")
-          echo "  [$pkg] $line"
-        done
+        printf '%s\n' "$rg_hits" | annotate_lines hits
       fi
     fi
     ;;
@@ -230,7 +260,15 @@ case "$kind" in
       cs_args=()
       [ "$include_tests" = "true" ] && cs_args+=(--include-tests)
       [ -n "$pkg_filter" ] && cs_args+=(--package "$pkg_filter")
-      bash "$script_dir/concept_search.sh" "$normalized" "${cs_args[@]+"${cs_args[@]}"}"
+      raw=$(bash "$script_dir/concept_search.sh" "$normalized" "${cs_args[@]+"${cs_args[@]}"}")
+      if [ "$json" = "true" ]; then
+        # Keep the same JSON envelope as the ast-grep path — the fallback used
+        # to stream raw text regardless of --json, breaking JSON consumers.
+        emit_json_head
+        printf '"route":"ripgrep-fallback","matches":%s}\n' "$(json_encode "$raw")"
+      else
+        [ -n "$raw" ] && printf '%s\n' "$raw"
+      fi
       exit 0
     fi
 
@@ -304,11 +342,7 @@ for p in (d.get("packages") or []):
         echo "  (no files match)"
       else
         # Group by package.
-        printf '%s\n' "$files" | while IFS= read -r f; do
-          [ -z "$f" ] && continue
-          pkg=$(classify_pkg "$f")
-          echo "  [$pkg] $f"
-        done | sort
+        printf '%s\n' "$files" | annotate_lines files | sort
       fi
     fi
     ;;
@@ -350,12 +384,7 @@ for p in (d.get("packages") or []):
       if [ -z "$hits" ]; then
         echo "  (no hits)"
       else
-        printf '%s\n' "$hits" | while IFS= read -r line; do
-          file=$(printf '%s' "$line" | sed -n 's/^\([^:]*\):.*/\1/p')
-          [ -z "$file" ] && continue
-          pkg=$(classify_pkg "$file")
-          echo "  [$pkg] $line"
-        done
+        printf '%s\n' "$hits" | annotate_lines hits
       fi
     fi
     ;;

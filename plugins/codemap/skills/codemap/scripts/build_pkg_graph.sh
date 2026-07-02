@@ -13,8 +13,12 @@
 
 set -euo pipefail
 
-repo_root="${1:?repo_root required}"
-workspace_json="${2:?workspace_json required}"
+if [ $# -lt 2 ]; then
+  echo "usage: build_pkg_graph.sh <repo_root> <workspace_json_file> [--refresh]" >&2
+  exit 2
+fi
+repo_root="$1"
+workspace_json="$2"
 refresh_args=()
 if [ "${3:-}" = "--refresh" ]; then
   refresh_args=(--refresh)
@@ -77,7 +81,11 @@ if [ -x "$impact_script" ]; then
     if [ -f "$graph_json" ]; then
       # Roll file-level edges up to package-level using python or jq.
       if have_py; then
-        python3 - "$graph_json" "$pkgs_file" > "$edges_file" <<'PY' || true
+        # No `|| true` here: surface a rollup crash instead of masking it
+        # (kimi, PR #23 pass 1). Python's stderr is NOT suppressed, and on
+        # failure we degrade to an explicitly-empty edges file rather than
+        # leaving a half-written one behind.
+        if ! python3 - "$graph_json" "$pkgs_file" > "$edges_file" <<'PY' 
 import json,sys,os
 g=json.load(open(sys.argv[1]))
 pkgs=[]
@@ -104,6 +112,10 @@ for src, deps in (g.get("files") or {}).items():
 for (a,b),c in sorted(counts.items()):
   print(json.dumps({"from":a,"to":b,"count":c}))
 PY
+        then
+          echo "build_pkg_graph: package-edge rollup failed — continuing without dependency edges" >&2
+          : > "$edges_file"
+        fi
         if [ -s "$edges_file" ]; then
           cat "$edges_file"
           exit 0
@@ -133,19 +145,14 @@ if [ ! -s "$files_list" ]; then
   exit 0
 fi
 
-# Build a single ERE alternation pattern of all package names (regex-escaped).
-pat=$(awk '{
-  gsub(/[][\.|*+?(){}^$\\\/]/,"\\\\&")
-  print
-}' "$names_pattern_file" | paste -sd'|' -)
-
-[ -z "$pat" ] && exit 0
-
 # Roll up file -> package and count edges with python (portable, deterministic).
+# The alternation regex of package names is built INSIDE python via re.escape —
+# assembling it in shell and passing it as argv risked ARG_MAX on repos with
+# hundreds of packages, and awk-level escaping was best-effort.
 if have_py; then
-  python3 - "$repo_root" "$pkgs_file" "$files_list" "$pat" > "$edges_file" <<'PY' || true
+  python3 - "$repo_root" "$pkgs_file" "$files_list" "$names_pattern_file" > "$edges_file" <<'PY' || true
 import sys,re,os,json
-repo=sys.argv[1]; pkgs_path=sys.argv[2]; files_path=sys.argv[3]; pat=sys.argv[4]
+repo=sys.argv[1]; pkgs_path=sys.argv[2]; files_path=sys.argv[3]; names_path=sys.argv[4]
 pkgs=[]
 for line in open(pkgs_path):
   line=line.rstrip("\n")
@@ -159,7 +166,15 @@ def pkg_of(path):
     if path.startswith(d) and len(d)>bestlen:
       best=name; bestlen=len(d)
   return best
-rx=re.compile(r"""(?:from|require\s*\(\s*)\s*['"]("""+pat+r""")(?:/[^'"]*)?['"]""")
+names=[l.strip() for l in open(names_path) if l.strip()]
+if not names: sys.exit(0)
+pat="|".join(re.escape(n) for n in names)
+# Import shapes matched (gemini pass-3: dynamic + side-effect were missed):
+#   import x from 'pkg' / export ... from 'pkg'   -> from-branch
+#   require('pkg')                                -> require-branch
+#   import('pkg')  (dynamic)                      -> import( branch
+#   import 'pkg'   (bare side-effect)             -> import<space> branch
+rx=re.compile(r"""(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+)['"]("""+pat+r""")(?:/[^'"]*)?['"]""")
 counts={}
 for rel in (l.strip() for l in open(files_path)):
   if not rel: continue

@@ -11,6 +11,14 @@
 #
 # Globs: only single-trailing-* is expanded (e.g. packages/*). Nested **/ globs
 # are intentionally not supported — keeps the script bash-3.2 safe and predictable.
+#
+# pnpm-workspace.yaml parsing is deliberately NAIVE (documented limitation,
+# shared with where-is's detect_layout.sh): only a top-level `packages:` block
+# of `- glob` list items is read. Inline `# comments` are stripped and
+# single/double quotes unwrapped, but there is NO support for flow-style lists
+# (`packages: [a, b]`), block scalars, YAML anchors, or escape sequences
+# inside quoted strings. Exclusion patterns (`- '!...'`) are skipped. Repos
+# with exotic YAML should rely on package.json workspaces.
 
 set -euo pipefail
 
@@ -46,19 +54,25 @@ PY
 }
 
 # Detect language inside a directory by counting .ts(x) vs .js(x) source files.
+# Single find pass — the old implementation walked the tree twice (one find
+# for ts, one for js), doubling I/O per package on large repos. Extension
+# counting happens in awk over the one file list. (codemap.sh still does its
+# own os.walk for file counts; that lives in a different process/language and
+# is not folded here.)
 detect_lang() {
   local dir="$1"
   [ -d "$dir" ] || { printf 'unknown'; return 0; }
-  local ts js
-  ts=$(find "$dir" -type d \( -name node_modules -o -name dist -o -name build -o -name .next -o -name coverage \) -prune \
-        -o -type f \( -name '*.ts' -o -name '*.tsx' \) -print 2>/dev/null | wc -l | tr -d ' ')
-  js=$(find "$dir" -type d \( -name node_modules -o -name dist -o -name build -o -name .next -o -name coverage \) -prune \
-        -o -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.mjs' -o -name '*.cjs' \) -print 2>/dev/null | wc -l | tr -d ' ')
-  if [ "$ts" -gt 0 ] && [ "$js" -gt 0 ]; then printf 'mixed'
-  elif [ "$ts" -gt 0 ]; then printf 'ts'
-  elif [ "$js" -gt 0 ]; then printf 'js'
-  else printf 'unknown'
-  fi
+  find "$dir" -type d \( -name node_modules -o -name dist -o -name build -o -name .next -o -name coverage \) -prune \
+    -o -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.mjs' -o -name '*.cjs' \) -print 2>/dev/null \
+  | awk '
+      /\.tsx?$/ { ts++; next }
+      { js++ }
+      END {
+        if (ts > 0 && js > 0) printf "mixed"
+        else if (ts > 0) printf "ts"
+        else if (js > 0) printf "js"
+        else printf "unknown"
+      }'
 }
 
 # Escape a string for JSON embedding (handles quotes, backslashes, newlines).
@@ -138,6 +152,10 @@ else
   while IFS= read -r pat; do
     [ -z "$pat" ] && continue
     case "$pat" in
+      \!*)
+        # Exclusion pattern (pnpm/yarn `!...`) — skip rather than treating it
+        # as a positive glob for a literal `!...` directory.
+        ;;
       */\*)
         base="${pat%/\*}"
         if [ -d "$repo_root/$base" ]; then
