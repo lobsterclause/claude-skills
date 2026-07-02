@@ -107,6 +107,48 @@ assert_eq "enrichment: factcheck drop counted" \
 assert_eq "same-provider agreement NOT convergent (agy laps)" \
   "$(jq -r '.reviewers.antigravity.findings_convergent' <<<"$ENTRY")" "0"
 
+echo "── append_runlog.sh (reasonless-drop evidence gate) ──"
+# [pin: falsification evidence is binding — a drop without factcheck.reason
+# must reject the append, not silently starve the leaderboard]
+cat >"$T/bad-findings.json" <<'EOF'
+{"findings":[
+ {"id":"g1","file":"a.sh","line":1,"claim":"x","sources":["codex"],"factcheck":{"verdict":"drop","reason":""}},
+ {"id":"g2","file":"a.sh","line":2,"claim":"y","sources":["kimi"],"factcheck":{"verdict":"drop"}}
+]}
+EOF
+GATELOG="$T/gate-runlog.jsonl"
+CROSS_REVIEW_RUNLOG="$GATELOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" --findings "$T/bad-findings.json" >/dev/null 2>"$T/gate.err"
+rc=$?
+assert_eq "reasonless drops reject with exit 2" "$rc" "2"
+assert_contains "gate names the offending findings" "$(cat "$T/gate.err")" "g1, g2"
+[ ! -s "$GATELOG" ] && ok "nothing appended on gate rejection" || bad "runlog written despite gate rejection"
+cat >"$T/nonstring-findings.json" <<'EOF'
+{"findings":[
+ {"id":"g4","file":"a.sh","line":4,"claim":"w","sources":["glm"],"factcheck":{"verdict":"drop","reason":{"oops":"object"}}}
+]}
+EOF
+CROSS_REVIEW_RUNLOG="$GATELOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" --findings "$T/nonstring-findings.json" >/dev/null 2>&1
+assert_eq "non-string reason counts as reasonless (exit 2)" "$?" "2"
+printf 'not json\n' >"$T/garbage-findings.json"
+CROSS_REVIEW_RUNLOG="$GATELOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" --findings "$T/garbage-findings.json" >/dev/null 2>&1
+assert_eq "malformed findings JSON rejects (exit 2)" "$?" "2"
+cat >"$T/good-findings.json" <<'EOF'
+{"findings":[
+ {"id":"g3","file":"a.sh","line":3,"claim":"z","sources":["codex"],"factcheck":{"verdict":"drop","reason":"falsified: coreutils timeout -k exits 137; call sites treat 124||137 as timed_out"}}
+]}
+EOF
+CROSS_REVIEW_RUNLOG="$GATELOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" --findings "$T/good-findings.json" >/dev/null 2>&1
+assert_eq "evidenced drop appends fine" "$?" "0"
+assert_eq "gated entry landed in runlog" "$(wc -l <"$GATELOG" | tr -d ' ')" "1"
+
 echo "── select_roster.sh (determinism, floor, --fast fallback) ──"
 # select_roster.sh doesn't read CROSS_REVIEW_RUNLOG itself — it shells out to
 # leaderboard.sh, which inherits the exported var and reads the fixture. The
