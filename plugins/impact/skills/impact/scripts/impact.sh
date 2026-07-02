@@ -10,6 +10,8 @@
 #   impact.sh path1 [path2 ...]     # explicit
 #   impact.sh --refresh             # force-rebuild graph cache
 #   impact.sh --json                # JSON output
+#
+# Exit codes: 0 ok, 1 runtime failure, 2 usage.
 
 set -euo pipefail
 
@@ -26,7 +28,11 @@ explicit=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --staged) mode="staged"; shift ;;
-    --base)   mode="base"; base_ref="${2:-}"; shift 2 ;;
+    --base)
+      # Bounds-check before `shift 2`: `--base` as the last arg would make
+      # `shift 2` fail (silently, under set -e) with no diagnostic (issue #12).
+      [ $# -ge 2 ] || { echo "ERROR: --base requires a ref argument" >&2; exit 2; }
+      mode="base"; base_ref="$2"; shift 2 ;;
     --refresh) refresh="true"; shift ;;
     --json)   json="true"; shift ;;
     -h|--help)
@@ -82,12 +88,19 @@ graph_file=$("$script_dir/build_graph.sh" "${graph_args[@]}")
 # --- invert graph and compute reverse deps ---------------------------------
 # Use node for speed; the graph can be 100k+ nodes on a big monorepo.
 
-entries_csv=$(printf '%s\n' "${entries[@]}" | awk 'NF' | paste -sd '|' -)
+# Entries are handed to node via a newline-delimited temp file, not argv:
+#   - `|` (the old join delimiter) is legal in filenames (issue #12 high);
+#   - thousands of changed paths in one argv string hits ARG_MAX/E2BIG
+#     (~128KB per-arg OS limit) on huge PRs (issue #12 design high).
+entries_file=$(mktemp "${TMPDIR:-/tmp}/impact-entries.XXXXXXXX")
+tests_file=$(mktemp "${TMPDIR:-/tmp}/impact-tests.XXXXXXXX")
+trap 'rm -f "$entries_file" "$tests_file"' EXIT
+printf '%s\n' "${entries[@]}" | awk 'NF' > "$entries_file"
 
 report_json=$(node -e '
   const fs = require("fs"), path = require("path");
   const graph = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-  const entries = process.argv[2].split("|").filter(Boolean);
+  const entries = fs.readFileSync(process.argv[2], "utf8").split("\n").filter(Boolean);
   const root = process.argv[3];
 
   // Normalize: graph keys may be relative; entries from git diff are relative.
@@ -107,15 +120,21 @@ report_json=$(node -e '
   }
 
   // BFS reverse closure for each entry.
+  // `seen` is hoisted OUTSIDE the entries loop (issue #12 medium): shared
+  // ancestors are walked once, not once per entry. Skipping an entry already
+  // in `seen` is sound — its reverse closure was fully explored when it was
+  // first enqueued as another entry\x27s ancestor.
   const closure = new Set();
   const missing = [];
+  const seen = new Set();
   for (const e of entries) {
     const n = norm(e);
     if (!known.has(n)) missing.push(e);
+    if (seen.has(n)) continue;
+    seen.add(n);
     // BFS with an index pointer instead of Array.shift() — shift() is O(N) and
     // makes the whole traversal O(N²) on wide graphs.
     const q = [n];
-    const seen = new Set([n]);
     for (let head = 0; head < q.length; head++) {
       const cur = q[head];
       for (const parent of (rev.get(cur) || [])) {
@@ -140,7 +159,9 @@ report_json=$(node -e '
   const globs = [];
   if (fs.existsSync(pnpmWs)) {
     const txt = fs.readFileSync(pnpmWs, "utf8");
-    for (const m of txt.matchAll(/-\s+["\x27]?([^"\x27\n#]+)["\x27]?/g)) globs.push(m[1].trim());
+    // Anchored to line start so commented-out entries (`# - path/`) are not
+    // parsed as workspace globs (issue #12 medium, convergent gemini+kimi).
+    for (const m of txt.matchAll(/^[ \t]*-\s+["\x27]?([^"\x27\n#]+)["\x27]?/gm)) globs.push(m[1].trim());
   }
   const rootPj = readJson(path.join(root, "package.json"));
   if (rootPj && Array.isArray(rootPj.workspaces)) globs.push(...rootPj.workspaces);
@@ -148,6 +169,7 @@ report_json=$(node -e '
 
   // Expand globs (only single trailing /* supported — good enough for typical layouts).
   for (const g of globs) {
+    if (typeof g !== "string") continue; // package.json workspaces may hold non-strings
     const clean = g.replace(/\/\*$/, "");
     const full = path.join(root, clean);
     if (g.endsWith("/*") && fs.existsSync(full) && fs.statSync(full).isDirectory()) {
@@ -199,7 +221,7 @@ report_json=$(node -e '
     dynamicImportHits: dynamicHits,
   };
   process.stdout.write(JSON.stringify(out));
-' "$graph_file" "$entries_csv" "$repo_root")
+' "$graph_file" "$entries_file" "$repo_root")
 
 # --- find tests ------------------------------------------------------------
 
@@ -220,16 +242,19 @@ mkdir -p "$cache_dir"
 report_file="$cache_dir/last-report.txt"
 
 if [ "$json" = "true" ]; then
-  # Merge tests into JSON
+  # Merge tests into JSON. Tests are passed via a temp file, not argv — a big
+  # monorepo can surface enough test paths to hit the per-arg OS limit.
+  printf '%s\n' "$tests" > "$tests_file"
   printf '%s' "$report_json" | node -e '
     let s=""; process.stdin.on("data",c=>s+=c);
     process.stdin.on("end",()=>{
       const o = JSON.parse(s);
-      const t = (process.argv[1] || "").split("\n").filter(Boolean);
+      const fs = require("fs");
+      const t = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean);
       o.tests = t;
       process.stdout.write(JSON.stringify(o, null, 2));
     });
-  ' "$tests"
+  ' "$tests_file"
   exit 0
 fi
 
