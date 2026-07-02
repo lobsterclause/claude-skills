@@ -124,7 +124,7 @@ if command -v agy >/dev/null 2>&1; then
   fi
 fi
 if has_openrouter; then
-  POOL+=(glm deepseek mimo minimax fugu north nemotron)
+  POOL+=(glm deepseek mimo minimax north nemotron)
 fi
 
 if [[ ${#BASELINES[@]} -eq 0 && ${#POOL[@]} -eq 0 ]]; then

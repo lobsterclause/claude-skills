@@ -143,23 +143,6 @@
     "notes": "MiniMax M3 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (MiniMax), routed through OpenRouter (US) — surface both for security-sensitive repos."
   },
 
-  "fugu": {
-    "timeout_s": 600,
-    "provider": "sakana",
-    "cli": "openrouter",
-    "model": "sakana/fugu-ultra",
-    "retry_policy": "retry_on_transient",
-    "prompt_style": "diff_only_no_tools",
-    "severity_priors": {
-      "Critical": "trust_if_convergent",
-      "High": "verify",
-      "Medium": "verify",
-      "Low": "skip_unless_convergent"
-    },
-    "synthesis_weight": 0.7,
-    "specialization": "single-turn diff reasoning; independent provider vote (Sakana). Rotation-pool member — EXPERIMENTAL trial seat.",
-    "notes": "Sakana Fugu Ultra via OpenRouter. Added 2026-07-01 explicitly as a trial ('let's try fugu-ultra') — lowest starting weight in the fleet; promote or cut based on leaderboard data after ~10 sampled runs. Japan-origin provider (Sakana AI), routed through OpenRouter (US)."
-  },
 
   "north": {
     "timeout_s": 600,

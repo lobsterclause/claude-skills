@@ -17,12 +17,11 @@
 #   deepseek — deepseek/deepseek-v4-flash          (DeepSeek)
 #   mimo     — xiaomi/mimo-v2.5                    (Xiaomi)
 #   minimax  — minimax/minimax-m3                  (MiniMax)
-#   fugu     — sakana/fugu-ultra                   (Sakana — experimental)
 #   north    — cohere/north-mini-code:free         (Cohere — free tier)
 #   nemotron — nvidia/nemotron-3-ultra-550b-a55b:free (NVIDIA — free tier)
 #   All are single-turn diff-inline reviews (same niche as kimi), each an
 #   independent provider vote. Key resolution: $OPENROUTER_API_KEY env var,
-#   else ~/.config/openrouter/key. No key → all seven are skipped.
+#   else ~/.config/openrouter/key. No key → all six are skipped.
 #
 #   POLICY (2026-07-01, per Gabriel): first-party reviewers (codex, the agy
 #   Gemini laps, kimi) do NOT fall back to OpenRouter — when agy hits its
@@ -42,7 +41,7 @@
 #
 # Usage:
 #   run_reviewers.sh --base <branch> --out <dir>
-#                    [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,fugu,north,nemotron]
+#                    [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,north,nemotron]
 #                    [--timeout <sec>]
 #                    [--timeout-codex <sec>] [--timeout-antigravity <sec>]
 #                    [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>]
@@ -71,7 +70,7 @@
 #   <out>/kimi.stderr
 #   <out>/kimi.meta.json
 #   <out>/<or>.stdout          — each OpenRouter reviewer (glm, deepseek, mimo,
-#   <out>/<or>.stderr            minimax, fugu, north, nemotron) writes
+#   <out>/<or>.stderr            minimax, north, nemotron) writes
 #   <out>/<or>.meta.json         stdout/stderr/meta plus request.json and
 #                                response.json for audit
 #   <out>/agy.quota_exhausted  — sentinel: agy hit the shared Individual quota
@@ -129,7 +128,6 @@ glm_model="z-ai/glm-5.2"
 deepseek_model="deepseek/deepseek-v4-flash"
 mimo_model="xiaomi/mimo-v2.5"
 minimax_model="minimax/minimax-m3"
-fugu_model="sakana/fugu-ultra"
 north_model="cohere/north-mini-code:free"
 nemotron_model="nvidia/nemotron-3-ultra-550b-a55b:free"
 
@@ -166,7 +164,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,fugu,north,nemotron] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,north,nemotron] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>]" >&2
   exit 2
 fi
 
@@ -212,7 +210,6 @@ _zm="$(profile_get glm model)";         [[ -n "$_zm" ]] && glm_model="$_zm"
 _dm="$(profile_get deepseek model)";    [[ -n "$_dm" ]] && deepseek_model="$_dm"
 _mm="$(profile_get mimo model)";        [[ -n "$_mm" ]] && mimo_model="$_mm"
 _xm="$(profile_get minimax model)";     [[ -n "$_xm" ]] && minimax_model="$_xm"
-_fm="$(profile_get fugu model)";        [[ -n "$_fm" ]] && fugu_model="$_fm"
 _nm="$(profile_get north model)";       [[ -n "$_nm" ]] && north_model="$_nm"
 _vm="$(profile_get nemotron model)";    [[ -n "$_vm" ]] && nemotron_model="$_vm"
 
@@ -224,7 +221,6 @@ glm_profile="$(profile_timeout glm)"
 deepseek_profile="$(profile_timeout deepseek)"
 mimo_profile="$(profile_timeout mimo)"
 minimax_profile="$(profile_timeout minimax)"
-fugu_profile="$(profile_timeout fugu)"
 north_profile="$(profile_timeout north)"
 nemotron_profile="$(profile_timeout nemotron)"
 codex_timeout="${timeout_codex:-${timeout_s:-${codex_profile:-$(( timeout_s_default < 300 ? timeout_s_default : 300 ))}}}"
@@ -240,7 +236,6 @@ glm_timeout="${timeout_glm:-${timeout_s:-${glm_profile:-$timeout_s_default}}}"
 deepseek_timeout="${timeout_s:-${deepseek_profile:-$timeout_s_default}}"
 mimo_timeout="${timeout_s:-${mimo_profile:-$timeout_s_default}}"
 minimax_timeout="${timeout_s:-${minimax_profile:-$timeout_s_default}}"
-fugu_timeout="${timeout_s:-${fugu_profile:-$timeout_s_default}}"
 north_timeout="${timeout_s:-${north_profile:-$timeout_s_default}}"
 nemotron_timeout="${timeout_s:-${nemotron_profile:-$timeout_s_default}}"
 
@@ -464,10 +459,10 @@ openrouter_key() {
 # and prompt shape as run_kimi, and the same stdin/argv reasoning: the prompt
 # body goes through a temp file + jq --rawfile, never argv). This is the shared
 # runner for the whole OpenRouter rotation pool (glm, deepseek, mimo, minimax,
-# fugu) — each an independent provider vote. It is NOT a fallback lane for the
+# north, nemotron) — each an independent provider vote. It is NOT a fallback lane for the
 # first-party reviewers (policy: no OR fallbacks for codex/gemini/kimi).
 # Args:
-#   $1 slug           (glm | deepseek | mimo | minimax | fugu)
+#   $1 slug           (glm | deepseek | mimo | minimax | north | nemotron)
 #   $2 model          (OpenRouter model id, e.g. z-ai/glm-5.2)
 #   $3 timeout_budget (seconds)
 run_openrouter_reviewer() {
@@ -701,7 +696,6 @@ run_glm()      { run_openrouter_reviewer glm      "$glm_model"      "$glm_timeou
 run_deepseek() { run_openrouter_reviewer deepseek "$deepseek_model" "$deepseek_timeout"; }
 run_mimo()     { run_openrouter_reviewer mimo     "$mimo_model"     "$mimo_timeout"; }
 run_minimax()  { run_openrouter_reviewer minimax  "$minimax_model"  "$minimax_timeout"; }
-run_fugu()     { run_openrouter_reviewer fugu     "$fugu_model"     "$fugu_timeout"; }
 run_north()    { run_openrouter_reviewer north    "$north_model"    "$north_timeout"; }
 run_nemotron() { run_openrouter_reviewer nemotron "$nemotron_model" "$nemotron_timeout"; }
 
@@ -897,7 +891,7 @@ for r in "${requested[@]}"; do
         echo "kimi not installed — skipping" >&2
       fi
       ;;
-    glm|deepseek|mimo|minimax|fugu|north|nemotron)
+    glm|deepseek|mimo|minimax|north|nemotron)
       if ! command -v curl >/dev/null 2>&1; then
         echo "$r: curl not available — skipping" >&2
       elif openrouter_key >/dev/null 2>&1; then
@@ -940,7 +934,7 @@ for i in "${!pids[@]}"; do
         # failure_kind and the .agy.log tail are where the answer lives.
         echo "$name: failed (check failure_kind in $out/$name.meta.json; agy's own log: $out/$name.agy.log)" >&2 ;;
       kimi)        echo "$name: failed (see $out/kimi.stderr and $out/kimi.meta.json)" >&2 ;;
-      glm|deepseek|mimo|minimax|fugu|north|nemotron)
+      glm|deepseek|mimo|minimax|north|nemotron)
         echo "$name: failed (see $out/$name.stderr, $out/$name.response.json, $out/$name.meta.json)" >&2 ;;
       *)           echo "$name: failed (see $out/$name.* )" >&2 ;;
     esac
