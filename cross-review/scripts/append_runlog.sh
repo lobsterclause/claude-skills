@@ -84,7 +84,9 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-runlog="$(cd "$(dirname "$0")/.." && pwd)/runlog.jsonl"
+# CROSS_REVIEW_RUNLOG override exists for the fixture tests — production
+# callers never set it.
+runlog="${CROSS_REVIEW_RUNLOG:-$(cd "$(dirname "$0")/.." && pwd)/runlog.jsonl}"
 
 # Build per-reviewer payload from each meta.json the wrapper wrote. Reviewers
 # whose meta is absent are reported as "skipped" so the runlog entry is honest

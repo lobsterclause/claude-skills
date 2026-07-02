@@ -57,7 +57,9 @@ done
 command -v jq >/dev/null 2>&1 || { echo "leaderboard: jq required" >&2; exit 1; }
 
 skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
-runlog="$skill_dir/runlog.jsonl"
+# CROSS_REVIEW_RUNLOG override exists for the fixture tests (tests/run_tests.sh)
+# — production callers never set it.
+runlog="${CROSS_REVIEW_RUNLOG:-$skill_dir/runlog.jsonl}"
 profile_file="$skill_dir/references/reviewer_profiles.json"
 
 # Full fleet — keep in sync with run_reviewers.sh dispatch and analyze_runlog.sh.

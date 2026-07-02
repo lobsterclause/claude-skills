@@ -522,6 +522,10 @@ The merge is **idempotent** (exact-object dedup — re-importing the same source
 
 When tuning a reviewer's behavior — e.g. "kimi nits are wasting time, downweight them" — edit `reviewer_profiles.json`, not the wrapper or SKILL.md prose. Centralizing the config keeps the self-improvement loop honest: the analyzer's suggestions land in the same file humans edit by hand.
 
+## Tests
+
+`tests/run_tests.sh` is an offline fixture suite — no network, no reviewer CLIs (PATH shims), no tokens. It pins every behavior a real review round flagged on PR #18: leaderboard scoring branches, runlog status classification (`skipped`/`quota`) and findings enrichment, seeded selector determinism + the `--fast` floor fallback, kimi budget scaling + explicit-cap precedence, rc-137 timeout semantics, anchor resolution, and import idempotency. **Run it before editing any script**; in the skills repo, CI runs it on every PR plus a dual-copy identity check (root `cross-review/` must stay byte-identical to `plugins/cross-review/skills/cross-review/`).
+
 ## What this skill does not do
 
 - It does not run lint/type/test suites as the reviewer. Those are Claude's own pre-PR checks — this skill layers on top.
