@@ -196,6 +196,34 @@ assert_eq "rc 137 classified timed_out" "$(jq -r '.timed_out' "$T/o3/kimi.meta.j
 assert_eq "rc 137 not retried" "$(jq -r '.attempt' "$T/o3/kimi.meta.json")" "1"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 
+echo "── degenerate-output detection (glm 'wait'-loop class) ──"
+# [pin: PR #25 pass 3 — glm exited 0 with 145KB of repetition; the leaderboard
+# counted it as a reliable run. gzip-ratio detector: degenerate ≈69:1 vs
+# healthy 2-3:1 (calibrated on 2026-07-02 real outputs); threshold 15:1]
+cat >"$T/bin/kimi" <<'SHIM'
+#!/bin/sh
+cat >/dev/null 2>&1 || true
+i=0; while [ $i -lt 3000 ]; do printf 'wait wait wait wait wait wait wait wait '; i=$((i+1)); done
+SHIM
+chmod +x "$T/bin/kimi"
+# NOTE: this suite deliberately runs WITHOUT set -e (naked expected-fail
+# calls throughout) — do not flip it on here; a stray `set -e` mid-file
+# aborted the suite at the next nonzero exit (caught pre-merge, PR #26).
+bash "$S/run_reviewers.sh" --base main --out "$T/o5" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1 || true
+assert_eq "degenerate output stamps failure_kind" \
+  "$(jq -r '.failure_kind' "$T/o5/kimi.meta.json")" "degenerate_output"
+assert_eq "degenerate output classifies exit 5" \
+  "$(jq -r '.exit_code' "$T/o5/kimi.meta.json")" "5"
+printf '{"exit_code": 5, "duration_s": 9, "timed_out": false, "output_bytes": 96000, "attempt": 1, "timeout_budget_s": 600, "failure_kind": "degenerate_output"}\n' >"$RUN/raw/glm.meta.json"
+DEGLOG="$T/degen-runlog.jsonl"
+CROSS_REVIEW_RUNLOG="$DEGLOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+assert_eq "runlog status is degenerate, not ok" \
+  "$(tail -1 "$DEGLOG" | jq -r '.reviewers.glm.status')" "degenerate"
+rm -f "$RUN/raw/glm.meta.json"
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+
 echo "── anchor_findings.sh (resolve vs hallucinated location) ──"
 cat >"$T/anchor.json" <<EOF
 {"base":"main","head":"HEAD","findings":[
