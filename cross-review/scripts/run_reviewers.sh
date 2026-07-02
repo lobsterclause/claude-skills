@@ -327,22 +327,33 @@ run_with_timeout() {
   # deadline, KILL 10s later, exit codes mapped to coreutils semantics
   # (124 timeout, 137 KILL escalation) so meta.timed_out and the retry
   # policy behave identically on both paths.
+  # Job control (set -m) puts each background job in its own process group so
+  # the watchdog can signal the whole reviewer process TREE, not just the
+  # top-level PID — GNU timeout signals the child's group the same way, and
+  # without this a reviewer's child process would survive the "timeout" and
+  # keep burning CPU/API budget (codex P2, PR #21 pass 1).
+  local had_m=0; [[ $- == *m* ]] && had_m=1
+  set -m
   "$@" &
   local cmd_pid=$!
-  ( sleep "$secs" && kill -TERM "$cmd_pid" 2>/dev/null
-    sleep 10 && kill -KILL "$cmd_pid" 2>/dev/null ) &
+  ( sleep "$secs" && kill -TERM -- "-$cmd_pid" 2>/dev/null
+    sleep 10 && kill -KILL -- "-$cmd_pid" 2>/dev/null ) &
   local wd_pid=$!
+  [[ $had_m -eq 0 ]] && set +m
   local rc=0
   wait "$cmd_pid" 2>/dev/null || rc=$?
   if kill -0 "$wd_pid" 2>/dev/null; then
-    # Command beat the deadline — reap the watchdog subshell (and its sleep).
-    kill "$wd_pid" 2>/dev/null || true
+    # Command beat the deadline — group-kill the watchdog so its in-flight
+    # `sleep $secs` dies with it instead of lingering (kimi, PR #21 pass 1).
+    kill -TERM -- "-$wd_pid" 2>/dev/null || true
     wait "$wd_pid" 2>/dev/null || true
-  else
-    # Watchdog already fired: the nonzero rc came from its signal.
-    :
   fi
-  [[ $rc -eq 143 ]] && rc=124   # 128+SIGTERM → coreutils timeout exit
+  # 128+SIGTERM → coreutils timeout exit. 137 (KILL escalation) passes
+  # through UNMAPPED on purpose: coreutils `timeout -k` also exits 137 in
+  # that case and every meta call-site classifies `124 || 137` as timed_out —
+  # a convergent laguna+qwen "map 137→124" finding on pass 1 was falsified
+  # against the call sites (see feedback_convergent_not_correct).
+  [[ $rc -eq 143 ]] && rc=124
   return "$rc"
 }
 

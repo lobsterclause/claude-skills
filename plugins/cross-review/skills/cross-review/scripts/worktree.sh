@@ -37,8 +37,8 @@ LEGACY_TMP_ROOT="${CROSS_REVIEW_LEGACY_TMP_ROOT:-/tmp}"
 # Refuse to operate with a degenerate root: an empty or "/" WORKTREE_ROOT
 # would make the "$WORKTREE_ROOT"/cr-* prefix checks below match /cr-* at the
 # filesystem root, and sweep would scan / (issue #7).
-if [[ -z "$WORKTREE_ROOT" || "$WORKTREE_ROOT" == "/" ]]; then
-  echo "worktree.sh: WORKTREE_ROOT resolved empty — refusing to run" >&2
+if [[ -z "$WORKTREE_ROOT" || "$WORKTREE_ROOT" == "/" || "$WORKTREE_ROOT" != /* ]]; then
+  echo "worktree.sh: WORKTREE_ROOT must be a non-root absolute path (got: '$WORKTREE_ROOT') — refusing to run" >&2
   exit 2
 fi
 
@@ -50,7 +50,9 @@ fi
 #     cr-* worktree — covers pre-marker legacy dirs still on disk
 owns_worktree() {
   [[ -f "$1/.cross-review-worktree" ]] && return 0
-  [[ -f "$1/.git" ]] && grep -q 'worktrees/cr-' "$1/.git" 2>/dev/null
+  # Anchored to the gitdir pointer line so a stray substring elsewhere in an
+  # unrelated file can't count as ownership (laguna, PR #21 pass 1).
+  [[ -f "$1/.git" ]] && grep -q '^gitdir: .*/worktrees/cr-' "$1/.git" 2>/dev/null
 }
 
 usage() {
