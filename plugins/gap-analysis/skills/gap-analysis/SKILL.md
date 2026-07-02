@@ -49,10 +49,13 @@ Use the ClickUp MCP connector to pull live task data. Search your available tool
 > "ClickUp MCP connector is not available in this session. Please connect ClickUp through Claude's MCP settings before running the gap analysis. I need live access to pull tasks by status, including closed ones."
 
 When ClickUp MCP is available:
-- Pull all tasks from relevant spaces/lists/folders
-- **Include CLOSED and ARCHIVED tasks** — these are critical for ghost closure detection
+- Pull all OPEN / In Progress / Review tasks from relevant spaces/lists/folders
+- **Include CLOSED tasks, bounded** — closed tasks are critical for ghost closure detection, but a mature project can hold thousands and an unbounded pull will blow the context window or trip ClickUp rate limits. Default bounds: **closed within the last 90 days**, capped at the **most recent 200 closed tasks** (use the filter tool's date + pagination params, newest first)
+- **Exclude ARCHIVED tasks on the initial reconciliation pass** — treat a full archive review as a separate, explicitly-requested drill-down
+- **When to widen the window**: auditing a long-stalled initiative, chasing a ghost closure older than the window, or when the user names a specific historical phase — widen to that phase's date range (still paginated), not to "everything"
+- If the 200-task cap truncates the closed set, say so in the report ("closed-task scan covered the most recent 200 of ~N — older closures unverified") rather than presenting the scan as exhaustive
 - For each task capture: ID, title, status, assignee, dates, description, custom fields
-- Group by status: Open, In Progress, Review, Closed, Archived
+- Group by status: Open, In Progress, Review, Closed
 
 #### GitHub Issues
 
