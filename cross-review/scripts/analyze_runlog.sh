@@ -58,7 +58,7 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
-runlog="$skill_dir/runlog.jsonl"
+runlog="${CROSS_REVIEW_RUNLOG:-$skill_dir/runlog.jsonl}"
 profile_file="$skill_dir/references/reviewer_profiles.json"
 
 if [[ ! -f "$runlog" ]]; then
