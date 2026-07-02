@@ -84,6 +84,25 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+# Evidence gate (binding, not advisory): a finding dropped at triage MUST
+# carry its falsification evidence in factcheck.reason — the smoke test run,
+# the call-site citation, the man-page semantics. A reasonless drop is how a
+# real finding dies silently and how the leaderboard's survival signal rots.
+# This rejects the append outright rather than trusting the orchestrator to
+# remember the discipline (see feedback_convergent_not_correct: claims get
+# falsified AND confirmed by 5-second smoke tests — record which happened).
+if [[ -n "$findings_file" && -f "$findings_file" ]]; then
+  reasonless="$(jq -r '[(.findings // [])[]
+      | select((.factcheck.verdict // "") == "drop")
+      | select(((.factcheck.reason // "") | gsub("\\s"; "")) == "")
+      | (.id // .file // "?")] | join(", ")' "$findings_file" 2>/dev/null)"
+  if [[ -n "$reasonless" ]]; then
+    echo "append_runlog: dropped finding(s) without recorded evidence: $reasonless" >&2
+    echo "  record WHY each was falsified in factcheck.reason (smoke test output, call-site citation), then re-run" >&2
+    exit 2
+  fi
+fi
+
 # CROSS_REVIEW_RUNLOG override exists for the fixture tests — production
 # callers never set it.
 runlog="${CROSS_REVIEW_RUNLOG:-$(cd "$(dirname "$0")/.." && pwd)/runlog.jsonl}"
