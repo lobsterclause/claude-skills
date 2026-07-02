@@ -28,8 +28,30 @@
 
 set -euo pipefail
 
-WORKTREE_ROOT="$HOME/.cross-review/worktrees"
-RUN_ROOT="$HOME/.cross-review/runs"
+# Env overrides exist for the fixture tests (tests/run_tests.sh) — production
+# callers never set them.
+WORKTREE_ROOT="${CROSS_REVIEW_WORKTREE_ROOT:-$HOME/.cross-review/worktrees}"
+RUN_ROOT="${CROSS_REVIEW_RUN_ROOT:-$HOME/.cross-review/runs}"
+LEGACY_TMP_ROOT="${CROSS_REVIEW_LEGACY_TMP_ROOT:-/tmp}"
+
+# Refuse to operate with a degenerate root: an empty or "/" WORKTREE_ROOT
+# would make the "$WORKTREE_ROOT"/cr-* prefix checks below match /cr-* at the
+# filesystem root, and sweep would scan / (issue #7).
+if [[ -z "$WORKTREE_ROOT" || "$WORKTREE_ROOT" == "/" ]]; then
+  echo "worktree.sh: WORKTREE_ROOT resolved empty — refusing to run" >&2
+  exit 2
+fi
+
+# owns_worktree <dir> — true only for directories this tool provably created
+# (issue #6: sweep/end must never rm -rf a cr-* path someone else made).
+# Evidence, either of:
+#   - the marker file `start` drops in every worktree (v1.2+)
+#   - a git worktree pointer (.git FILE, not dir) whose gitdir references a
+#     cr-* worktree — covers pre-marker legacy dirs still on disk
+owns_worktree() {
+  [[ -f "$1/.cross-review-worktree" ]] && return 0
+  [[ -f "$1/.git" ]] && grep -q 'worktrees/cr-' "$1/.git" 2>/dev/null
+}
 
 usage() {
   cat <<EOF >&2
@@ -100,7 +122,7 @@ case "$cmd" in
     ts="$(date +%Y%m%dT%H%M%S)"
     pid="$$"
     # Slugify id so it's filesystem-safe.
-    slug="$(echo -n "$id" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
+    slug="$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
     run_name="${repo_name}-${slug}-${ts}-${pid}"
     wt_name="cr-${slug}-${ts}-${pid}"
     worktree="$WORKTREE_ROOT/$wt_name"
@@ -109,11 +131,19 @@ case "$cmd" in
     mkdir -p "$WORKTREE_ROOT" "$run_dir/raw"
 
     # Detached worktree so we don't take over the branch in the main checkout.
-    # --force because in rare cases the ref may be "in use" elsewhere.
-    if ! git worktree add -d --force "$worktree" "$ref" >/dev/null 2>&1; then
-      echo "git worktree add failed for ref: $ref" >&2
-      exit 1
+    # No blanket --force (issue #7): if add fails, prune stale worktree
+    # bookkeeping (the one recoverable cause we've seen) and retry once.
+    if ! git worktree add -d "$worktree" "$ref" >/dev/null 2>&1; then
+      git worktree prune 2>/dev/null || true
+      if ! git worktree add -d "$worktree" "$ref" >/dev/null 2>&1; then
+        echo "git worktree add failed for ref: $ref" >&2
+        exit 1
+      fi
     fi
+
+    # Ownership marker — sweep/end only ever delete marked dirs (issue #6).
+    printf 'created-by=cross-review/worktree.sh\nrun=%s\n' "$run_name" \
+      >"$worktree/.cross-review-worktree"
 
     # Size check — run inside the worktree.
     size_files=$(git -C "$worktree" diff --name-only "$base"...HEAD | wc -l | tr -d ' ')
@@ -167,7 +197,7 @@ case "$cmd" in
     #   - /private/tmp/cr-* (how git worktree list reports paths on macOS
     #     since /tmp is a symlink)
     case "$worktree" in
-      "$WORKTREE_ROOT"/cr-*|/tmp/cr-*|/private/tmp/cr-*) ;;
+      "$WORKTREE_ROOT"/cr-*|"$LEGACY_TMP_ROOT"/cr-*|/tmp/cr-*|/private/tmp/cr-*) ;;
       *)
         echo "refusing to remove path outside managed worktree roots: $worktree" >&2
         echo "  expected prefix: $WORKTREE_ROOT/cr-* (or /tmp/cr-*)" >&2
@@ -180,6 +210,18 @@ case "$cmd" in
       echo '{"removed": false, "reason": "not-found"}'
       exit 0
     fi
+
+    # Legacy tmp paths need positive ownership evidence before rm -rf — the
+    # prefix alone doesn't prove this tool created the dir (issue #6).
+    case "$worktree" in
+      "$WORKTREE_ROOT"/cr-*) ;;
+      *)
+        if ! owns_worktree "$worktree"; then
+          echo "refusing to remove unowned legacy path (no cross-review marker or worktree pointer): $worktree" >&2
+          exit 1
+        fi
+        ;;
+    esac
 
     # Best-effort: let git do its bookkeeping first, then scrub filesystem.
     git worktree remove --force "$worktree" 2>/dev/null || true
@@ -212,9 +254,16 @@ case "$cmd" in
     removed=0
     # Check both the canonical location and legacy /tmp — users upgrading from
     # the earlier skill version may still have /tmp/cr-* leftovers.
-    for root in "$WORKTREE_ROOT" "/tmp"; do
+    for root in "$WORKTREE_ROOT" "$LEGACY_TMP_ROOT"; do
       [[ -d "$root" ]] || continue
       while IFS= read -r -d '' dir; do
+        # The canonical root is ours by construction; anything under the
+        # legacy tmp root must carry ownership evidence (issue #6 — an
+        # unrelated /tmp/cr-foo must survive the sweep).
+        if [[ "$root" != "$WORKTREE_ROOT" ]] && ! owns_worktree "$dir"; then
+          echo "  sweep: skipping unowned $dir" >&2
+          continue
+        fi
         git worktree remove --force "$dir" 2>/dev/null || true
         # `|| true` so a single rm failure (permissions, mount issue, race
         # with another sweep) doesn't abort the loop and leave the rest

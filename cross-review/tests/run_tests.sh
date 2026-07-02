@@ -175,6 +175,52 @@ assert_eq "import: valid lines merged, garbage skipped" "$(wc -l <"$DST" | tr -d
 bash "$S/import_runlog.sh" --from "$SRC" --into "$DST" >/dev/null 2>&1
 assert_eq "import: re-import adds nothing (idempotent)" "$(wc -l <"$DST" | tr -d ' ')" "2"
 
+echo "── worktree.sh sweep/end ownership (issue #6) ──"
+# Sandboxed roots via the test-only env overrides; dirs backdated so -mmin matches.
+WTROOT="$T/wtroot"; FAKETMP="$T/faketmp"; mkdir -p "$WTROOT" "$FAKETMP"
+mkdir -p "$FAKETMP/cr-unrelated"          # someone else's dir — must survive
+mkdir -p "$FAKETMP/cr-legacy-owned"       # our marker → swept
+printf 'created-by=cross-review/worktree.sh\n' >"$FAKETMP/cr-legacy-owned/.cross-review-worktree"
+mkdir -p "$FAKETMP/cr-legacy-gitptr"      # pre-marker legacy worktree pointer → swept
+printf 'gitdir: /some/repo/.git/worktrees/cr-old-123\n' >"$FAKETMP/cr-legacy-gitptr/.git"
+mkdir -p "$WTROOT/cr-stale-canonical"     # canonical root is ours by construction → swept
+touch -t 202601010000 "$FAKETMP/cr-unrelated" "$FAKETMP/cr-legacy-owned" "$FAKETMP/cr-legacy-gitptr" "$WTROOT/cr-stale-canonical"
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_LEGACY_TMP_ROOT="$FAKETMP" \
+  bash "$S/worktree.sh" sweep --older-than-hours 1 >/dev/null 2>&1
+if [[ -d "$FAKETMP/cr-unrelated" ]]; then ok "unrelated tmp cr-* dir survives sweep"; else bad "unrelated tmp dir was deleted"; fi
+if [[ ! -d "$FAKETMP/cr-legacy-owned" ]]; then ok "marker-owned legacy dir swept"; else bad "marker-owned legacy dir not swept"; fi
+if [[ ! -d "$FAKETMP/cr-legacy-gitptr" ]]; then ok "git-pointer legacy dir swept"; else bad "git-pointer legacy dir not swept"; fi
+if [[ ! -d "$WTROOT/cr-stale-canonical" ]]; then ok "stale canonical-root dir swept"; else bad "canonical stale dir not swept"; fi
+
+# end: refuses an unowned legacy path, removes an owned one
+mkdir -p "$FAKETMP/cr-end-unowned" "$FAKETMP/cr-end-owned"
+printf 'created-by=cross-review/worktree.sh\n' >"$FAKETMP/cr-end-owned/.cross-review-worktree"
+if CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_LEGACY_TMP_ROOT="$FAKETMP" \
+  bash "$S/worktree.sh" end --worktree "$FAKETMP/cr-end-unowned" >/dev/null 2>&1; then
+  bad "end removed an unowned legacy path (exit 0)"
+else
+  if [[ -d "$FAKETMP/cr-end-unowned" ]]; then ok "end refuses unowned legacy path"; else bad "end deleted unowned dir despite nonzero exit"; fi
+fi
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_LEGACY_TMP_ROOT="$FAKETMP" \
+  bash "$S/worktree.sh" end --worktree "$FAKETMP/cr-end-owned" >/dev/null 2>&1
+if [[ ! -d "$FAKETMP/cr-end-owned" ]]; then ok "end removes marker-owned legacy path"; else bad "end did not remove owned dir"; fi
+
+# start drops the ownership marker in every new worktree
+( cd "$REPO" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$T/runroot" \
+    bash "$S/worktree.sh" start --ref HEAD --id marker-test --base main >"$T/wt-start.json" 2>/dev/null )
+WT_PATH="$(jq -r '.worktree' "$T/wt-start.json")"
+if [[ -n "$WT_PATH" && -f "$WT_PATH/.cross-review-worktree" ]]; then ok "start drops ownership marker"; else bad "no marker in fresh worktree ($WT_PATH)"; fi
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$WT_PATH" >/dev/null 2>&1 || true
+
+echo "── run_with_timeout bash-watchdog fallback (issue #7) ──"
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nsleep 30\n' >"$T/bin/kimi"
+WD_START=$(date +%s)
+CROSS_REVIEW_FORCE_NO_TIMEOUT_BIN=1 bash "$S/run_reviewers.sh" --base main --out "$T/o4" --reviewers kimi --timeout-kimi 3 >/dev/null 2>&1
+WD_ELAPSED=$(( $(date +%s) - WD_START ))
+assert_eq "watchdog classifies timeout (timed_out=true)" "$(jq -r '.timed_out' "$T/o4/kimi.meta.json")" "true"
+if [[ "$WD_ELAPSED" -lt 25 ]]; then ok "watchdog bounded the run (${WD_ELAPSED}s, shim sleeps 30)"; else bad "watchdog did not bound the run (${WD_ELAPSED}s)"; fi
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"

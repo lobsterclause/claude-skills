@@ -302,8 +302,12 @@ else
     [[ -x "$_tb" ]] && { TIMEOUT_BIN="$_tb"; break; }
   done
 fi
+# Fixture-test override: force the bash-watchdog fallback path even on
+# machines that have coreutils. Production callers never set it.
+[[ "${CROSS_REVIEW_FORCE_NO_TIMEOUT_BIN:-}" == "1" ]] && TIMEOUT_BIN=""
+
 if [[ -z "$TIMEOUT_BIN" ]]; then
-  echo "warning: neither 'timeout' nor 'gtimeout' is available (checked PATH + homebrew paths) — reviewers will run unbounded. Install coreutils (brew install coreutils) to enable the ${timeout_s_default}s cutoff." >&2
+  echo "warning: neither 'timeout' nor 'gtimeout' is available (checked PATH + homebrew paths) — falling back to a bash watchdog for the ${timeout_s_default}s cutoff. Install coreutils (brew install coreutils) for the real thing." >&2
 fi
 
 run_with_timeout() {
@@ -315,9 +319,31 @@ run_with_timeout() {
   local secs="$1"; shift
   if [[ -n "$TIMEOUT_BIN" ]]; then
     "$TIMEOUT_BIN" -k 10 "$secs" "$@"
-  else
-    "$@"
+    return
   fi
+  # No coreutils: bash-watchdog fallback so a reviewer can never run
+  # unbounded (issue #7 — a stalled auth prompt in a headless environment
+  # used to hang the round forever and burn API budget). TERM at the
+  # deadline, KILL 10s later, exit codes mapped to coreutils semantics
+  # (124 timeout, 137 KILL escalation) so meta.timed_out and the retry
+  # policy behave identically on both paths.
+  "$@" &
+  local cmd_pid=$!
+  ( sleep "$secs" && kill -TERM "$cmd_pid" 2>/dev/null
+    sleep 10 && kill -KILL "$cmd_pid" 2>/dev/null ) &
+  local wd_pid=$!
+  local rc=0
+  wait "$cmd_pid" 2>/dev/null || rc=$?
+  if kill -0 "$wd_pid" 2>/dev/null; then
+    # Command beat the deadline — reap the watchdog subshell (and its sleep).
+    kill "$wd_pid" 2>/dev/null || true
+    wait "$wd_pid" 2>/dev/null || true
+  else
+    # Watchdog already fired: the nonzero rc came from its signal.
+    :
+  fi
+  [[ $rc -eq 143 ]] && rc=124   # 128+SIGTERM → coreutils timeout exit
+  return "$rc"
 }
 
 # retry_reviewer: run a reviewer function once, retry once on nonzero exit
@@ -631,6 +657,18 @@ Changed files (diff --stat against $base):
 $diff_summary
 
 Use your file-reading tools to inspect the actual changes. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
+
+  # argv guard (issue #7): Linux caps a single argv element at ~128KB
+  # (MAX_ARG_STRLEN). The agy prompt is review_prompt + a 50-line diff-stat —
+  # small by construction — but a large custom review_prompt.txt would E2BIG
+  # the exec. agy has no documented stdin-prompt mode, so truncate loudly
+  # instead of dying opaquely.
+  if [[ ${#full_prompt} -gt 100000 ]]; then
+    echo "$slug: prompt is ${#full_prompt} bytes — truncating to 100KB to stay under the argv limit (trim references/review_prompt.txt)" >&2
+    full_prompt="${full_prompt:0:100000}
+
+[NOTE: prompt truncated at 100KB by the argv-size guard — the tail of the instructions above may be missing.]"
+  fi
 
   # In-CLI timeout runs 15s UNDER the wrapper budget so agy exits cleanly and
   # flushes partial output instead of being hard-killed by coreutils `timeout`
