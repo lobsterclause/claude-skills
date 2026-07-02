@@ -33,7 +33,7 @@
 #                   (rookies pass — unknown speed is worth one probe). For
 #                   quick loops and incremental re-review passes.
 #
-# stdout: comma-separated roster, e.g. "codex,kimi,gemini-pro,fugu"
+# stdout: comma-separated roster, e.g. "codex,kimi,gemini-pro,minimax"
 # stderr: the decision detail (weights, exclusions) for the log.
 
 set -uo pipefail
@@ -124,7 +124,7 @@ if command -v agy >/dev/null 2>&1; then
   fi
 fi
 if has_openrouter; then
-  POOL+=(glm deepseek mimo minimax fugu north nemotron)
+  POOL+=(glm deepseek mimo minimax qwen devstral laguna kat north nemotron)
 fi
 
 if [[ ${#BASELINES[@]} -eq 0 && ${#POOL[@]} -eq 0 ]]; then

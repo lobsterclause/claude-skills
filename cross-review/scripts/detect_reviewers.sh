@@ -2,8 +2,9 @@
 # detect_reviewers.sh — report which review CLIs are available.
 # Prints JSON to stdout:
 #   {"codex": bool, "antigravity": bool, "gemini-pro": bool, "kimi": bool,
-#    "glm": bool, "deepseek": bool, "mimo": bool, "minimax": bool,
-#    "fugu": bool, "north": bool, "nemotron": bool, "openrouter": bool}
+#    "glm": bool, "deepseek": bool, "mimo": bool, "minimax": bool, "qwen": bool,
+#    "devstral": bool, "laguna": bool, "kat": bool,
+#    "north": bool, "nemotron": bool, "openrouter": bool}
 #
 # As of the 2026-06-18 Gemini-CLI consumer sunset, BOTH Gemini-family reviewers
 # run on Google's `agy` (Antigravity) CLI:
@@ -13,8 +14,9 @@
 # `gemini` CLI is no longer used (it stopped serving consumer requests on
 # 2026-06-18). codex and kimi are unchanged.
 #
-# The OpenRouter pool (glm, deepseek, mimo, minimax, fugu, north, nemotron)
-# runs via the OpenRouter API — no CLI; all seven track the same condition:
+# The OpenRouter pool (glm, deepseek, mimo, minimax, qwen, devstral, laguna,
+# kat, north, nemotron)
+# runs via the OpenRouter API — no CLI; all ten track the same condition:
 # an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key) + curl.
 # `openrouter` reports that shared condition. NOTE: there is NO OpenRouter
 # fallback for the first-party reviewers (policy, 2026-07-01) — a failed agy
@@ -91,7 +93,7 @@ if command -v curl >/dev/null 2>&1; then
   fi
 fi
 
-printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "fugu": %s, "north": %s, "nemotron": %s, "openrouter": %s}\n' \
+printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "openrouter": %s}\n' \
   "$codex" "$antigravity" "$gemini_pro" "$kimi" \
-  "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" \
+  "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" \
   "$openrouter"

@@ -51,7 +51,7 @@ mkdir -p "$HOME"
 #   (0.45*1.0 + 0.35*0.25 + 0.20*1.0 = 0.7375 → 74); p50 of [100,200] → 200
 # kimi: 1 ok, no findings data → telemetry-only: 100*1.0*0.75 = 75
 # gemini-pro: ok,failed,failed,quota → reliability 1/4 → 18.75 → 19; quota=1
-# fugu: absent → rookie prior 50
+# nemotron: absent → rookie prior 50
 FIXLOG="$T/runlog.jsonl"
 cat >"$FIXLOG" <<'EOF'
 {"ts":"2026-07-01T01:00:00Z","reviewers":{"codex":{"status":"ok","exit_code":0,"duration_s":100,"output_bytes":10,"timeout_budget_s":300,"findings_total":3,"findings_convergent":1,"findings_dropped":0},"kimi":{"status":"ok","exit_code":0,"duration_s":40,"output_bytes":10,"timeout_budget_s":600},"gemini-pro":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":900}}}
@@ -73,9 +73,9 @@ assert_eq "gemini-pro reliability with quota+failed runs" \
 assert_eq "gemini-pro quota count" \
   "$(jq -r '.[] | select(.reviewer=="gemini-pro") | .quota' <<<"$LB")" "1"
 assert_eq "never-run reviewer gets rookie prior" \
-  "$(jq -r '.[] | select(.reviewer=="fugu") | .score' <<<"$LB")" "50"
+  "$(jq -r '.[] | select(.reviewer=="nemotron") | .score' <<<"$LB")" "50"
 assert_eq "rookie flag set" \
-  "$(jq -r '.[] | select(.reviewer=="fugu") | .rookie' <<<"$LB")" "true"
+  "$(jq -r '.[] | select(.reviewer=="nemotron") | .rookie' <<<"$LB")" "true"
 
 echo "── append_runlog.sh (status classification + enrichment) ──"
 # [pin: fugu pass-1 High FALSIFIED — missing meta must be skipped, not failed]
@@ -123,7 +123,7 @@ if [[ "$N_R1" -ge 3 ]]; then ok "roster ≥3 ($N_R1)"; else bad "roster <3 ($R1)
 # must redraw unfiltered and keep the floor]
 SLOWLOG="$T/slow-runlog.jsonl"
 jq -nc '{ts:"2026-07-01T05:00:00Z", reviewers: (
-  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","fugu","north","nemotron"]
+  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","qwen","devstral","laguna","kat","north","nemotron"]
   | map({key: ., value: {status:"ok", exit_code:0, duration_s:5000, output_bytes:10, timeout_budget_s:600}}) | from_entries)}' >"$SLOWLOG"
 FAST_ERR="$T/fast.err"
 RF="$(CROSS_REVIEW_RUNLOG="$SLOWLOG" bash "$S/select_roster.sh" --seed 7 --fast 2>"$FAST_ERR")"
