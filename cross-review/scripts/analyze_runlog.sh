@@ -77,7 +77,7 @@ if [[ "$n_entries" -eq 0 ]]; then
 fi
 
 # Per-reviewer aggregation.
-# For each reviewer in {codex, gemini, kimi}, compute:
+# For each reviewer in {codex, antigravity, gemini-pro, kimi}, compute:
 #   total: number of times the reviewer was attempted (status != "skipped")
 #   ok: status == "ok"
 #   timed_out: status == "timed_out"
@@ -94,6 +94,7 @@ analyze_reviewer() {
     | ($attempts | map(select(.status == "timed_out")) | length) as $to
     | ($attempts | map(select(.status == "empty"))     | length) as $empty
     | ($attempts | map(select(.status == "failed"))    | length) as $failed
+    | ($attempts | map(select(.status == "quota"))     | length) as $quota
     | ($attempts | map(.duration_s // 0) | sort) as $durs
     | ($durs | length) as $dn
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
@@ -106,6 +107,7 @@ analyze_reviewer() {
         timed_out: $to,
         empty: $empty,
         failed: $failed,
+        quota: $quota,
         reliability: (if $total == 0 then null else (($ok * 100) / $total | floor) end),
         timeout_rate: (if $total == 0 then null else (($to * 100) / $total | floor) end),
         empty_rate:   (if $total == 0 then null else (($empty * 100) / $total | floor) end),
@@ -116,9 +118,16 @@ analyze_reviewer() {
   '
 }
 
-codex_stats=$(analyze_reviewer codex)
-gemini_stats=$(analyze_reviewer gemini)
-kimi_stats=$(analyze_reviewer kimi)
+# Reviewer fleet. antigravity + gemini-pro both ride the agy CLI (Gemini Flash
+# and Pro laps respectively); codex, kimi, and the OpenRouter pool (glm,
+# deepseek, mimo, minimax, fugu, north, nemotron) are independent providers.
+# Keep in sync with run_reviewers.sh's dispatch and leaderboard.sh. Bash 3.2
+# (macOS /bin/bash) has no associative arrays — use a parallel indexed array.
+REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax fugu north nemotron)
+reviewer_stats=()
+for _r in "${REVIEWERS[@]}"; do
+  reviewer_stats+=("$(analyze_reviewer "$_r")")
+done
 
 # Suggest timeout bump if p95 is within 10% of current budget OR timeout rate >20%.
 suggest_timeout_bump() {
@@ -133,28 +142,33 @@ suggest_timeout_bump() {
   '
 }
 
-# Warning thresholds.
+# Warning thresholds. Quota outranks the generic warnings: it has a specific
+# remedy (wait for the reset / rely on the OpenRouter fallback), and its
+# failures would otherwise masquerade as a reliability problem worth "tuning".
 emit_warning() {
   local stats="$1"
   echo "$stats" | jq -r '
     if .total < 3 then empty   # not enough data
+    elif (.quota // 0) > 0 then
+      "  WARN: \(.reviewer) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). No fallback by policy; roster rotation covers the gap"
     elif .timeout_rate > 30 then
-      "  WARN: \(.reviewer) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — consider --timeout-\(.reviewer) \(.current_timeout_budget_s + 200)"
+      (if (["codex","antigravity","gemini-pro","kimi","glm"] | index(.reviewer)) != null
+       then "  WARN: \(.reviewer) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — consider --timeout-\(.reviewer) \(.current_timeout_budget_s + 200)"
+       # Only 5 reviewers have per-reviewer CLI flags; suggesting a nonexistent
+       # --timeout-<r> made the next run exit 2 (fugu finding, PR #18 pass 1).
+       else "  WARN: \(.reviewer) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — bump its timeout_s in reviewer_profiles.json (or pass global --timeout for a one-off)"
+       end)
     elif .empty_rate > 40 then
-      "  WARN: \(.reviewer) empty-output rate \(.empty_rate)% over last \(.total) runs — likely auth/wrapper issue, not a timeout fix"
+      "  WARN: \(.reviewer) empty-output rate \(.empty_rate)% over last \(.total) runs — quota or auth, not a timeout fix: check failure_kind in meta.json and the .agy.log tail (Individual quota → wait/fallback; otherwise re-run `agy login`)"
     elif .reliability != null and .reliability < 60 then
-      "  WARN: \(.reviewer) reliability \(.reliability)% over last \(.total) runs (ok=\(.ok), timeout=\(.timed_out), empty=\(.empty), failed=\(.failed))"
+      "  WARN: \(.reviewer) reliability \(.reliability)% over last \(.total) runs (ok=\(.ok), timeout=\(.timed_out), empty=\(.empty), failed=\(.failed), quota=\(.quota // 0))"
     else empty end
   '
 }
 
 case "$mode" in
   warn)
-    out=$({
-      emit_warning "$codex_stats"
-      emit_warning "$gemini_stats"
-      emit_warning "$kimi_stats"
-    })
+    out=$(for stats in "${reviewer_stats[@]}"; do emit_warning "$stats"; done)
     if [[ -n "$out" ]]; then
       echo "── cross-review pre-run check (last $n_entries runs) ──"
       echo "$out"
@@ -165,22 +179,18 @@ case "$mode" in
     ;;
   report)
     echo "── cross-review reviewer health (last $n_entries runs) ──"
-    for stats in "$codex_stats" "$gemini_stats" "$kimi_stats"; do
+    for stats in "${reviewer_stats[@]}"; do
       echo "$stats" | jq -r '
         if .total == 0 then "  \(.reviewer): no data in window"
         else
-          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s"
+          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  quota=\(.quota // 0)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s"
         end'
     done
     echo ""
     echo "── tuning suggestions ──"
     suggestions=$({
-      suggest_timeout_bump "$codex_stats"
-      suggest_timeout_bump "$gemini_stats"
-      suggest_timeout_bump "$kimi_stats"
-      emit_warning "$codex_stats"
-      emit_warning "$gemini_stats"
-      emit_warning "$kimi_stats"
+      for stats in "${reviewer_stats[@]}"; do suggest_timeout_bump "$stats"; done
+      for stats in "${reviewer_stats[@]}"; do emit_warning "$stats"; done
     } | sort -u)
     if [[ -n "$suggestions" ]]; then
       echo "$suggestions"

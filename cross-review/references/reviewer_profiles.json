@@ -1,9 +1,11 @@
 {
   "$schema": "./reviewer_profiles.schema.md",
-  "_doc": "Per-reviewer behavioral profile. Read by run_reviewers.sh (timeout, retry), the SKILL.md synthesis step (severity_priors, synthesis_weight), and analyze_runlog.sh (suggests edits to this file). Tune values here, not in scattered defaults. Edit notes/specialization freely; numeric tuning is best driven by analyze_runlog.sh suggestions over real runs.",
+  "_doc": "Per-reviewer behavioral profile. Read by run_reviewers.sh (timeout, retry, model), the SKILL.md synthesis step (severity_priors, synthesis_weight), and analyze_runlog.sh (suggests edits to this file). Tune values here, not in scattered defaults. Edit notes/specialization freely; numeric tuning is best driven by analyze_runlog.sh suggestions over real runs. NOTE: antigravity and gemini-pro are BOTH served by Google's `agy` (Antigravity) CLI as of the 2026-06-18 Gemini-CLI sunset — the only difference is the --model value. The `model` field here MUST be the exact display-name string `agy models` prints (e.g. \"Gemini 3.1 Pro (High)\"); agy silently falls back to its default (Flash) on an unrecognized model string instead of erroring.",
 
   "codex": {
     "timeout_s": 300,
+    "provider": "openai",
+    "baseline": true,
     "retry_policy": "none",
     "prompt_style": "builtin_review",
     "severity_priors": {
@@ -16,8 +18,11 @@
     "notes": "Reliable in observed runs (4/4 most rounds). Treat solo P1 as near-certain real. Output sometimes truncates on very long sessions — surface the truncation in the runlog rather than retrying."
   },
 
-  "gemini": {
+  "antigravity": {
     "timeout_s": 600,
+    "provider": "google",
+    "cli": "agy",
+    "model": "Gemini 3.5 Flash (High)",
     "retry_policy": "retry_on_transient",
     "prompt_style": "custom_with_tools",
     "severity_priors": {
@@ -27,12 +32,32 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.85,
-    "specialization": "architecture, side-effects, cross-file reasoning; uses file-reading tools",
-    "notes": "Solo findings have noticeably lower precision than convergent ones — weight accordingly. Frequent silent-failure mode (empty output) deserves runlog attention; if it recurs, check auth state before bumping timeout."
+    "specialization": "architecture, side-effects, cross-file reasoning; agentic file-reading via Google's `agy` CLI on Gemini 3.5 Flash. Fast lap of the Gemini fleet. Rotation-pool member (not a baseline).",
+    "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.5 Flash (High)\"` — must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones — weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing — quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. NO FALLBACK (policy 2026-07-01): on quota/panic the lap drops out of the round; roster rotation covers the gap and the leaderboard down-weights it until it recovers."
+  },
+
+  "gemini-pro": {
+    "timeout_s": 900,
+    "provider": "google",
+    "cli": "agy",
+    "model": "Gemini 3.1 Pro (High)",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "custom_with_tools",
+    "severity_priors": {
+      "Critical": "high_precision",
+      "High": "trust_if_convergent",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 1.0,
+    "specialization": "deep reasoning, multi-step logic, architectural and semantic-drift findings the Flash lap misses. Slower and more expensive than antigravity (Flash). Deep lap of the Gemini fleet. Rotation-pool member (not a baseline).",
+    "notes": "Same `agy` CLI as antigravity, just pinned to `--model \"Gemini 3.1 Pro (High)\"`. Previously routed through the standalone `gemini` CLI (-m gemini-3.1-pro-preview); migrated to agy in the 2026-06-18 sunset since agy now hosts Gemini 3.1 Pro and exposes --model. Pro is a preview tier — surface model-availability errors to the user, don't auto-retry. NOTE: antigravity + gemini-pro are the SAME provider (Google) — their agreement is NOT independent the way codex/kimi convergence is; treat Flash+Pro overlap as one provider's vote, not two. Pro triggers agy's SIGSEGV panic (RunCommandHandler nil-deref, agy ≤1.0.15) far more than Flash — it roams files/commands harder; exit 2 + ~20-45s + empty output = the panic, not your diff. Quota semantics: same as antigravity (check failure_kind). NO FALLBACK (policy 2026-07-01) — a failed lap drops out; rotation + leaderboard handle it."
   },
 
   "kimi": {
     "timeout_s": 600,
+    "provider": "moonshot",
+    "baseline": true,
     "retry_policy": "retry_on_transient",
     "prompt_style": "diff_only_no_tools",
     "severity_priors": {
@@ -46,12 +71,140 @@
     "notes": "Strong on the diff-as-given. Frequent Low/nit output is skip-worthy unless convergent. China-origin provider — surface for security-sensitive repos."
   },
 
+  "glm": {
+    "timeout_s": 600,
+    "provider": "zhipu",
+    "cli": "openrouter",
+    "model": "z-ai/glm-5.2",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.8,
+    "specialization": "single-turn diff reasoning; independent provider vote (Zhipu). Rotation-pool member.",
+    "notes": "GLM 5.2 via the OpenRouter chat-completions API — no CLI, no agentic tools; the diff is inlined (8000-line cap, same as kimi). Requires an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key); without one the wrapper skips it. Added 2026-07-01; verified live (caught a planted one-line bug as Critical on its first run). Priors start conservative (mirroring kimi); let leaderboard.sh data drive tuning. China-origin provider (Zhipu), routed through OpenRouter (US) — surface both for security-sensitive repos."
+  },
+
+  "deepseek": {
+    "timeout_s": 600,
+    "provider": "deepseek",
+    "cli": "openrouter",
+    "model": "deepseek/deepseek-v4-flash",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.8,
+    "specialization": "single-turn diff reasoning, fast tier; independent provider vote (DeepSeek). Rotation-pool member. Also the designated OpenRouter substitute for the fact-check pass when agy is down.",
+    "notes": "DeepSeek V4 Flash via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (DeepSeek), routed through OpenRouter (US) — surface both for security-sensitive repos."
+  },
+
+  "mimo": {
+    "timeout_s": 600,
+    "provider": "xiaomi",
+    "cli": "openrouter",
+    "model": "xiaomi/mimo-v2.5",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "specialization": "single-turn diff reasoning; independent provider vote (Xiaomi). Rotation-pool member.",
+    "notes": "Xiaomi MiMo v2.5 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Xiaomi), routed through OpenRouter (US) — surface both for security-sensitive repos."
+  },
+
+  "minimax": {
+    "timeout_s": 600,
+    "provider": "minimax",
+    "cli": "openrouter",
+    "model": "minimax/minimax-m3",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "specialization": "single-turn diff reasoning; independent provider vote (MiniMax). Rotation-pool member.",
+    "notes": "MiniMax M3 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (MiniMax), routed through OpenRouter (US) — surface both for security-sensitive repos."
+  },
+
+  "fugu": {
+    "timeout_s": 600,
+    "provider": "sakana",
+    "cli": "openrouter",
+    "model": "sakana/fugu-ultra",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.7,
+    "specialization": "single-turn diff reasoning; independent provider vote (Sakana). Rotation-pool member — EXPERIMENTAL trial seat.",
+    "notes": "Sakana Fugu Ultra via OpenRouter. Added 2026-07-01 explicitly as a trial ('let's try fugu-ultra') — lowest starting weight in the fleet; promote or cut based on leaderboard data after ~10 sampled runs. Japan-origin provider (Sakana AI), routed through OpenRouter (US)."
+  },
+
+  "north": {
+    "timeout_s": 600,
+    "provider": "cohere",
+    "cli": "openrouter",
+    "model": "cohere/north-mini-code:free",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "specialization": "single-turn diff reasoning, code-tuned; independent provider vote (Cohere). Rotation-pool member. FREE tier — zero marginal cost.",
+    "notes": "Cohere North Mini Code (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid — check the route's terms for security-sensitive repos. Canada-origin provider (Cohere)."
+  },
+
+  "nemotron": {
+    "timeout_s": 600,
+    "provider": "nvidia",
+    "cli": "openrouter",
+    "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "specialization": "single-turn diff reasoning, large-parameter tier; independent provider vote (NVIDIA). Rotation-pool member. FREE tier — zero marginal cost.",
+    "notes": "NVIDIA Nemotron 3 Ultra 550B (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid — check the route's terms for security-sensitive repos. US-origin provider (NVIDIA)."
+  },
+
   "_synthesis_rules": {
     "skip_unless_convergent": "Drop a single-reviewer finding at this severity unless another reviewer flagged the same file/area.",
     "trust_if_convergent": "Promote/keep when 2+ reviewers agree; downgrade or verify when solo.",
     "verify": "Solo finding is worth a manual look but not auto-applied.",
     "high_precision": "Solo finding still ranks; treat as near-certain real.",
     "medium_precision": "Solo finding ranks but apply judgment; convergence boosts confidence.",
-    "synthesis_weight_use": "Tie-breaker when reviewers disagree on severity. Higher weight wins. Also used by analyze_runlog.sh to compute weighted reliability scores."
+    "synthesis_weight_use": "Tie-breaker when reviewers disagree on severity. Higher weight wins. Also used by analyze_runlog.sh to compute weighted reliability scores.",
+    "provider_independence": "antigravity and gemini-pro share the Google/Gemini provider — count their agreement as a single provider vote when judging convergence. True independent convergence means agreement ACROSS providers; each profile carries an explicit `provider` field (openai, google, moonshot, zhipu, deepseek, xiaomi, minimax, sakana, cohere, nvidia). OpenRouter is a ROUTER, not a provider: glm through OpenRouter is the Zhipu vote, nemotron is the NVIDIA vote, etc. With a rotating roster, 3+ distinct-provider agreement is the near-certain tier.",
+    "rotation": "codex and kimi are fixed baselines (`baseline: true`) — always on. Everything else is drawn per-round by select_roster.sh, weighted by leaderboard.sh scores (see those scripts for the formula). NO OpenRouter fallbacks for first-party reviewers (codex/gemini/claude — policy 2026-07-01): a failed lap drops out and rotation covers the gap."
   }
 }
