@@ -153,7 +153,9 @@ for r in "${POOL[@]}"; do
 done
 
 # --- weighted sample without replacement (awk: proper float math, seedable) ---
-selected="$(printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v fastmax="$fast_max" '
+draw_picks() {
+  # $1 = fastmax (0 disables the speed filter)
+  printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v fastmax="$1" '
   BEGIN { srand(seed) }
   NF >= 4 {
     p50 = (NF >= 5 ? $5 + 0 : 0)
@@ -190,7 +192,17 @@ selected="$(printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v 
       }
     }
   }
-')"
+'
+}
+
+selected="$(draw_picks "$fast_max")"
+# --fast can filter the ENTIRE pool (kimi+deepseek convergent finding, PR #18
+# pass 3): fall back to an unfiltered draw rather than shipping a roster below
+# the ≥3 floor — a slow rotation pick beats a missing one.
+if [[ -z "$selected" && "$fast_max" -gt 0 ]]; then
+  echo "  note: --fast filtered every candidate — redrawing without the speed filter" >&2
+  selected="$(draw_picks 0)"
+fi
 
 # --- assemble ------------------------------------------------------------------
 roster=""

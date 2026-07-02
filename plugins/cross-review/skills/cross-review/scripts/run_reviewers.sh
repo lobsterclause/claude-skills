@@ -334,7 +334,7 @@ retry_reviewer() {
     unset CROSS_REVIEW_ATTEMPT
     return "$rc"
   fi
-  if [[ $rc -ne 0 && $rc -ne 124 ]]; then
+  if [[ $rc -ne 0 && $rc -ne 124 && $rc -ne 137 ]]; then
     local backoff=$((5 + RANDOM % 11))
     echo "$name: attempt 1 failed (rc=$rc), retrying in ${backoff}s" >&2
     sleep "$backoff"
@@ -346,8 +346,11 @@ retry_reviewer() {
     else
       echo "$name: attempt 2 also failed (rc=$rc)" >&2
     fi
-  elif [[ $rc -eq 124 ]]; then
-    echo "$name: attempt 1 timed out (rc=124), not retrying — bump --timeout-$name if this recurs" >&2
+  elif [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    # 137 = timeout's -k SIGKILL after an ignored SIGTERM (codex P2, PR #18
+    # pass 3) — same retry semantics as 124: the budget was consumed and a
+    # retry would just consume it again.
+    echo "$name: attempt 1 timed out (rc=$rc), not retrying — bump the timeout if this recurs" >&2
   fi
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
@@ -426,7 +429,7 @@ run_codex() {
   rc=$?
   end=$(date +%s)
   local timed_out="false"
-  [[ $rc -eq 124 ]] && timed_out="true"
+  [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
   local bytes
   bytes=$(output_bytes_of "$out/codex.stdout")
   printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d}\n' \
@@ -546,7 +549,7 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   fi
   end=$(date +%s)
   local timed_out="false"
-  [[ $rc -eq 124 ]] && timed_out="true"
+  [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
   local bytes
   bytes=$(output_bytes_of "$out/${slug}.stdout")
   # rc=0 with empty content is still a failure (filtered/refused/odd response)
@@ -629,7 +632,7 @@ Use your file-reading tools to inspect the actual changes. Do NOT edit, write, o
   rc=$?
   end=$(date +%s)
   local timed_out="false"
-  [[ $rc -eq 124 ]] && timed_out="true"
+  [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
   local bytes
   bytes=$(output_bytes_of "$out/${slug}.stdout")
 
@@ -775,8 +778,11 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # speed-aware roster draw and incremental re-reviews keep big-diff rounds
   # rare. Empirical rate ≈500s per 1000 diff lines beyond the first 1000.
   local kimi_budget="$kimi_timeout"
-  if [[ "${total_lines:-0}" -gt 1000 ]]; then
-    kimi_budget=$(( kimi_timeout + 500 * ( (total_lines - 1000) / 1000 + 1 ) ))
+  # Scale ONLY when the caller didn't set an explicit cap: --timeout-kimi or
+  # --timeout means a smoke run / CI hard cap and must be honored verbatim
+  # (codex P2, PR #18 pass 3). Ceiling division per north's pass-3 nit.
+  if [[ -z "$timeout_kimi" && -z "$timeout_s" && "${total_lines:-0}" -gt 1000 ]]; then
+    kimi_budget=$(( kimi_timeout + 500 * ( (total_lines - 1000 + 999) / 1000 ) ))
     [[ "$kimi_budget" -gt 3000 ]] && kimi_budget=3000
     echo "kimi: ${total_lines}-line diff — budget scaled ${kimi_timeout}s → ${kimi_budget}s" >&2
   fi
@@ -791,7 +797,7 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # partial review as complete. Convergent finding from both codex and kimi
   # itself in pass 2 of cross-reviewing this skill.
   local timed_out="false"
-  [[ $rc -eq 124 ]] && timed_out="true"
+  [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
   local bytes
   bytes=$(output_bytes_of "$out/kimi.stdout")
   printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d}\n' \
