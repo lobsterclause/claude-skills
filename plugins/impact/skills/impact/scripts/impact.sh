@@ -83,7 +83,9 @@ fi
 
 graph_args=()
 [ "$refresh" = "true" ] && graph_args+=(--refresh)
-graph_file=$("$script_dir/build_graph.sh" "${graph_args[@]}")
+# `${arr[@]+...}` guards against `set -u` crashing on an empty array
+# (bash 3.2 / macOS default) — found by the fixture suite.
+graph_file=$("$script_dir/build_graph.sh" ${graph_args[@]+"${graph_args[@]}"})
 
 # --- invert graph and compute reverse deps ---------------------------------
 # Use node for speed; the graph can be 100k+ nodes on a big monorepo.
