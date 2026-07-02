@@ -145,6 +145,12 @@ for p in (l.rstrip("\n") for l in sys.stdin):
     if n not in seen:
         seen.add(n); print(n)')
         EXPANDED=("${NORMALIZED[@]+"${NORMALIZED[@]}"}")
+      else
+        # Fail-closed (kimi, PR #24 pass 2): without python3 the containment
+        # check above cannot run, and un-normalized `a/../../..` expansions
+        # must NOT reach the include list. Imports are enrichment — drop them.
+        echo "compute_scope.sh: python3 unavailable — skipping import expansion (containment check requires it)" >&2
+        EXPANDED=()
       fi
       if [ "${#EXPANDED[@]}" -gt 0 ]; then
         INCLUDES+=("${EXPANDED[@]}")

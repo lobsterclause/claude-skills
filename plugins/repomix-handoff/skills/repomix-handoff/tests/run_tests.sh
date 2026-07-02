@@ -224,6 +224,22 @@ assert_eq "all 300 files in scope" "$n_inc" "300"
 assert_contains "last file's content packed" "$(cat "$T/big.md")" "FILE_299_MARKER"
 
 echo
+echo "── handoff.sh (repo repomix.config.json ignores merged) ──"
+# [pin: PR #24 pass 2 (codex P2) — passing --config made repomix skip the
+# repo's own config, silently dropping a project's deliberate ignores]
+printf '{"ignore":{"customPatterns":["src/secret-*.ts"]}}\n' > repomix.config.json
+set +e
+DR2="$(bash "$S/handoff.sh" --base "$BASE_BRANCH" --dry-run 2>/dev/null)"; rc=$?
+set -e
+assert_eq "dry-run with repo config exits 0" "$rc" "0"
+MERGED_CFG="$(printf '%s' "$DR2" | jq -r '.config // empty' 2>/dev/null)"
+if [ -n "$MERGED_CFG" ] && jq -e '.ignore.customPatterns | index("src/secret-*.ts")' "$MERGED_CFG" >/dev/null 2>&1; then
+  ok "repo config ignore pattern merged into generated config"
+else
+  bad "repo config ignores were dropped (codex P2 regression; cfg: ${MERGED_CFG:-none})"
+fi
+rm -f repomix.config.json
+
 echo "── handoff.sh (--max-tokens validation) ──"
 # [pin: PR #24 pass 1 (kimi) — negative/non-numeric budgets corrupted trim math]
 set +e

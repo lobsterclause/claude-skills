@@ -182,12 +182,28 @@ CONFIG_FILE="$WORK_DIR/repomix.config.json"
 
 # write_repomix_config <include-list-file> — regenerates $CONFIG_FILE.
 write_repomix_config() {
-  python3 - "$1" "$WORK_DIR/exclude.txt" "$CONFIG_FILE" <<'PY'
-import json, sys
+  # Passing --config makes repomix IGNORE any repo-level repomix.config.json —
+  # including a project's deliberate ignore patterns (privacy-relevant). Merge
+  # the repo config's ignores into the generated one so a project's "never
+  # pack this" survives the handoff (codex P2, PR #24 pass 2). include stays
+  # ours: the computed scope IS the point of the generated config.
+  python3 - "$1" "$WORK_DIR/exclude.txt" "$CONFIG_FILE" "repomix.config.json" <<'PY'
+import json, sys, os
 def lines(p):
     with open(p, encoding="utf-8") as f:
         return [l for l in f.read().splitlines() if l]
-cfg = {"include": lines(sys.argv[1]), "ignore": {"customPatterns": lines(sys.argv[2])}}
+ignore = lines(sys.argv[2])
+repo_cfg_path = sys.argv[4]
+if os.path.isfile(repo_cfg_path):
+    try:
+        with open(repo_cfg_path, encoding="utf-8") as f:
+            repo_cfg = json.load(f)
+        for pat in (repo_cfg.get("ignore", {}) or {}).get("customPatterns", []) or []:
+            if isinstance(pat, str) and pat and pat not in ignore:
+                ignore.append(pat)
+    except Exception as e:
+        print(f"handoff.sh: could not merge {repo_cfg_path}: {e}", file=sys.stderr)
+cfg = {"include": lines(sys.argv[1]), "ignore": {"customPatterns": ignore}}
 with open(sys.argv[3], "w", encoding="utf-8") as f:
     json.dump(cfg, f)
 PY
