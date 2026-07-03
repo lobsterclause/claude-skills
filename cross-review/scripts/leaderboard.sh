@@ -32,7 +32,9 @@
 #     --mode json    one JSON array, consumed by select_roster.sh
 #
 # JSON fields per reviewer: reviewer, provider, attempts, ok, quota,
-# reliability_pct, findings, convergent, dropped, latest_status, rookie, score.
+# reliability_pct, findings, convergent, dropped, latest_status, rookie, score,
+# sleep_excluded (timed_out samples whose wall clock overran the enforced
+# budget — machine slept mid-run; dropped from the attempt set, see below).
 
 set -uo pipefail
 
@@ -101,7 +103,20 @@ score_reviewer() {
   local r="$1" provider="$2"
   printf '%s\n' "$structured" | jq -s --arg r "$r" --arg provider "$provider" '
     map(.reviewers[$r] // {status:"skipped"}) as $rs
-    | ($rs | map(select(.status != "skipped"))) as $attempts
+    # Sleep-killed timeouts (2026-07-03): a timed_out sample whose wall-clock
+    # duration overran the ENFORCED budget by >60s means the machine slept
+    # mid-run (gtimeout/curl timers freeze during system sleep) — it says
+    # nothing about the provider and must not ding reliability. Excluded from
+    # the attempt set entirely. ok-status over-budget runs are KEPT: they
+    # delivered a review, and their durations feed the --fast speed signal.
+    | ($rs | map(select((.status == "timed_out")
+                        and ((.timeout_budget_s // 0) > 0)
+                        and ((.duration_s // 0) > ((.timeout_budget_s // 0) + 60))))
+           | length) as $sleep_excluded
+    | ($rs | map(select(.status != "skipped"
+                        and (((.status == "timed_out")
+                              and ((.timeout_budget_s // 0) > 0)
+                              and ((.duration_s // 0) > ((.timeout_budget_s // 0) + 60))) | not)))) as $attempts
     | ($attempts | length) as $n
     | ($attempts | map(select(.status == "ok"))    | length) as $ok
     | ($attempts | map(select(.status == "quota")) | length) as $quota
@@ -132,6 +147,7 @@ score_reviewer() {
         dropped: $dropped,
         latest_status: $latest,
         p50_duration_s: $p50,
+        sleep_excluded: $sleep_excluded,
         rookie: ($n == 0),
         score: $score }
   '
@@ -151,7 +167,7 @@ case "$mode" in
     echo "── cross-review leaderboard (window: last $recent structured runs) ──"
     printf '%s' "$rows" | jq -s -r '
       sort_by(-.score) | to_entries[] |
-      "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)"
+      "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if (.value.sleep_excluded // 0) > 0 then " (sleep-excl ×\(.value.sleep_excluded))" else "" end)\(if .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)"
     '
     echo "──"
     echo "  score = 45% reliability + 35% cross-provider convergence + 20% fact-check survival"

@@ -155,6 +155,7 @@ reviewer_obj() {
   jq -c '. + {status: (if .timed_out == true then "timed_out"
                        elif .failure_kind == "quota_exhausted" then "quota"
                        elif .failure_kind == "degenerate_output" then "degenerate"
+                       elif .failure_kind == "no_verdict_output" then "no_verdict"
                        elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
                        elif .exit_code == 0 then "empty"
                        else "failed" end)}' "$meta" 2>/dev/null \

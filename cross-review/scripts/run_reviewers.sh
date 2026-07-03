@@ -443,6 +443,37 @@ output_degenerate() {
   [[ $(( comp * 15 )) -lt "$raw" ]]
 }
 
+# output_no_verdict <file> — detect a preamble-only response: rc=0 with a tiny
+# output carrying neither a severity rank nor an explicit clean verdict. kimi
+# delivered a 161-byte "I will now review…" preamble on PR #2620 (2026-07-03)
+# that logged status ok — synthesis silently lost the vote while the
+# leaderboard counted a reliable run. The gzip gate can't catch short
+# non-repetitive text, so this is its < 512-byte complement.
+# A legitimate clean review is often SHORT but always SAYS so ("no findings",
+# "looks correct", severity headings…) — require one marker below 512 bytes;
+# at ≥512 bytes assume real prose and stay out of the way. False positives are
+# cheap: rc=5 gets one retry_reviewer swing and an honest failure_kind.
+output_no_verdict() {
+  local f="$1" raw
+  raw=$(output_bytes_of "$f")
+  [[ "$raw" -gt 0 && "$raw" -lt 512 ]] || return 1
+  # NOTE: no empty alternatives — `(a |b |)` is invalid POSIX ERE and BSD
+  # grep silently fails the whole pattern; use `( … )?` optional groups.
+  ! grep -qiE 'critical|high|medium|low|no (significant |material )?(issues|findings|problems|concerns)|looks (good|correct|fine)|lgtm|no regressions|\[P[0-9]\]' "$f"
+}
+
+# wall_over_budget <duration_s> <budget_s> — "true" when the wall-clock
+# duration overran the enforced budget by >60s. That cannot happen when
+# enforcement works (TERM/KILL lag ≤10s; curl fires at --max-time exactly)
+# UNLESS the machine slept mid-run: gtimeout/curl timers freeze during system
+# sleep while date +%s keeps counting (observed 2026-07-03 — codex logged
+# 1024s against a 300s budget with rc=0 during pmset Dark Wake churn).
+# Stamped into meta.json so analyze_runlog/leaderboard can discount the sample.
+wall_over_budget() {
+  local dur="$1" budget="$2"
+  if [[ "$dur" -gt $(( budget + 60 )) ]]; then echo "true"; else echo "false"; fi
+}
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompt_file="$script_dir/../references/review_prompt.txt"
 
@@ -512,9 +543,13 @@ run_codex() {
     echo "codex: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
     rc=5
+  elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_no_verdict "$out/codex.stdout"; then
+    echo "codex: output is preamble-only (<512B, no severity or clean-verdict marker) — classifying as failed" >&2
+    fk_json='"no_verdict_output"'
+    rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" "$fk_json" >"$out/codex.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" "$fk_json" "$(wall_over_budget "$((end - start))" "$codex_timeout")" >"$out/codex.meta.json"
   # IMPORTANT: return $rc so the caller's `wait "$pid"` sees the real exit code.
   # Previous version ended with `printf` whose success (exit 0) masked every
   # upstream reviewer failure.
@@ -643,9 +678,13 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     echo "$slug: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
     rc=5
+  elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_no_verdict "$out/${slug}.stdout"; then
+    echo "$slug: output is preamble-only (<512B, no severity or clean-verdict marker) — classifying as failed" >&2
+    fk_json='"no_verdict_output"'
+    rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "openrouter", "failure_kind": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" >"$out/${slug}.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "openrouter", "failure_kind": %s, "wall_over_budget": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" >"$out/${slug}.meta.json"
   return "$rc"
 }
 
@@ -777,12 +816,17 @@ Use your file-reading tools to inspect the actual changes. Do NOT edit, write, o
     echo "$slug: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     failure_kind="degenerate_output"
     rc=5
+  elif output_no_verdict "$out/${slug}.stdout"; then
+    # rc=0 with a tiny preamble and no verdict — kimi's PR #2620 class.
+    echo "$slug: output is preamble-only (<512B, no severity or clean-verdict marker) — classifying as failed" >&2
+    failure_kind="no_verdict_output"
+    rc=5
   fi
   local fk_json="null" qr_json="null"
   [[ -n "$failure_kind" ]] && fk_json="\"$failure_kind\""
   [[ -n "$quota_resets_in" ]] && qr_json="\"$quota_resets_in\""
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" >"$out/${slug}.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" >"$out/${slug}.meta.json"
   # No fallback: a failed agy lap stays failed (failure_kind says why). Roster
   # rotation compensates across runs; the leaderboard's reliability signal
   # naturally down-weights a quota-dead lap until it recovers.
@@ -915,9 +959,13 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     echo "kimi: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
     rc=5
+  elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_no_verdict "$out/kimi.stdout"; then
+    echo "kimi: output is preamble-only (<512B, no severity or clean-verdict marker) — classifying as failed" >&2
+    fk_json='"no_verdict_output"'
+    rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d, "failure_kind": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_budget" "$fk_json" \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_budget" "$fk_json" "$(wall_over_budget "$((end - start))" "$kimi_budget")" \
     >"$out/kimi.meta.json"
   return "$rc"
 }

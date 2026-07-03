@@ -291,6 +291,96 @@ assert_eq "watchdog classifies timeout (timed_out=true)" "$(jq -r '.timed_out' "
 if [[ "$WD_ELAPSED" -lt 25 ]]; then ok "watchdog bounded the run (${WD_ELAPSED}s, shim sleeps 30)"; else bad "watchdog did not bound the run (${WD_ELAPSED}s)"; fi
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 
+echo "── analyze_runlog.sh degraded-reviewer warnings (jq pipe-context crash) ──"
+# [pin: 2026-07-03 — emit_warning's `["…"] | index(.reviewer)` re-bound `.` to
+# the array literal, so jq crashed ("Cannot index array with string") for
+# exactly the reviewers degraded enough to warn about, and warn mode reported
+# "all reviewers nominal" while north sat at a 50% timeout rate.]
+WARNLOG="$T/warn-runlog.jsonl"
+cat >"$WARNLOG" <<'EOF'
+{"ts":"2026-07-03T01:00:00Z","reviewers":{"north":{"status":"ok","exit_code":0,"duration_s":300,"output_bytes":10,"timeout_budget_s":600},"codex":{"status":"ok","exit_code":0,"duration_s":100,"output_bytes":10,"timeout_budget_s":300}}}
+{"ts":"2026-07-03T02:00:00Z","reviewers":{"north":{"status":"timed_out","exit_code":124,"duration_s":600,"output_bytes":0,"timeout_budget_s":600},"codex":{"status":"timed_out","exit_code":124,"duration_s":300,"output_bytes":0,"timeout_budget_s":300}}}
+{"ts":"2026-07-03T03:00:00Z","reviewers":{"north":{"status":"timed_out","exit_code":124,"duration_s":600,"output_bytes":0,"timeout_budget_s":600},"codex":{"status":"timed_out","exit_code":124,"duration_s":300,"output_bytes":0,"timeout_budget_s":300}}}
+EOF
+WARN_OUT="$(CROSS_REVIEW_RUNLOG="$WARNLOG" bash "$S/analyze_runlog.sh" --mode warn 2>&1)"
+assert_contains "pool reviewer at 66% timeout rate warns" "$WARN_OUT" "north timed out"
+assert_contains "flag reviewer warning suggests --timeout-codex" "$WARN_OUT" "--timeout-codex"
+
+echo "── analyze_runlog.sh sleep-suspect samples (wall clock past enforced budget) ──"
+# [pin: 2026-07-03 — the Mac slept mid-round (pmset: Dark Wake Thermal
+# Emergency); gtimeout/curl timers freeze during system sleep while date +%s
+# keeps counting, so codex logged 1024s against a 300s budget with rc=0 and
+# the analyzer suggested bumping every timeout. Sleep-inflated samples must
+# be excluded from tuning math, not learned from.]
+SLEEPLOG="$T/sleep-runlog.jsonl"
+cat >"$SLEEPLOG" <<'EOF'
+{"ts":"2026-07-03T01:00:00Z","reviewers":{"codex":{"status":"ok","exit_code":0,"duration_s":100,"output_bytes":10,"timeout_budget_s":300}}}
+{"ts":"2026-07-03T02:00:00Z","reviewers":{"codex":{"status":"ok","exit_code":0,"duration_s":110,"output_bytes":10,"timeout_budget_s":300}}}
+{"ts":"2026-07-03T03:00:00Z","reviewers":{"codex":{"status":"ok","exit_code":0,"duration_s":1024,"output_bytes":10,"timeout_budget_s":300}}}
+{"ts":"2026-07-03T04:00:00Z","reviewers":{"codex":{"status":"ok","exit_code":0,"duration_s":120,"output_bytes":10,"timeout_budget_s":300}}}
+EOF
+SLEEP_OUT="$(CROSS_REVIEW_RUNLOG="$SLEEPLOG" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
+assert_contains "report surfaces sleep-suspect count" "$SLEEP_OUT" "sleep_suspect=1"
+case "$SLEEP_OUT" in
+  *"SUGGEST: bump codex"*) bad "sleep-inflated p95 still drives a timeout bump" ;;
+  *) ok "no timeout bump from sleep-inflated p95" ;;
+esac
+
+echo "── leaderboard.sh sleep-killed timeout exclusion ──"
+# [pin: 2026-07-03 — north's 4 same-day timeouts all overran the enforced
+# curl --max-time on wall clock (machine asleep mid-transfer); they say
+# nothing about the provider and must not ding reliability.]
+SLPLB="$T/sleeplb-runlog.jsonl"
+cat >"$SLPLB" <<'EOF'
+{"ts":"2026-07-03T01:00:00Z","reviewers":{"north":{"status":"ok","exit_code":0,"duration_s":400,"output_bytes":10,"timeout_budget_s":600}}}
+{"ts":"2026-07-03T02:00:00Z","reviewers":{"north":{"status":"timed_out","exit_code":124,"duration_s":926,"output_bytes":0,"timeout_budget_s":600}}}
+EOF
+LB2="$(CROSS_REVIEW_RUNLOG="$SLPLB" bash "$S/leaderboard.sh" --mode json)"
+assert_eq "sleep-killed timeout excluded from attempts" \
+  "$(jq -r '.[] | select(.reviewer=="north") | .attempts' <<<"$LB2")" "1"
+assert_eq "reliability unpunished by sleep-killed timeout" \
+  "$(jq -r '.[] | select(.reviewer=="north") | .score' <<<"$LB2")" "75"
+# a genuine timeout (duration ≈ budget) still counts against reliability
+GENLB="$T/genlb-runlog.jsonl"
+cat >"$GENLB" <<'EOF'
+{"ts":"2026-07-03T01:00:00Z","reviewers":{"north":{"status":"ok","exit_code":0,"duration_s":400,"output_bytes":10,"timeout_budget_s":600}}}
+{"ts":"2026-07-03T02:00:00Z","reviewers":{"north":{"status":"timed_out","exit_code":124,"duration_s":610,"output_bytes":0,"timeout_budget_s":600}}}
+EOF
+LB3="$(CROSS_REVIEW_RUNLOG="$GENLB" bash "$S/leaderboard.sh" --mode json)"
+assert_eq "genuine timeout still counts as an attempt" \
+  "$(jq -r '.[] | select(.reviewer=="north") | .attempts' <<<"$LB3")" "2"
+
+echo "── no-verdict (preamble-only) output detection ──"
+# [pin: PR #2620 2026-07-03 — kimi delivered a 161-byte preamble with no
+# findings and no clean verdict; it logged status ok, silently starving
+# synthesis of the vote while the leaderboard counted a reliable run. The
+# gzip-ratio gate can't catch short non-repetitive text.]
+cat >"$T/bin/kimi" <<'SHIM'
+#!/bin/sh
+cat >/dev/null 2>&1 || true
+printf "I will now examine the changes on the current branch against the base and report back with a thorough assessment of the code.\n"
+SHIM
+chmod +x "$T/bin/kimi"
+bash "$S/run_reviewers.sh" --base main --out "$T/o6" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1 || true
+assert_eq "preamble-only output stamps no_verdict_output" \
+  "$(jq -r '.failure_kind' "$T/o6/kimi.meta.json")" "no_verdict_output"
+assert_eq "preamble-only output classifies exit 5" \
+  "$(jq -r '.exit_code' "$T/o6/kimi.meta.json")" "5"
+# a short but explicit clean verdict must stay ok — brevity alone is not failure
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "No findings - the change looks correct.\\n"\n' >"$T/bin/kimi"
+bash "$S/run_reviewers.sh" --base main --out "$T/o7" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1
+assert_eq "short explicit clean verdict stays ok" \
+  "$(jq -r '.exit_code' "$T/o7/kimi.meta.json")" "0"
+printf '{"exit_code": 5, "duration_s": 9, "timed_out": false, "output_bytes": 161, "attempt": 2, "timeout_budget_s": 600, "failure_kind": "no_verdict_output"}\n' >"$RUN/raw/kimi.meta.json"
+NVLOG="$T/nv-runlog.jsonl"
+CROSS_REVIEW_RUNLOG="$NVLOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+assert_eq "runlog status is no_verdict, not ok" \
+  "$(tail -1 "$NVLOG" | jq -r '.reviewers.kimi.status')" "no_verdict"
+rm -f "$RUN/raw/kimi.meta.json"
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"

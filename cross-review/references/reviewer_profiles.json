@@ -122,7 +122,7 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning; independent provider vote (Xiaomi). Rotation-pool member.",
-    "notes": "Xiaomi MiMo v2.5 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Xiaomi), routed through OpenRouter (US) — surface both for security-sensitive repos."
+    "notes": "Xiaomi MiMo v2.5 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Xiaomi), routed through OpenRouter (US) — surface both for security-sensitive repos. 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets — see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data — re-evaluate after clean rounds."
   },
 
   "minimax": {
@@ -230,7 +230,7 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning, code-tuned; independent provider vote (Cohere). Rotation-pool member. FREE tier — zero marginal cost.",
-    "notes": "Cohere North Mini Code (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid — check the route's terms for security-sensitive repos. Canada-origin provider (Cohere)."
+    "notes": "Cohere North Mini Code (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid — check the route's terms for security-sensitive repos. Canada-origin provider (Cohere). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets — see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data — re-evaluate after clean rounds."
   },
 
   "nemotron": {
@@ -248,7 +248,7 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning, large-parameter tier; independent provider vote (NVIDIA). Rotation-pool member. FREE tier — zero marginal cost.",
-    "notes": "NVIDIA Nemotron 3 Ultra 550B (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid — check the route's terms for security-sensitive repos. US-origin provider (NVIDIA)."
+    "notes": "NVIDIA Nemotron 3 Ultra 550B (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid — check the route's terms for security-sensitive repos. US-origin provider (NVIDIA). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets — see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data — re-evaluate after clean rounds."
   },
 
   "_synthesis_rules": {

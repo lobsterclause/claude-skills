@@ -95,7 +95,19 @@ analyze_reviewer() {
     | ($attempts | map(select(.status == "empty"))     | length) as $empty
     | ($attempts | map(select(.status == "failed"))    | length) as $failed
     | ($attempts | map(select(.status == "quota"))     | length) as $quota
-    | ($attempts | map(.duration_s // 0) | sort) as $durs
+    # Sleep-suspect filter (2026-07-03): when the machine sleeps mid-run,
+    # gtimeout/curl timers freeze but the wall-clock duration_s keeps counting,
+    # so a sample can log far past its ENFORCED budget (codex: 1024s vs 300s,
+    # rc=0). Such samples carry no signal about the reviewer — learning from
+    # them made the analyzer suggest bumping every timeout. Anything >60s over
+    # budget is suspect (TERM/KILL lag is ≤10s; curl fires at max-time exactly).
+    # Budget 0/missing = legacy entry, kept.
+    | ($attempts | map(select(((.timeout_budget_s // 0) == 0)
+                              or ((.duration_s // 0) <= ((.timeout_budget_s // 0) + 60))))) as $clean
+    | (($attempts | length) - ($clean | length)) as $suspect
+    | ($clean | length) as $cn
+    | ($clean | map(select(.status == "timed_out")) | length) as $clean_to
+    | ($clean | map(.duration_s // 0) | sort) as $durs
     | ($durs | length) as $dn
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
     | (if $dn == 0 then 0 else $durs[($dn * 0.95 | floor) | (if . >= $dn then $dn - 1 else . end)] end) as $p95
@@ -108,8 +120,11 @@ analyze_reviewer() {
         empty: $empty,
         failed: $failed,
         quota: $quota,
+        sleep_suspect: $suspect,
+        to_suspect: ($to - $clean_to),
         reliability: (if $total == 0 then null else (($ok * 100) / $total | floor) end),
         timeout_rate: (if $total == 0 then null else (($to * 100) / $total | floor) end),
+        clean_timeout_rate: (if $cn == 0 then null else (($clean_to * 100) / $cn | floor) end),
         empty_rate:   (if $total == 0 then null else (($empty * 100) / $total | floor) end),
         p50_duration_s: $p50,
         p95_duration_s: $p95,
@@ -131,12 +146,19 @@ for _r in "${REVIEWERS[@]}"; do
 done
 
 # Suggest timeout bump if p95 is within 10% of current budget OR timeout rate >20%.
+# Both signals use the sleep-clean sample set: p50/p95 are already clean-only,
+# and clean_timeout_rate excludes sleep-killed timeouts — a round the machine
+# slept through must not drive tuning (see the sleep-suspect filter above).
 suggest_timeout_bump() {
   local stats="$1"
   echo "$stats" | jq -r '
     if .total == 0 or .current_timeout_budget_s == 0 then empty
-    elif .timeout_rate >= 20 then
-      "  SUGGEST: bump \(.reviewer).timeout_s from \(.current_timeout_budget_s) → \(.current_timeout_budget_s + 200) (timeout rate \(.timeout_rate)% over window)"
+    elif .clean_timeout_rate == null then
+      (if .sleep_suspect > 0 then
+        "  NOTE: \(.reviewer): all \(.sleep_suspect) sample(s) in the window are sleep-suspect (wall clock overran the enforced budget) — no tuning signal; re-evaluate after clean rounds"
+      else empty end)
+    elif .clean_timeout_rate >= 20 then
+      "  SUGGEST: bump \(.reviewer).timeout_s from \(.current_timeout_budget_s) → \(.current_timeout_budget_s + 200) (timeout rate \(.clean_timeout_rate)% over window, sleep-suspect samples excluded)"
     elif (.p95_duration_s * 10) >= (.current_timeout_budget_s * 9) then
       "  SUGGEST: bump \(.reviewer).timeout_s from \(.current_timeout_budget_s) → \(.current_timeout_budget_s + 100) (p95 \(.p95_duration_s)s within 10% of budget)"
     else empty end
@@ -148,21 +170,30 @@ suggest_timeout_bump() {
 # failures would otherwise masquerade as a reliability problem worth "tuning".
 emit_warning() {
   local stats="$1"
+  # NOTE: `.reviewer as $rv` is load-bearing. The old code wrote
+  # `["codex",…] | index(.reviewer)` — after the pipe `.` is the array
+  # literal, so jq crashed ("Cannot index array with string") for exactly the
+  # reviewers degraded enough to reach that branch, and warn mode reported
+  # "all reviewers nominal" over a 50%-timeout window (caught 2026-07-03).
   echo "$stats" | jq -r '
-    if .total < 3 then empty   # not enough data
+    .reviewer as $rv
+    | (if (.to_suspect // 0) > 0 then
+         " [\(.to_suspect) of \(.timed_out) timeouts are sleep-suspect — wall clock overran the enforced budget, machine likely slept mid-run; discount before tuning]"
+       else "" end) as $sleep_note
+    | if .total < 3 then empty   # not enough data
     elif (.quota // 0) > 0 then
-      "  WARN: \(.reviewer) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). No fallback by policy; roster rotation covers the gap"
+      "  WARN: \($rv) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). No fallback by policy; roster rotation covers the gap"
     elif .timeout_rate > 30 then
-      (if (["codex","antigravity","gemini-pro","kimi","glm"] | index(.reviewer)) != null
-       then "  WARN: \(.reviewer) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — consider --timeout-\(.reviewer) \(.current_timeout_budget_s + 200)"
+      (if (["codex","antigravity","gemini-pro","kimi","glm"] | index($rv)) != null
+       then "  WARN: \($rv) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — consider --timeout-\($rv) \(.current_timeout_budget_s + 200)\($sleep_note)"
        # Only 5 reviewers have per-reviewer CLI flags; suggesting a nonexistent
        # --timeout-<r> made the next run exit 2 (fugu finding, PR #18 pass 1).
-       else "  WARN: \(.reviewer) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — bump its timeout_s in reviewer_profiles.json (or pass global --timeout for a one-off)"
+       else "  WARN: \($rv) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — bump its timeout_s in reviewer_profiles.json (or pass global --timeout for a one-off)\($sleep_note)"
        end)
     elif .empty_rate > 40 then
-      "  WARN: \(.reviewer) empty-output rate \(.empty_rate)% over last \(.total) runs — quota or auth, not a timeout fix: check failure_kind in meta.json and the .agy.log tail (Individual quota → wait/fallback; otherwise re-run `agy login`)"
+      "  WARN: \($rv) empty-output rate \(.empty_rate)% over last \(.total) runs — quota or auth, not a timeout fix: check failure_kind in meta.json and the .agy.log tail (Individual quota → wait/fallback; otherwise re-run `agy login`)"
     elif .reliability != null and .reliability < 60 then
-      "  WARN: \(.reviewer) reliability \(.reliability)% over last \(.total) runs (ok=\(.ok), timeout=\(.timed_out), empty=\(.empty), failed=\(.failed), quota=\(.quota // 0))"
+      "  WARN: \($rv) reliability \(.reliability)% over last \(.total) runs (ok=\(.ok), timeout=\(.timed_out), empty=\(.empty), failed=\(.failed), quota=\(.quota // 0))\($sleep_note)"
     else empty end
   '
 }
@@ -184,7 +215,7 @@ case "$mode" in
       echo "$stats" | jq -r '
         if .total == 0 then "  \(.reviewer): no data in window"
         else
-          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  quota=\(.quota // 0)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s"
+          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  quota=\(.quota // 0)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s\(if (.sleep_suspect // 0) > 0 then "  sleep_suspect=\(.sleep_suspect)" else "" end)"
         end'
     done
     echo ""
