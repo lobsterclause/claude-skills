@@ -396,6 +396,55 @@ assert_eq "reviewer binary resolved via ~/.local/bin PATH guard" \
   "$(jq -r '.exit_code' "$T/o8/kimi.meta.json" 2>/dev/null)" "0"
 rm -f "$HOME/.local/bin/kimi"
 
+echo "── agy no-verdict gate: guarded by the rc/bytes if-elif chain ──"
+# [pin: PR #27 pass 1 — mimo+minimax convergent claim that the agy runner's
+# `elif output_no_verdict` lacks the rc==0 guard and would mask real failures
+# as no_verdict_output. FALSIFIED: the chain's opening
+# `if [[ $rc -eq 0 && "$bytes" -eq 0 || $rc -ne 0 ]]` catches every non-zero
+# rc first, so the elif is only reachable when rc==0 && bytes>0 — diff-only
+# reviewers couldn't see the enclosing if outside the hunk. Both directions
+# verified live before pinning (see feedback_convergent_not_correct).]
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+printf "Error: something went wrong during startup\n"
+exit 1
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o9" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "agy rc=1 + short no-marker stdout keeps real exit code" \
+  "$(jq -r '.exit_code' "$T/o9/antigravity.meta.json")" "1"
+assert_eq "agy rc=1 not reclassified as no_verdict_output" \
+  "$(jq -r '.failure_kind' "$T/o9/antigravity.meta.json")" "null"
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+printf "I will now examine the changes on the current branch and report back with an assessment.\n"
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o10" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "agy rc=0 preamble-only stamps no_verdict_output" \
+  "$(jq -r '.failure_kind' "$T/o10/antigravity.meta.json")" "no_verdict_output"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+chmod +x "$T/bin/agy"
+
+echo "── analyze_runlog.sh contaminated-window NOTE (raw vs clean timeout rate) ──"
+# [pin: PR #27 pass 1, minimax M2 — a window whose timeouts are all
+# sleep-killed must emit an informational NOTE, not a WARN demanding tuning.]
+CONTAMLOG="$T/contam-runlog.jsonl"
+cat >"$CONTAMLOG" <<'EOF'
+{"ts":"2026-07-03T01:00:00Z","reviewers":{"north":{"status":"ok","exit_code":0,"duration_s":300,"output_bytes":10,"timeout_budget_s":600}}}
+{"ts":"2026-07-03T02:00:00Z","reviewers":{"north":{"status":"timed_out","exit_code":124,"duration_s":926,"output_bytes":0,"timeout_budget_s":600}}}
+{"ts":"2026-07-03T03:00:00Z","reviewers":{"north":{"status":"timed_out","exit_code":124,"duration_s":930,"output_bytes":0,"timeout_budget_s":600}}}
+EOF
+CONTAM_OUT="$(CROSS_REVIEW_RUNLOG="$CONTAMLOG" bash "$S/analyze_runlog.sh" --mode warn 2>&1)"
+assert_contains "sleep-contaminated timeout window notes, not warns" "$CONTAM_OUT" "NOTE: north raw timeout rate 66"
+case "$CONTAM_OUT" in
+  *"WARN: north timed out"*) bad "contaminated window still fires a tuning WARN" ;;
+  *) ok "no tuning WARN from contaminated window" ;;
+esac
+
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"

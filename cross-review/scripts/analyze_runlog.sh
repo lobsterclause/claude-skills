@@ -183,13 +183,22 @@ emit_warning() {
     | if .total < 3 then empty   # not enough data
     elif (.quota // 0) > 0 then
       "  WARN: \($rv) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). No fallback by policy; roster rotation covers the gap"
-    elif .timeout_rate > 30 then
+    # Gate the timeout WARN on the sleep-CLEAN rate, matching
+    # suggest_timeout_bump: a window whose timeouts are all sleep-killed must
+    # not demand action (minimax finding, PR #27 pass 1). When the raw rate is
+    # high but the clean rate is not, emit an informational NOTE instead so
+    # the degradation is visible without pretending it needs tuning.
+    # (No apostrophes in these comments — they live inside a bash single-quoted
+    # jq program and would terminate it.)
+    elif (.clean_timeout_rate // 0) > 30 then
       (if (["codex","antigravity","gemini-pro","kimi","glm"] | index($rv)) != null
-       then "  WARN: \($rv) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — consider --timeout-\($rv) \(.current_timeout_budget_s + 200)\($sleep_note)"
+       then "  WARN: \($rv) timed out \(.clean_timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — consider --timeout-\($rv) \(.current_timeout_budget_s + 200)\($sleep_note)"
        # Only 5 reviewers have per-reviewer CLI flags; suggesting a nonexistent
        # --timeout-<r> made the next run exit 2 (fugu finding, PR #18 pass 1).
-       else "  WARN: \($rv) timed out \(.timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — bump its timeout_s in reviewer_profiles.json (or pass global --timeout for a one-off)\($sleep_note)"
+       else "  WARN: \($rv) timed out \(.clean_timeout_rate)% of last \(.total) runs (p95 \(.p95_duration_s)s, budget \(.current_timeout_budget_s)s) — bump its timeout_s in reviewer_profiles.json (or pass global --timeout for a one-off)\($sleep_note)"
        end)
+    elif .timeout_rate > 30 and (.to_suspect // 0) > 0 then
+      "  NOTE: \($rv) raw timeout rate \(.timeout_rate)% over last \(.total) runs is sleep-contaminated (clean rate \(.clean_timeout_rate // 0)%) — no tuning action; re-evaluate after clean rounds"
     elif .empty_rate > 40 then
       "  WARN: \($rv) empty-output rate \(.empty_rate)% over last \(.total) runs — quota or auth, not a timeout fix: check failure_kind in meta.json and the .agy.log tail (Individual quota → wait/fallback; otherwise re-run `agy login`)"
     elif .reliability != null and .reliability < 60 then

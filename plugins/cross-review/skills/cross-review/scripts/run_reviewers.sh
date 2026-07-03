@@ -463,14 +463,18 @@ output_degenerate() {
 # A legitimate clean review is often SHORT but always SAYS so ("no findings",
 # "looks correct", severity headings…) — require one marker below 512 bytes;
 # at ≥512 bytes assume real prose and stay out of the way. False positives are
-# cheap: rc=5 gets one retry_reviewer swing and an honest failure_kind.
+# cheap: rc=5 gets one retry_reviewer swing and an honest failure_kind — and
+# synthesis reads the raw stdout regardless, so a real finding phrased without
+# any marker still reaches triage. The review prompt mandates Critical/High/
+# Medium/Low ranking, so compliant reviews always carry a marker; markers are
+# English-only, same as the review prompt and the current pool.
 output_no_verdict() {
   local f="$1" raw
   raw=$(output_bytes_of "$f")
   [[ "$raw" -gt 0 && "$raw" -lt 512 ]] || return 1
   # NOTE: no empty alternatives — `(a |b |)` is invalid POSIX ERE and BSD
   # grep silently fails the whole pattern; use `( … )?` optional groups.
-  ! grep -qiE 'critical|high|medium|low|no (significant |material )?(issues|findings|problems|concerns)|looks (good|correct|fine)|lgtm|no regressions|\[P[0-9]\]' "$f"
+  ! grep -qiE 'critical|high|medium|low|no (significant |material )?(issues?|findings?|problems?|concerns?)|looks (good|correct|fine)|lgtm|approved|no regressions|\[P[0-9]\]' "$f"
 }
 
 # wall_over_budget <duration_s> <budget_s> — "true" when the wall-clock
