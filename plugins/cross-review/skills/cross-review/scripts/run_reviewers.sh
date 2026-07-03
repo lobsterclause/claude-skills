@@ -103,7 +103,11 @@ set -uo pipefail
 # kimi logged failed=6 of 10 runs before this was caught (2026-07-03; a
 # background-dispatched round hit `timeout: failed to run command 'kimi'`).
 # Same failure class as the TIMEOUT_BIN homebrew probe further down.
-for _d in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
+# Iterate in REVERSE precedence order — each dir is prepended, so the last
+# one wins the front of PATH. Forward order left ~/.local/bin THIRD when all
+# three were missing, letting a stale homebrew kimi/agy shadow the intended
+# user-level install (codex P2, PR #27 pass 2; smoke-tested both orders).
+for _d in /usr/local/bin /opt/homebrew/bin "$HOME/.local/bin"; do
   [[ -d "$_d" && ":$PATH:" != *":$_d:"* ]] && PATH="$_d:$PATH"
 done
 export PATH
