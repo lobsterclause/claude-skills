@@ -653,7 +653,8 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   prompt_tmp="$(mktemp)"
   printf '%s' "$full_prompt" >"$prompt_tmp"
   jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
-    '{model: $m, messages: [{role: "user", content: $p}], stream: false}' >"$body_file"
+    '{model: $m, messages: [{role: "user", content: $p}], stream: false,
+      usage: {include: true}}' >"$body_file"
   rm -f "$prompt_tmp"
 
   local resp_file="$out/${slug}.response.json"
@@ -702,8 +703,22 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     fk_json='"no_verdict_output"'
     rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "openrouter", "failure_kind": %s, "wall_over_budget": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" >"$out/${slug}.meta.json"
+  # Cost accounting (fugu lesson, PR #20): usage:{include:true} makes OR
+  # return authoritative per-call cost; recording it in meta → runlog lets
+  # the leaderboard weight findings-per-dollar, so a 100x-priced reviewer
+  # is visible in telemetry instead of only on a billing dashboard. Null
+  # (older entries, failed calls, providers that omit usage) degrades to 0.
+  local cost_json="null" tokp_json="null" tokc_json="null"
+  if [[ -s "$resp_file" ]]; then
+    cost_json="$(jq -r '.usage.cost // "null" | tostring' "$resp_file" 2>/dev/null || echo null)"
+    tokp_json="$(jq -r '.usage.prompt_tokens // "null" | tostring' "$resp_file" 2>/dev/null || echo null)"
+    tokc_json="$(jq -r '.usage.completion_tokens // "null" | tostring' "$resp_file" 2>/dev/null || echo null)"
+    [[ "$cost_json" =~ ^([0-9.eE+-]+|null)$ ]] || cost_json="null"
+    [[ "$tokp_json" =~ ^([0-9]+|null)$ ]] || tokp_json="null"
+    [[ "$tokc_json" =~ ^([0-9]+|null)$ ]] || tokc_json="null"
+  fi
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "openrouter", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" >"$out/${slug}.meta.json"
   return "$rc"
 }
 

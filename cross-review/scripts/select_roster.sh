@@ -9,7 +9,7 @@
 #     provider on every run but every provider keeps earning leaderboard data.
 #
 # Weighting (exploit + explore + speed, bandit-style):
-#   weight = max(score, 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240)
+#   weight = max(score, 15) * (1 + 0.5/sqrt(attempts+1)) / (1 + p50/240) / (1 + avg_cost/0.50)
 #     - score comes from leaderboard.sh (rookies get an optimistic 50, so new
 #       models are drawn early and earn real data)
 #     - the sqrt term is an exploration bonus that decays as a reviewer
@@ -145,8 +145,8 @@ weight_lines=""
 for r in "${POOL[@]}"; do
   line="$(printf '%s' "$lb_json" | jq -r --arg r "$r" '
     (map(select(.reviewer == $r)) | first) as $s
-    | if $s == null then "\($r) 50 0 never_run 0"
-      else "\($r) \($s.score) \($s.attempts) \($s.latest_status) \($s.p50_duration_s // 0)"
+    | if $s == null then "\($r) 50 0 never_run 0 0"
+      else "\($r) \($s.score) \($s.attempts) \($s.latest_status) \($s.p50_duration_s // 0) \($s.avg_cost_usd // 0)"
       end
   ')"
   weight_lines="$weight_lines$line"$'\n'
@@ -168,13 +168,18 @@ draw_picks() {
     score = $2 + 0
     attempts = $3 + 0
     latest = $4
-    # exploit * explore / latency — latency shapes the draw, never the
-    # synthesis-time weighting of findings.
-    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240)
+    cost = (NF >= 6 ? $6 + 0 : 0)
+    # exploit * explore / latency / cost — latency and COST shape the draw,
+    # never the synthesis-time weighting of findings. The cost divisor is the
+    # fugu lesson made structural (PR #20: $4.74/call, 94.9% of a week'"'"'s OR
+    # spend): a $0.50-per-run reviewer draws at half weight, fugu-priced ones
+    # at ~1/10 — expensive-but-good still gets sampled, runaway spend cannot
+    # dominate the roster. Free/first-party lanes have cost 0 (no divisor).
+    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240) / (1 + cost / 0.50)
     if (latest == "quota") w *= 0.1
     weight[n] = w
     total += w
-    printf "  candidate %-12s score=%-4s attempts=%-3s latest=%-10s p50=%-5ss weight=%.1f\n", $1, $2, $3, $4, p50, w > "/dev/stderr"
+    printf "  candidate %-12s score=%-4s attempts=%-3s latest=%-10s p50=%-5ss cost=$%-7.4f weight=%.1f\n", $1, $2, $3, $4, p50, cost, w > "/dev/stderr"
   }
   END {
     for (pick = 0; pick < k && total > 0.0001; pick++) {

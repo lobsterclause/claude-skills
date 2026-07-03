@@ -224,6 +224,47 @@ assert_eq "runlog status is degenerate, not ok" \
 rm -f "$RUN/raw/glm.meta.json"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 
+echo "── OpenRouter cost accounting (fugu lesson) ──"
+# [pin: PR #20 follow-up — usage:{include:true} cost lands in meta so the
+# leaderboard can weight findings-per-dollar; fugu burned $4.74 in one call
+# and only the billing dashboard knew]
+cat >"$T/canned_or_response.json" <<'EOF'
+{"choices":[{"message":{"content":"## Critical\nNone.\n\n## High\nNone. Clean — no findings."}}],"usage":{"prompt_tokens":1000,"completion_tokens":50,"cost":0.0123}}
+EOF
+cat >"$T/bin/curl" <<SHIM
+#!/bin/sh
+cat "$T/canned_or_response.json"
+SHIM
+chmod +x "$T/bin/curl"
+bash "$S/run_reviewers.sh" --base main --out "$T/o6" --reviewers glm >/dev/null 2>&1 || true
+assert_eq "OR meta carries cost_usd" "$(jq -r '.cost_usd' "$T/o6/glm.meta.json")" "0.0123"
+assert_eq "OR meta carries tokens_prompt" "$(jq -r '.tokens_prompt' "$T/o6/glm.meta.json")" "1000"
+assert_eq "OR request asks for usage accounting" \
+  "$(jq -r '.usage.include' "$T/o6/glm.request.json")" "true"
+rm -f "$T/bin/curl"
+
+# leaderboard: avg_cost_usd aggregates; roster draw halves a $0.50 reviewer
+COSTLOG="$T/cost-runlog.jsonl"
+cat >"$COSTLOG" <<'EOF'
+{"ts":"2026-07-03T01:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0.5},"deepseek":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0}}}
+{"ts":"2026-07-03T02:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0.5},"deepseek":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0}}}
+EOF
+CLB="$(CROSS_REVIEW_RUNLOG="$COSTLOG" bash "$S/leaderboard.sh" --mode json)"
+assert_eq "leaderboard aggregates avg_cost_usd" \
+  "$(jq -r '.[] | select(.reviewer=="glm") | .avg_cost_usd' <<<"$CLB")" "0.5"
+assert_eq "zero-cost reviewer stays 0" \
+  "$(jq -r '.[] | select(.reviewer=="deepseek") | .avg_cost_usd' <<<"$CLB")" "0"
+# identical twins except cost: expensive one draws at half weight
+CAND="$(CROSS_REVIEW_RUNLOG="$COSTLOG" bash "$S/select_roster.sh" --seed 5 2>&1 >/dev/null | grep '^  candidate')"
+W_GLM="$(printf '%s\n' "$CAND" | awk '$2=="glm" {sub(/weight=/,"",$NF); print $NF}')"
+W_DS="$(printf '%s\n' "$CAND" | awk '$2=="deepseek" {sub(/weight=/,"",$NF); print $NF}')"
+assert_contains "candidate line surfaces cost" "$CAND" 'cost=$'
+if [ -n "$W_GLM" ] && [ -n "$W_DS" ] && awk -v g="$W_GLM" -v d="$W_DS" 'BEGIN{exit !(g*1.9 < d*1.1 && g*2.1 > d*0.9)}'; then
+  ok "\$0.50/run reviewer draws at ~half weight ($W_GLM vs $W_DS)"
+else
+  bad "cost divisor not applied in draw weight (glm=$W_GLM deepseek=$W_DS)"
+fi
+
 echo "── anchor_findings.sh (resolve vs hallucinated location) ──"
 cat >"$T/anchor.json" <<EOF
 {"base":"main","head":"HEAD","findings":[
