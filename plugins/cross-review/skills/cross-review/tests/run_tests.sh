@@ -381,6 +381,21 @@ assert_eq "runlog status is no_verdict, not ok" \
 rm -f "$RUN/raw/kimi.meta.json"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 
+echo "── reviewer-binary PATH guard (background-shell 127) ──"
+# [pin: 2026-07-03 — background-dispatched rounds ran with a PATH lacking
+# ~/.local/bin, so `timeout … kimi` exited 127 ("No such file or directory")
+# and kimi logged failed=6 of 10 runs. detect_reviewers.sh had the ~/.local/bin
+# guard; run_reviewers.sh (the dispatcher) did not — detection said available,
+# dispatch said command-not-found.]
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$HOME/.local/bin/kimi"
+chmod +x "$HOME/.local/bin/kimi"
+STRIPPED_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$T/bin" | paste -s -d: -)"
+PATH="$STRIPPED_PATH" bash "$S/run_reviewers.sh" --base main --out "$T/o8" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1
+assert_eq "reviewer binary resolved via ~/.local/bin PATH guard" \
+  "$(jq -r '.exit_code' "$T/o8/kimi.meta.json" 2>/dev/null)" "0"
+rm -f "$HOME/.local/bin/kimi"
+
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"

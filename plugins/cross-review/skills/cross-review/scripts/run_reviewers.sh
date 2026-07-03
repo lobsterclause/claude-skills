@@ -97,6 +97,17 @@
 
 set -uo pipefail
 
+# Background/cron shells often run with a PATH that lacks the user-level bin
+# dirs where reviewer CLIs live (kimi → ~/.local/bin; codex/agy → homebrew).
+# rc=127 "command not found" then masquerades as reviewer unreliability —
+# kimi logged failed=6 of 10 runs before this was caught (2026-07-03; a
+# background-dispatched round hit `timeout: failed to run command 'kimi'`).
+# Same failure class as the TIMEOUT_BIN homebrew probe further down.
+for _d in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
+  [[ -d "$_d" && ":$PATH:" != *":$_d:"* ]] && PATH="$_d:$PATH"
+done
+export PATH
+
 base=""
 out=""
 # Empty default: resolved after arg parsing. If --reviewers is not passed,
