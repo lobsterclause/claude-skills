@@ -152,10 +152,20 @@ for r in "${POOL[@]}"; do
   weight_lines="$weight_lines$line"$'\n'
 done
 
+# COST_PIVOT_USD tunes the cost divisor (weight /= 1 + avg_cost/pivot).
+# Guard the knob: zero, negative, or non-numeric would make awk divide by
+# zero (or invert the penalty) and could draw an empty pool — coerce any
+# invalid value back to the 0.50 default (codex, PR #28 pass 2).
+cost_pivot="${COST_PIVOT_USD:-0.50}"
+case "$cost_pivot" in
+  ''|*[!0-9.]*) cost_pivot="0.50" ;;
+  *) awk -v p="$cost_pivot" 'BEGIN{exit !(p > 0)}' || cost_pivot="0.50" ;;
+esac
+
 # --- weighted sample without replacement (awk: proper float math, seedable) ---
 draw_picks() {
   # $1 = fastmax (0 disables the speed filter)
-  printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v fastmax="$1" -v costpivot="${COST_PIVOT_USD:-0.50}" '
+  printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v fastmax="$1" -v costpivot="$cost_pivot" '
   BEGIN { srand(seed) }
   NF >= 4 {
     p50 = (NF >= 5 ? $5 + 0 : 0)

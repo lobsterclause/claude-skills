@@ -289,6 +289,14 @@ if [ -n "$W_GLM" ] && [ -n "$W_DS" ] && awk -v g="$W_GLM" -v d="$W_DS" 'BEGIN{ex
 else
   bad "cost divisor not applied in draw weight (glm=$W_GLM deepseek=$W_DS)"
 fi
+# [pin: PR #28 pass 2 (codex) — a zero/garbage COST_PIVOT_USD must not
+# divide-by-zero the draw or shrink the roster below the floor]
+R_PIVOT0="$(COST_PIVOT_USD=0 CROSS_REVIEW_RUNLOG="$COSTLOG" bash "$S/select_roster.sh" --seed 5 2>/dev/null)"
+N_PIVOT0="$(awk -F',' '{print NF}' <<<"$R_PIVOT0")"
+if [ "$N_PIVOT0" -ge 3 ]; then ok "COST_PIVOT_USD=0 coerced to default (roster $N_PIVOT0)"; else bad "pivot=0 broke the draw ($R_PIVOT0)"; fi
+R_PIVOTX="$(COST_PIVOT_USD=banana CROSS_REVIEW_RUNLOG="$COSTLOG" bash "$S/select_roster.sh" --seed 5 2>/dev/null)"
+N_PIVOTX="$(awk -F',' '{print NF}' <<<"$R_PIVOTX")"
+if [ "$N_PIVOTX" -ge 3 ]; then ok "non-numeric COST_PIVOT_USD coerced (roster $N_PIVOTX)"; else bad "pivot=banana broke the draw ($R_PIVOTX)"; fi
 
 echo "── anchor_findings.sh (resolve vs hallucinated location) ──"
 cat >"$T/anchor.json" <<EOF
