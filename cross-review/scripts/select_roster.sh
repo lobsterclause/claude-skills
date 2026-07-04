@@ -156,11 +156,14 @@ done
 # Guard the knob: zero, negative, or non-numeric would make awk divide by
 # zero (or invert the penalty) and could draw an empty pool — coerce any
 # invalid value back to the 0.50 default (codex, PR #28 pass 2).
+# Strict decimal shape FIRST: awk -v treats "0.0.1" as a STRING, and
+# `p > 0` string-compares to true while the later numeric coercion yields
+# zero — divide-by-zero (codex, PR #28 pass 3; falsified kimi's contrary
+# assumption by smoke test). `p + 0` forces numeric for the positivity check.
 cost_pivot="${COST_PIVOT_USD:-0.50}"
-case "$cost_pivot" in
-  ''|*[!0-9.]*) cost_pivot="0.50" ;;
-  *) awk -v p="$cost_pivot" 'BEGIN{exit !(p > 0)}' || cost_pivot="0.50" ;;
-esac
+if ! [[ "$cost_pivot" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v p="$cost_pivot" 'BEGIN{exit !(p + 0 > 0)}'; then
+  cost_pivot="0.50"
+fi
 
 # --- weighted sample without replacement (awk: proper float math, seedable) ---
 draw_picks() {

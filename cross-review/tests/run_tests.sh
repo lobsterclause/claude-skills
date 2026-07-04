@@ -297,6 +297,9 @@ if [ "$N_PIVOT0" -ge 3 ]; then ok "COST_PIVOT_USD=0 coerced to default (roster $
 R_PIVOTX="$(COST_PIVOT_USD=banana CROSS_REVIEW_RUNLOG="$COSTLOG" bash "$S/select_roster.sh" --seed 5 2>/dev/null)"
 N_PIVOTX="$(awk -F',' '{print NF}' <<<"$R_PIVOTX")"
 if [ "$N_PIVOTX" -ge 3 ]; then ok "non-numeric COST_PIVOT_USD coerced (roster $N_PIVOTX)"; else bad "pivot=banana broke the draw ($R_PIVOTX)"; fi
+R_PIVOTD="$(COST_PIVOT_USD=0.0.1 CROSS_REVIEW_RUNLOG="$COSTLOG" bash "$S/select_roster.sh" --seed 5 2>/dev/null)"
+N_PIVOTD="$(awk -F',' '{print NF}' <<<"$R_PIVOTD")"
+if [ "$N_PIVOTD" -ge 3 ]; then ok "multi-dot COST_PIVOT_USD coerced (roster $N_PIVOTD)"; else bad "pivot=0.0.1 broke the draw ($R_PIVOTD)"; fi
 
 echo "── anchor_findings.sh (resolve vs hallucinated location) ──"
 cat >"$T/anchor.json" <<EOF
