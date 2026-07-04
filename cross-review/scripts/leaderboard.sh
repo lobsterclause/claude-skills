@@ -126,6 +126,9 @@ score_reviewer() {
     | ($scored | map(.findings_dropped    // 0) | add // 0) as $dropped
     | (if $n == 0 then null else ($ok / $n) end) as $rel
     | (if $n == 0 then "never_run" else ($attempts | last | .status) end) as $latest
+    | ($attempts | map(.cost_usd // empty | select(type == "number"))) as $costs
+    | (if ($costs | length) == 0 then 0
+       else (($costs | add) / ($costs | length) * 1000000 | round) / 1000000 end) as $avg_cost
     | ($attempts | map(.duration_s // 0) | sort) as $durs
     | ($durs | length) as $dn
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
@@ -147,6 +150,7 @@ score_reviewer() {
         dropped: $dropped,
         latest_status: $latest,
         p50_duration_s: $p50,
+        avg_cost_usd: $avg_cost,
         sleep_excluded: $sleep_excluded,
         rookie: ($n == 0),
         score: $score }
