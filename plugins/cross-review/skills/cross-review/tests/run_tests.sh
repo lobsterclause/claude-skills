@@ -40,6 +40,7 @@ printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export OPENROUTER_API_KEY="sk-or-test-shim"   # lights the OR pool; never called
+export MOONSHOT_API_KEY="sk-ms-test-shim"     # lights the kimi27 seat; never called
 # Sandbox HOME: the selector caches `agy models` output under
 # $HOME/.cross-review/cache with a 6h TTL — running tests against the real
 # HOME would poison real roster draws with the shim's list (codex P2, PR #19).
@@ -165,7 +166,7 @@ if [[ "$N_R1" -ge 3 ]]; then ok "roster ≥3 ($N_R1)"; else bad "roster <3 ($R1)
 # must redraw unfiltered and keep the floor]
 SLOWLOG="$T/slow-runlog.jsonl"
 jq -nc '{ts:"2026-07-01T05:00:00Z", reviewers: (
-  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","qwen","devstral","laguna","kat","north","nemotron"]
+  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","qwen","devstral","laguna","kat","north","nemotron","kimi27"]
   | map({key: ., value: {status:"ok", exit_code:0, duration_s:5000, output_bytes:10, timeout_budget_s:600}}) | from_entries)}' >"$SLOWLOG"
 FAST_ERR="$T/fast.err"
 RF="$(CROSS_REVIEW_RUNLOG="$SLOWLOG" bash "$S/select_roster.sh" --seed 7 --fast 2>"$FAST_ERR")"
@@ -521,6 +522,62 @@ case "$CONTAM_OUT" in
   *"WARN: north timed out"*) bad "contaminated window still fires a tuning WARN" ;;
   *) ok "no tuning WARN from contaminated window" ;;
 esac
+
+echo "── kimi27 rotation seat (direct-Moonshot, draw_boost) ──"
+# [pin: 2026-07-03, per Gabriel — kimi-k2.7-code joins the rotation pool as a
+# direct-Moonshot seat (NOT an OpenRouter fallback; the no-OR-for-first-party
+# policy is untouched) with a draw_boost so it is selected frequently while it
+# earns leaderboard data.]
+DETECT_OUT="$(bash "$S/detect_reviewers.sh")"
+assert_eq "detect reports kimi27 available with Moonshot key" \
+  "$(jq -r '.kimi27' <<<"$DETECT_OUT")" "true"
+BOOST_ERR="$T/boost.err"
+CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR"
+assert_contains "selector draws kimi27 as a candidate" "$(cat "$BOOST_ERR")" "kimi27"
+# rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0;
+# draw_boost 2.5 → 187.5. nemotron (same rookie stats, no boost) stays 75.0.
+assert_contains "kimi27 weight carries the profile draw_boost" \
+  "$(grep 'kimi27' "$BOOST_ERR")" "weight=187.5"
+assert_contains "unboosted rookie weight unchanged" \
+  "$(grep 'nemotron' "$BOOST_ERR")" "weight=75.0"
+# no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
+MOONSHOT_API_KEY= bash "$S/run_reviewers.sh" --base main --out "$T/o11" --reviewers kimi27 >/dev/null 2>"$T/k27skip.err"
+assert_eq "kimi27 without a key exits 1 (all requested reviewers failed)" "$?" "1"
+assert_contains "kimi27 skip names the missing key" "$(cat "$T/k27skip.err")" "Moonshot"
+# same-provider convergence: kimi (baseline) + kimi27 agreeing is ONE provider vote
+printf '{"exit_code": 0, "duration_s": 30, "timed_out": false, "output_bytes": 900, "attempt": 1, "timeout_budget_s": 600, "model": "kimi-k2.7-code", "cli": "moonshot", "failure_kind": null}\n' >"$RUN/raw/kimi27.meta.json"
+cat >"$T/k27-findings.json" <<'EOF'
+{"findings":[
+ {"id":"m1","file":"a.sh","line":1,"claim":"x","sources":["kimi","kimi27"],"factcheck":{"verdict":"keep"}},
+ {"id":"m2","file":"a.sh","line":2,"claim":"y","sources":["kimi27","codex"],"factcheck":{"verdict":"keep"}}
+]}
+EOF
+K27LOG="$T/k27-runlog.jsonl"
+CROSS_REVIEW_RUNLOG="$K27LOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 1 --top "-" --findings "$T/k27-findings.json" >/dev/null 2>&1
+assert_eq "kimi27 telemetry lands in the runlog" \
+  "$(tail -1 "$K27LOG" | jq -r '.reviewers.kimi27.status')" "ok"
+assert_eq "kimi+kimi27 agreement is NOT cross-provider convergent" \
+  "$(tail -1 "$K27LOG" | jq -r '.reviewers.kimi27.findings_convergent')" "1"
+rm -f "$RUN/raw/kimi27.meta.json"
+# request body: usage:{include:true} is an OpenRouter extension — the moonshot
+# cli path must omit it (codex P2 falsified-as-worded but accepted as hygiene,
+# PR #29 pass 1). The shim key makes curl fail fast; the body file is written
+# BEFORE curl runs, so this asserts offline on the file, not the network.
+bash "$S/run_reviewers.sh" --base main --out "$T/o12" --reviewers kimi27 --timeout 15 >/dev/null 2>&1 || true
+if [[ -f "$T/o12/kimi27.request.json" ]]; then
+  assert_eq "moonshot request body omits OpenRouter usage extension" \
+    "$(jq 'has("usage")' "$T/o12/kimi27.request.json")" "false"
+else
+  bad "kimi27 request body was never written"
+fi
+# detect positional coupling: clearing ONLY the moonshot key must flip kimi27
+# to false while the OR pool stays true (kimi+kat convergent nit — pins the
+# printf arg mapping empirically, not just by comment)
+DETECT2="$(MOONSHOT_API_KEY= bash "$S/detect_reviewers.sh")"
+assert_eq "no moonshot key → kimi27 false" "$(jq -r '.kimi27' <<<"$DETECT2")" "false"
+assert_eq "no moonshot key → OR pool unaffected" "$(jq -r '.glm' <<<"$DETECT2")" "true"
 
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]

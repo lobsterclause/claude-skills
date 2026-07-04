@@ -71,6 +71,25 @@
     "notes": "Strong on the diff-as-given. Frequent Low/nit output is skip-worthy unless convergent. China-origin provider — surface for security-sensitive repos."
   },
 
+  "kimi27": {
+    "timeout_s": 600,
+    "provider": "moonshot",
+    "cli": "moonshot",
+    "model": "kimi-k2.7-code",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "draw_boost": 2.5,
+    "specialization": "single-turn diff reasoning on Moonshot's code-specialized k2.7; rotation-pool member on the DIRECT Moonshot platform API (same billing rail as the kimi baseline, NOT OpenRouter).",
+    "notes": "Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it is drawn frequently while earning leaderboard data — retire the boost once ~10 sampled runs exist. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) — surface for security-sensitive repos."
+  },
+
   "glm": {
     "timeout_s": 600,
     "provider": "zhipu",
