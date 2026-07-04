@@ -46,6 +46,7 @@ antigravity=false
 gemini_pro=false
 kimi=false
 openrouter=false
+kimi27=false
 
 has codex && codex=true
 # Both Gemini reviewers ride the same agy binary — but `agy --model` silently
@@ -91,9 +92,14 @@ if command -v curl >/dev/null 2>&1; then
   if [[ -n "${OPENROUTER_API_KEY:-}" || -s "$HOME/.config/openrouter/key" ]]; then
     openrouter=true
   fi
+  # kimi27 (k2.7-code rotation seat) rides the DIRECT Moonshot API — its own
+  # key, independent of both the kimi CLI baseline and the OpenRouter pool.
+  if [[ -n "${MOONSHOT_API_KEY:-}" || -s "$HOME/.config/moonshot/key" ]]; then
+    kimi27=true
+  fi
 fi
 
-printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "openrouter": %s}\n' \
+printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "kimi27": %s, "openrouter": %s}\n' \
   "$codex" "$antigravity" "$gemini_pro" "$kimi" \
   "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" \
-  "$openrouter"
+  "$kimi27" "$openrouter"

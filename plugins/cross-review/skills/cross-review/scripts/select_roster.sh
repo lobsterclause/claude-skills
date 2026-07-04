@@ -74,6 +74,11 @@ has_openrouter() {
   [[ -n "${OPENROUTER_API_KEY:-}" || -s "$HOME/.config/openrouter/key" ]]
 }
 
+has_moonshot() {
+  command -v curl >/dev/null 2>&1 || return 1
+  [[ -n "${MOONSHOT_API_KEY:-}" || -s "$HOME/.config/moonshot/key" ]]
+}
+
 # --- availability ------------------------------------------------------------
 BASELINES=()
 missing_baselines=()
@@ -126,6 +131,13 @@ fi
 if has_openrouter; then
   POOL+=(glm deepseek mimo minimax qwen devstral laguna kat north nemotron)
 fi
+# kimi27 (k2.7-code) rides the DIRECT Moonshot API — a deliberate rotation
+# seat (2026-07-03, per Gabriel), not an OpenRouter fallback for the kimi
+# baseline. Its profile carries a draw_boost so it is drawn frequently while
+# it earns leaderboard data.
+if has_moonshot; then
+  POOL+=(kimi27)
+fi
 
 if [[ ${#BASELINES[@]} -eq 0 && ${#POOL[@]} -eq 0 ]]; then
   echo "select_roster: no reviewers available at all" >&2
@@ -138,15 +150,26 @@ need=$(( 3 - ${#BASELINES[@]} ))
 [[ "$extras" -gt ${#POOL[@]} ]] && extras=${#POOL[@]}
 
 # --- weights from the leaderboard ---------------------------------------------
-# lines: "<name> <score> <attempts> <latest_status>"
+# lines: "<name> <score> <attempts> <latest_status> <p50> <draw_boost>"
 lb_json="$(bash "$script_dir/leaderboard.sh" --mode json 2>/dev/null || echo '[]')"
+
+# Per-reviewer draw_boost from reviewer_profiles.json (default 1): a manual
+# multiplier on the draw weight only — synthesis weighting is untouched. Used
+# to make a deliberately-seated reviewer (kimi27, 2026-07-03) come up
+# frequently while it earns leaderboard data; retire boosts once real scores
+# accumulate.
+profile_file="$script_dir/../references/reviewer_profiles.json"
+draw_boost_of() {
+  [[ -f "$profile_file" ]] || { echo 1; return; }
+  jq -r --arg r "$1" '.[$r].draw_boost // 1' "$profile_file" 2>/dev/null || echo 1
+}
 
 weight_lines=""
 for r in "${POOL[@]}"; do
-  line="$(printf '%s' "$lb_json" | jq -r --arg r "$r" '
+  line="$(printf '%s' "$lb_json" | jq -r --arg r "$r" --arg boost "$(draw_boost_of "$r")" '
     (map(select(.reviewer == $r)) | first) as $s
-    | if $s == null then "\($r) 50 0 never_run 0"
-      else "\($r) \($s.score) \($s.attempts) \($s.latest_status) \($s.p50_duration_s // 0)"
+    | if $s == null then "\($r) 50 0 never_run 0 \($boost)"
+      else "\($r) \($s.score) \($s.attempts) \($s.latest_status) \($s.p50_duration_s // 0) \($boost)"
       end
   ')"
   weight_lines="$weight_lines$line"$'\n'
@@ -170,11 +193,13 @@ draw_picks() {
     latest = $4
     # exploit * explore / latency — latency shapes the draw, never the
     # synthesis-time weighting of findings.
-    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240)
+    boost = (NF >= 6 ? $6 + 0 : 1)
+    if (boost <= 0) boost = 1
+    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240) * boost
     if (latest == "quota") w *= 0.1
     weight[n] = w
     total += w
-    printf "  candidate %-12s score=%-4s attempts=%-3s latest=%-10s p50=%-5ss weight=%.1f\n", $1, $2, $3, $4, p50, w > "/dev/stderr"
+    printf "  candidate %-12s score=%-4s attempts=%-3s latest=%-10s p50=%-5ss boost=%s weight=%.1f\n", $1, $2, $3, $4, p50, boost, w > "/dev/stderr"
   }
   END {
     for (pick = 0; pick < k && total > 0.0001; pick++) {

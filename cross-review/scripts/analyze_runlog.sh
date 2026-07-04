@@ -139,7 +139,7 @@ analyze_reviewer() {
 # independent providers.
 # Keep in sync with run_reviewers.sh's dispatch and leaderboard.sh. Bash 3.2
 # (macOS /bin/bash) has no associative arrays — use a parallel indexed array.
-REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax qwen devstral laguna kat north nemotron)
+REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax qwen devstral laguna kat north nemotron kimi27)
 reviewer_stats=()
 for _r in "${REVIEWERS[@]}"; do
   reviewer_stats+=("$(analyze_reviewer "$_r")")
