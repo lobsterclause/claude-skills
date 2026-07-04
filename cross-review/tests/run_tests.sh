@@ -561,6 +561,23 @@ assert_eq "kimi27 telemetry lands in the runlog" \
 assert_eq "kimi+kimi27 agreement is NOT cross-provider convergent" \
   "$(tail -1 "$K27LOG" | jq -r '.reviewers.kimi27.findings_convergent')" "1"
 rm -f "$RUN/raw/kimi27.meta.json"
+# request body: usage:{include:true} is an OpenRouter extension — the moonshot
+# cli path must omit it (codex P2 falsified-as-worded but accepted as hygiene,
+# PR #29 pass 1). The shim key makes curl fail fast; the body file is written
+# BEFORE curl runs, so this asserts offline on the file, not the network.
+bash "$S/run_reviewers.sh" --base main --out "$T/o12" --reviewers kimi27 --timeout 15 >/dev/null 2>&1 || true
+if [[ -f "$T/o12/kimi27.request.json" ]]; then
+  assert_eq "moonshot request body omits OpenRouter usage extension" \
+    "$(jq 'has("usage")' "$T/o12/kimi27.request.json")" "false"
+else
+  bad "kimi27 request body was never written"
+fi
+# detect positional coupling: clearing ONLY the moonshot key must flip kimi27
+# to false while the OR pool stays true (kimi+kat convergent nit — pins the
+# printf arg mapping empirically, not just by comment)
+DETECT2="$(MOONSHOT_API_KEY= bash "$S/detect_reviewers.sh")"
+assert_eq "no moonshot key → kimi27 false" "$(jq -r '.kimi27' <<<"$DETECT2")" "false"
+assert_eq "no moonshot key → OR pool unaffected" "$(jq -r '.glm' <<<"$DETECT2")" "true"
 
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]

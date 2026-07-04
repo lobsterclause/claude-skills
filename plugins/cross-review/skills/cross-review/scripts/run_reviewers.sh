@@ -689,9 +689,21 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   local body_file="$out/${slug}.request.json" prompt_tmp
   prompt_tmp="$(mktemp)"
   printf '%s' "$full_prompt" >"$prompt_tmp"
-  jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
-    '{model: $m, messages: [{role: "user", content: $p}], stream: false,
-      usage: {include: true}}' >"$body_file"
+  # usage:{include:true} is an OPENROUTER extension (per-call cost for the
+  # findings-per-dollar leaderboard). Moonshot tolerates it today (live-probed
+  # 2026-07-03: normal completion + token usage returned) but it buys nothing
+  # there and a stricter OpenAI-compatible endpoint could reject it — build
+  # the body per cli, same hygiene as the X-Title gate below (codex P2,
+  # PR #29 pass 1; the "fails when selected" wording was falsified by the
+  # live probe, the cross-provider-leakage hygiene stands).
+  if [[ "$cli" == "openrouter" ]]; then
+    jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
+      '{model: $m, messages: [{role: "user", content: $p}], stream: false,
+        usage: {include: true}}' >"$body_file"
+  else
+    jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
+      '{model: $m, messages: [{role: "user", content: $p}], stream: false}' >"$body_file"
+  fi
   rm -f "$prompt_tmp"
 
   local resp_file="$out/${slug}.response.json"
