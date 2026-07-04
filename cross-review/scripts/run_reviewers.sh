@@ -155,6 +155,11 @@ laguna_model="poolside/laguna-m.1"
 kat_model="kwaipilot/kat-coder-pro-v2"
 north_model="cohere/north-mini-code:free"
 nemotron_model="nvidia/nemotron-3-ultra-550b-a55b:free"
+# kimi27 rides the DIRECT Moonshot platform API (OpenAI-compatible), not
+# OpenRouter — a deliberate rotation seat (2026-07-03, per Gabriel) on the
+# same billing rail as the kimi baseline. The first-party no-OR-fallback
+# policy above is untouched: this is not a fallback lane for kimi.
+kimi27_model="kimi-k2.7-code"
 
 # Antigravity installs `agy` to $HOME/.local/bin. That directory isn't always
 # on $PATH for non-interactive shells (notably bash invocations from other
@@ -241,6 +246,7 @@ _lg="$(profile_get laguna model)";      [[ -n "$_lg" ]] && laguna_model="$_lg"
 _kt="$(profile_get kat model)";         [[ -n "$_kt" ]] && kat_model="$_kt"
 _nm="$(profile_get north model)";       [[ -n "$_nm" ]] && north_model="$_nm"
 _vm="$(profile_get nemotron model)";    [[ -n "$_vm" ]] && nemotron_model="$_vm"
+_k7="$(profile_get kimi27 model)";      [[ -n "$_k7" ]] && kimi27_model="$_k7"
 
 codex_profile="$(profile_timeout codex)"
 antigravity_profile="$(profile_timeout antigravity)"
@@ -256,6 +262,7 @@ laguna_profile="$(profile_timeout laguna)"
 kat_profile="$(profile_timeout kat)"
 north_profile="$(profile_timeout north)"
 nemotron_profile="$(profile_timeout nemotron)"
+kimi27_profile="$(profile_timeout kimi27)"
 codex_timeout="${timeout_codex:-${timeout_s:-${codex_profile:-$(( timeout_s_default < 300 ? timeout_s_default : 300 ))}}}"
 antigravity_timeout="${timeout_antigravity:-${timeout_s:-${antigravity_profile:-$timeout_s_default}}}"
 # gemini-pro defaults to a longer budget than Flash: Pro's deeper reasoning
@@ -275,6 +282,7 @@ laguna_timeout="${timeout_s:-${laguna_profile:-$timeout_s_default}}"
 kat_timeout="${timeout_s:-${kat_profile:-$timeout_s_default}}"
 north_timeout="${timeout_s:-${north_profile:-$timeout_s_default}}"
 nemotron_timeout="${timeout_s:-${nemotron_profile:-$timeout_s_default}}"
+kimi27_timeout="${timeout_s:-${kimi27_profile:-$timeout_s_default}}"
 
 mkdir -p "$out"
 
@@ -592,6 +600,23 @@ openrouter_key() {
   return 1
 }
 
+# moonshot_key: same getter/probe contract as openrouter_key, for the direct
+# Moonshot platform API (the kimi27 rotation seat and the kimi baseline share
+# this billing rail). Env var wins; ~/.config/moonshot/key (single line,
+# chmod 600) is the persistent home.
+moonshot_key() {
+  if [[ -n "${MOONSHOT_API_KEY:-}" ]]; then
+    printf '%s' "$MOONSHOT_API_KEY"
+    return 0
+  fi
+  local f="$HOME/.config/moonshot/key"
+  if [[ -s "$f" ]]; then
+    tr -d '[:space:]' <"$f"
+    return 0
+  fi
+  return 1
+}
+
 # run_openrouter_reviewer: single-turn, diff-inline review via the OpenRouter
 # chat-completions API. No agentic tools — the diff IS the input (same niche
 # and prompt shape as run_kimi, and the same stdin/argv reasoning: the prompt
@@ -602,13 +627,25 @@ openrouter_key() {
 # first-party reviewers (policy: no OR fallbacks for codex/gemini/kimi).
 # Args:
 #   $1 slug           (glm | deepseek | mimo | minimax | qwen | devstral |
-#                      laguna | kat | north | nemotron)
-#   $2 model          (OpenRouter model id, e.g. z-ai/glm-5.2)
+#                      laguna | kat | north | nemotron | kimi27)
+#   $2 model          (model id, e.g. z-ai/glm-5.2 or kimi-k2.7-code)
 #   $3 timeout_budget (seconds)
+#   $4 endpoint       (optional; default OpenRouter chat-completions. kimi27
+#                      passes the direct Moonshot endpoint — the API is
+#                      OpenAI-compatible, so the whole body is shared)
+#   $5 cli label      (optional; default "openrouter" — selects the key
+#                      source and is recorded verbatim in meta.json)
 run_openrouter_reviewer() {
   local slug="$1" model="$2" timeout_budget="$3"
+  local endpoint="${4:-https://openrouter.ai/api/v1/chat/completions}"
+  local cli="${5:-openrouter}"
   local key
-  if ! key="$(openrouter_key)"; then
+  if [[ "$cli" == "moonshot" ]]; then
+    if ! key="$(moonshot_key)"; then
+      echo "$slug: no Moonshot key (set MOONSHOT_API_KEY or ~/.config/moonshot/key)" >&2
+      return 5
+    fi
+  elif ! key="$(openrouter_key)"; then
     echo "$slug: no OpenRouter key (set OPENROUTER_API_KEY or ~/.config/openrouter/key)" >&2
     return 5
   fi
@@ -663,12 +700,16 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # as the kimi stdin-prompt rule). Kimi cross-review finding, PR #18 pass 1.
   local auth_file="$out/.${slug}.curl-auth.$$"
   ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$key" >"$auth_file" )
+  # X-Title is OpenRouter-specific attribution metadata — don't send it to
+  # other OpenAI-compatible endpoints (kimi27 Low, its first sampled finding).
+  local -a title_header=()
+  [[ "$cli" == "openrouter" ]] && title_header=(-H "X-Title: cross-review")
   curl -sS --max-time "$timeout_budget" \
     --config "$auth_file" \
     -H "Content-Type: application/json" \
-    -H "X-Title: cross-review" \
+    ${title_header[@]+"${title_header[@]}"} \
     -d @"$body_file" \
-    https://openrouter.ai/api/v1/chat/completions \
+    "$endpoint" \
     >"$resp_file" 2>"$out/${slug}.stderr"
   rc=$?
   rm -f "$auth_file"
@@ -679,7 +720,7 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     local api_error
     api_error="$(jq -r '.error.message // empty' "$resp_file" 2>/dev/null)"
     if [[ -n "$api_error" ]]; then
-      echo "$slug: OpenRouter API error: $api_error" >>"$out/${slug}.stderr"
+      echo "$slug: $cli API error: $api_error" >>"$out/${slug}.stderr"
       rc=1
     else
       jq -r '.choices[0].message.content // empty' "$resp_file" >"$out/${slug}.stdout" 2>>"$out/${slug}.stderr" || rc=1
@@ -733,8 +774,8 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
       fi
     fi
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "openrouter", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" >"$out/${slug}.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$cli" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" >"$out/${slug}.meta.json"
   return "$rc"
 }
 
@@ -906,6 +947,10 @@ run_laguna()   { run_openrouter_reviewer laguna   "$laguna_model"   "$laguna_tim
 run_kat()      { run_openrouter_reviewer kat      "$kat_model"      "$kat_timeout"; }
 run_north()    { run_openrouter_reviewer north    "$north_model"    "$north_timeout"; }
 run_nemotron() { run_openrouter_reviewer nemotron "$nemotron_model" "$nemotron_timeout"; }
+# kimi27: same OpenAI-compatible single-turn body, direct Moonshot endpoint +
+# key. cli label "moonshot" selects the key source and lands in meta.json.
+run_kimi27()   { run_openrouter_reviewer kimi27   "$kimi27_model"   "$kimi27_timeout" \
+                   "https://api.moonshot.ai/v1/chat/completions" moonshot; }
 
 run_kimi() {
   local start end rc
@@ -1121,6 +1166,18 @@ for r in "${requested[@]}"; do
         echo "$r (OpenRouter reviewer) unavailable — set OPENROUTER_API_KEY or put the key in ~/.config/openrouter/key. Skipping." >&2
       fi
       ;;
+    kimi27)
+      if ! command -v curl >/dev/null 2>&1; then
+        echo "$r: curl not available — skipping" >&2
+      elif moonshot_key >/dev/null 2>&1; then
+        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        retry_reviewer run_kimi27 kimi27 &
+        pids+=($!)
+        ran+=("kimi27")
+      else
+        echo "kimi27 (direct-Moonshot reviewer) unavailable — set MOONSHOT_API_KEY or put the key in ~/.config/moonshot/key. Skipping." >&2
+      fi
+      ;;
     *)
       echo "unknown reviewer: $r" >&2
       ;;
@@ -1152,7 +1209,7 @@ for i in "${!pids[@]}"; do
         # failure_kind and the .agy.log tail are where the answer lives.
         echo "$name: failed (check failure_kind in $out/$name.meta.json; agy's own log: $out/$name.agy.log)" >&2 ;;
       kimi)        echo "$name: failed (see $out/kimi.stderr and $out/kimi.meta.json)" >&2 ;;
-      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron)
+      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|kimi27)
         echo "$name: failed (see $out/$name.stderr, $out/$name.response.json, $out/$name.meta.json)" >&2 ;;
       *)           echo "$name: failed (see $out/$name.* )" >&2 ;;
     esac

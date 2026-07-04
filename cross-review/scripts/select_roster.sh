@@ -9,7 +9,7 @@
 #     provider on every run but every provider keeps earning leaderboard data.
 #
 # Weighting (exploit + explore + speed, bandit-style):
-#   weight = max(score, 15) * (1 + 0.5/sqrt(attempts+1)) / (1 + p50/240) / (1 + avg_cost/0.50)
+#   weight = max(score, 15) * (1 + 0.5/sqrt(attempts+1)) / (1 + p50/240) / (1 + avg_cost/0.50) * draw_boost
 #     - score comes from leaderboard.sh (rookies get an optimistic 50, so new
 #       models are drawn early and earn real data)
 #     - the sqrt term is an exploration bonus that decays as a reviewer
@@ -74,6 +74,11 @@ has_openrouter() {
   [[ -n "${OPENROUTER_API_KEY:-}" || -s "$HOME/.config/openrouter/key" ]]
 }
 
+has_moonshot() {
+  command -v curl >/dev/null 2>&1 || return 1
+  [[ -n "${MOONSHOT_API_KEY:-}" || -s "$HOME/.config/moonshot/key" ]]
+}
+
 # --- availability ------------------------------------------------------------
 BASELINES=()
 missing_baselines=()
@@ -126,6 +131,13 @@ fi
 if has_openrouter; then
   POOL+=(glm deepseek mimo minimax qwen devstral laguna kat north nemotron)
 fi
+# kimi27 (k2.7-code) rides the DIRECT Moonshot API — a deliberate rotation
+# seat (2026-07-03, per Gabriel), not an OpenRouter fallback for the kimi
+# baseline. Its profile carries a draw_boost so it is drawn frequently while
+# it earns leaderboard data.
+if has_moonshot; then
+  POOL+=(kimi27)
+fi
 
 if [[ ${#BASELINES[@]} -eq 0 && ${#POOL[@]} -eq 0 ]]; then
   echo "select_roster: no reviewers available at all" >&2
@@ -138,15 +150,26 @@ need=$(( 3 - ${#BASELINES[@]} ))
 [[ "$extras" -gt ${#POOL[@]} ]] && extras=${#POOL[@]}
 
 # --- weights from the leaderboard ---------------------------------------------
-# lines: "<name> <score> <attempts> <latest_status>"
+# lines: "<name> <score> <attempts> <latest_status> <p50> <avg_cost_usd> <draw_boost>"
 lb_json="$(bash "$script_dir/leaderboard.sh" --mode json 2>/dev/null || echo '[]')"
+
+# Per-reviewer draw_boost from reviewer_profiles.json (default 1): a manual
+# multiplier on the draw weight only — synthesis weighting is untouched. Used
+# to make a deliberately-seated reviewer (kimi27, 2026-07-03) come up
+# frequently while it earns leaderboard data; retire boosts once real scores
+# accumulate.
+profile_file="$script_dir/../references/reviewer_profiles.json"
+draw_boost_of() {
+  [[ -f "$profile_file" ]] || { echo 1; return; }
+  jq -r --arg r "$1" '.[$r].draw_boost // 1' "$profile_file" 2>/dev/null || echo 1
+}
 
 weight_lines=""
 for r in "${POOL[@]}"; do
-  line="$(printf '%s' "$lb_json" | jq -r --arg r "$r" '
+  line="$(printf '%s' "$lb_json" | jq -r --arg r "$r" --arg boost "$(draw_boost_of "$r")" '
     (map(select(.reviewer == $r)) | first) as $s
-    | if $s == null then "\($r) 50 0 never_run 0 0"
-      else "\($r) \($s.score) \($s.attempts) \($s.latest_status) \($s.p50_duration_s // 0) \($s.avg_cost_usd // 0)"
+    | if $s == null then "\($r) 50 0 never_run 0 0 \($boost)"
+      else "\($r) \($s.score) \($s.attempts) \($s.latest_status) \($s.p50_duration_s // 0) \($s.avg_cost_usd // 0) \($boost)"
       end
   ')"
   weight_lines="$weight_lines$line"$'\n'
@@ -182,17 +205,22 @@ draw_picks() {
     attempts = $3 + 0
     latest = $4
     cost = (NF >= 6 ? $6 + 0 : 0)
-    # exploit * explore / latency / cost — latency and COST shape the draw,
-    # never the synthesis-time weighting of findings. The cost divisor is the
-    # fugu lesson made structural (PR #20: $4.74/call, 94.9% of a week'"'"'s OR
+    boost = (NF >= 7 ? $7 + 0 : 1)
+    if (boost <= 0) boost = 1
+    # exploit * explore / latency / cost * boost — latency and COST shape the
+    # draw, never the synthesis-time weighting of findings. The cost divisor is
+    # the fugu lesson made structural (PR #20: $4.74/call, 94.9% of a week'"'"'s OR
     # spend): a $0.50-per-run reviewer draws at half weight, fugu-priced ones
     # at ~1/10 — expensive-but-good still gets sampled, runaway spend cannot
     # dominate the roster. Free/first-party lanes have cost 0 (no divisor).
-    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240) / (1 + cost / costpivot)
+    # draw_boost (reviewer_profiles.json, default 1) is a manual seat-priority
+    # multiplier — kimi27 (2026-07-03, per Gabriel) rides it while earning
+    # leaderboard data; it scales the DRAW only, never synthesis weighting.
+    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240) / (1 + cost / costpivot) * boost
     if (latest == "quota") w *= 0.1
     weight[n] = w
     total += w
-    printf "  candidate %-12s score=%-4s attempts=%-3s latest=%-10s p50=%-5ss cost=$%-7.4f weight=%.1f\n", $1, $2, $3, $4, p50, cost, w > "/dev/stderr"
+    printf "  candidate %-12s score=%-4s attempts=%-3s latest=%-10s p50=%-5ss cost=$%-7.4f boost=%s weight=%.1f\n", $1, $2, $3, $4, p50, cost, boost, w > "/dev/stderr"
   }
   END {
     for (pick = 0; pick < k && total > 0.0001; pick++) {
