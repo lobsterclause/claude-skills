@@ -155,7 +155,7 @@ done
 # --- weighted sample without replacement (awk: proper float math, seedable) ---
 draw_picks() {
   # $1 = fastmax (0 disables the speed filter)
-  printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v fastmax="$1" '
+  printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v fastmax="$1" -v costpivot="${COST_PIVOT_USD:-0.50}" '
   BEGIN { srand(seed) }
   NF >= 4 {
     p50 = (NF >= 5 ? $5 + 0 : 0)
@@ -175,7 +175,7 @@ draw_picks() {
     # spend): a $0.50-per-run reviewer draws at half weight, fugu-priced ones
     # at ~1/10 — expensive-but-good still gets sampled, runaway spend cannot
     # dominate the roster. Free/first-party lanes have cost 0 (no divisor).
-    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240) / (1 + cost / 0.50)
+    w = (score > 15 ? score : 15) * (1 + 0.5 / sqrt(attempts + 1)) / (1 + p50 / 240) / (1 + cost / costpivot)
     if (latest == "quota") w *= 0.1
     weight[n] = w
     total += w

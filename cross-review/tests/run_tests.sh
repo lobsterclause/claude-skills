@@ -243,6 +243,31 @@ assert_eq "OR request asks for usage accounting" \
   "$(jq -r '.usage.include' "$T/o6/glm.request.json")" "true"
 rm -f "$T/bin/curl"
 
+# retry accumulates spend: attempt 1 charged but preamble-only (rc=5, retried),
+# attempt 2 charged and good — meta must carry the SUM, not the last attempt
+# [pin: codex P2, PR #28 pass 1 — leaderboard undercounted flaky-expensive]
+cat >"$T/canned_or_preamble.json" <<'EOF'
+{"choices":[{"message":{"content":"I will now begin reviewing the changes."}}],"usage":{"prompt_tokens":900,"completion_tokens":9,"cost":0.01}}
+EOF
+cat >"$T/canned_or_good.json" <<'EOF'
+{"choices":[{"message":{"content":"## Critical\nNone.\n\n## High\nNone. Clean — no findings."}}],"usage":{"prompt_tokens":900,"completion_tokens":40,"cost":0.02}}
+EOF
+rm -f "$T/curl_calls"
+cat >"$T/bin/curl" <<SHIM
+#!/bin/sh
+echo x >> "$T/curl_calls"
+if [ "\$(wc -l < "$T/curl_calls" | tr -d ' ')" -ge 2 ]; then
+  cat "$T/canned_or_good.json"
+else
+  cat "$T/canned_or_preamble.json"
+fi
+SHIM
+chmod +x "$T/bin/curl"
+bash "$S/run_reviewers.sh" --base main --out "$T/o7" --reviewers glm >/dev/null 2>&1 || true
+assert_eq "retried run reports summed cost" "$(jq -r '.cost_usd' "$T/o7/glm.meta.json")" "0.030000"
+assert_eq "second attempt recorded" "$(jq -r '.attempt' "$T/o7/glm.meta.json")" "2"
+rm -f "$T/bin/curl" "$T/curl_calls"
+
 # leaderboard: avg_cost_usd aggregates; roster draw halves a $0.50 reviewer
 COSTLOG="$T/cost-runlog.jsonl"
 cat >"$COSTLOG" <<'EOF'

@@ -128,7 +128,7 @@ score_reviewer() {
     | (if $n == 0 then "never_run" else ($attempts | last | .status) end) as $latest
     | ($attempts | map(.cost_usd // empty | select(type == "number"))) as $costs
     | (if ($costs | length) == 0 then 0
-       else (($costs | add) / ($costs | length) * 10000 | round) / 10000 end) as $avg_cost
+       else (($costs | add) / ($costs | length) * 1000000 | round) / 1000000 end) as $avg_cost
     | ($attempts | map(.duration_s // 0) | sort) as $durs
     | ($durs | length) as $dn
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50

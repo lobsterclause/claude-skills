@@ -710,12 +710,28 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # (older entries, failed calls, providers that omit usage) degrades to 0.
   local cost_json="null" tokp_json="null" tokc_json="null"
   if [[ -s "$resp_file" ]]; then
-    cost_json="$(jq -r '.usage.cost // "null" | tostring' "$resp_file" 2>/dev/null || echo null)"
-    tokp_json="$(jq -r '.usage.prompt_tokens // "null" | tostring' "$resp_file" 2>/dev/null || echo null)"
-    tokc_json="$(jq -r '.usage.completion_tokens // "null" | tostring' "$resp_file" 2>/dev/null || echo null)"
-    [[ "$cost_json" =~ ^([0-9.eE+-]+|null)$ ]] || cost_json="null"
-    [[ "$tokp_json" =~ ^([0-9]+|null)$ ]] || tokp_json="null"
-    [[ "$tokc_json" =~ ^([0-9]+|null)$ ]] || tokc_json="null"
+    # jq type check instead of a permissive bash regex (nemotron, PR #28
+    # pass 1): anything non-numeric — strings, objects, corrupt provider
+    # output — degrades to null. Field is `.usage.cost` per a REAL captured
+    # response (fugu, runs/…-pr18…/raw/fugu.response.json), not total_cost.
+    cost_json="$(jq -r '.usage.cost | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+    tokp_json="$(jq -r '.usage.prompt_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+    tokc_json="$(jq -r '.usage.completion_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+  fi
+  # A retried attempt overwrites meta — but attempt 1's spend was real money
+  # (a charged response classified degenerate/no-verdict still billed).
+  # Accumulate across attempts so the leaderboard sees true per-run cost
+  # (codex P2, PR #28 pass 1).
+  if [[ "${CROSS_REVIEW_ATTEMPT:-1}" -gt 1 && -f "$out/${slug}.meta.json" ]]; then
+    local prior_cost
+    prior_cost="$(jq -r '.cost_usd | if type=="number" then tostring else "0" end' "$out/${slug}.meta.json" 2>/dev/null || echo 0)"
+    if [[ "$prior_cost" != "0" ]]; then
+      if [[ "$cost_json" == "null" ]]; then
+        cost_json="$prior_cost"
+      else
+        cost_json="$(awk -v a="$cost_json" -v b="$prior_cost" 'BEGIN{printf "%.6f", a + b}')"
+      fi
+    fi
   fi
   printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "openrouter", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" >"$out/${slug}.meta.json"
