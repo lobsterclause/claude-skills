@@ -489,22 +489,32 @@ output_no_verdict() {
   ! grep -qiE 'critical|high|medium|low|no (significant |material )?(issues?|findings?|problems?|concerns?)|looks (good|correct|fine)|lgtm|approved|no regressions|\[P[0-9]\]' "$f"
 }
 
-# doc_narrative_risk <diff_stat> — true when the diff touches doc/markdown
-# files, which often narrate PAST bugs in prose (investigation docs,
-# postmortems, changelogs). A text-only reviewer (no file-reading tools) can
-# mistake a document description of a PRE-FIX bug for a live finding:
-# devstral replayed 9 of 12 findings, and deepseek 4 of 5, straight from an
-# in-diff investigation doc on PR #350 (2026-07-05) — codex and kimi (which
-# roam files) were not fooled, since they could check whether the described
-# bugs were actually still present. Detection is by file EXTENSION only, not
-# prose content — content-sniffing for bug language needs unbounded phrasing
-# coverage and is the same fragile-heuristic trap output_no_verdict already
-# warns against; knowing a file CAN narrate history is caution enough.
+# doc_narrative_risk <name_only_paths> — true when the diff touches
+# doc/markdown files, which often narrate PAST bugs in prose (investigation
+# docs, postmortems, changelogs). A text-only reviewer (no file-reading
+# tools) can mistake a document description of a PRE-FIX bug for a live
+# finding: devstral replayed 9 of 12 findings, and deepseek 4 of 5, straight
+# from an in-diff investigation doc on PR #350 (2026-07-05) — codex and kimi
+# (which roam files) were not fooled, since they could check whether the
+# described bugs were actually still present. Detection is by file EXTENSION
+# only, not prose content — content-sniffing for bug language needs
+# unbounded phrasing coverage and is the same fragile-heuristic trap
+# output_no_verdict already warns against; knowing a file CAN narrate
+# history is caution enough.
+#
+# Takes `git diff --name-only` output (one path per line), NOT `--stat`:
+# --stat compresses a rename as "docs/{old.txt => new.md} | 1 +" (the
+# extension check misses it — ".md" is followed by "}", not whitespace/EOL)
+# and the caller elsewhere caps --stat at 50 lines for prompt display, which
+# would truncate a doc file past the cutoff on a >50-file diff — exactly the
+# false-negative this feature exists to prevent (both empirically confirmed
+# and fixed, codex P2/P3, PR #30 pass 1). --name-only has neither problem:
+# clean per-line paths, uncapped by the caller.
 doc_narrative_risk() {
-  grep -qiE '\.(md|mdx|rst|adoc)([[:space:]]|$)' <<<"$1"
+  grep -qiE '\.(md|mdx|markdown|rst|adoc)$' <<<"$1"
 }
 
-# doc_narrative_note <diff_stat> — the caution text to splice into a
+# doc_narrative_note <name_only_paths> — the caution text to splice into a
 # text-only reviewer prompt when doc_narrative_risk fires; empty otherwise.
 # Injected only for kimi and the OpenRouter-pool runner (this function is
 # NOT called from run_codex/run_agy_reviewer): those reviewers have
@@ -698,8 +708,12 @@ run_openrouter_reviewer() {
   # Defuse a literal </diff> inside untrusted patch content (same
   # prompt-injection guard as run_kimi).
   diff_full="${diff_full//<\/diff>/< \/diff>}"
-  local doc_note
-  doc_note="$(doc_narrative_note "$diff_summary")"
+  local doc_note doc_file_list
+  # Uncapped and rename-clean by construction — see doc_narrative_risk's
+  # comment for why --name-only, not the (capped, brace-compressing) --stat
+  # display used for the prompt body.
+  doc_file_list="$(git diff --name-only "$base"...HEAD 2>/dev/null || true)"
+  doc_note="$(doc_narrative_note "$doc_file_list")"
   local full_prompt
   full_prompt="$review_prompt
 
@@ -1047,8 +1061,12 @@ run_kimi() {
   # Defuse a literal </diff> inside untrusted patch content so a malicious diff
   # can't close the fence early and inject instructions (prompt-injection "inj").
   diff_full="${diff_full//<\/diff>/< \/diff>}"
-  local doc_note
-  doc_note="$(doc_narrative_note "$diff_summary")"
+  local doc_note doc_file_list
+  # Uncapped and rename-clean by construction — see doc_narrative_risk's
+  # comment for why --name-only, not the (capped, brace-compressing) --stat
+  # display used for the prompt body.
+  doc_file_list="$(git diff --name-only "$base"...HEAD 2>/dev/null || true)"
+  doc_note="$(doc_narrative_note "$doc_file_list")"
   local full_prompt
   full_prompt="$review_prompt
 

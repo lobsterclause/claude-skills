@@ -626,7 +626,46 @@ assert_contains "openrouter-pool prompt (glm) warns on doc-narrative risk" \
   "$(jq -r '.messages[0].content' "$T/o18/glm.request.json" 2>/dev/null)" "documentation/markdown"
 
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+git branch -D docbranch >/dev/null 2>&1
 git checkout -q feat
+
+echo "── doc-narrative caution: brace-compressed rename + 50-file cap (codex P2/P3) ──"
+# [pin: PR #30 pass 1, codex — both FALSIFIED against real git output before
+# being accepted (parent direct-source verification): git diff --stat
+# compresses a rename as "docs/{old.txt => new.md} | 1 +" (the ".md" is
+# followed by "}", not whitespace/EOL — the original regex missed it), and
+# `head -50` on --stat can truncate a doc file past the cutoff on a >50-file
+# diff — exactly the false-negative this feature exists to prevent. Fixed by
+# switching detection from the capped --stat display to an uncapped
+# `git diff --name-only` file list (one clean path per line, no brace
+# compression, no cap).]
+cat >"$T/bin/kimi" <<'SHIM'
+#!/bin/sh
+cat >"${KIMI_STDIN_CAPTURE:-/dev/null}"
+printf "shim review: no findings\n"
+SHIM
+chmod +x "$T/bin/kimi"
+git checkout -qb renamebranch main
+git mv f.txt renamed-doc.md 2>/dev/null || git mv f.txt docs.md
+git commit -qam "rename to markdown"
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-rename.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o19" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+assert_contains "brace-compressed rename to .md still triggers the caution" \
+  "$(cat "$T/kimi-stdin-rename.txt" 2>/dev/null)" "documentation/markdown"
+git checkout -q feat
+git branch -D renamebranch >/dev/null 2>&1
+
+git checkout -qb capbranch main
+for _i in $(seq 1 55); do echo "x" >"cap$_i.ts"; done
+git add . && git -c user.email=t@t -c user.name=t commit -qm "55 code files"
+git checkout -qb capbranch2 capbranch
+for _i in $(seq 1 55); do echo "y" >"cap$_i.ts"; done
+echo "doc content" >zzz-late-doc.md
+git add . && git -c user.email=t@t -c user.name=t commit -qm "55 code files + 1 late doc file"
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-cap.txt" bash "$S/run_reviewers.sh" --base capbranch --out "$T/o20" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+assert_contains "doc file past the 50-file --stat cap still triggers the caution" \
+  "$(cat "$T/kimi-stdin-cap.txt" 2>/dev/null)" "documentation/markdown"
+git checkout -q feat
+git branch -D capbranch capbranch2 >/dev/null 2>&1
 
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
