@@ -579,6 +579,55 @@ DETECT2="$(MOONSHOT_API_KEY= bash "$S/detect_reviewers.sh")"
 assert_eq "no moonshot key → kimi27 false" "$(jq -r '.kimi27' <<<"$DETECT2")" "false"
 assert_eq "no moonshot key → OR pool unaffected" "$(jq -r '.glm' <<<"$DETECT2")" "true"
 
+echo "── doc-narrative caution note (text-only reviewers, PR #350 class) ──"
+# [pin: PR #350 (2026-07-05) — devstral replayed 9 of 12 findings, and
+# deepseek 4 of 5, from an in-diff investigation doc's PROSE description of
+# PRE-FIX bugs, reporting them as live findings. codex+kimi (agentic, with
+# file-reading tools) were not fooled — they could check whether the
+# described bugs were actually still present. Text-only reviewers (kimi +
+# the OpenRouter pool, including kimi27) get an explicit caution injected
+# into the prompt whenever the diff touches a doc/markdown file. Detection is
+# by FILE EXTENSION, not prose content — content-sniffing for "bug language"
+# needs unbounded phrasing coverage and is the same fragile-heuristic trap
+# output_no_verdict already warns against.]
+git checkout -qb docbranch main
+printf 'bug: X used to crash before the fix was applied\n' >investigation.md
+git add investigation.md
+git -c user.email=t@t -c user.name=t commit -qm "add investigation doc"
+
+# kimi: prompt goes over stdin, not a file — capture it via a shim variant
+# that tees stdin before answering, so the assertion reads real prompt text
+# rather than trusting the wiring by inspection.
+cat >"$T/bin/kimi" <<'SHIM'
+#!/bin/sh
+cat >"${KIMI_STDIN_CAPTURE:-/dev/null}"
+printf "shim review: no findings\n"
+SHIM
+chmod +x "$T/bin/kimi"
+
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-doc.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o16" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+assert_contains "kimi prompt warns on doc-narrative risk (.md in diff)" \
+  "$(cat "$T/kimi-stdin-doc.txt" 2>/dev/null)" "documentation/markdown"
+
+# negative case: feat's diff (thousands of numbered lines in f.txt) has no
+# doc/markdown file — the caution must NOT fire on an ordinary code diff.
+git checkout -q feat
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-nodoc.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o17" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+case "$(cat "$T/kimi-stdin-nodoc.txt" 2>/dev/null)" in
+  *"documentation/markdown"*) bad "kimi prompt warns even without doc files in the diff" ;;
+  *) ok "no doc-narrative note when diff has no doc files" ;;
+esac
+
+# openrouter-pool path shares the same prompt-building function — one probe
+# (glm) confirms the wiring reaches it too, not just kimi's separate runner.
+git checkout -q docbranch
+bash "$S/run_reviewers.sh" --base main --out "$T/o18" --reviewers glm --timeout 15 >/dev/null 2>&1 || true
+assert_contains "openrouter-pool prompt (glm) warns on doc-narrative risk" \
+  "$(jq -r '.messages[0].content' "$T/o18/glm.request.json" 2>/dev/null)" "documentation/markdown"
+
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+git checkout -q feat
+
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
