@@ -489,7 +489,7 @@ output_no_verdict() {
   ! grep -qiE 'critical|high|medium|low|no (significant |material )?(issues?|findings?|problems?|concerns?)|looks (good|correct|fine)|lgtm|approved|no regressions|\[P[0-9]\]' "$f"
 }
 
-# doc_narrative_risk <name_only_paths> — true when the diff touches
+# doc_narrative_risk <name_status_lines> — true when the diff touches
 # doc/markdown files, which often narrate PAST bugs in prose (investigation
 # docs, postmortems, changelogs). A text-only reviewer (no file-reading
 # tools) can mistake a document description of a PRE-FIX bug for a live
@@ -502,19 +502,28 @@ output_no_verdict() {
 # output_no_verdict already warns against; knowing a file CAN narrate
 # history is caution enough.
 #
-# Takes `git diff --name-only` output (one path per line), NOT `--stat`:
-# --stat compresses a rename as "docs/{old.txt => new.md} | 1 +" (the
-# extension check misses it — ".md" is followed by "}", not whitespace/EOL)
-# and the caller elsewhere caps --stat at 50 lines for prompt display, which
-# would truncate a doc file past the cutoff on a >50-file diff — exactly the
-# false-negative this feature exists to prevent (both empirically confirmed
-# and fixed, codex P2/P3, PR #30 pass 1). --name-only has neither problem:
-# clean per-line paths, uncapped by the caller.
+# Takes `git diff --name-status` output (one change per line, tab-separated:
+# "M\tpath" / "A\tpath" / "R083\told\tnew" for a rename), NOT `--stat` or
+# `--name-only`:
+#   - `--stat` compresses a rename as "docs/{old.txt => new.md} | 1 +" (the
+#     extension check misses it — ".md" is followed by "}", not
+#     whitespace/EOL) and is capped at 50 lines by the caller elsewhere for
+#     prompt display, which would truncate a doc file past the cutoff on a
+#     >50-file diff (codex P2/P3, PR #30 pass 1).
+#   - `--name-only` reports ONLY the destination path on a rename — a doc
+#     renamed AWAY to a non-doc extension with edits (e.g.
+#     investigation.md => notes.txt) drops out of detection entirely, even
+#     though the diff hunk still carries every line of the original doc's
+#     prose as context/removed lines (codex P2, PR #30 pass 2).
+# `--name-status` reports BOTH paths on a rename (tab-separated), uncapped,
+# no brace compression — the same extension regex now checks source AND
+# destination; a tab is `[[:space:]]` so the mid-line source column still
+# matches.
 doc_narrative_risk() {
-  grep -qiE '\.(md|mdx|markdown|rst|adoc)$' <<<"$1"
+  grep -qiE '\.(md|mdx|markdown|rst|adoc)([[:space:]]|$)' <<<"$1"
 }
 
-# doc_narrative_note <name_only_paths> — the caution text to splice into a
+# doc_narrative_note <name_status_lines> — the caution text to splice into a
 # text-only reviewer prompt when doc_narrative_risk fires; empty otherwise.
 # Injected only for kimi and the OpenRouter-pool runner (this function is
 # NOT called from run_codex/run_agy_reviewer): those reviewers have
@@ -709,10 +718,11 @@ run_openrouter_reviewer() {
   # prompt-injection guard as run_kimi).
   diff_full="${diff_full//<\/diff>/< \/diff>}"
   local doc_note doc_file_list
-  # Uncapped and rename-clean by construction — see doc_narrative_risk's
-  # comment for why --name-only, not the (capped, brace-compressing) --stat
-  # display used for the prompt body.
-  doc_file_list="$(git diff --name-only "$base"...HEAD 2>/dev/null || true)"
+  # Uncapped, rename-clean, and source-path-preserving by construction — see
+  # doc_narrative_risk's comment for why --name-status, not the capped/
+  # brace-compressing --stat display used for the prompt body, nor
+  # --name-only (which drops a rename's source path).
+  doc_file_list="$(git diff --name-status "$base"...HEAD 2>/dev/null || true)"
   doc_note="$(doc_narrative_note "$doc_file_list")"
   local full_prompt
   full_prompt="$review_prompt
@@ -1062,10 +1072,11 @@ run_kimi() {
   # can't close the fence early and inject instructions (prompt-injection "inj").
   diff_full="${diff_full//<\/diff>/< \/diff>}"
   local doc_note doc_file_list
-  # Uncapped and rename-clean by construction — see doc_narrative_risk's
-  # comment for why --name-only, not the (capped, brace-compressing) --stat
-  # display used for the prompt body.
-  doc_file_list="$(git diff --name-only "$base"...HEAD 2>/dev/null || true)"
+  # Uncapped, rename-clean, and source-path-preserving by construction — see
+  # doc_narrative_risk's comment for why --name-status, not the capped/
+  # brace-compressing --stat display used for the prompt body, nor
+  # --name-only (which drops a rename's source path).
+  doc_file_list="$(git diff --name-status "$base"...HEAD 2>/dev/null || true)"
   doc_note="$(doc_narrative_note "$doc_file_list")"
   local full_prompt
   full_prompt="$review_prompt

@@ -667,6 +667,31 @@ assert_contains "doc file past the 50-file --stat cap still triggers the caution
 git checkout -q feat
 git branch -D capbranch capbranch2 >/dev/null 2>&1
 
+# [pin: PR #30 pass 2, codex — FALSIFIED-then-confirmed against real git
+# output: `git diff --name-only` drops the SOURCE path on a rename, showing
+# only the destination ("investigation.md => notes.txt" becomes just
+# "notes.txt"). If the doc is renamed to a non-doc extension WITH edits, the
+# extension check on the destination alone misses it entirely — even though
+# the diff hunk still carries every line of the original doc's prose as
+# context/removed lines. `--name-status` reports BOTH paths for a rename
+# (tab-separated: "R083\told.md\tnew.txt"), so the same extension regex
+# catches the source column too.]
+git checkout -qb revrename-base main
+printf 'bug: X used to crash before the fix was applied\nmore prose\n' >investigation2.md
+git add investigation2.md
+git -c user.email=t@t -c user.name=t commit -qm "add investigation doc (base)"
+git checkout -qb revrename-feat revrename-base
+git mv investigation2.md notes2.txt
+printf 'bug: X used to crash before the fix was applied\nmore prose\nan added line\n' >notes2.txt
+git commit -qam "rename doc to non-doc extension with an edit"
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-revrename.txt" bash "$S/run_reviewers.sh" --base revrename-base --out "$T/o21" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+assert_contains "doc renamed away to a non-doc extension (with edit) still triggers the caution" \
+  "$(cat "$T/kimi-stdin-revrename.txt" 2>/dev/null)" "documentation/markdown"
+git checkout -q feat
+git branch -D revrename-base revrename-feat >/dev/null 2>&1
+
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
