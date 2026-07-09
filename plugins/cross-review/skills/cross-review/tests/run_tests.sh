@@ -647,7 +647,7 @@ SHIM
 chmod +x "$T/bin/kimi"
 git checkout -qb renamebranch main
 git mv f.txt renamed-doc.md 2>/dev/null || git mv f.txt docs.md
-git commit -qam "rename to markdown"
+git -c user.email=t@t -c user.name=t commit -qam "rename to markdown"
 KIMI_STDIN_CAPTURE="$T/kimi-stdin-rename.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o19" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
 assert_contains "brace-compressed rename to .md still triggers the caution" \
   "$(cat "$T/kimi-stdin-rename.txt" 2>/dev/null)" "documentation/markdown"
@@ -683,7 +683,7 @@ git -c user.email=t@t -c user.name=t commit -qm "add investigation doc (base)"
 git checkout -qb revrename-feat revrename-base
 git mv investigation2.md notes2.txt
 printf 'bug: X used to crash before the fix was applied\nmore prose\nan added line\n' >notes2.txt
-git commit -qam "rename doc to non-doc extension with an edit"
+git -c user.email=t@t -c user.name=t commit -qam "rename doc to non-doc extension with an edit"
 KIMI_STDIN_CAPTURE="$T/kimi-stdin-revrename.txt" bash "$S/run_reviewers.sh" --base revrename-base --out "$T/o21" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
 assert_contains "doc renamed away to a non-doc extension (with edit) still triggers the caution" \
   "$(cat "$T/kimi-stdin-revrename.txt" 2>/dev/null)" "documentation/markdown"
