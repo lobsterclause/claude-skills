@@ -579,6 +579,119 @@ DETECT2="$(MOONSHOT_API_KEY= bash "$S/detect_reviewers.sh")"
 assert_eq "no moonshot key → kimi27 false" "$(jq -r '.kimi27' <<<"$DETECT2")" "false"
 assert_eq "no moonshot key → OR pool unaffected" "$(jq -r '.glm' <<<"$DETECT2")" "true"
 
+echo "── doc-narrative caution note (text-only reviewers, PR #350 class) ──"
+# [pin: PR #350 (2026-07-05) — devstral replayed 9 of 12 findings, and
+# deepseek 4 of 5, from an in-diff investigation doc's PROSE description of
+# PRE-FIX bugs, reporting them as live findings. codex+kimi (agentic, with
+# file-reading tools) were not fooled — they could check whether the
+# described bugs were actually still present. Text-only reviewers (kimi +
+# the OpenRouter pool, including kimi27) get an explicit caution injected
+# into the prompt whenever the diff touches a doc/markdown file. Detection is
+# by FILE EXTENSION, not prose content — content-sniffing for "bug language"
+# needs unbounded phrasing coverage and is the same fragile-heuristic trap
+# output_no_verdict already warns against.]
+git checkout -qb docbranch main
+printf 'bug: X used to crash before the fix was applied\n' >investigation.md
+git add investigation.md
+git -c user.email=t@t -c user.name=t commit -qm "add investigation doc"
+
+# kimi: prompt goes over stdin, not a file — capture it via a shim variant
+# that tees stdin before answering, so the assertion reads real prompt text
+# rather than trusting the wiring by inspection.
+cat >"$T/bin/kimi" <<'SHIM'
+#!/bin/sh
+cat >"${KIMI_STDIN_CAPTURE:-/dev/null}"
+printf "shim review: no findings\n"
+SHIM
+chmod +x "$T/bin/kimi"
+
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-doc.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o16" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+assert_contains "kimi prompt warns on doc-narrative risk (.md in diff)" \
+  "$(cat "$T/kimi-stdin-doc.txt" 2>/dev/null)" "documentation/markdown"
+
+# negative case: feat's diff (thousands of numbered lines in f.txt) has no
+# doc/markdown file — the caution must NOT fire on an ordinary code diff.
+git checkout -q feat
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-nodoc.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o17" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+case "$(cat "$T/kimi-stdin-nodoc.txt" 2>/dev/null)" in
+  *"documentation/markdown"*) bad "kimi prompt warns even without doc files in the diff" ;;
+  *) ok "no doc-narrative note when diff has no doc files" ;;
+esac
+
+# openrouter-pool path shares the same prompt-building function — one probe
+# (glm) confirms the wiring reaches it too, not just kimi's separate runner.
+git checkout -q docbranch
+bash "$S/run_reviewers.sh" --base main --out "$T/o18" --reviewers glm --timeout 15 >/dev/null 2>&1 || true
+assert_contains "openrouter-pool prompt (glm) warns on doc-narrative risk" \
+  "$(jq -r '.messages[0].content' "$T/o18/glm.request.json" 2>/dev/null)" "documentation/markdown"
+
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+git branch -D docbranch >/dev/null 2>&1
+git checkout -q feat
+
+echo "── doc-narrative caution: brace-compressed rename + 50-file cap (codex P2/P3) ──"
+# [pin: PR #30 pass 1, codex — both FALSIFIED against real git output before
+# being accepted (parent direct-source verification): git diff --stat
+# compresses a rename as "docs/{old.txt => new.md} | 1 +" (the ".md" is
+# followed by "}", not whitespace/EOL — the original regex missed it), and
+# `head -50` on --stat can truncate a doc file past the cutoff on a >50-file
+# diff — exactly the false-negative this feature exists to prevent. Fixed by
+# switching detection from the capped --stat display to an uncapped
+# `git diff --name-only` file list (one clean path per line, no brace
+# compression, no cap).]
+cat >"$T/bin/kimi" <<'SHIM'
+#!/bin/sh
+cat >"${KIMI_STDIN_CAPTURE:-/dev/null}"
+printf "shim review: no findings\n"
+SHIM
+chmod +x "$T/bin/kimi"
+git checkout -qb renamebranch main
+git mv f.txt renamed-doc.md 2>/dev/null || git mv f.txt docs.md
+git -c user.email=t@t -c user.name=t commit -qam "rename to markdown"
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-rename.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o19" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+assert_contains "brace-compressed rename to .md still triggers the caution" \
+  "$(cat "$T/kimi-stdin-rename.txt" 2>/dev/null)" "documentation/markdown"
+git checkout -q feat
+git branch -D renamebranch >/dev/null 2>&1
+
+git checkout -qb capbranch main
+for _i in $(seq 1 55); do echo "x" >"cap$_i.ts"; done
+git add . && git -c user.email=t@t -c user.name=t commit -qm "55 code files"
+git checkout -qb capbranch2 capbranch
+for _i in $(seq 1 55); do echo "y" >"cap$_i.ts"; done
+echo "doc content" >zzz-late-doc.md
+git add . && git -c user.email=t@t -c user.name=t commit -qm "55 code files + 1 late doc file"
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-cap.txt" bash "$S/run_reviewers.sh" --base capbranch --out "$T/o20" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+assert_contains "doc file past the 50-file --stat cap still triggers the caution" \
+  "$(cat "$T/kimi-stdin-cap.txt" 2>/dev/null)" "documentation/markdown"
+git checkout -q feat
+git branch -D capbranch capbranch2 >/dev/null 2>&1
+
+# [pin: PR #30 pass 2, codex — FALSIFIED-then-confirmed against real git
+# output: `git diff --name-only` drops the SOURCE path on a rename, showing
+# only the destination ("investigation.md => notes.txt" becomes just
+# "notes.txt"). If the doc is renamed to a non-doc extension WITH edits, the
+# extension check on the destination alone misses it entirely — even though
+# the diff hunk still carries every line of the original doc's prose as
+# context/removed lines. `--name-status` reports BOTH paths for a rename
+# (tab-separated: "R083\told.md\tnew.txt"), so the same extension regex
+# catches the source column too.]
+git checkout -qb revrename-base main
+printf 'bug: X used to crash before the fix was applied\nmore prose\n' >investigation2.md
+git add investigation2.md
+git -c user.email=t@t -c user.name=t commit -qm "add investigation doc (base)"
+git checkout -qb revrename-feat revrename-base
+git mv investigation2.md notes2.txt
+printf 'bug: X used to crash before the fix was applied\nmore prose\nan added line\n' >notes2.txt
+git -c user.email=t@t -c user.name=t commit -qam "rename doc to non-doc extension with an edit"
+KIMI_STDIN_CAPTURE="$T/kimi-stdin-revrename.txt" bash "$S/run_reviewers.sh" --base revrename-base --out "$T/o21" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
+assert_contains "doc renamed away to a non-doc extension (with edit) still triggers the caution" \
+  "$(cat "$T/kimi-stdin-revrename.txt" 2>/dev/null)" "documentation/markdown"
+git checkout -q feat
+git branch -D revrename-base revrename-feat >/dev/null 2>&1
+
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
