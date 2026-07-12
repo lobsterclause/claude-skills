@@ -527,7 +527,9 @@ echo "── kimi27 rotation seat (direct-Moonshot, draw_boost) ──"
 # [pin: 2026-07-03, per Gabriel — kimi-k2.7-code joins the rotation pool as a
 # direct-Moonshot seat (NOT an OpenRouter fallback; the no-OR-for-first-party
 # policy is untouched) with a draw_boost so it is selected frequently while it
-# earns leaderboard data.]
+# earns leaderboard data. Retired 2026-07-12 (10 sampled runs, score 72) — the
+# profile's draw_boost dropped from 2.5 to 1.0, so this now pins the boost
+# mechanism being a true no-op at 1.0, not the earlier forced-sampling weight.]
 DETECT_OUT="$(bash "$S/detect_reviewers.sh")"
 assert_eq "detect reports kimi27 available with Moonshot key" \
   "$(jq -r '.kimi27' <<<"$DETECT_OUT")" "true"
@@ -535,9 +537,9 @@ BOOST_ERR="$T/boost.err"
 CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR"
 assert_contains "selector draws kimi27 as a candidate" "$(cat "$BOOST_ERR")" "kimi27"
 # rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0;
-# draw_boost 2.5 → 187.5. nemotron (same rookie stats, no boost) stays 75.0.
-assert_contains "kimi27 weight carries the profile draw_boost" \
-  "$(grep 'kimi27' "$BOOST_ERR")" "weight=187.5"
+# draw_boost retired to 1.0 → 75.0, identical to an unboosted rookie (nemotron).
+assert_contains "kimi27 weight reflects the retired (1.0) draw_boost" \
+  "$(grep 'kimi27' "$BOOST_ERR")" "weight=75.0"
 assert_contains "unboosted rookie weight unchanged" \
   "$(grep 'nemotron' "$BOOST_ERR")" "weight=75.0"
 # no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
