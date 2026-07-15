@@ -26,7 +26,12 @@ explicit=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --staged) mode="staged"; shift ;;
-    --base)   mode="base"; base_ref="${2:-}"; shift 2 ;;
+    --base)   mode="base"; base_ref="${2:-}"
+              # Guard the shift count: `shift 2` with no value after --base
+              # (only 1 arg left) fails under `set -e` and aborts with no
+              # message, before the "--base requires a ref" check below ever
+              # runs. Shift what's actually there; the emptiness check catches it.
+              shift "$(( $# >= 2 ? 2 : 1 ))" ;;
     --refresh) refresh="true"; shift ;;
     --json)   json="true"; shift ;;
     -h|--help)

@@ -86,7 +86,11 @@ resolve_install_cmd() {
   elif [ -f "$repo_root/yarn.lock" ] && command -v yarn >/dev/null 2>&1; then
     RESOLVED_INSTALL_CMD=(yarn add -D dependency-cruiser)
     # Same idea for yarn classic's -W ("this is intentionally the workspace root").
-    if grep -q '"workspaces"' "$repo_root/package.json" 2>/dev/null; then
+    # A real JSON check, not a grep: a plain string match on `"workspaces"`
+    # false-positives on a dependency/keyword literally named that (e.g. a
+    # `"workspaces"` devDependency, or a `["workspaces", ...]` keywords
+    # array) and would wrongly pass -W to a non-workspace repo.
+    if node -e 'const p=require(process.argv[1]); process.exit(("workspaces" in p) ? 0 : 1)' "$repo_root/package.json" 2>/dev/null; then
       RESOLVED_INSTALL_CMD+=(-W)
     fi
   elif command -v npm >/dev/null 2>&1; then

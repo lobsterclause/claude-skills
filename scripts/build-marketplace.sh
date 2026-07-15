@@ -30,6 +30,18 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Runtime-visible echo of the comment block above — a comment only warns
+# whoever reads the file before running it; this warns whoever runs it,
+# every time, whether or not they've read the source.
+cat >&2 <<'EOF'
+build-marketplace.sh: this deletes plugins/ and rewrites it ONLY from
+root-level sources (a `<name>/SKILL.md` or `.skill` archive) — every plugin
+needs one, kept in sync, or it gets deleted or regressed to a stale copy.
+Also resets every plugin.json's version to 0.1.0 and author to matthewlarn,
+globally, with no per-plugin override. Check `git diff plugins/*/.claude-plugin/plugin.json`
+after this runs. See the header comment in this file for the full story.
+EOF
+
 claude-skill-marketplace \
   --source "$HERE" \
   --output "$HERE" \
