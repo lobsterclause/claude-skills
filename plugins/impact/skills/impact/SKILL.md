@@ -1,6 +1,6 @@
 ---
 name: impact
-description: Compute the reverse-dependency closure of one or more changed TypeScript/JavaScript files — what other files transitively import them, plus the test files that should be re-run — using madge and/or dependency-cruiser. Use whenever the user asks "what does this change affect", "what files depend on X", "what tests should I run after editing Y", "impact of this change", "what breaks if I touch this", "blast radius of this edit", or right before committing/pushing a non-trivial TS/JS change so Claude can decide which files to read and which test files to run. Also triggers on "find consumers of this module", "who imports this", "what's downstream of this file". Works on monorepos (auto-detects pnpm/yarn workspaces) and respects tsconfig path aliases. Do NOT trigger for single-symbol lookups (use Serena `find_symbol` / `find_referencing_symbols` instead — those return symbol-level edges, this returns file-level edges). Do NOT trigger for non-code changes (docs-only, asset-only). Do NOT trigger to find a definition — that's also Serena's job.
+description: Compute the reverse-dependency closure of one or more changed TypeScript/JavaScript files — what other files transitively import them, plus the test files that should be re-run — using madge and/or dependency-cruiser (auto-installed if neither is present), with codegraph-backed test-file detection when the repo has an index. Use whenever the user asks "what does this change affect", "what files depend on X", "what tests should I run after editing Y", "impact of this change", "what breaks if I touch this", "blast radius of this edit", or right before committing/pushing a non-trivial TS/JS change so Claude can decide which files to read and which test files to run. Also triggers on "find consumers of this module", "who imports this", "what's downstream of this file". Works on monorepos (auto-detects pnpm/yarn workspaces) and respects tsconfig path aliases. Do NOT trigger for single-symbol lookups (use Serena `find_symbol` / `find_referencing_symbols` instead — those return symbol-level edges, this returns file-level edges). Do NOT trigger for non-code changes (docs-only, asset-only). Do NOT trigger to find a definition — that's also Serena's job.
 ---
 
 # impact
@@ -52,7 +52,7 @@ What it does, in order:
 2. **Builds or reuses the cache** at `.impact-cache/graph.json`. Cache is invalidated when the lockfile hash changes, when the file count moves >5%, or on `--refresh`. The cache key is hashed from `package.json` + `pnpm-lock.yaml` (or `package-lock.json` / `yarn.lock`) + the root `tsconfig.json`.
 3. **Inverts the graph** to find transitive reverse-dependencies of each entry file.
 4. **Groups by package** if it detects `pnpm-workspace.yaml`, `package.json#workspaces`, `lerna.json`, or `nx.json`.
-5. **Pulls in test files** via `find_tests.sh` — picks up `*.test.ts(x)`, `*.spec.ts(x)`, anything under `__tests__/` whose subject is in the impacted set.
+5. **Pulls in test files** via `find_tests.sh`. Prefers `codegraph affected --stdin -j` when this repo has a codegraph index — a real transitive BFS over the indexed import graph, not a naming guess. Falls back to filename-convention matching (`*.test.ts(x)`, `*.spec.ts(x)`, anything under `__tests__/` whose subject is in the impacted set) when codegraph isn't available.
 6. **Prints the report** — human-readable by default, JSON with `--json`.
 
 ### 3. Interpret the output
@@ -103,18 +103,21 @@ Static analysis catches **import-graph edges only**. The following are invisible
 - **String-based config references** (Firebase functions registered via name, dependency-injection containers, JSON config that names a file): no static edge.
 - **CSS / asset imports** are tracked as edges by both tools but the rev-dep list will mostly be irrelevant. Use the `--json` mode and filter if needed.
 - **Type-only imports** are edges in TypeScript. A pure type change won't break runtime but the report still lists consumers — fine, since they may need re-type-checking.
+- **Test-file detection lags a fresh edit by ~1s** when it's using codegraph (its file watcher, not this skill) — re-run if you just saved the file that matters.
 
 The report is a **strong starting point, not an exhaustive list**. Mention this in the chat summary when handing the report to the user, especially for changes touching framework-route directories or DI containers.
 
 ## Install
 
-See [references/install.md](references/install.md). Short version:
+**Auto-install:** if `build_graph.sh` finds neither madge nor dependency-cruiser and this is a Node project (has `package.json`), it installs `dependency-cruiser` as a devDependency itself — using pnpm/yarn/npm, whichever matches the repo's lockfile — before falling back to grep. This happens once (the lockfile change invalidates the graph cache, so the next run picks it up); it prints what it's doing to stderr. Opt out with `IMPACT_NO_AUTO_INSTALL=1` (e.g. in CI, or a repo where you don't want an extra devDependency added automatically).
+
+See [references/install.md](references/install.md) for manual install / config. Short version:
 
 ```bash
-pnpm add -D -w madge dependency-cruiser
+pnpm add -D -w dependency-cruiser
 ```
 
-The skill works without these installed but degrades to one-hop grep — usable but noisy. Prefer the real tools for any non-trivial repo.
+If auto-install can't run (no `package.json`, no supported package manager on PATH, or it's opted out), the skill degrades to one-hop grep for the reverse-dependency section — usable but noisy. Test-file detection is unaffected either way if the repo has a codegraph index (see above).
 
 ## Related references
 

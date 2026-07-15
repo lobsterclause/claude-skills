@@ -77,7 +77,8 @@ fi
 
 graph_args=()
 [ "$refresh" = "true" ] && graph_args+=(--refresh)
-graph_file=$("$script_dir/build_graph.sh" "${graph_args[@]}")
+# `${arr[@]+...}` guards against `set -u` crashing on an empty array (bash 3.2 / macOS default).
+graph_file=$("$script_dir/build_graph.sh" ${graph_args[@]+"${graph_args[@]}"})
 
 # --- invert graph and compute reverse deps ---------------------------------
 # Use node for speed; the graph can be 100k+ nodes on a big monorepo.
@@ -203,7 +204,12 @@ report_json=$(node -e '
 
 # --- find tests ------------------------------------------------------------
 
-# Pipe closure + entries to find_tests.sh
+# IMPACT_ENTRY_FILES carries just the originally-changed files (not the
+# closure) for find_tests.sh's codegraph path, which does its own transitive
+# traversal from there. Stdin still carries entries + closure for the
+# filename-convention fallback, unchanged.
+export IMPACT_ENTRY_FILES=$(printf '%s\n' "${entries[@]}")
+
 tests=$(printf '%s\n' "$report_json" | node -e '
   let s = ""; process.stdin.on("data", c => s += c);
   process.stdin.on("end", () => {
@@ -275,4 +281,5 @@ fi
   ')
   [ -n "$missing" ] && echo "$missing"
   echo "  - Static analysis only. File-based routing, DI containers, and string-based config refs are invisible."
+  echo "  - Affected test files: codegraph-backed transitive BFS when this repo has a codegraph index, otherwise filename-convention matching (test naming + __tests__ siblings)."
 } | tee "$report_file"

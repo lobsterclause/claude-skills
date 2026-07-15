@@ -63,11 +63,72 @@ if [ "$refresh" != "true" ] && [ -f "$key_file" ] && [ -f "$graph_file" ]; then
   fi
 fi
 
-# --- detect tool -----------------------------------------------------------
+# --- detect tool, auto-installing dependency-cruiser if this is a JS/TS repo
+# with neither tool available (opt out with IMPACT_NO_AUTO_INSTALL=1) --------
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 detect_json=$("$script_dir/detect_tools.sh")
 preferred=$(printf '%s' "$detect_json" | sed -n 's/.*"preferred": *"\([^"]*\)".*/\1/p')
+
+# Pick the package manager matching the repo's lockfile, mirroring the three
+# variants documented in references/install.md. Sets the global
+# RESOLVED_INSTALL_CMD; empty if no supported package manager is on PATH.
+RESOLVED_INSTALL_CMD=()
+resolve_install_cmd() {
+  RESOLVED_INSTALL_CMD=()
+  if [ -f "$repo_root/pnpm-lock.yaml" ] && command -v pnpm >/dev/null 2>&1; then
+    RESOLVED_INSTALL_CMD=(pnpm add -D dependency-cruiser)
+    # -w ("workspace root") is pnpm's flag for installing at a workspace root
+    # from a subdirectory — it hard-errors ("may only be used inside a
+    # workspace") on a plain single-package repo, which is the common case.
+    # Only add it when pnpm-workspace.yaml proves this really is a workspace.
+    [ -f "$repo_root/pnpm-workspace.yaml" ] && RESOLVED_INSTALL_CMD+=(-w)
+  elif [ -f "$repo_root/yarn.lock" ] && command -v yarn >/dev/null 2>&1; then
+    RESOLVED_INSTALL_CMD=(yarn add -D dependency-cruiser)
+    # Same idea for yarn classic's -W ("this is intentionally the workspace root").
+    if grep -q '"workspaces"' "$repo_root/package.json" 2>/dev/null; then
+      RESOLVED_INSTALL_CMD+=(-W)
+    fi
+  elif command -v npm >/dev/null 2>&1; then
+    RESOLVED_INSTALL_CMD=(npm install -D dependency-cruiser)
+  fi
+}
+
+auto_install_depcruiser() {
+  # Only a real Node project has a package.json to add a devDependency to;
+  # skip silently for non-JS repos (e.g. this very repo, mostly bash/markdown).
+  [ -f "$repo_root/package.json" ] || return 1
+
+  resolve_install_cmd
+  [ "${#RESOLVED_INSTALL_CMD[@]}" -eq 0 ] && return 1
+
+  local install_log="$cache_dir/install.log"
+  echo "impact: neither madge nor dependency-cruiser found — installing dependency-cruiser (${RESOLVED_INSTALL_CMD[*]})..." >&2
+  if ( cd "$repo_root" && "${RESOLVED_INSTALL_CMD[@]}" ) >"$install_log" 2>&1; then
+    echo "impact: installed dependency-cruiser as a devDependency." >&2
+    return 0
+  else
+    echo "impact: auto-install failed (see $install_log); falling back to grep-based analysis. Install manually: pnpm add -D -w dependency-cruiser" >&2
+    return 1
+  fi
+}
+
+if [ "$preferred" = "none" ] && [ "${IMPACT_NO_AUTO_INSTALL:-}" != "1" ]; then
+  if auto_install_depcruiser; then
+    # The install just changed the lockfile — recompute the cache key so the
+    # graph we're about to build (with the new tool) isn't shadowed by a
+    # stale grep-built cache entry keyed off the pre-install lockfile hash.
+    for lock in pnpm-lock.yaml package-lock.json yarn.lock; do
+      if [ -f "$repo_root/$lock" ]; then
+        lock_hash=$(hash_file "$repo_root/$lock")
+        break
+      fi
+    done
+    key="$lock_hash|$tsconfig_hash|$file_count"
+    detect_json=$("$script_dir/detect_tools.sh")
+    preferred=$(printf '%s' "$detect_json" | sed -n 's/.*"preferred": *"\([^"]*\)".*/\1/p')
+  fi
+fi
 
 # Resolve binary command as an array. Sets the global RESOLVED_BIN_CMD; callers
 # should copy it before the next resolve_bin call.
@@ -94,6 +155,17 @@ if [ -f "$repo_root/tsconfig.json" ]; then
   ts_flag=(--ts-config "$repo_root/tsconfig.json")
 fi
 
+# dependency-cruiser >=17 errors out ("Can't open a config file") instead of
+# running config-free by default. Only pass --no-config when the repo truly
+# has no config, so an existing one (with the forbidden-dep rules etc. from
+# references/install.md) is still picked up and respected.
+depcruise_config_flag=()
+depcruise_has_config="false"
+for cfg in .dependency-cruiser.cjs .dependency-cruiser.mjs .dependency-cruiser.js .dependency-cruiser.json; do
+  [ -f "$repo_root/$cfg" ] && depcruise_has_config="true" && break
+done
+[ "$depcruise_has_config" = "false" ] && depcruise_config_flag=(--no-config)
+
 # PID-suffix the intermediate so concurrent invocations don't clobber each other.
 tmp_raw="$cache_dir/graph.raw.$$.json"
 trap 'rm -f "$tmp_raw"' EXIT
@@ -103,13 +175,14 @@ build_with_depcruise() {
   local bin_cmd=("${RESOLVED_BIN_CMD[@]}")
   # depcruise emits {modules: [{source, dependencies: [{resolved, ...}], ...}]}
   # We restrict to source extensions and skip node_modules.
-  # `${arr[@]+...}` guards against `set -u` crashing on an empty `ts_flag` (bash 3.2 / macOS default).
+  # `${arr[@]+...}` guards against `set -u` crashing on an empty array (bash 3.2 / macOS default).
   ( cd "$repo_root" && \
     "${bin_cmd[@]}" --output-type json \
       --exclude '(^|/)(node_modules|dist|build|\.next|coverage|\.impact-cache)(/|$)' \
       --include-only '\.(m?j|t)sx?$' \
+      ${depcruise_config_flag[@]+"${depcruise_config_flag[@]}"} \
       ${ts_flag[@]+"${ts_flag[@]}"} \
-      . > "$tmp_raw" 2>/dev/null )
+      . > "$tmp_raw" 2>"$cache_dir/depcruise.err.log" )
 
   # Convert to normalized adjacency via node one-liner (node always available if depcruise is)
   node -e '
@@ -134,7 +207,7 @@ build_with_madge() {
       --extensions ts,tsx,js,jsx,mjs,cjs \
       --exclude '(^|/)(node_modules|dist|build|\.next|coverage|\.impact-cache)(/|$)' \
       ${ts_flag[@]+"${ts_flag[@]}"} \
-      . > "$tmp_raw" 2>/dev/null )
+      . > "$tmp_raw" 2>"$cache_dir/madge.err.log" )
 
   # madge output is already an adjacency map of relative paths -> [deps]
   node -e '
@@ -190,9 +263,36 @@ build_with_grep() {
   ' "$repo_root" "$graph_file"
 }
 
+# True (exit 0) when graph.json has zero files even though the repo clearly
+# has source to crawl ($file_count > 0). A tool can exit 0 and still produce
+# nothing — e.g. dependency-cruiser silently disables .ts/.tsx parsing with
+# no error when the installed `typescript` version falls outside its
+# supported peer range (confirmed live: depcruise 18.1.0 + typescript 7.0.2
+# → 0 modules, no warning, `depcruise -i` is the only way to see it happened).
+# Trusting that blindly would render a confidently wrong "(none)" report.
+graph_is_suspiciously_empty() {
+  [ "$file_count" -eq 0 ] && return 1
+  node -e '
+    try {
+      const g = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      process.exit(Object.keys(g.files || {}).length === 0 ? 0 : 1);
+    } catch { process.exit(0); }
+  ' "$graph_file"
+}
+
 case "$preferred" in
-  depcruiser) build_with_depcruise ;;
-  madge)      build_with_madge ;;
+  depcruiser)
+    if ! build_with_depcruise || graph_is_suspiciously_empty; then
+      echo "WARN: dependency-cruiser produced an empty graph despite $file_count source file(s) present (see $cache_dir/depcruise.err.log, or run \`node_modules/.bin/depcruise -i\` to check which extensions/transpilers it has enabled — a common cause is the installed \`typescript\` version falling outside depcruise's supported peer range); falling back to grep (one-hop only)." >&2
+      build_with_grep
+    fi
+    ;;
+  madge)
+    if ! build_with_madge || graph_is_suspiciously_empty; then
+      echo "WARN: madge produced an empty graph despite $file_count source file(s) present (see $cache_dir/madge.err.log); falling back to grep (one-hop only)." >&2
+      build_with_grep
+    fi
+    ;;
   none)
     echo "WARN: neither madge nor dependency-cruiser found; using grep fallback (one-hop only)." >&2
     build_with_grep

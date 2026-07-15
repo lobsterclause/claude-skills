@@ -1,16 +1,30 @@
 # Install
 
-## Recommended (both)
+## Auto-install (default behavior)
+
+You usually don't need to do this yourself. When `build_graph.sh` finds neither tool and the target repo has a `package.json`, it installs `dependency-cruiser` as a devDependency automatically — detecting pnpm/yarn/npm from the repo's lockfile, same commands as below — and prints what it did to stderr. Opt out with `IMPACT_NO_AUTO_INSTALL=1`.
+
+## Manual install
+
+`dependency-cruiser` alone is enough — it's `detect_tools.sh`'s preferred tool whenever both are present, so adding `madge` too is redundant unless you specifically want it as an independent cross-check.
 
 ```bash
 # pnpm workspace root
-pnpm add -D -w madge dependency-cruiser
+pnpm add -D -w dependency-cruiser
 
 # npm
-npm i -D madge dependency-cruiser
+npm i -D dependency-cruiser
 
 # yarn (classic)
-yarn add -D -W madge dependency-cruiser
+yarn add -D -W dependency-cruiser
+```
+
+Add `madge` alongside it only if you want both tools installed for comparison — `dependency-cruiser` wins the preference either way:
+
+```bash
+pnpm add -D -w madge dependency-cruiser   # pnpm
+npm i -D madge dependency-cruiser         # npm
+yarn add -D -W madge dependency-cruiser   # yarn (classic)
 ```
 
 ## Minimum dependency-cruiser config
