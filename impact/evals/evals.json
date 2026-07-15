@@ -1,0 +1,56 @@
+{
+  "skill": "impact",
+  "description": "Sanity checks for the impact skill. These are not automated regression tests — they're scenarios a reviewer or skill-creator harness can walk through manually to verify trigger accuracy and output usefulness.",
+  "cases": [
+    {
+      "id": "trigger-positive-1",
+      "input": "I just edited apps/web/src/lib/useFoo.ts — what does this change affect?",
+      "expect": "skill invoked"
+    },
+    {
+      "id": "trigger-positive-2",
+      "input": "What tests should I run after editing packages/shared/lib/agent/coreTools.ts?",
+      "expect": "skill invoked"
+    },
+    {
+      "id": "trigger-positive-3",
+      "input": "What's the blast radius of renaming this hook?",
+      "expect": "skill invoked"
+    },
+    {
+      "id": "trigger-negative-1",
+      "input": "Where is the function loadConsent defined?",
+      "expect": "skill NOT invoked — should use Serena find_symbol"
+    },
+    {
+      "id": "trigger-negative-2",
+      "input": "Update the README to mention the new flag.",
+      "expect": "skill NOT invoked — docs-only change"
+    },
+    {
+      "id": "trigger-negative-3",
+      "input": "Find all call sites of useAuth().signOut",
+      "expect": "skill NOT invoked — symbol-level lookup, use Serena find_referencing_symbols"
+    },
+    {
+      "id": "behavior-empty-diff",
+      "scenario": "Run impact.sh on a branch with no code changes",
+      "expect": "exit 0, prints 'no code changes detected'"
+    },
+    {
+      "id": "behavior-no-tools",
+      "scenario": "Run impact.sh on a repo where neither madge nor dependency-cruiser is installed",
+      "expect": "warns about degraded mode on stderr, still produces a one-hop report from grep fallback"
+    },
+    {
+      "id": "behavior-monorepo-grouping",
+      "scenario": "Run impact.sh against an edit in packages/shared on a pnpm-workspace repo with apps/web and apps/mobile both consuming shared",
+      "expect": "reverse-deps section lists @kindred-mama/web and @kindred-mama/mobile as separate groups"
+    },
+    {
+      "id": "behavior-dynamic-imports-caveat",
+      "scenario": "Run impact.sh on a file containing `import(someVar)`",
+      "expect": "Caveats section reports 'N dynamic import() call(s) detected'"
+    }
+  ]
+}

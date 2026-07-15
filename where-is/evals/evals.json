@@ -1,0 +1,76 @@
+{
+  "skill": "where-is",
+  "description": "Sanity checks for the where-is skill. Manual review scenarios verifying classification accuracy, MCP routing, and output usefulness.",
+  "cases": [
+    {
+      "id": "trigger-positive-1",
+      "input": "Where is FirestoreMemoryClient defined?",
+      "expect": "skill invoked, classified as symbol, emits Serena MCP next-actions"
+    },
+    {
+      "id": "trigger-positive-2",
+      "input": "Who uses useResources?",
+      "expect": "skill invoked, classified as symbol, emits find_referencing_symbols call"
+    },
+    {
+      "id": "trigger-positive-3",
+      "input": "What file handles the login flow?",
+      "expect": "skill invoked, classified as concept, runs ripgrep"
+    },
+    {
+      "id": "trigger-positive-4",
+      "input": "Find every useEffect with empty dep array",
+      "expect": "skill invoked, classified as pattern, routes to ast-grep"
+    },
+    {
+      "id": "trigger-positive-5",
+      "input": "What's in apps/web/src/pages/Resources?",
+      "expect": "skill invoked, classified as path, runs fs_walk"
+    },
+    {
+      "id": "trigger-negative-1",
+      "input": "Refactor FirestoreMemoryClient to use the new key API",
+      "expect": "skill NOT invoked — editing task, not a lookup"
+    },
+    {
+      "id": "trigger-negative-2",
+      "input": "How do I write a custom React hook?",
+      "expect": "skill NOT invoked — general programming question"
+    },
+    {
+      "id": "trigger-negative-3",
+      "input": "What does this change affect? I edited apps/web/src/lib/useFoo.ts",
+      "expect": "skill NOT invoked — that's the impact skill"
+    },
+    {
+      "id": "classify-symbol-slash",
+      "scenario": "Run classify.sh on 'FirestoreMemoryClient/storeMemory'",
+      "expect": "kind=path (path heuristic wins due to /); user must pass --kind symbol for Serena name_path form"
+    },
+    {
+      "id": "classify-pattern-metavar",
+      "scenario": "Run classify.sh on 'useState<$T>($V)'",
+      "expect": "kind=pattern"
+    },
+    {
+      "id": "behavior-no-astgrep",
+      "scenario": "Pattern-mode invoked but ast-grep not installed",
+      "expect": "WARN on stderr, falls back to ripgrep with degradation notice"
+    },
+    {
+      "id": "behavior-symbol-no-serena",
+      "scenario": "Symbol-mode invoked from a conversation without Serena MCP enabled",
+      "expect": "ripgrep fallback_hits populated; model surfaces 'Serena unavailable, using ripgrep' caveat"
+    },
+    {
+      "id": "behavior-monorepo-grouping",
+      "scenario": "Run with a query that hits files in two workspace packages",
+      "expect": "output grouped by package label, longest-prefix match wins"
+    },
+    {
+      "id": "behavior-include-tests",
+      "scenario": "Run without --include-tests then with",
+      "expect": "first call excludes *.test.* and __tests__/; second includes them"
+    }
+  ]
+}

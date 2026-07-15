@@ -9,7 +9,8 @@
 # Usage:
 #   append_runlog.sh \
 #     --run-dir <path>             # produced by worktree.sh start; contains
-#                                  # codex.meta.json, gemini.meta.json, etc.
+#                                  # codex.meta.json, antigravity.meta.json,
+#                                  # gemini-pro.meta.json, kimi.meta.json, etc.
 #     --project <name>
 #     --base <branch>
 #     --pr <number|->              # use - for no PR (branch-only run)
@@ -114,7 +115,8 @@ reviewer_obj() {
 }
 
 codex_json=$(reviewer_obj codex)
-gemini_json=$(reviewer_obj gemini)
+antigravity_json=$(reviewer_obj antigravity)
+gemini_pro_json=$(reviewer_obj gemini-pro)
 kimi_json=$(reviewer_obj kimi)
 
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -132,7 +134,8 @@ entry=$(jq -nc \
   --arg diff_files "${diff_files:-}" \
   --arg diff_lines "${diff_lines:-}" \
   --argjson codex "$codex_json" \
-  --argjson gemini "$gemini_json" \
+  --argjson antigravity "$antigravity_json" \
+  --argjson gemini_pro "$gemini_pro_json" \
   --argjson kimi "$kimi_json" \
   '{
     ts: $ts,
@@ -143,7 +146,7 @@ entry=$(jq -nc \
     diff_size: (if $diff_files == "" and $diff_lines == "" then null
                 else {files: ($diff_files | tonumber? // null),
                       lines: ($diff_lines | tonumber? // null)} end),
-    reviewers: {codex: $codex, gemini: $gemini, kimi: $kimi},
+    reviewers: {codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi},
     convergent_count: $convergent,
     verdict: $verdict,
     top_finding: (if $top == "" then null else $top end),

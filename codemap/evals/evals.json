@@ -1,0 +1,56 @@
+{
+  "skill": "codemap",
+  "description": "Sanity checks for the codemap skill. These are not automated regression tests — they're scenarios a reviewer or skill-creator harness can walk through manually to verify trigger accuracy and output usefulness.",
+  "cases": [
+    {
+      "id": "trigger-positive-1",
+      "input": "Generate a codemap for this monorepo.",
+      "expect": "skill invoked"
+    },
+    {
+      "id": "trigger-positive-2",
+      "input": "Give me a top-down view of the architecture — what packages are in this repo and what depends on what?",
+      "expect": "skill invoked"
+    },
+    {
+      "id": "trigger-positive-3",
+      "input": "Refresh the codemap, I just added a new package.",
+      "expect": "skill invoked"
+    },
+    {
+      "id": "trigger-positive-4",
+      "input": "I'm spinning up a new subagent on this repo — give it an orientation file.",
+      "expect": "skill invoked"
+    },
+    {
+      "id": "trigger-negative-1",
+      "input": "I just edited apps/web/src/hooks/useFoo.ts — what does this change affect?",
+      "expect": "skill NOT invoked — use /impact (file-level)"
+    },
+    {
+      "id": "trigger-negative-2",
+      "input": "Where is loadConsent defined?",
+      "expect": "skill NOT invoked — use /where-is or Serena find_symbol"
+    },
+    {
+      "id": "trigger-negative-3",
+      "input": "Update the README to mention the new flag.",
+      "expect": "skill NOT invoked — docs-only edit"
+    },
+    {
+      "id": "output-determinism",
+      "input": "Run codemap.sh twice with CODEMAP_FAKE_TIME pinned and diff the outputs.",
+      "expect": "byte-identical output"
+    },
+    {
+      "id": "output-single-package",
+      "input": "Run codemap.sh against a single-package repo (no workspaces).",
+      "expect": "one package row, entry resolved, empty edges section"
+    },
+    {
+      "id": "output-json-shape",
+      "input": "Run codemap.sh --json on a pnpm monorepo.",
+      "expect": "top-level keys include repo_name, generated_at, stats, packages, edges, ownership, include_external, regen_cmd"
+    }
+  ]
+}

@@ -32,36 +32,47 @@ Flags we deliberately do not use:
 
 Auth: codex uses its own login (`codex login`). If the first run hangs on auth, that's almost always it. Re-run `codex login` interactively once, then headless runs work.
 
-## gemini
+## antigravity & gemini-pro (both via `agy`)
 
-Binary: `gemini` (`@google/gemini-cli`, npm global). Verify with `gemini --version`.
+Binary: `agy` (Google Antigravity CLI). Verify with `agy --version`. Install: `curl -fsSL https://antigravity.google/cli/install.sh | bash` (lands at `~/.local/bin/agy`). Auth: `agy login` once interactively (Google OAuth); state persists for headless runs.
 
-Invocation used by this skill:
+> **Why two reviewers on one CLI.** As of the **2026-06-18 Gemini-CLI consumer sunset**, the standalone `gemini` CLI no longer serves free/Pro/Ultra requests. Google's replacement is Antigravity (`agy`), which now hosts the whole Gemini lineup *and* exposes `--model`. So both Gemini-family reviewers ride `agy`, differing only by `--model`:
+>
+> | Reviewer | `--model` | Role | Default timeout |
+> |---|---|---|---|
+> | `antigravity` | `Gemini 3.5 Flash (High)` | fast lap | 600s |
+> | `gemini-pro`  | `Gemini 3.1 Pro (High)`   | deep lap | 900s |
+>
+> They are the **same provider (Google)** — count their agreement as a single provider's vote, not two independent ones (see `reviewer_profiles.json` `_synthesis_rules.provider_independence`).
+
+Invocation used by this skill (identical bar `--model` and timeout — see `run_agy_reviewer()`):
 
 ```bash
-gemini \
-  --approval-mode plan \
-  --output-format json \
+agy \
+  --model "Gemini 3.1 Pro (High)" \
+  --sandbox \
+  --print-timeout <budget>s \
+  --log-file <out>/<slug>.agy.log \
   -p "<prompt>" </dev/null
 ```
 
 Why these flags:
 
-- `--approval-mode plan` — read-only mode. Gemini can read files and run analysis but won't attempt edits. The alternatives are `default` (prompts on each action, breaks headless), `auto_edit` (auto-approves file edits — dangerous for a reviewer), and `yolo` (auto-approves everything — very dangerous).
-- `--output-format json` — single structured JSON blob at the end. Easier to diff across runs than the default text mode.
-- `-p <prompt>` — non-interactive mode. Without `-p`, gemini launches its TUI and blocks forever in a pipeline.
-- `</dev/null` on stdin — **important**. Gemini concatenates stdin to the `-p` value when both are present, which silently duplicates the prompt and doubles token cost. Blocking stdin with `</dev/null` prevents that. (An earlier iteration of this doc recommended piping the prompt in via stdin; that turned out to be actively wrong — don't do it.)
-
-Prompts in this skill are well under shell argv limits, so `-p` alone is fine. If you ever need to pass a prompt too large for argv, use a here-doc into stdin AND omit `-p`, not both.
+- `--model "<exact display name>"` — pins the model. **The value MUST match an `agy models` display name string exactly** (e.g. `Gemini 3.1 Pro (High)`, *with* the parenthesized reasoning tier). On an unrecognized string, `agy` does **NOT error** — it silently falls back to its default (`Gemini 3.5 Flash`). Verified on `agy 1.0.9` (2026-06-18). This silent fallback is the single biggest footgun: a typo turns the "deep lap" into a second Flash run with no warning. Run `agy models` to see the current valid strings; keep them in sync with `reviewer_profiles.json` `.model` and the defaults in `run_reviewers.sh`.
+- `--sandbox` — enables terminal/shell sandbox restrictions (the closest thing `agy` has to a read-only mode). We also prompt-instruct "do not edit/write/commit" as a backstop.
+- `--print-timeout <dur>` — `agy`'s own in-CLI timeout (Go duration syntax, e.g. `600s`). Set just under the wrapper's `timeout` budget so `agy` exits cleanly and flushes partial output rather than being hard-killed mid-write.
+- `-p <prompt>` — non-interactive single-shot. Aliases: `--print`, `--prompt`. Without it, `agy` launches its agent TUI and blocks forever in a pipeline.
+- `--log-file <path>` — pins `agy`'s own log next to our outputs for post-mortem.
+- `</dev/null` on stdin — keep stdin closed so `agy` doesn't block waiting on it.
 
 Flags we deliberately do not use:
 
-- `--yolo` / `--approval-mode yolo` — bypasses all confirmations. Not appropriate for an automated reviewer that might touch untrusted code.
-- `-m/--model` — default model is fine; pin only if needed.
-- `-s/--sandbox` — we're already scoped by `plan` mode, no extra sandboxing needed.
-- `--raw-output` — disables sanitization of model output (can leak ANSI escape sequences). Security footgun, don't use.
+- `--dangerously-skip-permissions` — auto-approves every tool call including writes. A reviewer that can auto-approve edits defeats the purpose.
+- `-i / --prompt-interactive`, `-c / --continue`, `--conversation <id>` — interactive/session-resume modes; we want one clean single-shot per pass.
 
-Auth: gemini uses Google OAuth. First run will need an interactive browser login. After that, headless runs work.
+Auth/empty-output gotcha: if `agy` returns empty stdout, suspect expired auth (re-run `agy login`) — that is **not** a timeout to bump. The wrapper records `output_bytes` in `<slug>.meta.json` so the runlog can tell "ran but produced nothing" (auth) from "ran and produced findings".
+
+Subcommands worth knowing: `agy models` (list valid `--model` strings), `agy update` (self-update), `agy changelog` (release notes — check it when a flag stops behaving).
 
 ## kimi
 
@@ -122,8 +133,9 @@ If the user has a `code.kimi.com/coding/v1` subscription key instead of a Moonsh
 
 ## Known issues and gotchas
 
-- **All three CLIs can cold-start slowly** on first run of the day (30–60s). Timeouts in the wrapper are set to 5 minutes per reviewer; if one hits that, it's usually auth or network, not actual work.
+- **All CLIs can cold-start slowly** on first run of the day (30–60s). Per-reviewer timeouts default to codex=300s, antigravity=600s, gemini-pro=900s, kimi=600s; if one hits its cap, it's usually auth or network, not actual work.
 - **codex may emit warnings about rate limits** on the free tier; they show up in stderr and do not fail the run. The final JSONL event will still contain the review.
-- **gemini JSON output is one blob, not JSONL.** If the output looks truncated, it's probably a write-to-pipe buffering issue — check `gemini.stderr` first.
+- **`agy --model` fails silently on a bad model string** — it falls back to Flash instead of erroring (see the antigravity/gemini-pro section above). If `gemini-pro` results look suspiciously fast/shallow, confirm the model string still matches an `agy models` entry.
+- **antigravity + gemini-pro share one `agy` auth + rate limit.** Running both concurrently can trip Google rate limits; the wrapper staggers spawns by 2s to soften the simultaneous-handshake case. Empty stdout from either usually means the shared auth expired — `agy login` once.
 - **kimi will print "To resume this session: kimi -r <uuid>" at the end** of every `--print` run (to stderr). Harmless, just noise in the log. Don't confuse it with an error.
-- **All three reviewers will read files in the repo.** If the repo contains untrusted input (e.g., fixture data for a parser), be aware that this is being sent to external APIs — including Moonshot for kimi, which is a China-origin provider. Worth flagging for security-sensitive or export-controlled work.
+- **codex and the two agy reviewers will read files in the repo** (kimi runs diff-only, no tools). If the repo contains untrusted input (e.g., fixture data for a parser), be aware that this is being sent to external providers — OpenAI (codex), Google (agy), and Moonshot (kimi, a China-origin provider). Worth flagging for security-sensitive or export-controlled work.
