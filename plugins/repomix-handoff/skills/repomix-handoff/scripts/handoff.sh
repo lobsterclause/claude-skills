@@ -75,10 +75,23 @@ case "$STYLE" in
   markdown) ext="md" ;;
 esac
 if [ -z "${OUTPUT:-}" ]; then
-  # macOS mktemp doesn't honor `--suffix`; do a rename after creation.
-  _tmp="$(mktemp -t repomix-handoff.XXXXXXXX)" || { echo "handoff.sh: mktemp failed" >&2; exit 9; }
-  OUTPUT="${_tmp}.${ext}"
-  mv "$_tmp" "$OUTPUT"
+  # macOS mktemp doesn't honor a suffix placed after the X template — it
+  # treats "repomix-handoff.XXXXXXXX.md" as a literal prefix and appends its
+  # own random suffix at the very end, so `mktemp -t "foo.XXXXXXXX.$ext"`
+  # does NOT produce a "foo.<rand>.$ext"-shaped name on macOS (verified).
+  # The old two-step mktemp-then-mv left a window where the final,
+  # non-mktemp'd "$OUTPUT" path didn't exist yet — a pre-placed file or
+  # symlink there would get silently clobbered by `mv` (CWE-377). Build the
+  # random component ourselves and create the final path atomically with
+  # noclobber (O_EXCL semantics): refuses if anything is already there,
+  # instead of writing through it.
+  rand="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  [ -n "$rand" ] || rand="$$-$RANDOM"
+  OUTPUT="${TMPDIR:-/tmp}/repomix-handoff.${rand}.${ext}"
+  if ! ( set -C; : > "$OUTPUT" ) 2>/dev/null; then
+    echo "handoff.sh: could not create $OUTPUT (unexpected collision)" >&2
+    exit 9
+  fi
 fi
 
 # 1. Detect repomix.
@@ -199,7 +212,7 @@ for p in patterns:
         batches.append(batch)
         remaining = [f for f in remaining if f not in set(batch)]
 # Fallback: largest non-source files, one per batch so we re-pack between drops.
-src_exts = (".ts", ".tsx", ".py", ".js", ".jsx")
+src_exts = (".ts", ".tsx", ".mjs", ".cjs", ".py", ".js", ".jsx")
 non_src = [f for f in remaining if os.path.isfile(f) and not f.endswith(src_exts)]
 non_src.sort(key=lambda f: os.path.getsize(f), reverse=True)
 for f in non_src:
@@ -280,3 +293,14 @@ print(json.dumps({
   "trim_iterations": int(os.environ["TRIM_ITER"]),
 }, indent=2))
 PY
+
+# Source files are deliberately never in the drop list, so a low enough
+# --max-tokens on a source-heavy diff can genuinely exhaust every batch
+# before reaching budget. The JSON above already says so (within_budget:
+# false), but a caller that only checks the exit code — which is exactly how
+# cross-review's step 2.5 invokes this (`>/dev/null`, JSON discarded) — would
+# otherwise see success and silently hand reviewers an oversized snapshot.
+if [ "$token_count" -gt "$MAX_TOKENS" ]; then
+  echo "handoff.sh: exhausted every droppable batch; ${token_count} tokens still exceeds budget ${MAX_TOKENS}." >&2
+  exit 10
+fi

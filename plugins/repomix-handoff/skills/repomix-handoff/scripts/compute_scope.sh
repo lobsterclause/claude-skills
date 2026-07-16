@@ -52,6 +52,11 @@ fi
 if [ -n "$EXTRA_EXCLUDE" ]; then
   IFS=',' read -r -a _user_ex <<< "$EXTRA_EXCLUDE"
   for g in "${_user_ex[@]}"; do
+    # Strip surrounding whitespace — "a, b" with a space after the comma
+    # used to leave a leading space that never matches a real path (same
+    # fix already applied in cross-review/scripts/run_reviewers.sh).
+    g="${g#"${g%%[![:space:]]*}"}"
+    g="${g%"${g##*[![:space:]]}"}"
     [ -n "$g" ] && DEFAULT_EXCLUDES+=("$g")
   done
 fi
@@ -64,6 +69,8 @@ if [ -n "$PATHS" ]; then
   MODE="paths"
   IFS=',' read -r -a _p <<< "$PATHS"
   for g in "${_p[@]}"; do
+    g="${g#"${g%%[![:space:]]*}"}"
+    g="${g%"${g##*[![:space:]]}"}"
     [ -n "$g" ] && INCLUDES+=("$g")
   done
   SEED_COUNT=${#INCLUDES[@]}

@@ -47,8 +47,20 @@ glob_to_regex() {
 
 re=$(glob_to_regex "$pat")
 # If pattern looks like a plain prefix path (no glob chars), match files under it.
+# Otherwise it's a real glob (has *, ?, or [) — anchor it too, or grep's
+# unanchored substring search lets `*.ts` match `a.tsx` or `x-a.ts.bak`
+# (both merely CONTAIN ".ts", they don't end in it). A pattern containing
+# `/` describes a specific path shape, so anchor both ends (`^...$`); a bare
+# basename glob like `*.ts` should still match at any depth, so only anchor
+# the end — `[^/]*` in the converted regex can't cross a `/`, so end-anchoring
+# alone already confines the match to within one path segment.
 case "$pat" in
-  *\**|*\?*|*\[*) : ;;
+  *\**|*\?*|*\[*)
+    case "$pat" in
+      */*) re="^${re}\$" ;;
+      *)   re="${re}\$" ;;
+    esac
+    ;;
   *) re="^${re}(/.*)?$" ;;
 esac
 

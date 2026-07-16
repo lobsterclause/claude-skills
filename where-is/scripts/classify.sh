@@ -20,29 +20,33 @@ q="${q%"${q##*[![:space:]]}"}"
 kind=""
 normalized="$q"
 
-# --- 1. symbol -------------------------------------------------------------
-# Single identifier, optionally Class/method form (Serena name_path style).
-# Run this BEFORE the path check so `Class/method` is classified as symbol,
-# not path. The pattern is restrictive (no spaces, no globs, no dots) so it
-# only matches identifier-shaped strings.
+# --- 1. path ----------------------------------------------------------------
+# Slash, glob char, or known code extension. Checked BEFORE symbol: the
+# symbol regex below is shape-only (identifier segments, optionally
+# slash-joined) and would otherwise also match ordinary extension-less
+# directory paths like `apps/mobile/hooks` — a far more common query shape
+# than the Serena `Class/method` name_path form path-first sacrifices.
+# Users wanting the latter pass `--kind symbol` explicitly (see SKILL.md).
 case "$q" in
-  *' '*) : ;;  # spaces -> not a symbol
-  *)
-    if printf '%s' "$q" | grep -Eq '^[A-Za-z_$][A-Za-z0-9_$]*(/[A-Za-z_$][A-Za-z0-9_$]*)*$'; then
-      kind="symbol"
-    fi
-    ;;
+  */*|*\**|*\?*|*\[*)
+    kind="path" ;;
+  *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.json|*.md|*.yml|*.yaml|*.css|*.scss|*.html)
+    kind="path" ;;
 esac
 
-# --- 2. path ---------------------------------------------------------------
-# Slash, glob char, or known code extension. Only fires if the string didn't
-# already qualify as a symbol — so `Class/method` stays a symbol.
+# --- 2. symbol ---------------------------------------------------------------
+# Single identifier. Only fires if the string didn't already qualify as a
+# path — so any `/`-containing query (including Class/method form) is a
+# path unless overridden. The pattern is restrictive (no spaces, no globs,
+# no dots) so it only matches identifier-shaped strings.
 if [ -z "$kind" ]; then
   case "$q" in
-    */*|*\**|*\?*|*\[*)
-      kind="path" ;;
-    *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.json|*.md|*.yml|*.yaml|*.css|*.scss|*.html)
-      kind="path" ;;
+    *' '*) : ;;  # spaces -> not a symbol
+    *)
+      if printf '%s' "$q" | grep -Eq '^[A-Za-z_$][A-Za-z0-9_$]*(/[A-Za-z_$][A-Za-z0-9_$]*)*$'; then
+        kind="symbol"
+      fi
+      ;;
   esac
 fi
 

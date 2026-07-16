@@ -1,6 +1,6 @@
 ---
 name: repomix-handoff
-description: Produce a bounded, token-budgeted codebase snapshot for handing off to external AI reviewers (codex CLI, gemini CLI, kimi CLI). Wraps Repomix and adds PR-scoped slicing, path/language filtering, token-budget enforcement, and per-reviewer output presets. Use whenever the user wants to prepare a snapshot for codex, pack the repo for review, bundle this for kimi, handoff to gemini, context-budget the repo, share this with another AI, or whenever cross-review needs a scoped input bundle for a one-shot reviewer.
+description: Produce a bounded, token-budgeted codebase snapshot for handing off to external AI reviewers (codex CLI, Gemini via Antigravity's agy CLI, kimi CLI). Wraps Repomix and adds PR-scoped slicing, path/language filtering, token-budget enforcement, and per-reviewer output presets. Use whenever the user wants to prepare a snapshot for codex, pack the repo for review, bundle this for kimi, handoff to gemini, context-budget the repo, share this with another AI, or whenever cross-review needs a scoped input bundle for a one-shot reviewer.
 ---
 
 # Repomix Handoff

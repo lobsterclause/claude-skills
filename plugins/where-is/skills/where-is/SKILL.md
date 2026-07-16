@@ -32,7 +32,7 @@ The query is normalized and routed via these heuristics (in order — first matc
 
 1. **path** — query contains `/`, ends in a known code extension (`.ts .tsx .js .jsx .mjs .cjs .json .md .yml .yaml`), or contains glob chars (`* ? [`). → `scripts/fs_walk.sh`
 2. **pattern** — query contains parens, angle-brackets, or one of the ast-grep marker tokens (`=>`, `as any`, `useEffect(`, `useState<`, `<$`, `$$$`). → `scripts/where-is.sh --kind pattern`
-3. **symbol** — single token matching `^[A-Za-z_$][A-Za-z0-9_$]*(\/[A-Za-z_$][A-Za-z0-9_$]*)?$`, *or* PascalCase/camelCase with no spaces. Slash-separated `Class/method` paths are allowed (Serena's `name_path` format). → emit canonical name and ask the model to call Serena MCP tools.
+3. **symbol** — single token matching `^[A-Za-z_$][A-Za-z0-9_$]*$`, PascalCase/camelCase with no spaces, no dots, no extension. Note rule 1 (path) is checked first: a slash-separated `Class/method` query (Serena's `name_path` format) matches the path rule and needs an explicit `--kind symbol` override to route to Serena instead — see `references/classification.md`. → emit canonical name and ask the model to call Serena MCP tools.
 4. **concept** — anything else (3+ words, natural language, lowercase phrases). → `scripts/concept_search.sh`
 
 See `references/classification.md` for the flowchart and edge cases.

@@ -5,7 +5,7 @@ The `--reviewer` flag selects a `{style, max_tokens}` pair tuned for that CLI's 
 | Reviewer | Style    | Max tokens  | Rationale                                                                                              |
 | -------- | -------- | ----------- | ------------------------------------------------------------------------------------------------------ |
 | `codex`  | xml      | 160,000     | OpenAI codex CLI consumes XML-fenced repo dumps with high fidelity; 160k leaves headroom under the GPT-4.1/o4 context for prompt + response. |
-| `gemini` | markdown | 1,000,000   | Gemini 1.5 Pro / 2.x supports ~1M-token context. Markdown is the recommended ingestion format per Google's prompting guide. Rarely triggers trimming. |
+| `gemini` | markdown | 1,000,000   | Gemini, consumed via Antigravity's `agy` CLI (replaced the standalone `gemini` CLI, retired 2026-06-18) — supports ~1M-token context. Markdown is the recommended ingestion format per Google's prompting guide. Rarely triggers trimming. |
 | `kimi`   | markdown | 200,000     | Moonshot Kimi K2 / K1.5 has 200k context. Markdown parses cleanly and matches Moonshot's own tooling. |
 | `claude` | xml      | 200,000     | Claude 3.5/4.x parses `<file path="...">...</file>` blocks reliably; 200k matches the default Claude API context. |
 

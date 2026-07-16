@@ -32,7 +32,7 @@ The classifier (`scripts/classify.sh`) inspects the raw query and routes it to o
 | ---------------------------------- | -------- | -------------------------------- |
 | `FirestoreMemoryClient`            | symbol   | Single PascalCase identifier     |
 | `useResources`                     | symbol   | Single camelCase identifier      |
-| `FirestoreMemoryClient/storeMemory`| symbol   | Class/method form (Serena `name_path`) |
+| `FirestoreMemoryClient/storeMemory`| path     | Path rule wins on `/`; pass `--kind symbol` for the Serena `name_path` form |
 | `useEffect($$$)`                   | pattern  | `$$$` is ast-grep metavar        |
 | `useState<$T>($V)`                 | pattern  | Angle brackets + metavar         |
 | `as any`                           | pattern  | Pattern marker token             |

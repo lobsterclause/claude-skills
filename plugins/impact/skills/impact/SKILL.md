@@ -49,7 +49,7 @@ bash ${CLAUDE_PLUGIN_ROOT}/skills/impact/scripts/impact.sh --json     # machine-
 What it does, in order:
 
 1. Resolves the **entry files** (explicit args > `--staged` > `--base <ref>` > `git diff HEAD`). Filters to `.ts|.tsx|.js|.jsx|.mjs|.cjs`. If nothing matches, prints "no code changes" and exits 0.
-2. **Builds or reuses the cache** at `.impact-cache/graph.json`. Cache is invalidated when the lockfile hash changes, when the file count moves >5%, or on `--refresh`. The cache key is hashed from `package.json` + `pnpm-lock.yaml` (or `package-lock.json` / `yarn.lock`) + the root `tsconfig.json`.
+2. **Builds or reuses the cache** at `.impact-cache/graph.json`. Cache is invalidated when the lockfile hash changes, when the file count changes at all (exact match, not a threshold — always favors a fresh graph over a possibly-stale one), or on `--refresh`. The cache key combines the lockfile hash + the root `tsconfig.json` hash + the file count.
 3. **Inverts the graph** to find transitive reverse-dependencies of each entry file.
 4. **Groups by package** if it detects `pnpm-workspace.yaml`, `package.json#workspaces`, `lerna.json`, or `nx.json`.
 5. **Pulls in test files** via `find_tests.sh`. Prefers `codegraph affected --stdin -j` when this repo has a codegraph index — a real transitive BFS over the indexed import graph, not a naming guess. Falls back to filename-convention matching (`*.test.ts(x)`, `*.spec.ts(x)`, anything under `__tests__/` whose subject is in the impacted set) when codegraph isn't available.
