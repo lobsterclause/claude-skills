@@ -1,0 +1,45 @@
+{
+  "skill_name": "repomix-handoff",
+  "evals": [
+    {
+      "id": 1,
+      "name": "pr-scoped-default",
+      "prompt": "Prepare a snapshot for codex of the current branch's changes.",
+      "expected_output": "Skill runs detect_repomix.sh, then handoff.sh --reviewer codex (XML, 160k budget). Output JSON has within_budget=true and a non-empty files_included list seeded from `git diff --name-only origin/main...HEAD`.",
+      "fixture": null,
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "path-scoped-gemini",
+      "prompt": "Bundle apps/web/src/components/chat for gemini so they can review the chat composer.",
+      "expected_output": "handoff.sh runs with --paths apps/web/src/components/chat --reviewer gemini. Style markdown, max_tokens 1000000. No trimming required given gemini's huge budget. Output file ends in .md.",
+      "fixture": null,
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "over-budget-triggers-trim",
+      "prompt": "Pack the whole apps/web tree for kimi at 50k tokens — must trim docs and configs first.",
+      "expected_output": "handoff.sh runs --paths apps/web --reviewer kimi --max-tokens 50000. Trim loop drops *.md, *.json, *.css, etc. before any .ts source. Summary JSON shows files_trimmed populated and within_budget=true, OR within_budget=false with a clear warning when source-only remains over budget.",
+      "fixture": null,
+      "files": []
+    },
+    {
+      "id": 4,
+      "name": "repomix-missing-graceful",
+      "prompt": "Prepare a snapshot for review (in an environment where repomix is not installed).",
+      "expected_output": "detect_repomix.sh returns available=false. handoff.sh exits with a non-zero status and prints an actionable install message (`npm i -g repomix`). Skill does NOT silently continue or fabricate a snapshot.",
+      "fixture": null,
+      "files": []
+    },
+    {
+      "id": 5,
+      "name": "cross-review-integration",
+      "prompt": "Cross-review this branch with codex, but the diff is huge — give codex enough context to actually review.",
+      "expected_output": "Skill first runs handoff.sh --reviewer codex --expand-imports to produce a context-rich snapshot, then suggests piping its --output path to the cross-review skill (without modifying cross-review scripts). Documents the integration in chat.",
+      "fixture": null,
+      "files": []
+    }
+  ]
+}
