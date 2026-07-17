@@ -20,33 +20,39 @@ q="${q%"${q##*[![:space:]]}"}"
 kind=""
 normalized="$q"
 
-# --- 1. path ----------------------------------------------------------------
-# Slash, glob char, or known code extension. Checked BEFORE symbol: the
-# symbol regex below is shape-only (identifier segments, optionally
-# slash-joined) and would otherwise also match ordinary extension-less
-# directory paths like `apps/mobile/hooks` — a far more common query shape
-# than the Serena `Class/method` name_path form path-first sacrifices.
-# Users wanting the latter pass `--kind symbol` explicitly (see SKILL.md).
+# --- 1. symbol -------------------------------------------------------------
+# Single identifier, optionally Class/method form (Serena name_path style).
+# Run this BEFORE the path check so `Class/method` is classified as symbol,
+# not path. The pattern is restrictive (no spaces, no globs, no dots) so it
+# only matches identifier-shaped strings.
+#
+# [pin: issue #14 item 16] A prior review pass questioned this ordering —
+# ordinary extension-less directory paths like `apps/mobile/hooks` also
+# match the shape-only regex below and would misclassify as symbol. Smoke-
+# verified this is intentional and working as designed: Serena's
+# `find_symbol` on a bogus name is a cheap, self-correcting miss (the model
+# notices and retries), while path-first would make the documented Serena
+# `Class/method` name_path form (SKILL.md rule 3) permanently unreachable
+# without `--kind symbol` on every call. Do not reorder without discussing —
+# see git history on plugins/where-is for the fuller writeup.
 case "$q" in
-  */*|*\**|*\?*|*\[*)
-    kind="path" ;;
-  *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.json|*.md|*.yml|*.yaml|*.css|*.scss|*.html)
-    kind="path" ;;
+  *' '*) : ;;  # spaces -> not a symbol
+  *)
+    if printf '%s' "$q" | grep -Eq '^[A-Za-z_$][A-Za-z0-9_$]*(/[A-Za-z_$][A-Za-z0-9_$]*)*$'; then
+      kind="symbol"
+    fi
+    ;;
 esac
 
-# --- 2. symbol ---------------------------------------------------------------
-# Single identifier. Only fires if the string didn't already qualify as a
-# path — so any `/`-containing query (including Class/method form) is a
-# path unless overridden. The pattern is restrictive (no spaces, no globs,
-# no dots) so it only matches identifier-shaped strings.
+# --- 2. path ---------------------------------------------------------------
+# Slash, glob char, or known code extension. Only fires if the string didn't
+# already qualify as a symbol — so `Class/method` stays a symbol.
 if [ -z "$kind" ]; then
   case "$q" in
-    *' '*) : ;;  # spaces -> not a symbol
-    *)
-      if printf '%s' "$q" | grep -Eq '^[A-Za-z_$][A-Za-z0-9_$]*(/[A-Za-z_$][A-Za-z0-9_$]*)*$'; then
-        kind="symbol"
-      fi
-      ;;
+    */*|*\**|*\?*|*\[*)
+      kind="path" ;;
+    *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.json|*.md|*.yml|*.yaml|*.css|*.scss|*.html)
+      kind="path" ;;
   esac
 fi
 
@@ -78,6 +84,9 @@ import json, os
 print(json.dumps({"kind": os.environ["KIND"], "normalized": os.environ["NORM"]}))
 '
 else
-  esc=$(printf '%s' "$normalized" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  # Strip control chars first (lossy, but raw control chars inside a JSON
+  # string are invalid JSON — the sed-only fallback used to emit them as-is),
+  # then escape backslashes and quotes.
+  esc=$(printf '%s' "$normalized" | LC_ALL=C tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
   printf '{"kind":"%s","normalized":"%s"}\n' "$kind" "$esc"
 fi

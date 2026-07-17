@@ -60,13 +60,30 @@ fi
 
 case "$mode" in
   summary)
-    body_file="$(mktemp)"
+    # Template + rc check (issue #7 nit): BSD/GNU mktemp default templates
+    # differ, and an unchecked failure would send an empty --body-file.
+    body_file="$(mktemp -t cr-comment.XXXXXX)" || { echo "mktemp failed" >&2; exit 1; }
     # Ensure the body file is always cleaned up, even if gh call fails or the
     # script is interrupted. Previous version only rm'd on the happy path.
     trap 'rm -f "$body_file"' EXIT
+    # Derive the roster from the run dir's meta files — under rotation the
+    # fleet varies per round, so a hardcoded list is frequently wrong (fugu
+    # finding, PR #18 pass 1). findings.md lives at $run_dir/findings.md and
+    # the wrapper writes $run_dir/raw/<reviewer>.meta.json per reviewer ran.
+    roster_line=""
+    raw_dir="$(dirname "$findings")/raw"
+    if [[ -d "$raw_dir" ]]; then
+      for m in "$raw_dir"/*.meta.json; do
+        [[ -f "$m" ]] || continue
+        n="$(basename "$m" .meta.json)"
+        [[ "$n" == *.agy-failed ]] && continue
+        roster_line="${roster_line:+$roster_line + }$n"
+      done
+    fi
+    [[ -z "$roster_line" ]] && roster_line="external reviewers"
     {
       printf '## Cross-review — pass %s\n\n' "$pass"
-      printf '_Automated review by codex + antigravity + gemini-pro + kimi. See the "Findings" collapsible for specifics._\n\n'
+      printf '_Automated review by %s. See the "Findings" collapsible for specifics._\n\n' "$roster_line"
       printf '<details><summary>Findings</summary>\n\n'
       cat "$findings"
       printf '\n</details>\n'
@@ -76,10 +93,12 @@ case "$mode" in
     # rather than failing the whole review run. The findings.md is already
     # on disk at $findings — the user still has the record.
     if gh pr comment "$pr" --body-file "$body_file"; then
-      exit 0
+      exit 0   # posted OK
     else
-      echo "gh pr comment failed — findings preserved at: $findings" >&2
-      exit 0
+      # Non-zero exit (issue #7 nit): a silent 0 here masked real auth/rate
+      # problems. The findings file is the fallback record either way.
+      echo "ACTION REQUIRED: gh pr comment failed (auth? rate limit? closed PR?) — findings preserved at: $findings" >&2
+      exit 1
     fi
     ;;
   inline)

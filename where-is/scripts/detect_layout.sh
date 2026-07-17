@@ -3,6 +3,14 @@
 #   {"workspace_kind": "pnpm|npm|nx|none", "packages": [{"name":"...","dir":"..."}]}
 #
 # Usage: detect_layout.sh [repo_root]
+#
+# pnpm-workspace.yaml parsing is deliberately NAIVE (documented limitation,
+# shared with codemap's detect_workspaces.sh): only a top-level `packages:`
+# block of `- glob` list items is read. Inline `# comments` are stripped and
+# single/double quotes unwrapped, but there is NO support for flow-style
+# lists (`packages: [a, b]`), block scalars, YAML anchors, or escape
+# sequences inside quoted strings. Exclusion patterns (`- '!...'`) are
+# skipped. Repos with exotic YAML should rely on package.json workspaces.
 
 set -eu
 
@@ -40,7 +48,9 @@ if command -v node >/dev/null 2>&1; then
         // Strip inline `# comments` (codex P3) before parsing the glob.
         const line = rawLine.replace(/\s+#.*$/, "");
         const m = line.match(/^[\s]*-\s+["\x27]?([^"\x27\n]+?)["\x27]?\s*$/);
-        if (m) globs.push(m[1].trim());
+        // Skip exclusion patterns (`- "!**/test/**"`) — treating them as
+        // positive globs would try to enumerate a literal `!...` directory.
+        if (m && !m[1].trim().startsWith("!")) globs.push(m[1].trim());
       }
     }
     const rootPj = readJson(path.join(root, "package.json"));
@@ -66,6 +76,50 @@ if command -v node >/dev/null 2>&1; then
         addPkg(clean);
       }
     }
+
+    if (kind === "nx") {
+      // Nx projects are not listed in pnpm/npm workspace globs, so without
+      // this the packages list stayed empty and Nx repos reported an empty
+      // workspace (codex P2). Two sources:
+      //   1. legacy workspace.json / angular.json "projects" maps
+      //      (value = dir string, or { root: dir })
+      //   2. modern Nx: per-project project.json files discovered by a
+      //      bounded walk (heavy dirs skipped, depth-capped)
+      const seenDirs = new Set(pkgs.map(p => p.dir));
+      function addNxPkg(name, dir) {
+        dir = String(dir).replace(/\\/g, "/").replace(/\/+$/, "");
+        if (!name || !dir || dir === "." || seenDirs.has(dir)) return;
+        seenDirs.add(dir);
+        pkgs.push({ name, dir });
+      }
+      for (const wsFile of ["workspace.json", "angular.json"]) {
+        const w = readJson(path.join(root, wsFile));
+        if (w && w.projects && typeof w.projects === "object") {
+          for (const [name, v] of Object.entries(w.projects)) {
+            const dir = typeof v === "string" ? v : (v && typeof v.root === "string" ? v.root : "");
+            if (dir) addNxPkg(name, dir);
+          }
+        }
+      }
+      const SKIP = new Set(["node_modules", "dist", "build", ".git", ".next", "coverage", "tmp", ".nx"]);
+      (function walk(rel, depth) {
+        if (depth > 6) return;
+        let ents;
+        try { ents = fs.readdirSync(path.join(root, rel), { withFileTypes: true }); } catch { return; }
+        for (const ent of ents) {
+          const sub = rel ? rel + "/" + ent.name : ent.name;
+          if (ent.isDirectory()) {
+            if (!SKIP.has(ent.name)) walk(sub, depth + 1);
+          } else if (ent.name === "project.json" && rel) {
+            const proj = readJson(path.join(root, sub));
+            const pj = readJson(path.join(root, rel, "package.json"));
+            const name = (proj && proj.name) || (pj && pj.name) || path.basename(rel);
+            addNxPkg(name, rel);
+          }
+        }
+      })("", 0);
+    }
+
     if (rootPj && rootPj.name) pkgs.push({ name: rootPj.name, dir: "." });
 
     process.stdout.write(JSON.stringify({ workspace_kind: kind, packages: pkgs }));

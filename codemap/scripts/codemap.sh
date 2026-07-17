@@ -27,9 +27,21 @@ max_external=10
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --output) shift; output="${1:-}";;
+    --output)
+      # Same last-arg guard as --max-external: a valueless flag should be a
+      # usage error, not a silent fall-through to the default.
+      if [ $# -lt 2 ]; then
+        echo "codemap.sh: --output requires a path" >&2
+        exit 2
+      fi
+      shift; output="$1";;
     --json) emit_json=1;;
-    --root) shift; root="${1:-}";;
+    --root)
+      if [ $# -lt 2 ]; then
+        echo "codemap.sh: --root requires a path" >&2
+        exit 2
+      fi
+      shift; root="$1";;
     --refresh) refresh="--refresh";;
     --no-external) no_external=1;;
     --max-external)
@@ -86,8 +98,10 @@ have_py() { command -v python3 >/dev/null 2>&1; }
 have_jq() { command -v jq >/dev/null 2>&1; }
 
 if ! have_py; then
+  # Exit-code convention: 0 ok, 1 runtime/environment failure, 2 usage error.
+  # A missing interpreter is an environment failure, not bad usage.
   echo "codemap.sh requires python3 (used for JSON assembly and rendering)" >&2
-  exit 2
+  exit 1
 fi
 
 # --- temp files (PID-suffixed) --------------------------------------------

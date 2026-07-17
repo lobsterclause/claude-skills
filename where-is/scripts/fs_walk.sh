@@ -32,14 +32,28 @@ glob_to_regex() {
     {
       s=$0
       # Escape ERE metacharacters BEFORE glob substitutions so paths
-      # containing `+`, `(`, `)`, `{`, `}`, `|`, `^`, `$` round-trip safely.
+      # containing `\`, `+`, `(`, `)`, `{`, `}`, `|`, `^`, `$` round-trip
+      # safely. Backslash goes FIRST so it does not double-escape the
+      # backslashes added by later substitutions.
       # (Brackets and dots stay; * and ? get rewritten below.)
+      # Empirically verified: replacement "\\\\" emits TWO backslashes in the
+      # output (the correct ERE escape for one literal backslash); the prior
+      # 8-backslash form emitted FOUR (kat, PR #23 pass 1).
+      gsub(/\\/, "\\\\", s)
       gsub(/[+(){}|^$]/, "\\\\&", s)
       gsub(/\./, "\\.", s)
-      gsub(/\*\*/, "@@DSTAR@@", s)   # placeholder for **
+      # `**/` means "zero or more directory levels" — translate to `(.*/)?`
+      # so `src/**/*.ts` matches BOTH `src/index.ts` and `src/a/b/c.ts`.
+      # The old direct `**` -> `.*` mapping forced two slashes around the
+      # wildcard, so zero-depth paths never matched. Placeholders are plain
+      # alphanumerics so the later `*` / `?` substitutions cannot touch the
+      # regex text they expand to.
+      gsub(/\*\*\//, "@@DSLASH@@", s)  # placeholder for **/
+      gsub(/\*\*/, "@@DSTAR@@", s)     # placeholder for remaining **
       gsub(/\*/, "[^/]*", s)
-      gsub(/@@DSTAR@@/, ".*", s)
       gsub(/\?/, ".", s)
+      gsub(/@@DSLASH@@/, "(.*/)?", s)
+      gsub(/@@DSTAR@@/, ".*", s)
       print s
     }
   '
@@ -70,10 +84,13 @@ list_files() {
   else
     # -prune skips traversing matched dirs entirely; -not -path only filters
     # output, so find still walks node_modules contents (huge I/O on big repos).
-    find "$root" \
+    # Run find from inside $root and strip the constant `./` prefix — the old
+    # `sed "s#^$root/##"` interpolated $root into a sed program, which broke
+    # when the path contained `#` (delimiter clash) or regex metacharacters.
+    (cd "$root" && find . \
       -type d \( -name node_modules -o -name .git -o -name dist -o -name build -o -name .next -o -name coverage \) -prune \
       -o -type f -print \
-      | sed "s#^$root/##"
+      | sed 's|^\./||')
   fi
 }
 

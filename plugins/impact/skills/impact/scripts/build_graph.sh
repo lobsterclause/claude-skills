@@ -2,8 +2,12 @@
 # build_graph.sh — build (or reuse cache of) the forward import graph as JSON.
 #
 # Output: writes graph JSON to $CACHE_DIR/graph.json
-# Cache key combines lockfile hash + root tsconfig hash + a coarse file count.
+# Cache key combines lockfile hash + root tsconfig hash + a signature over
+# every source file's (path, mtime, size) — so editing imports inside an
+# existing file invalidates the cache without hashing file contents.
 # Use --refresh to force rebuild.
+#
+# Exit codes: 0 ok, 1 runtime failure (graph tool failed), 2 usage.
 #
 # The graph schema is a normalized adjacency list:
 #   { "files": { "src/a.ts": ["src/b.ts", "src/c.ts"], ... } }
@@ -46,12 +50,29 @@ done
 
 tsconfig_hash=$(hash_file "$repo_root/tsconfig.json")
 
-# Coarse file count (cheap, no full scan)
-file_count=$(find "$repo_root" \
+# Source-file signature: sha256 over every source file's (path, mtime_ns, size).
+# Cheap — stat only, no content reads — but catches import edits inside existing
+# files, which the old coarse file-count key missed (issue #12, flagged in all
+# 4 review passes). `|| true` guards pipefail against find permission errors.
+files_sig=$({ find "$repo_root" \
   -type d \( -name node_modules -o -name .git -o -name dist -o -name build -o -name .next -o -name coverage -o -name .impact-cache \) -prune \
-  -o -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.mjs' -o -name '*.cjs' \) -print 2>/dev/null | wc -l | tr -d ' ')
+  -o -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.mjs' -o -name '*.cjs' \) -print 2>/dev/null || true; } \
+  | LC_ALL=C sort | python3 -c '
+import hashlib, os, sys
+h = hashlib.sha256()
+n = 0
+for line in sys.stdin:
+    p = line.rstrip("\n")
+    try:
+        st = os.stat(p)
+    except OSError:
+        continue
+    n += 1
+    h.update(("%s|%d|%d\n" % (p, st.st_mtime_ns, st.st_size)).encode())
+print("%d-%s" % (n, h.hexdigest()))
+')
 
-key="$lock_hash|$tsconfig_hash|$file_count"
+key="$lock_hash|$tsconfig_hash|$files_sig"
 key_file="$cache_dir/graph.key"
 graph_file="$cache_dir/graph.json"
 
@@ -128,7 +149,7 @@ if [ "$preferred" = "none" ] && [ "${IMPACT_NO_AUTO_INSTALL:-}" != "1" ]; then
         break
       fi
     done
-    key="$lock_hash|$tsconfig_hash|$file_count"
+    key="$lock_hash|$tsconfig_hash|$files_sig"
     detect_json=$("$script_dir/detect_tools.sh")
     preferred=$(printf '%s' "$detect_json" | sed -n 's/.*"preferred": *"\([^"]*\)".*/\1/p')
   fi
@@ -170,23 +191,37 @@ for cfg in .dependency-cruiser.cjs .dependency-cruiser.mjs .dependency-cruiser.j
 done
 [ "$depcruise_has_config" = "false" ] && depcruise_config_flag=(--no-config)
 
-# PID-suffix the intermediate so concurrent invocations don't clobber each other.
+# PID-suffix the intermediates so concurrent invocations don't clobber each other.
 tmp_raw="$cache_dir/graph.raw.$$.json"
-trap 'rm -f "$tmp_raw"' EXIT
+tool_err="$cache_dir/graph.stderr.$$.log"
+# $$ alone can collide across PID-namespace resets in containers (kimi,
+# PR #24 pass 1) — RANDOM makes concurrent same-PID writers diverge.
+graph_tmp="$graph_file.tmp.$$.$RANDOM"
+trap 'rm -f "$tmp_raw" "$tool_err" "$graph_tmp"' EXIT
+
+# Shared node converter epilogue: write to a PID-suffixed tmp in the same dir,
+# then rename — a concurrent reader never sees a half-written graph.json.
+# (issue #12 high: atomic write)
 
 build_with_depcruise() {
   resolve_bin depcruise
   local bin_cmd=("${RESOLVED_BIN_CMD[@]}")
   # depcruise emits {modules: [{source, dependencies: [{resolved, ...}], ...}]}
   # We restrict to source extensions and skip node_modules.
-  # `${arr[@]+...}` guards against `set -u` crashing on an empty array (bash 3.2 / macOS default).
-  ( cd "$repo_root" && \
+  # `${arr[@]+...}` guards against `set -u` crashing on an empty `ts_flag` (bash 3.2 / macOS default).
+  # stderr goes to $tool_err and is surfaced on failure — `2>/dev/null` used to
+  # hide syntax/OOM/missing-tsconfig errors (issue #12 high).
+  if ! ( cd "$repo_root" && \
     "${bin_cmd[@]}" --output-type json \
       --exclude '(^|/)(node_modules|dist|build|\.next|coverage|\.impact-cache)(/|$)' \
       --include-only '\.(m?j|t)sx?$' \
       ${depcruise_config_flag[@]+"${depcruise_config_flag[@]}"} \
       ${ts_flag[@]+"${ts_flag[@]}"} \
-      . > "$tmp_raw" 2>"$cache_dir/depcruise.err.log" )
+      . > "$tmp_raw" 2>"$tool_err" ); then
+    echo "ERROR: depcruise failed while building the import graph:" >&2
+    cat "$tool_err" >&2
+    exit 1
+  fi
 
   # Convert to normalized adjacency via node one-liner (node always available if depcruise is)
   node -e '
@@ -199,19 +234,24 @@ build_with_depcruise() {
         .filter(Boolean);
       out.files[m.source] = deps;
     }
-    fs.writeFileSync(process.argv[2], JSON.stringify(out));
-  ' "$tmp_raw" "$graph_file"
+    fs.writeFileSync(process.argv[3], JSON.stringify(out));
+    fs.renameSync(process.argv[3], process.argv[2]);
+  ' "$tmp_raw" "$graph_file" "$graph_tmp"
 }
 
 build_with_madge() {
   resolve_bin madge
   local bin_cmd=("${RESOLVED_BIN_CMD[@]}")
-  ( cd "$repo_root" && \
+  if ! ( cd "$repo_root" && \
     "${bin_cmd[@]}" --json \
       --extensions ts,tsx,js,jsx,mjs,cjs \
       --exclude '(^|/)(node_modules|dist|build|\.next|coverage|\.impact-cache)(/|$)' \
       ${ts_flag[@]+"${ts_flag[@]}"} \
-      . > "$tmp_raw" 2>"$cache_dir/madge.err.log" )
+      . > "$tmp_raw" 2>"$tool_err" ); then
+    echo "ERROR: madge failed while building the import graph:" >&2
+    cat "$tool_err" >&2
+    exit 1
+  fi
 
   # madge output is already an adjacency map of relative paths -> [deps]
   node -e '
@@ -219,15 +259,16 @@ build_with_madge() {
     const raw = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     const out = { files: {} };
     for (const k of Object.keys(raw)) out.files[k] = raw[k];
-    fs.writeFileSync(process.argv[2], JSON.stringify(out));
-  ' "$tmp_raw" "$graph_file"
+    fs.writeFileSync(process.argv[3], JSON.stringify(out));
+    fs.renameSync(process.argv[3], process.argv[2]);
+  ' "$tmp_raw" "$graph_file" "$graph_tmp"
 }
 
 build_with_grep() {
   # Degraded fallback: a sparse graph from `grep -RE "from ['\"]"`.
   # Only one-hop edges; resolution is heuristic. Used only when no tool is installed.
   node -e '
-    const fs = require("fs"), path = require("path"), cp = require("child_process");
+    const fs = require("fs"), path = require("path");
     const root = process.argv[1];
     const ignore = /(?:^|\/)(?:node_modules|dist|build|\.next|coverage|\.impact-cache|\.git)(?:\/|$)/;
     const exts = [".ts",".tsx",".js",".jsx",".mjs",".cjs"];
@@ -263,19 +304,21 @@ build_with_grep() {
       }
       out.files[rel] = [...deps];
     }
-    fs.writeFileSync(process.argv[2], JSON.stringify(out));
-  ' "$repo_root" "$graph_file"
+    fs.writeFileSync(process.argv[3], JSON.stringify(out));
+    fs.renameSync(process.argv[3], process.argv[2]);
+  ' "$repo_root" "$graph_file" "$graph_tmp"
 }
 
 # True (exit 0) when graph.json has zero files even though the repo clearly
-# has source to crawl ($file_count > 0). A tool can exit 0 and still produce
-# nothing — e.g. dependency-cruiser silently disables .ts/.tsx parsing with
-# no error when the installed `typescript` version falls outside its
-# supported peer range (confirmed live: depcruise 18.1.0 + typescript 7.0.2
-# → 0 modules, no warning, `depcruise -i` is the only way to see it happened).
-# Trusting that blindly would render a confidently wrong "(none)" report.
+# has source to crawl (the leading count in $files_sig, "<N>-<hash>", > 0).
+# A tool can exit 0 and still produce nothing — e.g. dependency-cruiser
+# silently disables .ts/.tsx parsing with no error when the installed
+# `typescript` version falls outside its supported peer range (confirmed
+# live: depcruise 18.1.0 + typescript 7.0.2 → 0 modules, no warning,
+# `depcruise -i` is the only way to see it happened). Trusting that blindly
+# would render a confidently wrong "(none)" report.
 graph_is_suspiciously_empty() {
-  [ "$file_count" -eq 0 ] && return 1
+  [ "${files_sig%%-*}" -eq 0 ] && return 1
   node -e '
     try {
       const g = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
@@ -287,13 +330,15 @@ graph_is_suspiciously_empty() {
 case "$preferred" in
   depcruiser)
     if ! build_with_depcruise || graph_is_suspiciously_empty; then
-      echo "WARN: dependency-cruiser produced an empty graph despite $file_count source file(s) present (see $cache_dir/depcruise.err.log, or run \`node_modules/.bin/depcruise -i\` to check which extensions/transpilers it has enabled — a common cause is the installed \`typescript\` version falling outside depcruise's supported peer range); falling back to grep (one-hop only)." >&2
+      echo "WARN: dependency-cruiser produced an empty graph despite ${files_sig%%-*} source file(s) present (run \`node_modules/.bin/depcruise -i\` to check which extensions/transpilers it has enabled — a common cause is the installed \`typescript\` version falling outside depcruise's supported peer range); falling back to grep (one-hop only)." >&2
+      [ -s "$tool_err" ] && cat "$tool_err" >&2
       build_with_grep
     fi
     ;;
   madge)
     if ! build_with_madge || graph_is_suspiciously_empty; then
-      echo "WARN: madge produced an empty graph despite $file_count source file(s) present (see $cache_dir/madge.err.log); falling back to grep (one-hop only)." >&2
+      echo "WARN: madge produced an empty graph despite ${files_sig%%-*} source file(s) present; falling back to grep (one-hop only)." >&2
+      [ -s "$tool_err" ] && cat "$tool_err" >&2
       build_with_grep
     fi
     ;;

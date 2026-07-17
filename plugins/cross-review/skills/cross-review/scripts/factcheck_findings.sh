@@ -15,9 +15,18 @@
 # Usage:
 #   factcheck_findings.sh --findings <json> --out <json>
 #                         (--base <ref> [--repo <dir>] | --diff <file>)
-#                         [--reviewer agy|kimi]     # default agy
+#                         [--reviewer agy|kimi|openrouter]  # default agy
 #                         [--model "<agy models name>"]   # default Flash High
 #                         [--timeout <sec>]         # default 300
+#
+# When the agy pass fails or produces empty output (quota exhaustion, panic,
+# expired auth — see run_reviewers.sh for the taxonomy) and an OpenRouter key
+# is available ($OPENROUTER_API_KEY or ~/.config/openrouter/key), the check
+# retries once via deepseek/deepseek-v4-flash on OpenRouter before falling
+# back to keep-all. (Policy 2026-07-01: first-party models — Gemini, codex,
+# claude — are never routed through OpenRouter; DeepSeek Flash is the
+# designated cheap fact-check substitute. The falsify-only contract is
+# model-agnostic, so the swap is safe.)
 #
 # Exit: 0 ok (incl. fail-safe keep-all), 2 usage, 1 io error.
 
@@ -41,7 +50,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$findings" || -z "$out" ]] && { echo "usage: $0 --findings <json> --out <json> (--base <ref> [--repo <dir>] | --diff <file>) [--reviewer agy|kimi] [--model <name>] [--timeout <sec>]" >&2; exit 2; }
+[[ -z "$findings" || -z "$out" ]] && { echo "usage: $0 --findings <json> --out <json> (--base <ref> [--repo <dir>] | --diff <file>) [--reviewer agy|kimi|openrouter] [--model <name>] [--timeout <sec>]" >&2; exit 2; }
 [[ -f "$findings" ]] || { echo "factcheck: findings file not found: $findings" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "factcheck: jq required" >&2; exit 1; }
 
@@ -121,6 +130,37 @@ command -v timeout  >/dev/null 2>&1 && TIMEOUT_BIN="timeout"
 [[ -z "$TIMEOUT_BIN" ]] && command -v gtimeout >/dev/null 2>&1 && TIMEOUT_BIN="gtimeout"
 run_to() { if [[ -n "$TIMEOUT_BIN" ]]; then "$TIMEOUT_BIN" "$1" "${@:2}"; else "${@:2}"; fi; }
 
+# OpenRouter helpers (mirrors run_reviewers.sh key resolution).
+openrouter_key() {
+  if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then printf '%s' "$OPENROUTER_API_KEY"; return 0; fi
+  [[ -s "$HOME/.config/openrouter/key" ]] && { tr -d '[:space:]' <"$HOME/.config/openrouter/key"; return 0; }
+  return 1
+}
+# openrouter_factcheck <model> — send the full prompt file (instructions + diff
+# + findings, via jq --rawfile so it never touches argv) to the OpenRouter
+# chat-completions API; writes the model text to $raw. Returns nonzero on any
+# transport/API failure — caller decides between fallback and keep_all.
+openrouter_factcheck() {
+  local or_model="$1" key
+  key="$(openrouter_key)" || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  local body="$tmp_dir/or_body.json" resp="$tmp_dir/or_resp.json" auth="$tmp_dir/curl-auth"
+  jq -n --rawfile p "$prompt" --arg m "$or_model" \
+    '{model: $m, messages: [{role: "user", content: $p}], stream: false}' >"$body" || return 1
+  # Key via 0600 --config file, never argv (ps-visible). tmp_dir is trap-cleaned.
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$key" >"$auth" )
+  curl -sS --max-time "$timeout_s" \
+    --config "$auth" \
+    -H "Content-Type: application/json" \
+    -H "X-Title: cross-review-factcheck" \
+    -d @"$body" \
+    https://openrouter.ai/api/v1/chat/completions >"$resp" 2>"$tmp_dir/err.txt" || return 1
+  [[ -n "$(jq -r '.error.message // empty' "$resp" 2>/dev/null)" ]] && return 1
+  jq -r '.choices[0].message.content // empty' "$resp" >"$raw" 2>/dev/null || return 1
+  [[ -s "$raw" ]]
+}
+or_fallback_model="deepseek/deepseek-v4-flash"
+
 raw="$tmp_dir/raw.txt"
 case "$reviewer" in
   agy)
@@ -128,16 +168,37 @@ case "$reviewer" in
     # Pass the prompt by FILE PATH, not argv: `-p "$(cat prompt)"` puts the whole
     # diff on the command line and hits MAX_ARG_STRLEN (~128KB) on large diffs
     # (bug b4). agy can read the file itself (--sandbox still permits reads).
-    run_to "$timeout_s" agy --model "$model" --sandbox --print-timeout "${timeout_s}s" \
+    # --print-timeout runs 15s under the wrapper cap so agy flushes instead of
+    # being hard-killed mid-write — mirrors run_agy_reviewer (fugu, PR #18 p1).
+    agy_pt="${timeout_s}s"; [[ "$timeout_s" -gt 30 ]] && agy_pt="$((timeout_s - 15))s"
+    run_to "$timeout_s" agy --model "$model" --sandbox --print-timeout "$agy_pt" \
       -p "Read the file at $prompt and follow its instructions EXACTLY. It contains your full fact-check instructions, a code diff, and a list of findings. Output ONLY the JSON block it specifies — nothing else." \
-      >"$raw" 2>"$tmp_dir/err.txt" </dev/null || keep_all "agy factcheck failed/timed out (fail-safe)"
+      >"$raw" 2>"$tmp_dir/err.txt" </dev/null || true
+    # agy fails empty on quota exhaustion / panics / expired auth (empty stdout,
+    # rc often 0 — see run_reviewers.sh classification). One OpenRouter swing —
+    # on DeepSeek Flash, NOT OR-hosted Gemini (policy) — before the keep-all
+    # fail-safe keeps the veto alive through agy outages.
+    if [[ ! -s "$raw" ]]; then
+      if openrouter_factcheck "$or_fallback_model"; then
+        model="$or_fallback_model (openrouter fallback)"
+        echo "factcheck: agy failed/empty — used OpenRouter fallback ($or_fallback_model)" >&2
+      else
+        keep_all "agy factcheck failed and OpenRouter fallback unavailable/failed (fail-safe)"
+      fi
+    fi
     ;;
   kimi)
     command -v kimi >/dev/null 2>&1 || keep_all "kimi not installed (fail-safe)"
     model="kimi"
     run_to "$timeout_s" kimi --plan --print --quiet >"$raw" 2>"$tmp_dir/err.txt" <"$prompt" || keep_all "kimi factcheck failed/timed out (fail-safe)"
     ;;
-  *) echo "factcheck: unknown --reviewer '$reviewer' (use agy|kimi)" >&2; exit 2 ;;
+  openrouter)
+    # Direct OpenRouter lane (no agy involved). --model here means an
+    # OpenRouter model id; the agy default display-name is not valid — swap it.
+    [[ "$model" == "Gemini 3.5 Flash (High)" ]] && model="$or_fallback_model"
+    openrouter_factcheck "$model" || keep_all "openrouter factcheck failed (fail-safe)"
+    ;;
+  *) echo "factcheck: unknown --reviewer '$reviewer' (use agy|kimi|openrouter)" >&2; exit 2 ;;
 esac
 [[ -s "$raw" ]] || keep_all "empty factcheck output (fail-safe)"
 

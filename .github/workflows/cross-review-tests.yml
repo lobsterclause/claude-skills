@@ -1,0 +1,39 @@
+name: cross-review tests
+
+# Offline fixture tests + dual-copy identity check for the cross-review skill.
+# The identity check is the insurance against the three-way drift that PR #18
+# had to untangle: the root skill copy and the plugin copy must stay
+# byte-identical (runlog/telemetry excluded).
+
+on:
+  pull_request:
+    paths:
+      - "cross-review/**"
+      - "plugins/cross-review/**"
+      - ".github/workflows/cross-review-tests.yml"
+  push:
+    branches: [master]
+    paths:
+      - "cross-review/**"
+      - "plugins/cross-review/**"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fixture tests (offline — shims, no tokens)
+        run: bash cross-review/tests/run_tests.sh
+
+      - name: Dual-copy identity check
+        run: |
+          diff -r \
+            --exclude 'runlog.jsonl*' \
+            --exclude 'iteration-1' \
+            --exclude '*.bak*' \
+            --exclude '.DS_Store' \
+            cross-review plugins/cross-review/skills/cross-review \
+          && echo "copies identical ✓" \
+          || { echo "::error::root cross-review/ and plugins/.../cross-review have drifted — rsync one onto the other before merging"; exit 1; }

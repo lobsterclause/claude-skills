@@ -4,12 +4,26 @@
 #
 # Usage: count_tokens.sh <file>
 # Output: a single integer on stdout. On stderr, the method used.
+#
+# Exit codes: 0 ok, 2 usage.
 set -eu
 
 file="${1:-}"
 if [ -z "$file" ] || [ ! -f "$file" ]; then
   echo "usage: count_tokens.sh <file>" >&2
   exit 2
+fi
+
+# Size guard (issue #12 medium): every exact method below loads the whole file
+# into memory (ttok stdin slurp, tiktoken f.read()). A multi-GB snapshot would
+# OOM — and is over any realistic token budget anyway, so a cheap estimate is
+# fine. Tunable via COUNT_TOKENS_MAX_BYTES; default 50 MB.
+max_bytes="${COUNT_TOKENS_MAX_BYTES:-52428800}"
+bytes="$(wc -c < "$file" | tr -d ' ')"
+if [ "$bytes" -gt "$max_bytes" ]; then
+  echo "method=char-div-4-estimate (size guard: ${bytes}B > ${max_bytes}B, skipping exact tokenization)" >&2
+  echo $(( bytes / 4 ))
+  exit 0
 fi
 
 # 1. ttok via npx (https://github.com/simonw/ttok is python; there is a node port).

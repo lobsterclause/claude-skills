@@ -5,6 +5,12 @@ The classifier (`scripts/classify.sh`) inspects the raw query and routes it to o
 ## Flowchart
 
 ```
+        ┌──────────────────────────────┐
+        │ single token matching        │
+        │ ^[A-Za-z_$][\w$]*(/[\w$]+)*$ │──────► symbol   (Serena MCP)
+        └─────────────┬────────────────┘
+                      │ no
+                      ▼
         ┌─────────────────────────────┐
         │ contains '/', '*', '?', '[' │
         │ OR ends in .ts/.tsx/.js/... │──────► path
@@ -17,14 +23,10 @@ The classifier (`scripts/classify.sh`) inspects the raw query and routes it to o
         └─────────────┬────────────────┘
                       │ no
                       ▼
-        ┌──────────────────────────────┐
-        │ single token matching        │
-        │ ^[A-Za-z_$][\w$]*(/[\w$]+)*$ │──────► symbol   (Serena MCP)
-        └─────────────┬────────────────┘
-                      │ no
-                      ▼
                   ─────►  concept  (ripgrep)
 ```
+
+Symbol is checked first: a slash-joined `Class/method` query (Serena's `name_path` form) matches the symbol shape and would otherwise be shadowed by the path rule below it. See "False-positive guards" for the trade-off this makes.
 
 ## Edge cases
 
@@ -32,7 +34,7 @@ The classifier (`scripts/classify.sh`) inspects the raw query and routes it to o
 | ---------------------------------- | -------- | -------------------------------- |
 | `FirestoreMemoryClient`            | symbol   | Single PascalCase identifier     |
 | `useResources`                     | symbol   | Single camelCase identifier      |
-| `FirestoreMemoryClient/storeMemory`| path     | Path rule wins on `/`; pass `--kind symbol` for the Serena `name_path` form |
+| `FirestoreMemoryClient/storeMemory`| symbol   | Class/method form (Serena `name_path`) |
 | `useEffect($$$)`                   | pattern  | `$$$` is ast-grep metavar        |
 | `useState<$T>($V)`                 | pattern  | Angle brackets + metavar         |
 | `as any`                           | pattern  | Pattern marker token             |
@@ -52,7 +54,7 @@ Pass `--kind <symbol|pattern|path|concept>` to bypass the classifier. Useful whe
 ## False-positive guards
 
 - Queries with embedded spaces and **also** containing a `/` are still classified as `path` — most monorepo paths have multiple slashes; an English sentence is unlikely to use them.
-- Class/method form `Foo/bar` collides with the path heuristic; the classifier checks the path rule **first**, so users wanting the Serena form must pass `--kind symbol`.
+- Class/method form `Foo/bar` also matches the path heuristic (contains `/`), but the classifier checks **symbol first**, so it correctly stays `symbol` (the Serena `name_path` form). An ordinary extension-less directory path (`apps/mobile/hooks`) is the false-positive trade this makes — it also matches the symbol shape, so a Serena lookup on it misses and self-corrects, rather than the more common case (a real path) needing `--kind symbol` on every call. Pass `--kind path` explicitly if you hit that edge case.
 
 ## When the model should pre-classify
 

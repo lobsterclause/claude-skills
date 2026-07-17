@@ -45,7 +45,7 @@
     {
       "id": "classify-symbol-slash",
       "scenario": "Run classify.sh on 'FirestoreMemoryClient/storeMemory'",
-      "expect": "kind=path (path heuristic wins due to /); user must pass --kind symbol for Serena name_path form"
+      "expect": "kind=symbol (symbol heuristic is checked before path, so Class/method form routes to Serena directly; pass --kind path to force the alternate reading, e.g. for an ordinary extension-less directory path)"
     },
     {
       "id": "classify-pattern-metavar",
