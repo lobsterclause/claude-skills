@@ -583,6 +583,21 @@ else
   review_prompt="$default_prompt"
 fi
 
+# json_findings_suffix: schema-mandate text appended ONLY in the curl lane
+# (run_openrouter_reviewer — the OpenRouter pool plus direct-Moonshot seats
+# like kimi27/kimi3). Those reviewers have no downstream tool loop of their
+# own; merge_raw_findings.sh depends on them answering with exactly the
+# findings.json shape documented in SKILL.md step 4, so their prompt must
+# demand it explicitly. The CLI reviewers (codex, the agy laps, kimi CLI)
+# deliberately do NOT get this suffix — they keep free-prose output for the
+# existing LLM-driven synthesis step; do not source this file from
+# run_codex/run_agy_reviewer/run_kimi.
+json_suffix_file="$script_dir/../references/json_findings_suffix.txt"
+json_findings_suffix=""
+if [[ -f "$json_suffix_file" ]]; then
+  json_findings_suffix="$(cat "$json_suffix_file")"
+fi
+
 run_codex() {
   local start end rc
   start=$(date +%s)
@@ -743,7 +758,7 @@ Full diff:
 $diff_full
 </diff>
 
-Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
+$json_findings_suffix"
 
   local body_file="$out/${slug}.request.json" prompt_tmp
   prompt_tmp="$(mktemp)"
@@ -755,13 +770,21 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # the body per cli, same hygiene as the X-Title gate below (codex P2,
   # PR #29 pass 1; the "fails when selected" wording was falsified by the
   # live probe, the cross-provider-leakage hygiene stands).
+  #
+  # response_format:{type:"json_object"} forces machine-parseable output on
+  # BOTH branches (OpenRouter's own extension, and Moonshot's identical
+  # OpenAI-compatible field) — merge_raw_findings.sh depends on this lane
+  # answering in the findings.json shape rather than free prose. This does
+  # NOT touch the CLI reviewers (codex/agy/kimi CLI), which have no
+  # request-body concept at all.
   if [[ "$cli" == "openrouter" ]]; then
     jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
       '{model: $m, messages: [{role: "user", content: $p}], stream: false,
-        usage: {include: true}}' >"$body_file"
+        usage: {include: true}, response_format: {type: "json_object"}}' >"$body_file"
   else
     jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
-      '{model: $m, messages: [{role: "user", content: $p}], stream: false}' >"$body_file"
+      '{model: $m, messages: [{role: "user", content: $p}], stream: false,
+        response_format: {type: "json_object"}}' >"$body_file"
   fi
   rm -f "$prompt_tmp"
 
