@@ -142,7 +142,7 @@ def prior_for($reviewer; $sev; $priormap):
 | (.findings // []) as $raw
 | ($raw | map(
     . as $f
-    | ($f.sources // []) as $sources
+    | ($f.sources // [] | map(select(type == "string"))) as $sources
     | ($f.severity // "") as $sev
     | ($sources | map($provmap[.] // .) | unique | sort) as $providers
     | ($providers | length) as $votes

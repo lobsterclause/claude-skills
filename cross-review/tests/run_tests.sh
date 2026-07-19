@@ -694,6 +694,21 @@ git branch -D revrename-base revrename-feat >/dev/null 2>&1
 
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 
+echo "── standalone suites: json-output / score / report-block / digest ──"
+# Each standalone suite exits 0 all-green, 1 on any failure; fold into this
+# harness as one assertion per suite so CI stays a single entrypoint.
+for suite in test_json_output test_score_findings test_report_block test_digest; do
+  if [[ -f "$SKILL_DIR/tests/$suite.sh" ]]; then
+    if bash "$SKILL_DIR/tests/$suite.sh" >"$T/$suite.log" 2>&1; then
+      ok "$suite suite green ($(grep -oE '[0-9]+ passed' "$T/$suite.log" | tail -1))"
+    else
+      bad "$suite suite failed — tail: $(tail -3 "$T/$suite.log" | tr '\n' ' ')"
+    fi
+  else
+    bad "$suite.sh missing from tests/"
+  fi
+done
+
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
