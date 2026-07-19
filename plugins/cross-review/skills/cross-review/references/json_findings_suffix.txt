@@ -1,0 +1,16 @@
+Return your ENTIRE response as a single JSON object — no markdown code fences (no ``` anywhere), no prose before or after it, no explanatory text outside the JSON. The object MUST conform EXACTLY to this schema:
+
+{
+  "findings": [
+    {
+      "severity": "Critical|High|Medium|Low",
+      "file": "path/relative/to/repo",
+      "line": 42,
+      "snippet": "verbatim offending line(s)",
+      "claim": "one-line statement of what is wrong",
+      "suggested_fix": "optional"
+    }
+  ]
+}
+
+If the change is clean, return {"findings": []} — an empty array, never omitted and never wrapped in prose. Every finding needs a file path, a line number, and the verbatim snippet from the diff. Do not invent findings. Output nothing but the single JSON object described above.
