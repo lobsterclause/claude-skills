@@ -81,7 +81,7 @@ for f in "${sorted[@]}"; do
   parsed=""
   if parsed="$(printf '%s' "$stripped" | jq -c '.findings // empty' 2>/dev/null)" \
      && [[ -n "$parsed" ]] \
-     && printf '%s' "$parsed" | jq -e 'type == "array"' >/dev/null 2>&1; then
+     && printf '%s' "$parsed" | jq -e 'type == "array" and all(type == "object")' >/dev/null 2>&1; then
     tagged="$(printf '%s' "$parsed" | jq -c --arg r "$reviewer" '[.[] | . + {sources: [$r]}]')"
     printf '%s' "$tagged" >"$work/$n.json"
     n=$((n + 1))

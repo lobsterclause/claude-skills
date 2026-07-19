@@ -176,6 +176,25 @@ assert_eq "all-prose run yields an empty findings array" \
 assert_contains "both prose reviewers reported unparsed" "$(cat "$T/all-prose.err")" "unparsed: kimi"
 assert_contains "both prose reviewers reported unparsed (2)" "$(cat "$T/all-prose.err")" "unparsed: antigravity"
 
+
+echo "── merge_raw_findings.sh: non-object findings element → reviewer unparsed, contract intact ──"
+NRAW="$T/nraw"; mkdir -p "$NRAW"
+printf '{"findings":["oops"]}' >"$NRAW/glm.stdout"
+printf '{"findings":[{"severity":"Low","file":"c.sh","line":1,"snippet":"x","claim":"ok"}]}' >"$NRAW/kat.stdout"
+bash "$S/merge_raw_findings.sh" --raw "$NRAW" --out "$T/nonobj.json" 2>"$T/nonobj.err"
+assert_eq "non-object element run still exits 0" "$?" "0"
+assert_eq "malformed reviewer excluded, valid one kept (findings==1)" \
+  "$(jq '.findings | length' "$T/nonobj.json")" "1"
+assert_eq "output .findings is an array, never null" \
+  "$(jq -r '.findings | type' "$T/nonobj.json")" "array"
+assert_contains "malformed reviewer reported as unparsed" "$(cat "$T/nonobj.err")" "unparsed: glm"
+
+SRAW="$T/sraw"; mkdir -p "$SRAW"
+printf '{"findings":["oops"]}' >"$SRAW/glm.stdout"
+bash "$S/merge_raw_findings.sh" --raw "$SRAW" --out "$T/solo-nonobj.json" 2>/dev/null
+assert_eq "solo malformed reviewer still yields empty array, not null" \
+  "$(jq -r '.findings | type' "$T/solo-nonobj.json")" "array"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]
