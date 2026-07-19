@@ -161,7 +161,15 @@ if [ -f "$worktree/sgconfig.yml" ] && command -v ast-grep >/dev/null; then
 fi
 ```
 
-When either file exists, include a short summary in the reviewer prompt's preamble (e.g. "ast-grep flagged 3 violations of `no-direct-memory-items-write` in this diff — review whether they're justified"). Do **not** dump full JSON into the prompt; summarize.
+When either file exists, generate the summary deterministically — do **not** summarize by hand and do **not** dump full JSON into the prompt:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/digest_context.sh \
+  --sgscan "$run_dir/sgscan.jsonl" --impact "$run_dir/impact.json" \
+  >> "$run_dir/context.md"
+```
+
+`digest_context.sh` emits a ≤20-line markdown digest (findings grouped by rule, top offending files, affected-file/test counts with overflow markers) — byte-identical for identical inputs. Splice its stdout into the reviewer prompt's preamble. Either flag may be omitted when that input doesn't exist.
 
 ### 3. Pick the roster and run reviewers in parallel
 
@@ -203,7 +211,23 @@ The wrapper logs timing and exit codes per reviewer. If one fails, continue with
 
 ### 4. Synthesize findings
 
-Read every file under the `raw/` directory. Do **not** shell out to a parser — the reviewer outputs are free-form prose plus structured fragments, and you (the model) are better at extracting the real findings than a regex would be. For each raw file:
+**First, run the deterministic pre-pass.** The curl-lane reviewers (OpenRouter pool + kimi27/kimi3) are forced to answer in the findings-JSON schema (`response_format: json_object` + `references/json_findings_suffix.txt`), so their output needs no LLM extraction:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/merge_raw_findings.sh \
+  --raw "$run_dir/raw" --out "$run_dir/findings.premerged.json"
+```
+
+Every reviewer whose stdout parsed cleanly is folded into `findings.premerged.json` with `sources` tags; reviewers listed as `unparsed:` on stderr (the CLI prose lanes — codex, agy laps, kimi CLI — plus any curl-lane reviewer that ignored the schema) are yours to extract by hand. Then score the merged set deterministically:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/score_findings.sh \
+  --findings "$run_dir/findings.json" --out "$run_dir/findings.scored.json"
+```
+
+`score_findings.sh` computes `providers`, `provider_votes`, `convergent`, `disposition` (from the `skip_unless_convergent`/`high_precision`/`trust_if_convergent` priors), and `rank_score` — the provider-vote and prior arithmetic below is now encoded there; trust its output over head-math.
+
+Read the remaining **unparsed** files under `raw/` yourself — for those free-form outputs you (the model) are still the extractor. For each such file:
 
 - Pull out concrete issues tied to specific files/lines when possible.
 - Drop pure praise, filler, and anything not actionable.
@@ -379,7 +403,17 @@ This keeps `git worktree list` and `/tmp` clean without the user needing to reme
 
 ### 9. Report back to the caller
 
-Whoever invoked this skill — the user directly, or a parent agent (e.g., a `/pr` wrapper) — needs a decision-ready summary without reading the full `findings.md`. At the end of **every pass**, emit exactly this block as the last thing you say before yielding control:
+Whoever invoked this skill — the user directly, or a parent agent (e.g., a `/pr` wrapper) — needs a decision-ready summary without reading the full `findings.md`. Generate the block deterministically rather than hand-formatting it:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/report_block.sh \
+  --findings "$run_dir/findings.verified.json" --pass <N> \
+  --verdict <CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED> \
+  --record "$run_dir/findings.md" --next <stop|re-review|ask-user|apply-fixes> \
+  [--pr-url <url>] [--notes "<≤1 sentence>"] [--roster-decision "$run_dir/roster_decision.json"]
+```
+
+It excludes factcheck-dropped findings from counts, computes `convergent` by distinct provider, and picks `Top` per the selection rule below. At the end of **every pass**, emit its output verbatim as the last thing you say before yielding control:
 
 ```
 ── cross-review pass <N>/3 ──

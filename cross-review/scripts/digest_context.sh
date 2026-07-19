@@ -135,6 +135,9 @@ if [[ -n "$impact" ]]; then
   if ! jq -e . >/dev/null 2>&1 <"$impact"; then
     echo "digest: --impact file is not valid JSON, skipping impact section" >&2
   else
+    itype="$(jq -r 'type' <"$impact" 2>/dev/null)"
+    [[ "$itype" != "object" ]] && \
+      echo "digest: --impact top-level is $itype, expected object — no impact data extracted" >&2
     [[ "$sections_rendered" -gt 0 ]] && echo
     echo "## impact"
 

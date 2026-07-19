@@ -140,6 +140,13 @@ RUN1="$(bash "$DIGEST" --sgscan "$T/sgscan.jsonl" --impact "$T/impact.json" --to
 RUN2="$(bash "$DIGEST" --sgscan "$T/sgscan.jsonl" --impact "$T/impact.json" --top 2 2>/dev/null)"
 assert_eq "two runs over identical inputs are byte-identical" "$RUN1" "$RUN2"
 
+
+echo "── bare-array impact.json warns on stderr instead of silent no-data ──"
+printf '[1,2,3]' >"$T/bare.json"
+bash "$S/digest_context.sh" --impact "$T/bare.json" >"$T/bare.out" 2>"$T/bare.err"
+assert_eq "bare-array impact still exits 0" "$?" "0"
+assert_contains "bare-array impact warns on stderr" "$(cat "$T/bare.err")" "expected object"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

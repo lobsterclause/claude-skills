@@ -191,6 +191,16 @@ else
   bad "two runs produce byte-identical output (diff detected)"
 fi
 
+
+echo "null-source filtering"
+cat >"$T/nullsrc.json" <<'EOF2'
+{"findings":[{"id":"n1","severity":"Low","file":"x.sh","line":1,"snippet":"s","claim":"c","sources":["codex",null]}]}
+EOF2
+bash "$S" --findings "$T/nullsrc.json" --profiles "$PROFILES" --out "$T/nullsrc.out.json" 2>"$T/nullsrc.err"
+assert_eq "null-source run exits 0" "$?" "0"
+assert_eq "null source filtered, codex vote survives" \
+  "$(jq -r '.findings[0].provider_votes' "$T/nullsrc.out.json")" "1"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]
