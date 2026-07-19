@@ -23,9 +23,10 @@
 #   kat      — kwaipilot/kat-coder-pro-v2          (Kuaishou)
 #   north    — cohere/north-mini-code:free         (Cohere — free tier)
 #   nemotron — nvidia/nemotron-3-ultra-550b-a55b:free (NVIDIA — free tier)
+#   spark    — meta/muse-spark-1.1                 (Meta)
 #   All are single-turn diff-inline reviews (same niche as kimi), each an
 #   independent provider vote. Key resolution: $OPENROUTER_API_KEY env var,
-#   else ~/.config/openrouter/key. No key → all ten are skipped.
+#   else ~/.config/openrouter/key. No key → all eleven are skipped.
 #
 #   POLICY (2026-07-01, per Gabriel): first-party reviewers (codex, the agy
 #   Gemini laps, kimi) do NOT fall back to OpenRouter — when agy hits its
@@ -45,7 +46,7 @@
 #
 # Usage:
 #   run_reviewers.sh --base <branch> --out <dir>
-#                    [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron]
+#                    [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark]
 #                    [--timeout <sec>]
 #                    [--timeout-codex <sec>] [--timeout-antigravity <sec>]
 #                    [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>]
@@ -75,7 +76,7 @@
 #   <out>/kimi.meta.json
 #   <out>/<or>.stdout          — each OpenRouter reviewer (glm, deepseek, mimo,
 #   <out>/<or>.stderr            minimax, qwen, devstral, laguna, kat,
-#   <out>/<or>.meta.json         north, nemotron) writes
+#   <out>/<or>.meta.json         north, nemotron, spark) writes
 #                                stdout/stderr/meta plus request.json and
 #                                response.json for audit
 #   <out>/agy.quota_exhausted  — sentinel: agy hit the shared Individual quota
@@ -155,6 +156,8 @@ laguna_model="poolside/laguna-m.1"
 kat_model="kwaipilot/kat-coder-pro-v2"
 north_model="cohere/north-mini-code:free"
 nemotron_model="nvidia/nemotron-3-ultra-550b-a55b:free"
+# spark model id verified against https://openrouter.ai/meta/muse-spark-1.1, 2026-07-19.
+spark_model="meta/muse-spark-1.1"
 # kimi27 rides the DIRECT Moonshot platform API (OpenAI-compatible), not
 # OpenRouter — a deliberate rotation seat (2026-07-03, per Gabriel) on the
 # same billing rail as the kimi baseline. The first-party no-OR-fallback
@@ -194,7 +197,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>]" >&2
   exit 2
 fi
 
@@ -246,6 +249,7 @@ _lg="$(profile_get laguna model)";      [[ -n "$_lg" ]] && laguna_model="$_lg"
 _kt="$(profile_get kat model)";         [[ -n "$_kt" ]] && kat_model="$_kt"
 _nm="$(profile_get north model)";       [[ -n "$_nm" ]] && north_model="$_nm"
 _vm="$(profile_get nemotron model)";    [[ -n "$_vm" ]] && nemotron_model="$_vm"
+_sp="$(profile_get spark model)";       [[ -n "$_sp" ]] && spark_model="$_sp"
 _k7="$(profile_get kimi27 model)";      [[ -n "$_k7" ]] && kimi27_model="$_k7"
 
 codex_profile="$(profile_timeout codex)"
@@ -262,6 +266,7 @@ laguna_profile="$(profile_timeout laguna)"
 kat_profile="$(profile_timeout kat)"
 north_profile="$(profile_timeout north)"
 nemotron_profile="$(profile_timeout nemotron)"
+spark_profile="$(profile_timeout spark)"
 kimi27_profile="$(profile_timeout kimi27)"
 codex_timeout="${timeout_codex:-${timeout_s:-${codex_profile:-$(( timeout_s_default < 300 ? timeout_s_default : 300 ))}}}"
 antigravity_timeout="${timeout_antigravity:-${timeout_s:-${antigravity_profile:-$timeout_s_default}}}"
@@ -282,6 +287,7 @@ laguna_timeout="${timeout_s:-${laguna_profile:-$timeout_s_default}}"
 kat_timeout="${timeout_s:-${kat_profile:-$timeout_s_default}}"
 north_timeout="${timeout_s:-${north_profile:-$timeout_s_default}}"
 nemotron_timeout="${timeout_s:-${nemotron_profile:-$timeout_s_default}}"
+spark_timeout="${timeout_s:-${spark_profile:-$timeout_s_default}}"
 kimi27_timeout="${timeout_s:-${kimi27_profile:-$timeout_s_default}}"
 
 mkdir -p "$out"
@@ -668,12 +674,12 @@ moonshot_key() {
 # and prompt shape as run_kimi, and the same stdin/argv reasoning: the prompt
 # body goes through a temp file + jq --rawfile, never argv). This is the shared
 # runner for the whole OpenRouter rotation pool (glm, deepseek, mimo, minimax,
-# qwen, devstral, laguna, kat, north, nemotron) — each an independent provider
+# qwen, devstral, laguna, kat, north, nemotron, spark) — each an independent provider
 # vote. It is NOT a fallback lane for the
 # first-party reviewers (policy: no OR fallbacks for codex/gemini/kimi).
 # Args:
 #   $1 slug           (glm | deepseek | mimo | minimax | qwen | devstral |
-#                      laguna | kat | north | nemotron | kimi27)
+#                      laguna | kat | north | nemotron | spark | kimi27)
 #   $2 model          (model id, e.g. z-ai/glm-5.2 or kimi-k2.7-code)
 #   $3 timeout_budget (seconds)
 #   $4 endpoint       (optional; default OpenRouter chat-completions. kimi27
@@ -885,21 +891,39 @@ run_agy_reviewer() {
   # bump the timeout.
   local start end rc
   start=$(date +%s)
-  local diff_summary
+  local diff_summary diff_full
   diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
+  # Embed the actual diff instead of just making the model go fetch it: agy
+  # 1.1.3+ soft-denies Bash/RunCommand tool confirmations in headless print
+  # mode (see docs/investigation-agy-empty-output.md) — a reviewer told to
+  # "use your file-reading tools to inspect the actual changes" reaches for
+  # `git diff` via Bash, gets silently denied, and the conversation ends with
+  # zero output (rc=0, 0 bytes — classified downstream as empty_output/rc=5).
+  # We already have full shell permission here, so fetch the diff ourselves
+  # and hand it over as text. This doesn't require guessing agy's
+  # permissions.allow syntax and doesn't touch its global settings.json.
+  # unified=50 keeps real context without ballooning the argv-guard below;
+  # a reviewer that still wants more (a file's surrounding code, imports)
+  # can use its native Read/Glob tools — those are a different permission
+  # category than "command" and aren't gated the same way in headless mode.
+  diff_full="$(git diff --unified=50 "$base"...HEAD 2>/dev/null || true)"
   local full_prompt
   full_prompt="$review_prompt
 
 Changed files (diff --stat against $base):
 $diff_summary
 
-Use your file-reading tools to inspect the actual changes. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
+Full diff (unified context, against $base):
+\`\`\`diff
+$diff_full
+\`\`\`
+
+The full diff is included above — you do NOT need to run git or any other shell command to see the changes. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
 
   # argv guard (issue #7): Linux caps a single argv element at ~128KB
-  # (MAX_ARG_STRLEN). The agy prompt is review_prompt + a 50-line diff-stat —
-  # small by construction — but a large custom review_prompt.txt would E2BIG
-  # the exec. agy has no documented stdin-prompt mode, so truncate loudly
-  # instead of dying opaquely.
+  # (MAX_ARG_STRLEN). Embedding the full diff (not just --stat) makes this
+  # guard load-bearing rather than defensive-only on large diffs — it still
+  # truncates loudly instead of dying opaquely on E2BIG.
   if [[ ${#full_prompt} -gt 100000 ]]; then
     echo "$slug: prompt is ${#full_prompt} bytes — truncating to 100KB to stay under the argv limit (trim references/review_prompt.txt)" >&2
     full_prompt="${full_prompt:0:100000}
@@ -945,8 +969,19 @@ Use your file-reading tools to inspect the actual changes. Do NOT edit, write, o
   #   agy_panic       — Go SIGSEGV in agy's RunCommandHandler (upstream bug,
   #                     seen on agy ≤1.0.15); exit 2, ~20-45s, empty output.
   #                     Flaky, so the agy retry is still worth one attempt.
-  #   empty_output    — rc=0, 0 bytes, no quota line: most often expired
-  #                     `agy login` auth.
+  #   empty_output    — rc=0, 0 bytes, no quota line. Historically blamed on
+  #                     expired `agy login` auth; as of agy 1.1.3+ the far
+  #                     more common cause is a soft-denied Bash/RunCommand
+  #                     tool confirmation in headless print mode (stderr:
+  #                     `jetski: no output produced — a tool required the
+  #                     "command" permission that headless mode cannot
+  #                     prompt for`). See
+  #                     docs/investigation-agy-empty-output.md. The prompt
+  #                     above now embeds the full diff precisely to avoid
+  #                     needing that tool call in the first place — if this
+  #                     still fires, check .agy.log for
+  #                     `soft-denying tool confirmation` before assuming
+  #                     auth expiry.
   local failure_kind="" quota_resets_in=""
   local agy_log="$out/${slug}.agy.log"
   if [[ $rc -eq 0 && "$bytes" -eq 0 || $rc -ne 0 ]]; then
@@ -1012,6 +1047,7 @@ run_laguna()   { run_openrouter_reviewer laguna   "$laguna_model"   "$laguna_tim
 run_kat()      { run_openrouter_reviewer kat      "$kat_model"      "$kat_timeout"; }
 run_north()    { run_openrouter_reviewer north    "$north_model"    "$north_timeout"; }
 run_nemotron() { run_openrouter_reviewer nemotron "$nemotron_model" "$nemotron_timeout"; }
+run_spark()    { run_openrouter_reviewer spark    "$spark_model"    "$spark_timeout"; }
 # kimi27: same OpenAI-compatible single-turn body, direct Moonshot endpoint +
 # key. cli label "moonshot" selects the key source and lands in meta.json.
 run_kimi27()   { run_openrouter_reviewer kimi27   "$kimi27_model"   "$kimi27_timeout" \
@@ -1226,7 +1262,7 @@ for r in "${requested[@]}"; do
         echo "kimi not installed — skipping" >&2
       fi
       ;;
-    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron)
+    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark)
       if ! command -v curl >/dev/null 2>&1; then
         echo "$r: curl not available — skipping" >&2
       elif openrouter_key >/dev/null 2>&1; then
@@ -1281,7 +1317,7 @@ for i in "${!pids[@]}"; do
         # failure_kind and the .agy.log tail are where the answer lives.
         echo "$name: failed (check failure_kind in $out/$name.meta.json; agy's own log: $out/$name.agy.log)" >&2 ;;
       kimi)        echo "$name: failed (see $out/kimi.stderr and $out/kimi.meta.json)" >&2 ;;
-      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|kimi27)
+      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|kimi27)
         echo "$name: failed (see $out/$name.stderr, $out/$name.response.json, $out/$name.meta.json)" >&2 ;;
       *)           echo "$name: failed (see $out/$name.* )" >&2 ;;
     esac

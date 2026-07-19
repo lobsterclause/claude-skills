@@ -270,6 +270,24 @@
     "notes": "NVIDIA Nemotron 3 Ultra 550B (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid — check the route's terms for security-sensitive repos. US-origin provider (NVIDIA). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets — see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data — re-evaluate after clean rounds."
   },
 
+  "spark": {
+    "timeout_s": 600,
+    "provider": "meta",
+    "cli": "openrouter",
+    "model": "meta/muse-spark-1.1",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "specialization": "single-turn diff reasoning; independent provider vote (Meta). Rotation-pool member.",
+    "notes": "Meta Muse Spark 1.1 via OpenRouter ($1.25/M in, $4.25/M out; Meta Superintelligence Labs' first paid model, multimodal/agentic-oriented natively but run here diff-only-no-tools like the rest of the OR pool). Added 2026-07-19, rookie — priors conservative until leaderboard data accumulates. US-origin provider (Meta), routed through OpenRouter (US)."
+  },
+
   "_synthesis_rules": {
     "skip_unless_convergent": "Drop a single-reviewer finding at this severity unless another reviewer flagged the same file/area.",
     "trust_if_convergent": "Promote/keep when 2+ reviewers agree; downgrade or verify when solo.",

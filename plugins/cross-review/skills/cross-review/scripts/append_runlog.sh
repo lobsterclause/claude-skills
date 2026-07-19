@@ -183,7 +183,7 @@ enrich_with_findings() {
       "kimi":"moonshot","glm":"zhipu","deepseek":"deepseek","mimo":"xiaomi",
       "minimax":"minimax","qwen":"alibaba","devstral":"mistral",
       "laguna":"poolside","kat":"kuaishou","north":"cohere","nemotron":"nvidia",
-      "kimi27":"moonshot"}) as $prov
+      "spark":"meta","kimi27":"moonshot"}) as $prov
     | [(.findings // [])[] | select((.sources // []) | index($r))] as $mine
     | { findings_total: ($mine | length),
         findings_convergent: ($mine | map(select(
@@ -211,6 +211,7 @@ laguna_json=$(enrich_with_findings laguna "$(reviewer_obj laguna)")
 kat_json=$(enrich_with_findings kat "$(reviewer_obj kat)")
 north_json=$(enrich_with_findings north "$(reviewer_obj north)")
 nemotron_json=$(enrich_with_findings nemotron "$(reviewer_obj nemotron)")
+spark_json=$(enrich_with_findings spark "$(reviewer_obj spark)")
 kimi27_json=$(enrich_with_findings kimi27 "$(reviewer_obj kimi27)")
 
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -241,6 +242,7 @@ entry=$(jq -nc \
   --argjson kat "$kat_json" \
   --argjson north "$north_json" \
   --argjson nemotron "$nemotron_json" \
+  --argjson spark "$spark_json" \
   --argjson kimi27 "$kimi27_json" \
   '{
     ts: $ts,
@@ -254,7 +256,7 @@ entry=$(jq -nc \
     reviewers: {codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, glm: $glm,
                 deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
                 devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
-                kimi27: $kimi27},
+                spark: $spark, kimi27: $kimi27},
     convergent_count: $convergent,
     verdict: $verdict,
     top_finding: (if $top == "" then null else $top end),
