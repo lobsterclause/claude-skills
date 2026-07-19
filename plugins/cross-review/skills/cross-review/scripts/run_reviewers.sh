@@ -490,6 +490,12 @@ output_no_verdict() {
   local f="$1" raw
   raw=$(output_bytes_of "$f")
   [[ "$raw" -gt 0 && "$raw" -lt 512 ]] || return 1
+  # A curl-lane JSON reply is an explicit verdict by construction: a parseable
+  # object with a top-level findings array says "clean" via [] — 16 bytes,
+  # zero marker words. The marker-word regex below is for prose lanes only.
+  if jq -e 'type=="object" and has("findings") and (.findings|type=="array")' "$f" >/dev/null 2>&1; then
+    return 1
+  fi
   # NOTE: no empty alternatives — `(a |b |)` is invalid POSIX ERE and BSD
   # grep silently fails the whole pattern; use `( … )?` optional groups.
   ! grep -qiE 'critical|high|medium|low|no (significant |material )?(issues?|findings?|problems?|concerns?)|looks (good|correct|fine)|lgtm|approved|no regressions|\[P[0-9]\]' "$f"

@@ -69,6 +69,19 @@ else
   bad "glm.request.json was never written"
 fi
 
+echo "── RED/GREEN: clean JSON reply {\"findings\":[]} is a verdict, not no_verdict_output ──"
+# A compliant clean review under response_format:json_object is 16 bytes with
+# none of output_no_verdict's marker words — it must classify as a successful
+# run, not failure_kind=no_verdict_output.
+if [[ -f "$T/o1/glm.meta.json" ]]; then
+  assert_eq "clean {\"findings\":[]} keeps exit_code 0" \
+    "$(jq -r '.exit_code' "$T/o1/glm.meta.json")" "0"
+  assert_eq "clean {\"findings\":[]} not reclassified as no_verdict_output" \
+    "$(jq -r '.failure_kind' "$T/o1/glm.meta.json")" "null"
+else
+  bad "glm.meta.json was never written"
+fi
+
 echo "── RED/GREEN: curl-lane prompt carries the schema-mandate suffix ──"
 if [[ -f "$T/o1/glm.request.json" ]]; then
   assert_contains "OpenRouter curl-lane prompt mandates the findings JSON schema" \
