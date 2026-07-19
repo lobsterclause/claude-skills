@@ -90,6 +90,25 @@
     "notes": "Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it would be drawn frequently while earning leaderboard data. Retired to draw_boost 1.0 on 2026-07-12 after reaching 10 sampled runs (score 72, 7/16 findings convergent) — now competes on the same footing as the rest of the pool. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) — surface for security-sensitive repos."
   },
 
+  "kimi3": {
+    "timeout_s": 600,
+    "provider": "moonshot",
+    "cli": "moonshot",
+    "model": "kimi-k3",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "draw_boost": 2.5,
+    "specialization": "single-turn diff reasoning on Moonshot's flagship Kimi K3 (2.8T MoE, 16/896 experts active, 1M context); rotation-pool member on the DIRECT Moonshot platform API (same billing rail as the kimi baseline and kimi27, NOT OpenRouter).",
+    "notes": "Kimi K3 via the direct Moonshot platform API (api.moonshot.ai/v1, model id `kimi-k3`, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-18 per Gabriel, two days after Moonshot's 2026-07-16 K3 release — draw_boost 2.5 so it's drawn frequently while it earns leaderboard data; retire the boost after ~10 sampled runs per the kimi27 precedent. Full open weights weren't out yet at add-time (expected 2026-07-27) — this seat hits the hosted API, not local weights. Same provider as kimi/kimi27: kimi+kimi27+kimi3 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) — surface for security-sensitive repos."
+  },
+
   "glm": {
     "timeout_s": 600,
     "provider": "zhipu",

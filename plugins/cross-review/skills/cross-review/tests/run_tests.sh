@@ -150,6 +150,36 @@ CROSS_REVIEW_RUNLOG="$GATELOG" bash "$S/append_runlog.sh" \
 assert_eq "evidenced drop appends fine" "$?" "0"
 assert_eq "gated entry landed in runlog" "$(wc -l <"$GATELOG" | tr -d ' ')" "1"
 
+echo "── append_runlog.sh (--roster-decision / --run-id) ──"
+cat >"$T/roster_decision.json" <<'EOF'
+{"roster":"codex,kimi,glm","baselines":["codex","kimi"],"selected":["glm"],"seed":42,"candidates":[{"reviewer":"glm","score":67,"weight":10.5,"selected":true}],"policy_version":"weighted-draw-v1"}
+EOF
+RDLOG="$T/rd-runlog.jsonl"
+CROSS_REVIEW_RUNLOG="$RDLOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+BASELINE_ENTRY="$(jq -Sc 'del(.ts)' "$RDLOG")"
+: >"$RDLOG"
+CROSS_REVIEW_RUNLOG="$RDLOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" \
+  --run-id run-test-xyz --roster-decision "$T/roster_decision.json" >/dev/null 2>&1
+WITH_ENTRY="$(tail -1 "$RDLOG")"
+assert_eq "run_id attached" "$(jq -r '.run_id' <<<"$WITH_ENTRY")" "run-test-xyz"
+assert_eq "roster_decision attached verbatim" \
+  "$(jq -Sc '.roster_decision' <<<"$WITH_ENTRY")" "$(jq -Sc . "$T/roster_decision.json")"
+assert_eq "omitting both flags reproduces today's entry byte-for-byte" \
+  "$BASELINE_ENTRY" "$(jq -Sc 'del(.ts, .run_id, .roster_decision)' <<<"$WITH_ENTRY")"
+: >"$RDLOG"
+printf 'not json\n' >"$T/bad-roster-decision.json"
+CROSS_REVIEW_RUNLOG="$RDLOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" \
+  --roster-decision "$T/bad-roster-decision.json" >/dev/null 2>"$T/rd.err"
+assert_eq "garbage roster-decision file still appends (exit 0)" "$?" "0"
+assert_eq "garbage roster-decision omits the key" "$(jq 'has("roster_decision")' "$RDLOG")" "false"
+assert_contains "garbage roster-decision warns to stderr" "$(cat "$T/rd.err")" "unreadable or invalid JSON"
+
 echo "── select_roster.sh (determinism, floor, --fast fallback) ──"
 # select_roster.sh doesn't read CROSS_REVIEW_RUNLOG itself — it shells out to
 # leaderboard.sh, which inherits the exported var and reads the fixture. The
@@ -166,13 +196,26 @@ if [[ "$N_R1" -ge 3 ]]; then ok "roster ≥3 ($N_R1)"; else bad "roster <3 ($R1)
 # must redraw unfiltered and keep the floor]
 SLOWLOG="$T/slow-runlog.jsonl"
 jq -nc '{ts:"2026-07-01T05:00:00Z", reviewers: (
-  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","qwen","devstral","laguna","kat","north","nemotron","spark","kimi27"]
+  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","qwen","devstral","laguna","kat","north","nemotron","spark","kimi27","kimi3"]
   | map({key: ., value: {status:"ok", exit_code:0, duration_s:5000, output_bytes:10, timeout_budget_s:600}}) | from_entries)}' >"$SLOWLOG"
 FAST_ERR="$T/fast.err"
 RF="$(CROSS_REVIEW_RUNLOG="$SLOWLOG" bash "$S/select_roster.sh" --seed 7 --fast 2>"$FAST_ERR")"
 N_RF="$(awk -F',' '{print NF}' <<<"$RF")"
 if [[ "$N_RF" -ge 3 ]]; then ok "--fast over-filter keeps ≥3 roster via fallback ($RF)"; else bad "--fast shipped sub-floor roster ($RF)"; fi
 assert_contains "--fast fallback announces the redraw" "$(cat "$FAST_ERR")" "redrawing without the speed filter"
+
+echo "── select_roster.sh --json (candidates array, policy_version) ──"
+RJ="$(CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 99 --json 2>/dev/null)"
+assert_eq "roster in --json matches plain-mode roster (same seed+fixture)" \
+  "$(jq -r '.roster' <<<"$RJ")" "$R1"
+assert_eq "policy_version stamped" "$(jq -r '.policy_version' <<<"$RJ")" "weighted-draw-v1"
+N_CAND="$(jq '.candidates | length' <<<"$RJ")"
+if [[ "$N_CAND" -gt 0 ]]; then ok "candidates array populated ($N_CAND)"; else bad "candidates array empty"; fi
+assert_eq "every candidate has a weight field" \
+  "$(jq '[.candidates[] | has("weight")] | all' <<<"$RJ")" "true"
+assert_eq "candidates.selected=true count matches .selected array length" \
+  "$(jq '[.candidates[] | select(.selected==true)] | length' <<<"$RJ")" \
+  "$(jq '.selected | length' <<<"$RJ")"
 
 echo "── run_reviewers.sh kimi budget + rc137 (shim kimi, fixture repo) ──"
 REPO="$T/repo"; mkdir -p "$REPO"; cd "$REPO"
@@ -314,6 +357,84 @@ assert_eq "real snippet anchors" \
   "$(jq -r '.findings[] | select(.id=="a1") | .anchor.resolved' "$T/anchored.json")" "true"
 assert_eq "hallucinated snippet stays unanchored" \
   "$(jq -r '.findings[] | select(.id=="a2") | .anchor.resolved' "$T/anchored.json")" "false"
+
+echo "── anchor_findings.sh --emit-events (opt-in, regression-safe) ──"
+ANCHOR_EVLOG="$T/anchor-events.jsonl"
+: >"$ANCHOR_EVLOG"
+CROSS_REVIEW_FINDING_EVENTS="$ANCHOR_EVLOG" bash "$S/anchor_findings.sh" \
+  --findings "$T/anchor.json" --base main --repo "$REPO" --out "$T/anchored-ev.json" \
+  --emit-events run-anchor-test >/dev/null 2>&1
+assert_eq "anchor output byte-identical with --emit-events added" \
+  "$(jq -Sc . "$T/anchored.json")" "$(jq -Sc . "$T/anchored-ev.json")"
+assert_eq "one anchored event per finding" "$(wc -l <"$ANCHOR_EVLOG" | tr -d ' ')" "2"
+assert_eq "anchored event carries resolved=true for a1" \
+  "$(jq -r 'select(.finding_id=="a1") | .resolved' "$ANCHOR_EVLOG")" "true"
+assert_eq "anchored event carries resolved=false for a2" \
+  "$(jq -r 'select(.finding_id=="a2") | .resolved' "$ANCHOR_EVLOG")" "false"
+
+echo "── factcheck_findings.sh --emit-events (opt-in, keep_all fail-safe path) ──"
+FACTCHECK_EVLOG="$T/factcheck-events.jsonl"
+: >"$FACTCHECK_EVLOG"
+cat >"$T/fc-findings.json" <<'EOF'
+{"findings":[
+ {"id":"c1","file":"f.txt","line":1,"snippet":"x","claim":"a claim","sources":["codex"]}
+]}
+EOF
+# --diff pointed at a nonexistent path forces the keep_all fail-safe
+# deterministically, before any agy/curl dispatch — zero network, per this
+# suite's hard constraint (see file header).
+CROSS_REVIEW_FINDING_EVENTS="$FACTCHECK_EVLOG" bash "$S/factcheck_findings.sh" \
+  --findings "$T/fc-findings.json" --out "$T/fc-out.json" --diff /nonexistent/path \
+  --emit-events run-factcheck-test >/dev/null 2>&1
+assert_eq "keep_all fail-safe still emits factcheck_kept" \
+  "$(jq -r '.event' "$FACTCHECK_EVLOG")" "factcheck_kept"
+assert_contains "event carries the fail-safe reason" \
+  "$(jq -r '.reason' "$FACTCHECK_EVLOG")" "diff file not found"
+
+echo "── fingerprint_findings.sh (stable ids) ──"
+cat >"$T/fp-findings.json" <<'EOF'
+{"findings":[
+ {"id":"f1","severity":"High","file":"a.ts","line":10,"snippet":"x","claim":"same claim text","sources":["codex","glm"]},
+ {"id":"f2","severity":"Low","file":"b.ts","line":20,"snippet":"y","claim":"different claim","sources":[]}
+]}
+EOF
+bash "$S/fingerprint_findings.sh" --findings "$T/fp-findings.json" --out "$T/fp-out1.json" --project fixtureproj >/dev/null 2>&1
+bash "$S/fingerprint_findings.sh" --findings "$T/fp-findings.json" --out "$T/fp-out2.json" --project fixtureproj >/dev/null 2>&1
+assert_eq "same (project,file,claim) -> same id across runs" \
+  "$(jq -r '.findings[0].id' "$T/fp-out1.json")" "$(jq -r '.findings[0].id' "$T/fp-out2.json")"
+assert_eq "local_id preserves the original sequence id" \
+  "$(jq -r '.findings[0].local_id' "$T/fp-out1.json")" "f1"
+F1_ID="$(jq -r '.findings[0].id' "$T/fp-out1.json")"
+F2_ID="$(jq -r '.findings[1].id' "$T/fp-out1.json")"
+if [[ "$F1_ID" =~ ^f-[0-9a-f]{8}$ ]]; then ok "id matches ^f-[0-9a-f]{8}\$ shape"; else bad "id shape wrong: $F1_ID"; fi
+if [[ "$F1_ID" != "$F2_ID" ]]; then ok "distinct findings get distinct ids"; else bad "different findings collided on id"; fi
+sed 's/same claim text/reworded claim text/' "$T/fp-findings.json" >"$T/fp-findings2.json"
+bash "$S/fingerprint_findings.sh" --findings "$T/fp-findings2.json" --out "$T/fp-out3.json" --project fixtureproj >/dev/null 2>&1
+F1_ID_REWORDED="$(jq -r '.findings[0].id' "$T/fp-out3.json")"
+if [[ "$F1_ID_REWORDED" != "$F1_ID" ]]; then ok "reworded claim changes the id (known limitation, expected)"; else bad "id unexpectedly stable across reworded claim"; fi
+
+echo "── append_finding_event.sh (append, validation, concurrency) ──"
+EVLOG="$T/events.jsonl"
+: >"$EVLOG"
+CROSS_REVIEW_FINDING_EVENTS="$EVLOG" bash "$S/append_finding_event.sh" \
+  --event proposed --finding-id f-aaaa1111 --run-id run-x --fields '{"reviewer":"codex"}' >/dev/null 2>&1
+assert_eq "valid append lands one line" "$(wc -l <"$EVLOG" | tr -d ' ')" "1"
+assert_eq "event field round-trips" "$(jq -r '.event' "$EVLOG")" "proposed"
+assert_eq "finding_id field round-trips" "$(jq -r '.finding_id' "$EVLOG")" "f-aaaa1111"
+assert_eq "fields payload merges in" "$(jq -r '.reviewer' "$EVLOG")" "codex"
+CROSS_REVIEW_FINDING_EVENTS="$EVLOG" bash "$S/append_finding_event.sh" \
+  --event x --finding-id f-1 --run-id r-1 --fields 'not-json' >/dev/null 2>&1
+assert_eq "malformed --fields rejects (exit 2)" "$?" "2"
+CONCLOG="$T/conc-events.jsonl"
+: >"$CONCLOG"
+for i in $(seq 1 20); do
+  CROSS_REVIEW_FINDING_EVENTS="$CONCLOG" bash "$S/append_finding_event.sh" \
+    --event proposed --finding-id "f-conc$i" --run-id run-conc --fields "{\"i\":$i}" >/dev/null 2>&1 &
+done
+wait
+assert_eq "concurrent appends: all 20 lines present" "$(wc -l <"$CONCLOG" | tr -d ' ')" "20"
+assert_eq "concurrent appends: every line parses as JSON" \
+  "$(jq -c . "$CONCLOG" 2>/dev/null | grep -c '^.' || true)" "20"
 
 echo "── import_runlog.sh (idempotent merge) ──"
 SRC="$T/src.jsonl"; DST="$T/dst.jsonl"; : >"$DST"
@@ -580,6 +701,61 @@ fi
 DETECT2="$(MOONSHOT_API_KEY= bash "$S/detect_reviewers.sh")"
 assert_eq "no moonshot key → kimi27 false" "$(jq -r '.kimi27' <<<"$DETECT2")" "false"
 assert_eq "no moonshot key → OR pool unaffected" "$(jq -r '.glm' <<<"$DETECT2")" "true"
+
+echo "── kimi3 rotation seat (direct-Moonshot K3, draw_boost) ──"
+# [pin: 2026-07-18, per Gabriel — kimi-k3 (Moonshot's flagship, released
+# 2026-07-16) joins the rotation pool as a second direct-Moonshot seat,
+# same billing rail as kimi27 and the kimi baseline (NOT an OpenRouter
+# fallback). Carries draw_boost 2.5 while it earns leaderboard data, same
+# bring-up pattern as kimi27.]
+DETECT_OUT3="$(bash "$S/detect_reviewers.sh")"
+assert_eq "detect reports kimi3 available with Moonshot key" \
+  "$(jq -r '.kimi3' <<<"$DETECT_OUT3")" "true"
+assert_eq "detect still reports kimi27 available (positional coupling check)" \
+  "$(jq -r '.kimi27' <<<"$DETECT_OUT3")" "true"
+BOOST_ERR3="$T/boost3.err"
+CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR3"
+assert_contains "selector draws kimi3 as a candidate" "$(cat "$BOOST_ERR3")" "kimi3"
+# rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0;
+# draw_boost 2.5 (fresh seat, not yet retired) → 75.0 * 2.5 = 187.5.
+assert_contains "kimi3 weight reflects its draw_boost (2.5, not yet retired)" \
+  "$(grep 'kimi3 ' "$BOOST_ERR3")" "weight=187.5"
+# no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
+MOONSHOT_API_KEY= bash "$S/run_reviewers.sh" --base main --out "$T/o13" --reviewers kimi3 >/dev/null 2>"$T/k3skip.err"
+assert_eq "kimi3 without a key exits 1 (all requested reviewers failed)" "$?" "1"
+assert_contains "kimi3 skip names the missing key" "$(cat "$T/k3skip.err")" "Moonshot"
+# same-provider convergence: kimi (baseline) + kimi3 agreeing is ONE provider vote
+printf '{"exit_code": 0, "duration_s": 30, "timed_out": false, "output_bytes": 900, "attempt": 1, "timeout_budget_s": 600, "model": "kimi-k3", "cli": "moonshot", "failure_kind": null}\n' >"$RUN/raw/kimi3.meta.json"
+cat >"$T/k3-findings.json" <<'EOF'
+{"findings":[
+ {"id":"n1","file":"a.sh","line":1,"claim":"x","sources":["kimi","kimi3"],"factcheck":{"verdict":"keep"}},
+ {"id":"n2","file":"a.sh","line":2,"claim":"y","sources":["kimi3","codex"],"factcheck":{"verdict":"keep"}}
+]}
+EOF
+K3LOG="$T/k3-runlog.jsonl"
+CROSS_REVIEW_RUNLOG="$K3LOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 1 --top "-" --findings "$T/k3-findings.json" >/dev/null 2>&1
+assert_eq "kimi3 telemetry lands in the runlog" \
+  "$(tail -1 "$K3LOG" | jq -r '.reviewers.kimi3.status')" "ok"
+assert_eq "kimi+kimi3 agreement is NOT cross-provider convergent" \
+  "$(tail -1 "$K3LOG" | jq -r '.reviewers.kimi3.findings_convergent')" "1"
+rm -f "$RUN/raw/kimi3.meta.json"
+# request body: usage:{include:true} is an OpenRouter extension — the moonshot
+# cli path must omit it, same hygiene as kimi27.
+bash "$S/run_reviewers.sh" --base main --out "$T/o14" --reviewers kimi3 --timeout 15 >/dev/null 2>&1 || true
+if [[ -f "$T/o14/kimi3.request.json" ]]; then
+  assert_eq "moonshot request body omits OpenRouter usage extension" \
+    "$(jq 'has("usage")' "$T/o14/kimi3.request.json")" "false"
+else
+  bad "kimi3 request body was never written"
+fi
+# detect positional coupling: clearing ONLY the moonshot key must flip BOTH
+# kimi27 and kimi3 to false while the OR pool stays true.
+DETECT3="$(MOONSHOT_API_KEY= bash "$S/detect_reviewers.sh")"
+assert_eq "no moonshot key → kimi3 false" "$(jq -r '.kimi3' <<<"$DETECT3")" "false"
+assert_eq "no moonshot key → kimi27 false" "$(jq -r '.kimi27' <<<"$DETECT3")" "false"
+assert_eq "no moonshot key → OR pool unaffected" "$(jq -r '.glm' <<<"$DETECT3")" "true"
 
 echo "── doc-narrative caution note (text-only reviewers, PR #350 class) ──"
 # [pin: PR #350 (2026-07-05) — devstral replayed 9 of 12 findings, and
