@@ -412,6 +412,21 @@ sed 's/same claim text/reworded claim text/' "$T/fp-findings.json" >"$T/fp-findi
 bash "$S/fingerprint_findings.sh" --findings "$T/fp-findings2.json" --out "$T/fp-out3.json" --project fixtureproj >/dev/null 2>&1
 F1_ID_REWORDED="$(jq -r '.findings[0].id' "$T/fp-out3.json")"
 if [[ "$F1_ID_REWORDED" != "$F1_ID" ]]; then ok "reworded claim changes the id (known limitation, expected)"; else bad "id unexpectedly stable across reworded claim"; fi
+# [pin: codex P2 on PR #38 — case-distinct files (Foo.ts vs foo.ts) must not
+# collide; only the CLAIM is case-normalized, file/project keep exact case]
+cat >"$T/fp-case.json" <<'EOF'
+{"findings":[
+ {"id":"c1","severity":"Low","file":"Foo.ts","line":1,"snippet":"x","claim":"same claim","sources":[]},
+ {"id":"c2","severity":"Low","file":"foo.ts","line":1,"snippet":"x","claim":"same claim","sources":[]},
+ {"id":"c3","severity":"Low","file":"Foo.ts","line":1,"snippet":"x","claim":"SAME   claim","sources":[]}
+]}
+EOF
+bash "$S/fingerprint_findings.sh" --findings "$T/fp-case.json" --out "$T/fp-case-out.json" --project fixtureproj >/dev/null 2>&1
+C1="$(jq -r '.findings[0].id' "$T/fp-case-out.json")"
+C2="$(jq -r '.findings[1].id' "$T/fp-case-out.json")"
+C3="$(jq -r '.findings[2].id' "$T/fp-case-out.json")"
+if [[ "$C1" != "$C2" ]]; then ok "case-distinct files get distinct ids"; else bad "Foo.ts and foo.ts collided on id"; fi
+assert_eq "claim stays case/whitespace-insensitive" "$C1" "$C3"
 
 echo "── append_finding_event.sh (append, validation, concurrency) ──"
 EVLOG="$T/events.jsonl"

@@ -90,9 +90,13 @@ while IFS= read -r f; do
   file="$(jq -r '.file // ""' <<<"$f")"
   claim="$(jq -r '.claim // ""' <<<"$f")"
   old_id="$(jq -r '.id // ""' <<<"$f")"
-  norm="$(printf '%s\x1f%s\x1f%s' "$project" "$file" "$claim" \
+  # Only the CLAIM is case/whitespace-normalized — project and file keep exact
+  # case, so Foo.ts and foo.ts on a case-sensitive fs never share an id
+  # (codex P2, PR #38).
+  claim_norm="$(printf '%s' "$claim" \
             | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' \
             | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  norm="$(printf '%s\x1f%s\x1f%s' "$project" "$file" "$claim_norm")"
   hash="$(printf '%s' "$norm" | sha1_of)"
   fid="f-${hash:0:8}"
   jq -c --arg fid "$fid" --arg local_id "$old_id" \
