@@ -380,6 +380,20 @@ Keep iterating until any of:
 
 Each pass's artifacts go in a new `run-<timestamp>/` so the record is preserved.
 
+Don't eyeball "did this recur" by re-reading old findings tables — key it off `check_recurrence.sh`, which compares this pass's fingerprinted findings.json against every prior pass's and returns a deterministic verdict:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/check_recurrence.sh \
+  --current "$run_dir/findings.json" \
+  --previous "$prior_run_dir_1/findings.json" \
+  --previous "$prior_run_dir_2/findings.json"
+# -> {"recurring":[...], "fresh":[...], "resolved":[...], "revenant":[...],
+#     "summary":{"recurring":N,"fresh":N,"resolved":N,"revenant":N,
+#                "verdict":"ok"|"recurrence_detected"}}
+```
+
+`summary.verdict == "recurrence_detected"` is the stop-and-ask signal above — go ask the user, quoting the `recurring` entries (each carries `passes_seen`/`first_seen_pass`). A finding that reappears but was factcheck-dropped in every prior pass lands in `revenant`, not `recurring` — that's a reviewer re-flagging something already vetoed, not a fix that failed to land, so it does NOT trip the stop-and-ask rule.
+
 ### 7. Post the record
 
 Write a PR-level record so future Claude runs (or human reviewers) can see what happened. The record mode is configurable — the cheapest default is `summary`.
