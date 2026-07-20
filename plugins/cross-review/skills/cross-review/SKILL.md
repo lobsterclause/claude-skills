@@ -1,13 +1,13 @@
 ---
 name: cross-review
-description: Run external AI code reviewers in parallel against the current branch's diff, synthesize deduped findings, auto-apply fixes, and iterate until clean. codex and kimi are fixed baselines; the rest of each round's roster (Gemini via agy, GLM/DeepSeek/MiMo/MiniMax/Qwen/Devstral/Laguna/KAT/North/Nemotron/Spark via OpenRouter, plus Kimi k2.7-code direct on Moonshot) rotates via a leaderboard-weighted random draw — every round has ≥3 reviewers. Use this skill whenever the user wants a second opinion on code, cross-review, swarm review, peer review, external review, or wants codex/antigravity/gemini/kimi/glm to look at changes before shipping — even if they don't explicitly name the CLIs. Also trigger on "have codex check this", "get a second pair of eyes", "cross-check my changes", "review before merge", "swarm review", "review this PR", or right after Claude creates a PR. Do NOT trigger for routine lint/test runs, style-only checks, or when the user wants Claude itself (not external CLIs) to review.
+description: Run external AI code reviewers in parallel against the current branch's diff, synthesize deduped findings, auto-apply fixes, and iterate until clean. codex and kimi are fixed baselines; the rest of each round's roster (Gemini via agy, GLM/DeepSeek/MiMo/MiniMax/Qwen/Devstral/Laguna/KAT/North/Nemotron/Spark via OpenRouter, plus Kimi k2.7-code and Kimi K3 direct on Moonshot) rotates via a leaderboard-weighted random draw — every round has ≥3 reviewers. Use this skill whenever the user wants a second opinion on code, cross-review, swarm review, peer review, external review, or wants codex/antigravity/gemini/kimi/glm to look at changes before shipping — even if they don't explicitly name the CLIs. Also trigger on "have codex check this", "get a second pair of eyes", "cross-check my changes", "review before merge", "swarm review", "review this PR", or right after Claude creates a PR. Do NOT trigger for routine lint/test runs, style-only checks, or when the user wants Claude itself (not external CLIs) to review.
 ---
 
 # cross-review
 
 Orchestrates a rotating fleet of external AI reviewers to review the current branch's changes, consolidates their findings, applies fixes, and re-runs until the diff is clean or an iteration budget is exhausted. The goal is to catch things a single model would miss — different reviewers have different blind spots, so their overlap is signal and their disagreements are worth reading.
 
-**The fleet (baselines + rotation):** `codex` (OpenAI) and `kimi` (Moonshot) are **fixed baselines — on every round**. The rest of the roster rotates per round via `select_roster.sh`: a weighted random draw over `antigravity` (agy / Gemini 3.5 Flash, fast lap), `gemini-pro` (agy / Gemini 3.1 Pro, deep lap), and the OpenRouter pool — `glm` (GLM 5.2, Zhipu), `deepseek` (DeepSeek V4 Flash), `mimo` (Xiaomi MiMo v2.5), `minimax` (MiniMax M3), `qwen` (Qwen3 Coder Next, Alibaba), `devstral` (Devstral 2, Mistral), `laguna` (Poolside Laguna M.1), `kat` (KAT-Coder-Pro V2, Kuaishou), `north` (Cohere North Mini Code, free tier), `nemotron` (NVIDIA Nemotron 3 Ultra, free tier), `spark` (Meta Muse Spark 1.1) — plus `kimi27` (Kimi k2.7-code) on the **direct Moonshot platform API** (2026-07-03, per Gabriel): a deliberate rotation seat on the same billing rail as the kimi baseline, NOT an OpenRouter fallback, carrying a `draw_boost` in its profile so it is drawn frequently while it earns leaderboard data. Same provider as the kimi baseline — kimi+kimi27 agreement is ONE provider vote. Draw weights come from the `leaderboard.sh` score, with an exploration bonus for under-sampled reviewers and an optional per-reviewer `draw_boost` multiplier from `reviewer_profiles.json`. **Every round has at least 3 reviewers.** See "Leaderboard & rotation" below.
+**The fleet (baselines + rotation):** `codex` (OpenAI) and `kimi` (Moonshot) are **fixed baselines — on every round**. The rest of the roster rotates per round via `select_roster.sh`: a weighted random draw over `antigravity` (agy / Gemini 3.5 Flash, fast lap), `gemini-pro` (agy / Gemini 3.1 Pro, deep lap), and the OpenRouter pool — `glm` (GLM 5.2, Zhipu), `deepseek` (DeepSeek V4 Flash), `mimo` (Xiaomi MiMo v2.5), `minimax` (MiniMax M3), `qwen` (Qwen3 Coder Next, Alibaba), `devstral` (Devstral 2, Mistral), `laguna` (Poolside Laguna M.1), `kat` (KAT-Coder-Pro V2, Kuaishou), `north` (Cohere North Mini Code, free tier), `nemotron` (NVIDIA Nemotron 3 Ultra, free tier), `spark` (Meta Muse Spark 1.1) — plus two seats on the **direct Moonshot platform API** (NOT an OpenRouter fallback, same billing rail as the kimi baseline): `kimi27` (Kimi k2.7-code, added 2026-07-03) and `kimi3` (Kimi K3, Moonshot's 2.8T-parameter flagship released 2026-07-16, added as a rotation seat 2026-07-18). Both carry a `draw_boost` in their profile while they're new, so they're drawn frequently to earn leaderboard data. Same provider as the kimi baseline — kimi+kimi27+kimi3 agreement is ONE provider vote. Draw weights come from the `leaderboard.sh` score, with an exploration bonus for under-sampled reviewers and an optional per-reviewer `draw_boost` multiplier from `reviewer_profiles.json`. **Every round has at least 3 reviewers.** See "Leaderboard & rotation" below.
 
 **On the Gemini fleet:** `antigravity` and `gemini-pro` are both Google-Gemini reviewers running through the **same** `agy` (Antigravity) CLI, differing only by `--model` (Flash High vs. Pro High). The `agy` CLI replaced the standalone `gemini` CLI, which stopped serving consumer requests on **2026-06-18**. Because they share a provider, treat Flash↔Pro agreement as **one** provider's vote, not two independent ones. They also **share one Google "Individual quota"** (resets on a ~2-day cadence) — when it's exhausted, agy exits 0 with empty stdout in seconds and only the `.agy.log` says why; the wrapper detects this (`failure_kind: "quota_exhausted"` + an `agy.quota_exhausted` sentinel). The sentinel spares **retries and the fact-check pass** — the concurrently-launched sibling lap usually completes its own doomed ~5s call first, since laps start only 2s apart.
 
@@ -31,13 +31,13 @@ The skill runs in this order. Do not skip steps — each produces state the next
 bash ~/.claude/skills/cross-review/scripts/detect_reviewers.sh
 ```
 
-Prints JSON like `{"codex": true, "antigravity": true, "gemini-pro": true, "kimi": true, "glm": true, "deepseek": true, "mimo": true, "minimax": true, "qwen": true, "devstral": true, "laguna": true, "kat": true, "north": true, "nemotron": true, "spark": true, "kimi27": true, "openrouter": true}`. Note that `antigravity` and `gemini-pro` both track the **single `agy` binary**, and the eleven OpenRouter-pool reviewers all track the **single `openrouter` condition** (key + curl). If none are available, stop and tell the user how to install them:
+Prints JSON like `{"codex": true, "antigravity": true, "gemini-pro": true, "kimi": true, "glm": true, "deepseek": true, "mimo": true, "minimax": true, "qwen": true, "devstral": true, "laguna": true, "kat": true, "north": true, "nemotron": true, "spark": true, "kimi27": true, "kimi3": true, "openrouter": true}`. Note that `antigravity` and `gemini-pro` both track the **single `agy` binary**, the eleven OpenRouter-pool reviewers all track the **single `openrouter` condition** (key + curl), and `kimi27`/`kimi3` both track the **single Moonshot platform key**. If none are available, stop and tell the user how to install them:
 
 - codex: `brew install codex-cli`
 - antigravity + gemini-pro (both via `agy`): `curl -fsSL https://antigravity.google/cli/install.sh | bash`, then `agy login` once
 - kimi: `curl -L code.kimi.com/install.sh | bash`
 - OpenRouter pool (glm/deepseek/mimo/minimax/qwen/devstral/laguna/kat/north/nemotron/spark): create a key at openrouter.ai, then `export OPENROUTER_API_KEY=...` or `mkdir -p ~/.config/openrouter && (umask 077; printf '%s\n' 'sk-or-...' > ~/.config/openrouter/key)`
-- kimi27 (Kimi k2.7-code, direct Moonshot): `export MOONSHOT_API_KEY=...` or `mkdir -p ~/.config/moonshot && (umask 077; printf '%s\n' 'sk-...' > ~/.config/moonshot/key)` — same platform key the kimi baseline bills against
+- kimi27 + kimi3 (Kimi k2.7-code and Kimi K3, direct Moonshot): `export MOONSHOT_API_KEY=...` or `mkdir -p ~/.config/moonshot && (umask 077; printf '%s\n' 'sk-...' > ~/.config/moonshot/key)` — same platform key the kimi baseline bills against
 
 Do not proceed with zero reviewers. (The standalone `gemini` CLI is no longer used — it was retired in the 2026-06-18 Gemini-CLI consumer sunset; both Gemini reviewers now run on `agy`.)
 
@@ -101,6 +101,8 @@ Reviewers shown a half-resolved state will hallucinate confidently about the bro
 If either warning fires, do **not** proceed silently. A skill that quietly sends sensitive content or bleeds tokens is worse than one that asks.
 
 Save the JSON to `$run_dir/context.json` and `cd` into `$worktree`. Future steps use `$run_dir` for outputs and `$worktree` as cwd.
+
+Mint `run_id="$(basename "$run_dir")"` now — `worktree.sh` already builds `run_dir` from a globally-unique `<repo>-<id>-<ts>-<pid>` name, so its basename is a ready-made join key. Every finding-lifecycle event (step 4/4.5) and the runlog entry (step 9.5) for this pass carry this same `run_id`, so they can be joined later.
 
 ### 2.5. (Optional) Bound the input with `repomix-handoff`
 
@@ -173,13 +175,20 @@ bash ~/.claude/skills/cross-review/scripts/digest_context.sh \
 
 ### 3. Pick the roster and run reviewers in parallel
 
+**Call `select_roster.sh` yourself first** (rather than leaving it to `run_reviewers.sh`'s internal default) so this round's draw gets a durable record instead of only a stderr line a human happens to read once:
+
 ```bash
+bash ~/.claude/skills/cross-review/scripts/select_roster.sh --json --extras 2 \
+  > "$run_dir/roster_decision.json"
+roster="$(jq -r '.roster' "$run_dir/roster_decision.json")"
+
 bash ~/.claude/skills/cross-review/scripts/run_reviewers.sh \
   --base <base-branch> \
+  --reviewers "$roster" \
   --out "$run_dir/raw"
 ```
 
-**With no `--reviewers` flag, the wrapper asks `select_roster.sh` for this round's roster**: codex + kimi (fixed baselines) plus a leaderboard-weighted random draw from the rotation pool (default 2 picks, always ≥3 reviewers total). The chosen roster and each candidate's weight are echoed to stderr — surface the roster line to the user. Pass `--reviewers <comma-list>` only when the user asks for specific reviewers or for the full fleet.
+`select_roster.sh --json` picks codex + kimi (fixed baselines) plus a leaderboard-weighted random draw from the rotation pool (default 2 picks, always ≥3 reviewers total), and its stdout carries the full decision record: `roster`, `baselines`, `selected`, `seed`, `policy_version`, and a `candidates` array (every pool member considered, with its score/weight/latest_status). The stderr candidate lines are still printed for the log tail — surface the roster line to the user same as before. Pass `--reviewers <comma-list>` directly to `run_reviewers.sh` (skipping `select_roster.sh` entirely) only when the user asks for specific reviewers or for the full fleet.
 
 The wrapper handles the flag dialects:
 
@@ -188,7 +197,7 @@ The wrapper handles the flag dialects:
 - `agy --model "Gemini 3.1 Pro (High)" --sandbox -p '<prompt>'` — the **gemini-pro** reviewer (deep lap; same `agy` binary, different model)
 - `kimi --plan --print --quiet` with the prompt piped via stdin
 - `curl` against the OpenRouter chat-completions API with the diff inlined (8000-line cap, like kimi) — the whole rotation pool: **glm** (`z-ai/glm-5.2`), **deepseek** (`deepseek/deepseek-v4-flash`), **mimo** (`xiaomi/mimo-v2.5`), **minimax** (`minimax/minimax-m3`), **qwen** (`qwen/qwen3-coder-next`), **devstral** (`mistralai/devstral-2512`), **laguna** (`poolside/laguna-m.1`), **kat** (`kwaipilot/kat-coder-pro-v2`), **north** (`cohere/north-mini-code:free`), **nemotron** (`nvidia/nemotron-3-ultra-550b-a55b:free`), **spark** (`meta/muse-spark-1.1`)
-- Same curl body against the **direct Moonshot** chat-completions endpoint — **kimi27** (`kimi-k2.7-code`, cli label `moonshot` in meta.json)
+- Same curl body against the **direct Moonshot** chat-completions endpoint — **kimi27** (`kimi-k2.7-code`, cli label `moonshot` in meta.json) and **kimi3** (`kimi-k3`, cli label `moonshot` in meta.json)
 
 Outputs land at `<reviewer>.{stdout,stderr,meta.json}` (OpenRouter reviewers also write `request.json`/`response.json` for audit); each `meta.json` carries `model` and `cli` fields — and, for the agy laps, a `failure_kind` field (`quota_exhausted` | `agy_panic` | `empty_output` | null). There are **no fallback runs**: a failed lap's meta says why it failed and that's the record. The wrapper returns when all are done.
 
@@ -272,7 +281,7 @@ When multiple reviewers flag the same issue at different severities, take the hi
 
 These priors live in `reviewer_profiles.json` — read once at synthesis time, edit there (not inline) when tuning. The analyzer's `--mode report` will eventually suggest edits to these values based on observed convergence and precision rates.
 
-**Also emit a structured `findings.json` sidecar** next to `findings.md` — this is what the step 4.5 verification gate consumes. One object per finding:
+**Also emit a structured `findings.json` sidecar** next to `findings.md` — this feeds the fingerprint step below, which in turn feeds the step 4.5 verification gate. One object per finding:
 
 ```json
 {
@@ -287,31 +296,41 @@ These priors live in `reviewer_profiles.json` — read once at synthesis time, e
 }
 ```
 
-The `snippet` field is load-bearing: it is what the anchor pass matches against the diff and what the fact-check pass falsifies. When a reviewer didn't quote the offending code, pull the line from the diff yourself; if you genuinely can't, leave `snippet` empty (that finding simply won't be anchorable).
+The `id` here is just a local sequence number for this pass — `fingerprint_findings.sh` (next step) replaces it with a stable, content-derived id before anchor/fact-check run. The `snippet` field is load-bearing: it is what the anchor pass matches against the diff and what the fact-check pass falsifies. When a reviewer didn't quote the offending code, pull the line from the diff yourself; if you genuinely can't, leave `snippet` empty (that finding simply won't be anchorable).
+
+**Fingerprint findings** — give each finding a stable id before anchor/fact-check touch it, so its lifecycle can be tracked across passes:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/fingerprint_findings.sh \
+  --findings "$run_dir/findings.json" --project "$(basename "$(git -C "$worktree" rev-parse --show-toplevel)")" \
+  --out "$run_dir/findings.fingerprinted.json" --emit-events "$run_id"
+```
+
+Replaces each finding's `id` (the local "f1" sequence number, preserved as `local_id`) with a stable `f-<hash>` derived from `project|file|claim` — so the same real-world issue keeps the same id pass-to-pass, which nothing did before. `--emit-events` appends one `proposed` event per (finding × contributing reviewer) to `~/.claude/skills/cross-review/finding_events.jsonl`. Feed `findings.fingerprinted.json` — not the raw `findings.json` — into the anchor step below.
 
 ### 4.5 Verify findings — anchor + fact-check (recommended; required before auto-fix)
 
-Two cheap passes that raise precision before any fix touches the tree. Lifted from open-code-review (see `docs/investigation-cr-ocr-ideas.md`). Run them in order on the `findings.json` from step 4:
+Two cheap passes that raise precision before any fix touches the tree. Lifted from open-code-review (see `docs/investigation-cr-ocr-ideas.md`). Run them in order on the `findings.fingerprinted.json` from the fingerprint step above:
 
 **(a) Anchor — deterministic, no tokens.** Re-derive each finding's line by matching its `snippet` against the actual diff hunks:
 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/anchor_findings.sh \
-  --findings "$run_dir/findings.json" --base <base-branch> --repo "$worktree" \
-  --out "$run_dir/findings.anchored.json"
+  --findings "$run_dir/findings.fingerprinted.json" --base <base-branch> --repo "$worktree" \
+  --out "$run_dir/findings.anchored.json" --emit-events "$run_id"
 ```
 
-Each finding gains `anchor: {resolved, start_line, end_line, side}`; resolved findings get their `line` corrected. A finding with `anchor.resolved=false` (snippet found nowhere in the diff) is a strong **hallucinated-location** signal — mark it "⚠ unanchored" in `findings.md` and **do not auto-fix it without human confirmation**. Don't auto-drop it: a reviewer may legitimately cite an unchanged neighbouring line.
+Each finding gains `anchor: {resolved, start_line, end_line, side}`; resolved findings get their `line` corrected. A finding with `anchor.resolved=false` (snippet found nowhere in the diff) is a strong **hallucinated-location** signal — mark it "⚠ unanchored" in `findings.md` and **do not auto-fix it without human confirmation**. Don't auto-drop it: a reviewer may legitimately cite an unchanged neighbouring line. `--emit-events` appends one `anchored` event per finding to `finding_events.jsonl`.
 
 **(b) Fact-check — falsify-only LLM pass.** A cheap, diff-only reviewer removes findings the diff itself *disproves*:
 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/factcheck_findings.sh \
   --findings "$run_dir/findings.anchored.json" --base <base-branch> --repo "$worktree" \
-  --reviewer agy --out "$run_dir/findings.verified.json"
+  --reviewer agy --out "$run_dir/findings.verified.json" --emit-events "$run_id"
 ```
 
-Each finding gains `factcheck: {verdict: "keep"|"drop", reason}`. The pass can **only drop a finding the diff actively contradicts** — it never invents findings and keeps anything it merely can't confirm (recall-safe by design; `references/factcheck_prompt.txt`). It is **fail-safe**: any error/timeout/unparseable response keeps every finding. When agy fails or returns empty (quota/panic/auth), the script automatically retries once via `deepseek/deepseek-v4-flash` on OpenRouter before the keep-all fail-safe — so the veto survives agy outages. (DeepSeek Flash, not OR-hosted Gemini: first-party models are never routed through OpenRouter by policy.) `--reviewer openrouter` also works to skip agy entirely. Exclude `verdict:"drop"` findings from the auto-fix triage and note them (struck through, with the veto reason) in `findings.md` and the record.
+Each finding gains `factcheck: {verdict: "keep"|"drop", reason}`. The pass can **only drop a finding the diff actively contradicts** — it never invents findings and keeps anything it merely can't confirm (recall-safe by design; `references/factcheck_prompt.txt`). It is **fail-safe**: any error/timeout/unparseable response keeps every finding. When agy fails or returns empty (quota/panic/auth), the script automatically retries once via `deepseek/deepseek-v4-flash` on OpenRouter before the keep-all fail-safe — so the veto survives agy outages. (DeepSeek Flash, not OR-hosted Gemini: first-party models are never routed through OpenRouter by policy.) `--reviewer openrouter` also works to skip agy entirely. Exclude `verdict:"drop"` findings from the auto-fix triage and note them (struck through, with the veto reason) in `findings.md` and the record. `--emit-events` appends one `factcheck_kept`/`factcheck_dropped` event per finding to `finding_events.jsonl` — including on the fail-safe keep-all paths, so a "agy was down, kept everything" round still lands in the ledger.
 
 **Parent direct-source verification may replace this pass entirely.** When you (the orchestrating session) have already verified each finding against the actual source files, test runs, or a live smoke test — evidence *stronger* than a diff-only LLM veto — running the LLM fact-check adds nothing: skip it. Two conditions bind: (1) the evidence gate still applies — every `verdict:"drop"` needs concrete falsification evidence in `factcheck.reason` (`append_runlog.sh` rejects reasonless drops regardless of who did the verifying); (2) record the substitution in the runlog `notes` (e.g. "factcheck replaced by parent direct-source verification") so the self-improvement loop can distinguish a skipped gate from a substituted one. This formalizes the de facto pattern from the 2026-07-03 rounds (PRs #2619–#2621).
 
@@ -465,10 +484,14 @@ bash ~/.claude/skills/cross-review/scripts/append_runlog.sh \
   --top "<file:line — title [severity][sources]>" \
   --diff-files "<n>" --diff-lines "<n>" \
   --notes "<≤1 sentence on anything non-obvious>" \
-  --findings "$run_dir/findings.verified.json"
+  --findings "$run_dir/findings.verified.json" \
+  --run-id "$run_id" \
+  --roster-decision "$run_dir/roster_decision.json"
 ```
 
 The script reads each `$run_dir/<reviewer>.meta.json` to fill in per-reviewer telemetry — duration, exit code, timed_out, output_bytes, attempt — so you only pass the high-level verdict and one-line summary. Pass `-` for `--pr` on branch-only runs (no GitHub PR).
+
+`--run-id` and `--roster-decision` are both optional and purely additive — pass `--run-id "$run_id"` (minted in step 2) always, and `--roster-decision "$run_dir/roster_decision.json"` whenever that file exists (it will, if step 3 used the `select_roster.sh --json` invocation above). Neither is read by `leaderboard.sh` yet; they exist so a future pass can join this entry to `finding_events.jsonl` and see exactly what this round's draw considered.
 
 **Always pass `--findings` with the most-verified findings JSON you have** (note: it hard-rejects any `verdict:"drop"` finding whose `factcheck.reason` is empty — falsification evidence is mandatory, not advisory) (post-anchor, post-factcheck). It enriches each reviewer's entry with `findings_total` / `findings_convergent` / `findings_dropped` — the quality signals `leaderboard.sh` scores on. Skipping it starves the leaderboard: that reviewer's run scores on reliability alone.
 
@@ -480,7 +503,8 @@ Append once per pass (not once per multi-pass run). The runlog is JSONL: one lin
 - **antigravity** (Gemini 3.5 Flash, fast lap): Uses `agy --model "Gemini 3.5 Flash (High)" --sandbox -p '<prompt>'`. `--sandbox` plus a "do not edit" prompt instruction keeps it read-only. Needs an explicit review prompt (see `references/review_prompt.txt`). Replaces the retired standalone `gemini` CLI. **Gotcha:** `agy --model` accepts only the exact `agy models` display string and **silently falls back to Flash** on a typo — never errors. Auth: `agy login` once (Google OAuth). **Empty output has two causes, not one**: check `failure_kind` in the meta.json — `quota_exhausted` (shared Google "Individual quota", 429, ~2-day reset; agy exits 0 with empty stdout in ~5s and only the `.agy.log` says why) means the lap is benched until the reset, while `empty_output` usually means expired auth (`agy login`). Don't re-auth for a quota problem. No fallback by policy — the lap just drops out of the round.
 - **gemini-pro** (Gemini 3.1 Pro, deep lap): Same `agy` binary, just `--model "Gemini 3.1 Pro (High)"` and a longer default timeout (900s). Pro reasons deeper and slower; for tiny diffs the Flash lap alone is often enough. Migrated off the standalone `gemini` CLI in the 2026-06-18 sunset. **Known upstream bug (agy ≤1.0.15):** a SIGSEGV panic in agy's `RunCommandHandler` — exit 2, ~20–45s, empty output, `panic: runtime error` in the `.agy.log`. Hits the Pro lap far more than Flash (Pro roams files/commands harder). Flaky, not deterministic: the wrapper retries agy once, then the lap drops out (no fallback).
 - **OpenRouter pool** (glm / deepseek / mimo / minimax / qwen / devstral / laguna / kat / north / nemotron / spark): No CLI — the wrapper `curl`s the OpenRouter chat-completions API with the diff inlined (8000-line cap, `<diff>` fencing and injection defusal identical to kimi). All eleven require `$OPENROUTER_API_KEY` or `~/.config/openrouter/key`. Each is its own provider vote: Zhipu, DeepSeek, Xiaomi, MiniMax, Alibaba, Mistral, Poolside, Kuaishou, Cohere, NVIDIA, Meta. Provenance caveats: glm/deepseek/mimo/minimax/qwen/kat are China-origin providers, devstral is France (Mistral), laguna is US (Poolside), north is Canada (Cohere), nemotron is US (NVIDIA), spark is US (Meta) — all routed through OpenRouter (US); surface for security-sensitive repos, same as the kimi caveat. `north` and `nemotron` are `:free` OpenRouter routes — zero marginal cost, but free routes can be rate-limited and may have different data-retention terms than paid. (`fugu` / Sakana Fugu Ultra held a trial seat here 2026-07-01→02; cut after 2 samples on cost: $5/M in, $30/M out — ~100× the pool — with hidden orchestration tokens billed as output. See PR notes. `qwen`/`devstral`/`laguna`/`kat` joined 2026-07-02 as rookies to restore lab diversity. `spark` — Meta Muse Spark 1.1 — joined 2026-07-19, per Gabriel.)
-- **kimi27** (Kimi k2.7-code, direct Moonshot): No CLI — same curl chat-completions body as the OpenRouter pool, but against `api.moonshot.ai/v1` with the Moonshot platform key (`MOONSHOT_API_KEY` or `~/.config/moonshot/key`; the same account the kimi baseline bills against — watch the shared balance). A deliberate rotation seat (2026-07-03, per Gabriel), NOT an OpenRouter fallback for the kimi baseline; carries `draw_boost: 2.5` in its profile so it is drawn frequently while earning leaderboard data — retire the boost after ~10 sampled runs. **Same provider as kimi**: kimi+kimi27 agreement counts as one provider vote at synthesis. China-origin provider (Moonshot) — same caveat as kimi.
+- **kimi27** (Kimi k2.7-code, direct Moonshot): No CLI — same curl chat-completions body as the OpenRouter pool, but against `api.moonshot.ai/v1` with the Moonshot platform key (`MOONSHOT_API_KEY` or `~/.config/moonshot/key`; the same account the kimi baseline bills against — watch the shared balance). A deliberate rotation seat (2026-07-03, per Gabriel), NOT an OpenRouter fallback for the kimi baseline; carries `draw_boost: 1.0` in its profile (retired from 2.5 on 2026-07-12 after 10 sampled runs). **Same provider as kimi**: kimi+kimi27 agreement counts as one provider vote at synthesis. China-origin provider (Moonshot) — same caveat as kimi.
+- **kimi3** (Kimi K3, direct Moonshot): Same lane as kimi27 — `api.moonshot.ai/v1`, model id `kimi-k3`, same Moonshot platform key and shared balance. Moonshot's flagship (2.8T MoE, 16/896 experts active, 1M context), released 2026-07-16; added as a rotation seat 2026-07-18 per Gabriel, two days later. Full open weights weren't out yet at add-time (expected 2026-07-27) — this seat hits the hosted API, not local weights. Carries `draw_boost: 2.5` in its profile so it's drawn frequently while earning leaderboard data — retire the boost after ~10 sampled runs, same precedent as kimi27. **Same provider as kimi/kimi27**: kimi+kimi27+kimi3 agreement counts as one provider vote at synthesis. China-origin provider (Moonshot) — same caveat as kimi.
 - **kimi** (Moonshot's Kimi Code CLI): Uses `kimi --plan --print --quiet` with the review prompt piped via stdin (NOT `-p`). `--plan` is read-only; `--print` is non-interactive; `--quiet` trims to just the final assistant message. Prompt goes on stdin because argv has a 128KB-per-argument limit on Linux (`MAX_ARG_STRLEN`) and argv-based prompts also leak the diff via `ps` to other local users. Default model is `kimi-k2.5` (256K ctx, thinking mode on) — configured in `~/.kimi/config.toml`. Auth is either the Moonshot platform API key (`openai_legacy` provider against `api.moonshot.ai/v1`) or the native Kimi Coding subscription (`kimi login` OAuth). Note: kimi sends code to a China-origin provider — surface that to the user for security-sensitive repos.
 
 More detail on flags and gotchas lives in [references/cli_flags.md](references/cli_flags.md). Read it if a reviewer is behaving unexpectedly.
@@ -500,7 +524,7 @@ This is not auto-invoked by the harness. To make it fire automatically after eve
 - **Reviewer hangs**: any CLI can hang on auth or on first-run config prompts. The wrapper has a per-reviewer timeout (codex 300s, antigravity/kimi/OpenRouter-pool 600s, gemini-pro 900s by default — see `references/reviewer_profiles.json`); if it fires, surface stderr so the user can re-auth. For the two `agy` reviewers, a hang is most often the shared `agy` auth — `agy login` once fixes both. Timeouts are not retried (a reviewer that used its budget will use it again on retry — that's a tuning signal, not a transient failure). If the same reviewer keeps timing out, the analyzer's `--mode warn` will surface a suggested bump on the next run.
 - **Durations far past the budget with `status: ok` (or a whole round of timeouts at once)**: the machine slept mid-round. gtimeout/curl timers freeze during system sleep while wall-clock `date +%s` keeps counting — enforcement is intact (verify with `pmset -g log | grep -E "Sleep|Wake"`); observed 2026-07-03 when codex logged 1024s against a 300s budget with rc=0 during Dark Wake thermal churn. meta.json stamps `wall_over_budget: true` on such samples; `analyze_runlog.sh` reports them as `sleep_suspect` and keeps them out of tuning suggestions, and `leaderboard.sh` drops sleep-killed timeouts from reliability. Do NOT bump timeouts, cut reviewers, or trust a same-day degradation cluster on such rounds — re-evaluate on clean data.
 - **kimi exits 127 in 0s ("timeout: failed to run command 'kimi': No such file or directory") while `command -v kimi` finds it**: the kimi-cli uv-tool venv's python interpreter is dead — a Homebrew python upgrade emptied the keg its symlink chain points at (`~/.local/bin/kimi` → uv venv shebang → `/opt/homebrew/opt/python@3.13/bin/python3.13`). PATH lookup succeeds (the symlink exists); exec fails with ENOENT (the interpreter doesn't). Repair: `uv tool install --reinstall --python <current> kimi-cli`. Caught 2026-07-03 after kimi logged failed=6 of 10 runs; diagnose with `head -1 $(command -v kimi)` and follow the chain before blaming PATH or the provider.
-- **A diff-only reviewer reports a bug that turns out to be a pre-fix bug DESCRIBED in an in-diff investigation/postmortem doc, not a live defect**: devstral replayed 9 of 12 findings, and deepseek 4 of 5, straight from an investigation doc's prose on PR #350 (2026-07-05) — codex and kimi (file-reading tools) weren't fooled since they could check whether the described bug was actually still present. The wrapper now auto-injects a caution into the prompt for every text-only reviewer (kimi + the OpenRouter pool, incl. kimi27) whenever the diff touches a `.md`/`.mdx`/`.rst`/`.adoc` file (`doc_narrative_risk`/`doc_narrative_note` in `run_reviewers.sh`) — but a determined reviewer can still ignore it. Verify any finding sourced from a doc-heavy diff against the actual code hunks before trusting it.
+- **A diff-only reviewer reports a bug that turns out to be a pre-fix bug DESCRIBED in an in-diff investigation/postmortem doc, not a live defect**: devstral replayed 9 of 12 findings, and deepseek 4 of 5, straight from an investigation doc's prose on PR #350 (2026-07-05) — codex and kimi (file-reading tools) weren't fooled since they could check whether the described bug was actually still present. The wrapper now auto-injects a caution into the prompt for every text-only reviewer (kimi + the OpenRouter pool, incl. kimi27 and kimi3) whenever the diff touches a `.md`/`.mdx`/`.rst`/`.adoc` file (`doc_narrative_risk`/`doc_narrative_note` in `run_reviewers.sh`) — but a determined reviewer can still ignore it. Verify any finding sourced from a doc-heavy diff against the actual code hunks before trusting it.
 - **Reviewer flags a tokens-vs-hardcoded issue that's actually fine**: Vibrant Punk / NativeWind contexts use tokens that look like hex to the reviewer. Check `constants/theme.ts` before "fixing" a perceived hardcoded color.
 - **Same finding keeps coming back**: either the fix is wrong, or the reviewer has a stale mental model (e.g., you moved logic to another file and it still complains about the old location). Don't loop — stop and investigate.
 - **Iteration 3 still dirty**: structural issue. Don't push through — ask the user whether to merge with known findings or take a different approach.

@@ -18,6 +18,13 @@
 #                         [--reviewer agy|kimi|openrouter]  # default agy
 #                         [--model "<agy models name>"]   # default Flash High
 #                         [--timeout <sec>]         # default 300
+#                         [--emit-events <run_id>]
+#
+# --emit-events <run_id>: optional, additive. After writing --out (on EVERY
+# exit path, including the keep_all fail-safe short-circuits below), append
+# one "factcheck_kept"/"factcheck_dropped" event per finding to
+# finding_events.jsonl via append_finding_event.sh. Omit and behavior is
+# identical to today.
 #
 # When the agy pass fails or produces empty output (quota exhaustion, panic,
 # expired auth — see run_reviewers.sh for the taxonomy) and an OpenRouter key
@@ -32,7 +39,7 @@
 
 set -uo pipefail
 
-findings="" ; out="" ; base="" ; repo="." ; diff_file=""
+findings="" ; out="" ; base="" ; repo="." ; diff_file="" ; emit_events_run_id=""
 reviewer="agy" ; model="Gemini 3.5 Flash (High)" ; timeout_s=300
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
@@ -46,11 +53,12 @@ while [[ $# -gt 0 ]]; do
     --reviewer) need_val "$1" "$#"; reviewer="$2"; shift 2 ;;
     --model)    need_val "$1" "$#"; model="$2";    shift 2 ;;
     --timeout)  need_val "$1" "$#"; timeout_s="$2"; shift 2 ;;
+    --emit-events) need_val "$1" "$#"; emit_events_run_id="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-[[ -z "$findings" || -z "$out" ]] && { echo "usage: $0 --findings <json> --out <json> (--base <ref> [--repo <dir>] | --diff <file>) [--reviewer agy|kimi|openrouter] [--model <name>] [--timeout <sec>]" >&2; exit 2; }
+[[ -z "$findings" || -z "$out" ]] && { echo "usage: $0 --findings <json> --out <json> (--base <ref> [--repo <dir>] | --diff <file>) [--reviewer agy|kimi|openrouter] [--model <name>] [--timeout <sec>] [--emit-events <run_id>]" >&2; exit 2; }
 [[ -f "$findings" ]] || { echo "factcheck: findings file not found: $findings" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "factcheck: jq required" >&2; exit 1; }
 
@@ -58,11 +66,31 @@ if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then PATH
 
 tmp_dir="$(mktemp -d)"; trap 'rm -rf "$tmp_dir"' EXIT
 
+# emit_factcheck_events <out-file> — no-op unless --emit-events was passed.
+# Called from EVERY exit path (keep_all's fail-safe short-circuits and the
+# normal completion at the bottom of the script) so a fail-safe "kept
+# everything, agy was down" round still lands in finding_events.jsonl same as
+# a real LLM verdict — both are legitimate factcheck_kept outcomes.
+emit_factcheck_events() {
+  [[ -n "$emit_events_run_id" ]] || return 0
+  local out_file="$1" script_dir fid ev fields
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  while IFS= read -r f; do
+    fid="$(jq -r '.id' <<<"$f")"
+    ev="factcheck_kept"
+    [[ "$(jq -r '.factcheck.verdict' <<<"$f")" == "drop" ]] && ev="factcheck_dropped"
+    fields="$(jq -c '{reason: .factcheck.reason, sources: (.sources // []), file, severity}' <<<"$f")"
+    bash "$script_dir/append_finding_event.sh" --event "$ev" --finding-id "$fid" \
+      --run-id "$emit_events_run_id" --fields "$fields"
+  done < <(jq -c '.findings[]' "$out_file")
+}
+
 # keep_all <reason> — write out with every finding kept; the fail-safe path.
 keep_all() {
   jq --arg why "$1" '.findings |= map(.factcheck = {verdict:"keep", reason:$why})' \
     "$findings" > "$out"
   echo "factcheck: kept all $(jq '.findings|length' "$findings") findings — $1" >&2
+  emit_factcheck_events "$out"
   exit 0
 }
 
@@ -246,3 +274,4 @@ cp "$raw" "$raw_sidecar" 2>/dev/null || true
 
 dropped_n="$(jq '[.findings[] | select(.factcheck.verdict=="drop")] | length' "$out")"
 echo "factcheck: dropped $dropped_n/$n_findings finding(s) as diff-disproven (reviewer=$reviewer)" >&2
+emit_factcheck_events "$out"

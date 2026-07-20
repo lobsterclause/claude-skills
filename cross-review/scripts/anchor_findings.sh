@@ -13,17 +13,24 @@
 # Usage:
 #   anchor_findings.sh --findings <findings.json> --out <findings.anchored.json>
 #                      (--base <ref> [--repo <dir>] | --diff <unified-diff-file>)
+#                      [--emit-events <run_id>]
 #
 # findings.json shape: { "findings": [ {id, file, line, snippet, ...}, ... ] }
 # Output: same object, each finding gains:
 #   "anchor": { "resolved": bool, "start_line": int, "end_line": int, "side": "new|old|none" }
 # and on resolved, "line" is overwritten with start_line (original kept as "line_claimed").
 #
+# --emit-events <run_id>: optional, additive. After writing --out, append one
+# "anchored" event per finding to finding_events.jsonl via
+# append_finding_event.sh, keyed on the finding's (already-stable, if
+# fingerprint_findings.sh ran first) .id. Omit and behavior is identical to
+# today — no event script is invoked.
+#
 # Exit: 0 ok, 2 usage, 1 io error. Never fails the pass on a per-finding miss.
 
 set -uo pipefail
 
-findings="" ; out="" ; base="" ; repo="." ; diff_file=""
+findings="" ; out="" ; base="" ; repo="." ; diff_file="" ; emit_events_run_id=""
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
@@ -33,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --base)     need_val "$1" "$#"; base="$2";     shift 2 ;;
     --repo)     need_val "$1" "$#"; repo="$2";     shift 2 ;;
     --diff)     need_val "$1" "$#"; diff_file="$2"; shift 2 ;;
+    --emit-events) need_val "$1" "$#"; emit_events_run_id="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -154,3 +162,14 @@ jq -s \
 resolved_n="$(jq '[.findings[] | select(.anchor.resolved)] | length' "$out")"
 total_n="$(jq '.findings | length' "$out")"
 echo "anchor: $resolved_n/$total_n findings anchored to the diff ($(( total_n - resolved_n )) unresolved/flagged)" >&2
+
+if [[ -n "$emit_events_run_id" ]]; then
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  while IFS= read -r f; do
+    fid="$(jq -r '.id' <<<"$f")"
+    fields="$(jq -c '{file, resolved: .anchor.resolved, start_line: .anchor.start_line,
+                      end_line: .anchor.end_line, side: .anchor.side, sources: (.sources // [])}' <<<"$f")"
+    bash "$script_dir/append_finding_event.sh" --event anchored --finding-id "$fid" \
+      --run-id "$emit_events_run_id" --fields "$fields"
+  done < <(jq -c '.findings[]' "$out")
+fi

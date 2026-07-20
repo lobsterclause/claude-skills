@@ -28,7 +28,24 @@
 #                   to keep the roster at ≥3 if a baseline is missing)
 #     --seed <n>    deterministic draw (tests); default seeds from $RANDOM
 #     --json        emit the full decision record as JSON on stdout instead of
-#                   the comma list (comma list then goes to stderr)
+#                   the comma list (comma list then goes to stderr). Adds a
+#                   `candidates` array (one object per pool member considered:
+#                   reviewer, score, attempts, latest_status, p50_duration_s,
+#                   cost_usd, draw_boost, weight, selected) and a
+#                   `policy_version` string (bump only if the weight formula
+#                   below changes) — a durable record of what this round's
+#                   draw actually saw, previously only printed to stderr and
+#                   discarded. NOTE: a candidate's logged `weight` is its raw
+#                   draw weight, NOT its true unconditional selection
+#                   probability — this is sampling WITHOUT replacement, so
+#                   each pick renormalizes over the shrinking remaining total.
+#                   weight + seed + policy_version are enough to reconstruct
+#                   the draw later (replay the same weighted-sampling logic
+#                   over the logged weights), but don't treat weight/total as
+#                   a marginal probability, and don't rely on bit-exact
+#                   cross-host seed replay — awk's rand()/srand() are libc/
+#                   implementation-defined beyond POSIX minimums (BSD awk on
+#                   macOS vs gawk/mawk elsewhere are not guaranteed to agree).
 #     --fast        drop pool candidates whose recent p50 exceeds 180s
 #                   (rookies pass — unknown speed is worth one probe). For
 #                   quick loops and incremental re-review passes.
@@ -135,8 +152,10 @@ fi
 # seat (2026-07-03, per Gabriel), not an OpenRouter fallback for the kimi
 # baseline. Its profile carries a draw_boost so it is drawn frequently while
 # it earns leaderboard data.
+# kimi3 (K3 flagship, released 2026-07-16) is the same direct-Moonshot seat
+# pattern, added 2026-07-18 — shares has_moonshot's gate and billing rail.
 if has_moonshot; then
-  POOL+=(kimi27)
+  POOL+=(kimi27 kimi3)
 fi
 
 if [[ ${#BASELINES[@]} -eq 0 && ${#POOL[@]} -eq 0 ]]; then
@@ -191,7 +210,11 @@ fi
 # --- weighted sample without replacement (awk: proper float math, seedable) ---
 draw_picks() {
   # $1 = fastmax (0 disables the speed filter)
-  printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v fastmax="$1" -v costpivot="$cost_pivot" '
+  # $2 = optional path to write one JSON line per considered candidate
+  #      (truncated fresh on every call, including a zero-candidate call, so
+  #      a later --fast-fallback redraw's file always reflects the draw that
+  #      actually produced $selected — never a stale earlier attempt's).
+  printf '%s' "$weight_lines" | awk -v k="$extras" -v seed="$seed" -v fastmax="$1" -v costpivot="$cost_pivot" -v cand_out="${2:-}" '
   BEGIN { srand(seed) }
   NF >= 4 {
     p50 = (NF >= 5 ? $5 + 0 : 0)
@@ -220,9 +243,14 @@ draw_picks() {
     if (latest == "quota") w *= 0.1
     weight[n] = w
     total += w
+    # Snapshot everything needed for the candidates JSON before the pick loop
+    # mutates weight[] to zero out chosen candidates (without-replacement).
+    oname[n] = $1; oscore[n] = score; oattempts[n] = attempts; olatest[n] = latest
+    op50[n] = p50; ocost[n] = cost; oboost[n] = boost; origw[n] = w
     printf "  candidate %-12s score=%-4s attempts=%-3s latest=%-10s p50=%-5ss cost=$%-7.4f boost=%s weight=%.1f\n", $1, $2, $3, $4, p50, cost, boost, w > "/dev/stderr"
   }
   END {
+    if (cand_out != "") printf "" > cand_out   # truncate/create even if n==0
     for (pick = 0; pick < k && total > 0.0001; pick++) {
       r = rand() * total
       acc = 0
@@ -231,17 +259,33 @@ draw_picks() {
         acc += weight[i]
         if (r <= acc) {
           print name[i]
+          picked[i] = 1
           total -= weight[i]
           weight[i] = 0
           break
         }
       }
     }
+    if (cand_out != "") {
+      for (i = 1; i <= n; i++) {
+        sel = (i in picked) ? "true" : "false"
+        printf "{\"reviewer\":\"%s\",\"score\":%s,\"attempts\":%s,\"latest_status\":\"%s\",\"p50_duration_s\":%s,\"cost_usd\":%s,\"draw_boost\":%s,\"weight\":%.4f,\"selected\":%s}\n", \
+          oname[i], oscore[i], oattempts[i], olatest[i], op50[i], ocost[i], oboost[i], origw[i], sel > cand_out
+      }
+    }
   }
 '
 }
 
-selected="$(draw_picks "$fast_max")"
+# cand_tmp only exists in --json mode — the candidates array is a --json-only
+# concern, no reason to pay a mktemp on every plain-stdout invocation.
+cand_tmp=""
+if [[ "$emit_json" -eq 1 ]]; then
+  cand_tmp="$(mktemp)"
+  trap 'rm -f "$cand_tmp"' EXIT
+fi
+
+selected="$(draw_picks "$fast_max" "$cand_tmp")"
 # --fast can filter the pool below what the roster needs (kimi+deepseek
 # convergent, PR #18 pass 3; partial-filter case codex P2, pass 4): the floor
 # check counts what was actually drawn, not just emptiness — with a missing
@@ -251,7 +295,7 @@ if [[ "$fast_max" -gt 0 ]]; then
   sel_n="$(printf '%s\n' "$selected" | grep -c '^.' || true)"
   if (( ${#BASELINES[@]} + sel_n < 3 )); then
     echo "  note: --fast left the roster below the 3-reviewer floor (${#BASELINES[@]} baselines + $sel_n picks) — redrawing without the speed filter" >&2
-    selected="$(draw_picks 0)"
+    selected="$(draw_picks 0 "$cand_tmp")"
   fi
 fi
 
@@ -274,9 +318,15 @@ fi
 if [[ "$emit_json" -eq 1 ]]; then
   sel_json="$(printf '%s\n' "$selected" | jq -R 'select(length > 0)' | jq -s .)"
   base_json="$(printf '%s\n' ${BASELINES[@]+"${BASELINES[@]}"} | jq -R 'select(length > 0)' | jq -s .)"
+  cand_json="[]"
+  if [[ -n "$cand_tmp" && -s "$cand_tmp" ]]; then
+    cand_json="$(jq -s . "$cand_tmp" 2>/dev/null || echo '[]')"
+  fi
   jq -nc --arg roster "$roster" --arg seed "$seed" \
      --argjson baselines "$base_json" --argjson selected "$sel_json" \
-     '{roster: $roster, baselines: $baselines, selected: $selected, seed: ($seed | tonumber)}'
+     --argjson candidates "$cand_json" \
+     '{roster: $roster, baselines: $baselines, selected: $selected, seed: ($seed | tonumber),
+       candidates: $candidates, policy_version: "weighted-draw-v1"}'
   echo "$roster" >&2
 else
   echo "$roster"

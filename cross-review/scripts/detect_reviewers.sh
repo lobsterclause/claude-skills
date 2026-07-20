@@ -4,7 +4,8 @@
 #   {"codex": bool, "antigravity": bool, "gemini-pro": bool, "kimi": bool,
 #    "glm": bool, "deepseek": bool, "mimo": bool, "minimax": bool, "qwen": bool,
 #    "devstral": bool, "laguna": bool, "kat": bool,
-#    "north": bool, "nemotron": bool, "spark": bool, "openrouter": bool}
+#    "north": bool, "nemotron": bool, "spark": bool, "kimi27": bool,
+#    "kimi3": bool, "openrouter": bool}
 #
 # As of the 2026-06-18 Gemini-CLI consumer sunset, BOTH Gemini-family reviewers
 # run on Google's `agy` (Antigravity) CLI:
@@ -47,6 +48,7 @@ gemini_pro=false
 kimi=false
 openrouter=false
 kimi27=false
+kimi3=false
 
 has codex && codex=true
 # Both Gemini reviewers ride the same agy binary — but `agy --model` silently
@@ -96,14 +98,17 @@ if command -v curl >/dev/null 2>&1; then
   # key, independent of both the kimi CLI baseline and the OpenRouter pool.
   if [[ -n "${MOONSHOT_API_KEY:-}" || -s "$HOME/.config/moonshot/key" ]]; then
     kimi27=true
+    # kimi3 (K3 rotation seat, added 2026-07-18) shares the exact same
+    # direct-Moonshot key — same billing rail as kimi27 and the kimi baseline.
+    kimi3=true
   fi
 fi
 
 # WARNING: the format-string keys and the positional args below are coupled
 # by POSITION ONLY — inserting a reviewer in one without the other silently
 # shifts every later value (kimi+kat convergent nit, PR #29 pass 1). Keep the
-# order: 4 named CLIs, 11x $openrouter for the OR pool, $kimi27, $openrouter.
-printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "spark": %s, "kimi27": %s, "openrouter": %s}\n' \
+# order: 4 named CLIs, 11x $openrouter for the OR pool, $kimi27, $kimi3, $openrouter.
+printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "spark": %s, "kimi27": %s, "kimi3": %s, "openrouter": %s}\n' \
   "$codex" "$antigravity" "$gemini_pro" "$kimi" \
   "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" \
-  "$kimi27" "$openrouter"
+  "$kimi27" "$kimi3" "$openrouter"

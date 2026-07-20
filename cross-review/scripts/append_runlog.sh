@@ -28,7 +28,19 @@
 #       sources span MORE THAN ONE provider (per the provider map below) — the
 #       cross-provider precision proxy leaderboard.sh scores on. Pass the most
 #       verified findings file you have (post-anchor, post-factcheck).
+#     [--run-id <id>]
+#       Joins this runlog entry to any finding_events.jsonl events from the
+#       same pass (run_id = basename of the run-dir; see worktree.sh). Omit
+#       and the entry has no `run_id` key at all — not even null — so old
+#       tooling reading past entries sees nothing new.
+#     [--roster-decision <json-file>]
+#       select_roster.sh --json output for this pass's draw, attached
+#       verbatim as `roster_decision`. Never blocks the append: a
+#       missing/unreadable file just warns to stderr and omits the key.
 #
+# Both --run-id and --roster-decision are purely additive telemetry — leave
+# either off and this entry is byte-identical to what today's callers already
+# produce. Neither is read by leaderboard.sh or select_roster.sh yet.
 # Schema is documented in plans/the-miss-on-pr-eager-pond.md (Phase 2).
 # Additive — old hand-curated entries in the runlog remain valid.
 
@@ -46,6 +58,8 @@ diff_files=""
 diff_lines=""
 notes=""
 findings_file=""
+run_id=""
+roster_decision_file=""
 
 need_val() {
   if [[ "$2" -lt 2 ]]; then
@@ -68,13 +82,15 @@ while [[ $# -gt 0 ]]; do
     --diff-lines) need_val "$1" "$#"; diff_lines="$2"; shift 2 ;;
     --notes)      need_val "$1" "$#"; notes="$2";      shift 2 ;;
     --findings)   need_val "$1" "$#"; findings_file="$2"; shift 2 ;;
+    --run-id)     need_val "$1" "$#"; run_id="$2";     shift 2 ;;
+    --roster-decision) need_val "$1" "$#"; roster_decision_file="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 for required in run_dir project base pr pass verdict; do
   if [[ -z "${!required}" ]]; then
-    echo "usage: $0 --run-dir <p> --project <n> --base <b> --pr <num|-> --pass <n> --verdict <v> [--convergent <n>] [--top <s>] [--diff-files <n>] [--diff-lines <n>] [--notes <s>]" >&2
+    echo "usage: $0 --run-dir <p> --project <n> --base <b> --pr <num|-> --pass <n> --verdict <v> [--convergent <n>] [--top <s>] [--diff-files <n>] [--diff-lines <n>] [--notes <s>] [--findings <json>] [--run-id <id>] [--roster-decision <json>]" >&2
     exit 2
   fi
 done
@@ -111,6 +127,18 @@ if [[ -n "$findings_file" && -f "$findings_file" ]]; then
     echo "append_runlog: dropped finding(s) without recorded evidence: $reasonless" >&2
     echo "  record WHY each was falsified in factcheck.reason (smoke test output, call-site citation), then re-run" >&2
     exit 2
+  fi
+fi
+
+# --roster-decision is fail-open (unlike the evidence gate above): losing
+# roster telemetry must never block a runlog append. Invalid/missing file ->
+# warn and proceed with the key omitted entirely.
+roster_decision_json="null"
+if [[ -n "$roster_decision_file" ]]; then
+  if [[ -f "$roster_decision_file" ]] && rd="$(jq -c . "$roster_decision_file" 2>/dev/null)"; then
+    roster_decision_json="$rd"
+  else
+    echo "append_runlog: --roster-decision file unreadable or invalid JSON: $roster_decision_file (omitting roster_decision)" >&2
   fi
 fi
 
@@ -183,7 +211,7 @@ enrich_with_findings() {
       "kimi":"moonshot","glm":"zhipu","deepseek":"deepseek","mimo":"xiaomi",
       "minimax":"minimax","qwen":"alibaba","devstral":"mistral",
       "laguna":"poolside","kat":"kuaishou","north":"cohere","nemotron":"nvidia",
-      "spark":"meta","kimi27":"moonshot"}) as $prov
+      "spark":"meta","kimi27":"moonshot","kimi3":"moonshot"}) as $prov
     | [(.findings // [])[] | select((.sources // []) | index($r))] as $mine
     | { findings_total: ($mine | length),
         findings_convergent: ($mine | map(select(
@@ -213,6 +241,7 @@ north_json=$(enrich_with_findings north "$(reviewer_obj north)")
 nemotron_json=$(enrich_with_findings nemotron "$(reviewer_obj nemotron)")
 spark_json=$(enrich_with_findings spark "$(reviewer_obj spark)")
 kimi27_json=$(enrich_with_findings kimi27 "$(reviewer_obj kimi27)")
+kimi3_json=$(enrich_with_findings kimi3 "$(reviewer_obj kimi3)")
 
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -244,6 +273,9 @@ entry=$(jq -nc \
   --argjson nemotron "$nemotron_json" \
   --argjson spark "$spark_json" \
   --argjson kimi27 "$kimi27_json" \
+  --argjson kimi3 "$kimi3_json" \
+  --arg run_id "$run_id" \
+  --argjson roster_decision "$roster_decision_json" \
   '{
     ts: $ts,
     project: $project,
@@ -256,12 +288,14 @@ entry=$(jq -nc \
     reviewers: {codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, glm: $glm,
                 deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
                 devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
-                spark: $spark, kimi27: $kimi27},
+                spark: $spark, kimi27: $kimi27, kimi3: $kimi3},
     convergent_count: $convergent,
     verdict: $verdict,
     top_finding: (if $top == "" then null else $top end),
     notes: (if $notes == "" then null else $notes end)
-  }')
+  }
+  + (if $run_id == "" then {} else {run_id: $run_id} end)
+  + (if $roster_decision == null then {} else {roster_decision: $roster_decision} end)')
 
 # JSONL — one line, append-only. Wrap in flock to make it splitstream-safe:
 # POSIX guarantees write() atomicity below PIPE_BUF (4KB Linux, 512B macOS).

@@ -79,6 +79,9 @@
 #   <out>/<or>.meta.json         north, nemotron, spark) writes
 #                                stdout/stderr/meta plus request.json and
 #                                response.json for audit
+#   <out>/kimi27.*, kimi3.*    — direct-Moonshot rotation seats (same
+#                                request/response/meta shape as the OR pool,
+#                                different endpoint — see run_openrouter_reviewer)
 #   <out>/agy.quota_exhausted  — sentinel: agy hit the shared Individual quota
 #                                this run (contains the reset ETA). Spares
 #                                retries and any lap that starts AFTER detection
@@ -163,6 +166,9 @@ spark_model="meta/muse-spark-1.1"
 # same billing rail as the kimi baseline. The first-party no-OR-fallback
 # policy above is untouched: this is not a fallback lane for kimi.
 kimi27_model="kimi-k2.7-code"
+# kimi3 is the same direct-Moonshot rotation seat pattern as kimi27, added
+# 2026-07-18 for Moonshot's K3 flagship release (2026-07-16).
+kimi3_model="kimi-k3"
 
 # Antigravity installs `agy` to $HOME/.local/bin. That directory isn't always
 # on $PATH for non-interactive shells (notably bash invocations from other
@@ -251,6 +257,7 @@ _nm="$(profile_get north model)";       [[ -n "$_nm" ]] && north_model="$_nm"
 _vm="$(profile_get nemotron model)";    [[ -n "$_vm" ]] && nemotron_model="$_vm"
 _sp="$(profile_get spark model)";       [[ -n "$_sp" ]] && spark_model="$_sp"
 _k7="$(profile_get kimi27 model)";      [[ -n "$_k7" ]] && kimi27_model="$_k7"
+_k3="$(profile_get kimi3 model)";       [[ -n "$_k3" ]] && kimi3_model="$_k3"
 
 codex_profile="$(profile_timeout codex)"
 antigravity_profile="$(profile_timeout antigravity)"
@@ -268,6 +275,7 @@ north_profile="$(profile_timeout north)"
 nemotron_profile="$(profile_timeout nemotron)"
 spark_profile="$(profile_timeout spark)"
 kimi27_profile="$(profile_timeout kimi27)"
+kimi3_profile="$(profile_timeout kimi3)"
 codex_timeout="${timeout_codex:-${timeout_s:-${codex_profile:-$(( timeout_s_default < 300 ? timeout_s_default : 300 ))}}}"
 antigravity_timeout="${timeout_antigravity:-${timeout_s:-${antigravity_profile:-$timeout_s_default}}}"
 # gemini-pro defaults to a longer budget than Flash: Pro's deeper reasoning
@@ -289,6 +297,7 @@ north_timeout="${timeout_s:-${north_profile:-$timeout_s_default}}"
 nemotron_timeout="${timeout_s:-${nemotron_profile:-$timeout_s_default}}"
 spark_timeout="${timeout_s:-${spark_profile:-$timeout_s_default}}"
 kimi27_timeout="${timeout_s:-${kimi27_profile:-$timeout_s_default}}"
+kimi3_timeout="${timeout_s:-${kimi3_profile:-$timeout_s_default}}"
 
 mkdir -p "$out"
 
@@ -700,11 +709,11 @@ moonshot_key() {
 # first-party reviewers (policy: no OR fallbacks for codex/gemini/kimi).
 # Args:
 #   $1 slug           (glm | deepseek | mimo | minimax | qwen | devstral |
-#                      laguna | kat | north | nemotron | spark | kimi27)
+#                      laguna | kat | north | nemotron | spark | kimi27 | kimi3)
 #   $2 model          (model id, e.g. z-ai/glm-5.2 or kimi-k2.7-code)
 #   $3 timeout_budget (seconds)
-#   $4 endpoint       (optional; default OpenRouter chat-completions. kimi27
-#                      passes the direct Moonshot endpoint — the API is
+#   $4 endpoint       (optional; default OpenRouter chat-completions. kimi27/
+#                      kimi3 pass the direct Moonshot endpoint — the API is
 #                      OpenAI-compatible, so the whole body is shared)
 #   $5 cli label      (optional; default "openrouter" — selects the key
 #                      source and is recorded verbatim in meta.json)
@@ -1081,6 +1090,10 @@ run_spark()    { run_openrouter_reviewer spark    "$spark_model"    "$spark_time
 # key. cli label "moonshot" selects the key source and lands in meta.json.
 run_kimi27()   { run_openrouter_reviewer kimi27   "$kimi27_model"   "$kimi27_timeout" \
                    "https://api.moonshot.ai/v1/chat/completions" moonshot; }
+# kimi3: same direct-Moonshot lane as kimi27, pointed at the K3 flagship
+# (released 2026-07-16; added as a rotation seat 2026-07-18).
+run_kimi3()    { run_openrouter_reviewer kimi3    "$kimi3_model"    "$kimi3_timeout" \
+                   "https://api.moonshot.ai/v1/chat/completions" moonshot; }
 
 run_kimi() {
   local start end rc
@@ -1315,6 +1328,18 @@ for r in "${requested[@]}"; do
         echo "kimi27 (direct-Moonshot reviewer) unavailable — set MOONSHOT_API_KEY or put the key in ~/.config/moonshot/key. Skipping." >&2
       fi
       ;;
+    kimi3)
+      if ! command -v curl >/dev/null 2>&1; then
+        echo "$r: curl not available — skipping" >&2
+      elif moonshot_key >/dev/null 2>&1; then
+        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        retry_reviewer run_kimi3 kimi3 &
+        pids+=($!)
+        ran+=("kimi3")
+      else
+        echo "kimi3 (direct-Moonshot reviewer) unavailable — set MOONSHOT_API_KEY or put the key in ~/.config/moonshot/key. Skipping." >&2
+      fi
+      ;;
     *)
       echo "unknown reviewer: $r" >&2
       ;;
@@ -1346,7 +1371,7 @@ for i in "${!pids[@]}"; do
         # failure_kind and the .agy.log tail are where the answer lives.
         echo "$name: failed (check failure_kind in $out/$name.meta.json; agy's own log: $out/$name.agy.log)" >&2 ;;
       kimi)        echo "$name: failed (see $out/kimi.stderr and $out/kimi.meta.json)" >&2 ;;
-      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|kimi27)
+      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|kimi27|kimi3)
         echo "$name: failed (see $out/$name.stderr, $out/$name.response.json, $out/$name.meta.json)" >&2 ;;
       *)           echo "$name: failed (see $out/$name.* )" >&2 ;;
     esac
