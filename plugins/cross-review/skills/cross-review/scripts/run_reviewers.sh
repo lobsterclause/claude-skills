@@ -1025,17 +1025,17 @@ The full diff is included above. HARD CONSTRAINT: you are running headless with 
   # stdout/stderr/log alongside it, then mirror the log to the canonical name
   # the classifier below greps.
   local attempt_n="${CROSS_REVIEW_ATTEMPT:-1}"
-  local agy_log="$out/${slug}.attempt${attempt_n}.agy.log"
+  local agy_log_path="$out/${slug}.attempt${attempt_n}.agy.log"
   run_with_timeout "$timeout_budget" agy \
     --model "$model" \
     --sandbox \
     --add-dir "$repo_root" \
     --print-timeout "$agy_internal_timeout" \
-    --log-file "$agy_log" \
+    --log-file "$agy_log_path" \
     -p "$full_prompt" \
     >"$out/${slug}.stdout" 2>"$out/${slug}.stderr" </dev/null
   rc=$?
-  cp -f "$agy_log" "$out/${slug}.agy.log" 2>/dev/null || true
+  cp -f "$agy_log_path" "$out/${slug}.agy.log" 2>/dev/null || true
   cp -f "$out/${slug}.stdout" "$out/${slug}.attempt${attempt_n}.stdout" 2>/dev/null || true
   cp -f "$out/${slug}.stderr" "$out/${slug}.attempt${attempt_n}.stderr" 2>/dev/null || true
   end=$(date +%s)
@@ -1043,6 +1043,22 @@ The full diff is included above. HARD CONSTRAINT: you are running headless with 
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
   local bytes
   bytes=$(output_bytes_of "$out/${slug}.stdout")
+
+  # Silent-fallback guard. `agy --model` does NOT error on a string it does not
+  # recognise — it quietly serves the default (Flash), so a renamed model would
+  # turn the deep Pro lap into a second Flash lap with nobody the wiser and the
+  # round would lose the provider diversity it is paying for. agy 1.1.10 already
+  # renamed the `agy models` listing out from under the detection grep, so this
+  # is a live risk, not a hypothetical. Read back what agy actually resolved;
+  # only warn when the log names a DIFFERENT model, so a future log-format
+  # change degrades to silence rather than false alarms.
+  local resolved_model=""
+  if [[ -f "$agy_log_path" ]]; then
+    resolved_model="$(grep -o 'Resolving model .*' "$agy_log_path" 2>/dev/null | tail -1 | sed 's/^Resolving model //')"
+    if [[ -n "$resolved_model" && "$resolved_model" != "$model" ]]; then
+      echo "WARN: $slug asked agy for \"$model\" but agy resolved \"$resolved_model\" — agy silently falls back to its default on an unrecognised model string. Check \`agy models\` and update the model strings in run_reviewers.sh." >&2
+    fi
+  fi
 
   # Classify the failure from agy's own log. On the observed failure modes
   # (2026-07-01) stdout AND stderr are both empty — the .agy.log is the only
@@ -1127,11 +1143,12 @@ The full diff is included above. HARD CONSTRAINT: you are running headless with 
     failure_kind="no_verdict_output"
     rc=5
   fi
-  local fk_json="null" qr_json="null"
+  local fk_json="null" qr_json="null" rm_json="null"
+  [[ -n "$resolved_model" ]] && rm_json="\"$resolved_model\""
   [[ -n "$failure_kind" ]] && fk_json="\"$failure_kind\""
   [[ -n "$quota_resets_in" ]] && qr_json="\"$quota_resets_in\""
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" >"$out/${slug}.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s, "model_resolved": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$rm_json" >"$out/${slug}.meta.json"
   cp -f "$out/${slug}.meta.json" "$out/${slug}.attempt${attempt_n}.meta.json" 2>/dev/null || true
   # No fallback: a failed agy lap stays failed (failure_kind says why). Roster
   # rotation compensates across runs; the leaderboard's reliability signal

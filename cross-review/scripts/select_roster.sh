@@ -139,7 +139,8 @@ if command -v agy >/dev/null 2>&1; then
     # codex P2, PR #18 pass 2). Fall through to the assume-Pro path below.
   fi
   if [[ -s "$models_cache" ]]; then
-    grep -qi 'Gemini 3.1 Pro' "$models_cache" && POOL+=(gemini-pro)
+    # Slug or display name — see detect_reviewers.sh (agy 1.1.10 switched).
+    grep -Eqi 'gemini[ ._-]?3\.1[ ._-]?pro' "$models_cache" && POOL+=(gemini-pro)
   else
     echo "  note: agy models probe unavailable — assuming gemini-pro exists" >&2
     POOL+=(gemini-pro)

@@ -992,6 +992,71 @@ for suite in test_json_output test_score_findings test_report_block test_digest;
   fi
 done
 
+echo "── agy model detection survives the models-listing rename ──"
+# [pin: 2026-08-03 — agy 1.1.10 changed `agy models` from display names
+# ("Gemini 3.1 Pro (High)") to slugs ("gemini-3.1-pro-high"). The detection
+# grep matched only the old shape, so gemini-pro silently false-negatived out
+# of every roster while the lap itself was perfectly healthy. Both shapes must
+# match, in detect_reviewers.sh AND select_roster.sh.]
+det_cache="$HOME/.cross-review/cache/agy_models.txt"
+det_saved=""
+if [[ -f "$det_cache" ]]; then det_saved="$T/agy_models.saved"; cp "$det_cache" "$det_saved"; fi
+mkdir -p "$(dirname "$det_cache")"
+for shape in "Gemini 3.1 Pro (High)" "gemini-3.1-pro-high"; do
+  printf 'gemini-3.5-flash-high\n%s\n' "$shape" >"$det_cache"
+  assert_eq "detect_reviewers sees gemini-pro in '$shape' listing" \
+    "$(PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "true"
+done
+# A listing with no Pro entry at all must still report false — the match must
+# not have been widened into "always true".
+printf 'gemini-3.5-flash-high\ngemini-3.6-flash-low\n' >"$det_cache"
+assert_eq "detect_reviewers reports gemini-pro false when no Pro model is listed" \
+  "$(PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "false"
+if [[ -n "$det_saved" ]]; then cp "$det_saved" "$det_cache"; else rm -f "$det_cache"; fi
+assert_contains "select_roster matches the slug shape too" \
+  "$(cat "$SKILL_DIR/scripts/select_roster.sh")" 'gemini[ ._-]?3'
+
+echo "── agy silent model fallback is surfaced, not swallowed ──"
+# [pin: 2026-08-03 — `agy --model` NEVER errors on an unrecognised string; it
+# quietly serves the default (Flash). A renamed model would turn the deep Pro
+# lap into a second Flash lap and the round would silently lose its provider
+# diversity. The resolved model must be read back from agy's own log.]
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-3.1-pro-high\n"; exit 0; fi
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--log-file" ]; then printf 'model_resolver.go:73] Resolving model Gemini 3.5 Flash (High)\n' >"$2"; fi
+  shift
+done
+printf 'shim review: no findings\n'
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o15" --reviewers gemini-pro --timeout 60 >/dev/null 2>"$T/o15.err" || true
+assert_eq "meta records the model agy actually resolved" \
+  "$(jq -r '.model_resolved' "$T/o15/gemini-pro.meta.json")" "Gemini 3.5 Flash (High)"
+assert_contains "a silent Flash fallback on the Pro lap warns loudly" \
+  "$(cat "$T/o15.err")" "but agy resolved"
+# Matching model => no warning, and the field still round-trips.
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-3.1-pro-high\n"; exit 0; fi
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--log-file" ]; then printf 'model_resolver.go:73] Resolving model Gemini 3.1 Pro (High)\n' >"$2"; fi
+  shift
+done
+printf 'shim review: no findings\n'
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o16" --reviewers gemini-pro --timeout 60 >/dev/null 2>"$T/o16.err" || true
+assert_eq "no fallback warning when agy resolves the requested model" \
+  "$(grep -c 'but agy resolved' "$T/o16.err" || true)" "0"
+assert_eq "matching resolution is still recorded in meta" \
+  "$(jq -r '.model_resolved' "$T/o16/gemini-pro.meta.json")" "Gemini 3.1 Pro (High)"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+chmod +x "$T/bin/agy"
+
 echo "── agy shell gate (headless permission deadlock) ──"
 # [pin: 2026-07-31 — agy >=1.1.3 kills a headless run at 0 bytes the moment the
 # model asks for a "command" permission. The gate must (a) emit valid JSON,
@@ -1040,7 +1105,10 @@ REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/
 COPY_A="$REPO_ROOT/cross-review"
 COPY_B="$REPO_ROOT/plugins/cross-review/skills/cross-review"
 if [[ -n "$REPO_ROOT" && -d "$COPY_A" && -d "$COPY_B" ]]; then
-  if diff -r --exclude 'runlog.jsonl*' --exclude 'iteration-1' --exclude '*.bak*' --exclude '.DS_Store' "$COPY_A" "$COPY_B" >/dev/null 2>&1; then
+  # runlog.jsonl / finding_events.jsonl are runtime state, not source: the
+  # installed skill is a symlink to COPY_A, so its history lands there and
+  # would otherwise read as drift on every run (2026-08-03).
+  if diff -r --exclude 'runlog.jsonl*' --exclude 'finding_events.jsonl' --exclude 'iteration-1' --exclude '*.bak*' --exclude '.DS_Store' "$COPY_A" "$COPY_B" >/dev/null 2>&1; then
     ok "root copy ≡ plugin copy"
   else
     bad "root copy and plugin copy have drifted — sync before merging"
