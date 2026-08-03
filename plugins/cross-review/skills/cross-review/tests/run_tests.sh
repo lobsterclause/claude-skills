@@ -670,6 +670,56 @@ assert_eq "soft-deny maps to status permission_denied in the runlog" \
                           elif .exit_code == 0 then "empty"
                           else "failed" end)} | .status' "$T/o11/antigravity.meta.json")" '"permission_denied"'
 
+echo "── agy internal print-timeout classifies apart from empty_output/failed ──"
+# [pin: 2026-08-03 — Gemini 3.1 Pro at High effort needs 300-400s on a 100KB
+# prompt. When agy's own --print-timeout expires first it exits rc=1 with 0
+# bytes and stderr "Error: timeout waiting for response"; coreutils `timeout`
+# never fires, so this used to land as a bare failed run with failure_kind=null
+# and timed_out=false — invisible to the runlog's timeout-rate warning, and one
+# step away from the empty_output "go re-auth" misdirection. It is a timeout:
+# it must say so, and the remedy is a bigger budget.]
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+printf 'Error: timeout waiting for response\n' >&2
+exit 1
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o13" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "agy print-timeout stamps print_timeout" \
+  "$(jq -r '.failure_kind' "$T/o13/antigravity.meta.json")" "print_timeout"
+assert_eq "agy print-timeout marks timed_out=true so the runlog warning sees it" \
+  "$(jq -r '.timed_out' "$T/o13/antigravity.meta.json")" "true"
+assert_eq "agy print-timeout is NOT misfiled as empty_output" \
+  "$(jq -r 'select(.failure_kind == "empty_output") | "LEAKED"' "$T/o13/antigravity.meta.json")" ""
+assert_eq "print-timeout maps to status timed_out in the runlog" \
+  "$(jq -c '. + {status: (if .timed_out == true then "timed_out"
+                          elif .failure_kind == "quota_exhausted" then "quota"
+                          elif .failure_kind == "headless_permission_denied" then "permission_denied"
+                          elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
+                          elif .exit_code == 0 then "empty"
+                          else "failed" end)} | .status' "$T/o13/antigravity.meta.json")" '"timed_out"'
+
+# A non-timeout nonzero exit must NOT be swallowed by the print_timeout branch.
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+printf 'Error: something else entirely\n' >&2
+exit 1
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o14" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "unrelated agy failure does not claim print_timeout" \
+  "$(jq -r '.failure_kind' "$T/o14/antigravity.meta.json")" "null"
+assert_eq "unrelated agy failure stays timed_out=false" \
+  "$(jq -r '.timed_out' "$T/o14/antigravity.meta.json")" "false"
+
+# Per-attempt artifacts must survive the retry that overwrites the canonical
+# paths — without them attempt 1's cause is unknowable (this flake took a
+# rebuild of the evidence trail to diagnose).
+assert_eq "attempt-stamped meta.json is preserved for forensics" \
+  "$(jq -r '.failure_kind' "$T/o13/antigravity.attempt1.meta.json" 2>/dev/null)" "print_timeout"
+
 # Silent agy (no log line, no stderr) must STILL classify as empty_output —
 # the new branch must not swallow the genuine expired-auth case.
 cat >"$T/bin/agy" <<'SHIM'
@@ -975,6 +1025,14 @@ assert_contains "run_reviewers.sh removes the gate on exit" \
   "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'remove_agy_shell_gate'
 assert_contains "agy laps mount the repo with --add-dir" \
   "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" '--add-dir'
+# [pin: 2026-08-03 — `command(echo)` alone is NOT enough. agy asks for
+# `unsandboxed(<target>)` whenever the model escalates a step outside the
+# sandbox, and the gate's rewritten echo inherits that request kind. Missing
+# rule = intermittent 0-byte laps that look like a flake.]
+assert_contains "preflight warns about the unsandboxed(echo) rule too" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'unsandboxed(echo)'
+assert_contains "SKILL.md documents both echo allow-rules" \
+  "$(cat "$SKILL_DIR/SKILL.md")" 'unsandboxed(echo)'
 
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]

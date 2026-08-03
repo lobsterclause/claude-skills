@@ -902,6 +902,22 @@ agy_soft_denied() {
   return 1
 }
 
+# agy_print_timeout <stderr_file> — true when agy gave up waiting for the model
+# and exited on its OWN --print-timeout rather than being killed by the wrapper.
+# Signature (verified 2026-08-03, agy 1.1.8): rc=1, 0 bytes stdout, stderr is
+# exactly `Error: timeout waiting for response`, and coreutils `timeout` never
+# fires (so rc is 1, not 124, and the old code left failure_kind=null). This is
+# the gemini-pro "attempt 1 empty, attempt 2 fine" flake: Gemini 3.1 Pro at High
+# effort routinely needs 300-400s on a 100KB prompt, so a budget whose internal
+# timeout lands near that mark loses the race intermittently. The remedy is a
+# bigger --timeout-gemini-pro, NOT re-auth — which is exactly what the
+# empty_output bucket would have told the operator to do.
+agy_print_timeout() {
+  local err="$1"
+  [[ -f "$err" ]] && grep -q 'timeout waiting for response' "$err" 2>/dev/null && return 0
+  return 1
+}
+
 # run_agy_reviewer: shared body for the two Gemini-family laps. Both run on the
 # `agy` (Antigravity) CLI; they differ only in slug, --model, and timeout.
 # POLICY: no OpenRouter fallback for first-party laps — on quota/panic the lap
@@ -1003,15 +1019,25 @@ The full diff is included above. HARD CONSTRAINT: you are running headless with 
     agy_internal_timeout="${timeout_budget}s"
   fi
 
+  # Per-attempt artifacts: retry_reviewer re-runs this function in place, so a
+  # single canonical path means attempt 2 overwrites the only evidence of why
+  # attempt 1 failed. Write the agy log to an attempt-stamped path and copy
+  # stdout/stderr/log alongside it, then mirror the log to the canonical name
+  # the classifier below greps.
+  local attempt_n="${CROSS_REVIEW_ATTEMPT:-1}"
+  local agy_log="$out/${slug}.attempt${attempt_n}.agy.log"
   run_with_timeout "$timeout_budget" agy \
     --model "$model" \
     --sandbox \
     --add-dir "$repo_root" \
     --print-timeout "$agy_internal_timeout" \
-    --log-file "$out/${slug}.agy.log" \
+    --log-file "$agy_log" \
     -p "$full_prompt" \
     >"$out/${slug}.stdout" 2>"$out/${slug}.stderr" </dev/null
   rc=$?
+  cp -f "$agy_log" "$out/${slug}.agy.log" 2>/dev/null || true
+  cp -f "$out/${slug}.stdout" "$out/${slug}.attempt${attempt_n}.stdout" 2>/dev/null || true
+  cp -f "$out/${slug}.stderr" "$out/${slug}.attempt${attempt_n}.stderr" 2>/dev/null || true
   end=$(date +%s)
   local timed_out="false"
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
@@ -1039,15 +1065,21 @@ The full diff is included above. HARD CONSTRAINT: you are running headless with 
   #                     tool required the "command" permission that headless
   #                     mode cannot prompt for`; log:
   #                     `Print mode: soft-denying tool confirmation`. See
-  #                     docs/investigation-agy-empty-output.md. The prompt
-  #                     above embeds the full diff precisely so no such tool
-  #                     call is needed — if this still fires, the reviewer
-  #                     reached for a shell anyway; tighten the prompt's
-  #                     "you do NOT need to run git" line rather than
+  #                     docs/investigation-agy-empty-output.md. The PreToolUse
+  #                     gate installed before dispatch exists precisely so this
+  #                     can never fire — if it does, the gate failed to install
+  #                     (check the WARN about `command(echo)` in
+  #                     ~/.gemini/antigravity-cli/settings.json) rather than
   #                     re-running `agy login`. Split out from empty_output
   #                     (2026-07-20) because the two have opposite remedies
   #                     and conflating them got the Gemini seats written off
   #                     as dead when they were merely gagged.
+  #   print_timeout   — rc=1, 0 bytes, stderr `Error: timeout waiting for
+  #                     response`. agy's OWN --print-timeout expired, so
+  #                     coreutils `timeout` never fired and rc is 1 rather than
+  #                     124. Remedy is a bigger budget, not re-auth; meta marks
+  #                     timed_out=true so the runlog's timeout-rate warning
+  #                     picks it up.
   #   empty_output    — rc=0, 0 bytes, no quota line, no permission line.
   #                     THIS is the one that usually means expired `agy
   #                     login` auth. Re-auth before suspecting anything else.
@@ -1066,6 +1098,13 @@ The full diff is included above. HARD CONSTRAINT: you are running headless with 
       rc=3
     elif [[ $rc -ne 0 && -f "$agy_log" ]] && grep -q 'panic: runtime error' "$agy_log" 2>/dev/null; then
       failure_kind="agy_panic"
+    elif [[ "$bytes" -eq 0 ]] && agy_print_timeout "$out/${slug}.stderr"; then
+      # agy hit its own --print-timeout. Report it as a timeout (it is one) so
+      # the runlog's timeout-rate warning fires and the operator raises the
+      # budget, instead of chasing an auth problem that does not exist.
+      failure_kind="print_timeout"
+      timed_out="true"
+      echo "$slug: agy gave up at its internal print-timeout (${agy_internal_timeout}) with no output — raise --timeout-${slug} if this recurs (Gemini 3.1 Pro at High effort often needs 300-400s)" >&2
     elif [[ $rc -eq 0 && "$bytes" -eq 0 ]] && agy_soft_denied "$agy_log" "$out/${slug}.stderr"; then
       # Gagged, not dead: the seat is authed and in quota, but a tool call it
       # made couldn't be confirmed in headless mode. Distinct remedy from
@@ -1093,6 +1132,7 @@ The full diff is included above. HARD CONSTRAINT: you are running headless with 
   [[ -n "$quota_resets_in" ]] && qr_json="\"$quota_resets_in\""
   printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" >"$out/${slug}.meta.json"
+  cp -f "$out/${slug}.meta.json" "$out/${slug}.attempt${attempt_n}.meta.json" 2>/dev/null || true
   # No fallback: a failed agy lap stays failed (failure_kind says why). Roster
   # rotation compensates across runs; the leaderboard's reliability signal
   # naturally down-weights a quota-dead lap until it recovers.
@@ -1302,12 +1342,24 @@ install_agy_shell_gate() {
     return 0
   fi
   # The gate rewrites every command to `echo`, but agy still permission-checks
-  # the rewritten line — so `command(echo)` has to be allow-listed or the laps
-  # die at 0 bytes exactly as before. Warn loudly rather than editing a global
-  # config behind the user's back.
+  # the rewritten line — so `echo` has to be allow-listed or the laps die at 0
+  # bytes exactly as before. BOTH rule kinds are required: agy asks for
+  # `command(<target>)` for an ordinary shell step and `unsandboxed(<target>)`
+  # when the model escalates outside the sandbox. Missing the second one is
+  # what produced the "gemini-pro fails, retry sometimes works" flake — the
+  # escalation is the model's choice, so it only bites some runs (verified
+  # 2026-08-03: stderr `a tool required the "unsandboxed" permission`). Warn
+  # loudly rather than editing a global config behind the user's back.
   local agy_settings="$HOME/.gemini/antigravity-cli/settings.json"
-  if [[ -f "$agy_settings" ]] && ! grep -q 'command(echo)' "$agy_settings" 2>/dev/null; then
-    echo "WARN: $agy_settings has no \"command(echo)\" rule under permissions.allow — the agy laps will fail with failure_kind=headless_permission_denied. Add: {\"permissions\": {\"allow\": [\"command(echo)\"]}}" >&2
+  if [[ -f "$agy_settings" ]]; then
+    local missing_rules=""
+    grep -q 'command(echo)' "$agy_settings" 2>/dev/null || missing_rules="command(echo)"
+    if ! grep -q 'unsandboxed(echo)' "$agy_settings" 2>/dev/null; then
+      missing_rules="${missing_rules:+$missing_rules, }unsandboxed(echo)"
+    fi
+    if [[ -n "$missing_rules" ]]; then
+      echo "WARN: $agy_settings is missing permissions.allow rule(s): $missing_rules — agy laps will fail with failure_kind=headless_permission_denied. Add: {\"permissions\": {\"allow\": [\"command(echo)\", \"unsandboxed(echo)\"]}}" >&2
+    fi
   fi
   agy_gate_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   agy_gate_file="$agy_gate_repo_root/.agents/hooks.json"

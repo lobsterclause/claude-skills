@@ -35,8 +35,11 @@ msg='SHELL DISABLED: this is a read-only code review running headless, so no she
 # printf %s the message into a single-quoted echo, escaping any embedded quote.
 # NOTE: the REWRITTEN command line is still permission-checked, and the hook's
 # own `permissionOverrides` does NOT cover it (verified 2026-07-31: the run
-# still died on `echo`). So `command(echo)` must be allow-listed in
-# ~/.gemini/antigravity-cli/settings.json — run_reviewers.sh warns when it is
-# not. That single rule is the entire global footprint of this fix.
+# still died on `echo`). So `echo` must be allow-listed in
+# ~/.gemini/antigravity-cli/settings.json under BOTH rule kinds —
+# `command(echo)` for an ordinary shell step and `unsandboxed(echo)` for the
+# escalated one the model sometimes picks (verified 2026-08-03). Those two
+# rules are the entire global footprint of this fix; run_reviewers.sh warns
+# when either is absent.
 printf '{"decision":"allow","reason":"read-only review sandbox: run_command is disabled","overwrite":{"CommandLine":"echo %s"}}\n' \
   "$(printf '%s' "'$msg'" | sed 's/\\/\\\\/g; s/"/\\"/g')"

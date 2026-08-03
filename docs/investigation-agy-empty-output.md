@@ -91,6 +91,60 @@ Verified on agy 1.1.8 against `--base HEAD~1` in this repo: antigravity rc=0 /
 Regression tests live in `cross-review/tests/run_tests.sh` under
 "agy shell gate" (151 passed, 0 failed).
 
+### Follow-up 2026-08-03: the gemini-pro "attempt 1 empty, attempt 2 fine" flake
+
+**Actual cause: a second permission class, `unsandboxed(...)`.** When the model
+escalates a step to run outside agy's sandbox, the permission it needs is
+`unsandboxed(<target>)`, not `command(<target>)` — and the gate's rewritten
+`echo` inherits that request kind. With only `command(echo)` allow-listed the
+lap died exactly as before (`jetski: no output produced — a tool required the
+"unsandboxed" permission`, `permission check failed for unsandboxed "echo
+'SHELL DISABLED: ...'"`). Escalating is the model's own choice, which is why it
+bit some runs and not others. The settings.json block therefore needs BOTH:
+
+```json
+{ "permissions": { "allow": ["command(echo)", "unsandboxed(echo)"] } }
+```
+
+`run_reviewers.sh` now names whichever rule is missing in its preflight WARN.
+
+Two red herrings were ruled out along the way. Both are documented because the
+classifier work they produced is worth keeping.
+
+**Red herring 1 — agy's internal print-timeout.** Real, reproducible, but not
+this flake. Signature: `rc=1`,
+0 bytes, stderr exactly `Error: timeout waiting for response`, `timed_out:
+false`, `failure_kind: null`. That is **agy's own `--print-timeout` expiring**,
+not the coreutils `timeout` wrapper (which would give rc=124) — `run_agy_reviewer`
+sets the internal timeout 15s under the wrapper budget so agy exits cleanly,
+and agy's clean exit code for that path is 1.
+
+Gemini 3.1 Pro at High effort routinely needs 300-400s on a 100KB prompt
+(measured: 136s, 175s, 359s, 360s across successful runs), so a budget whose
+internal timeout lands near that mark does lose the race — but the SKILL's own
+invocation passes no `--timeout`, giving the lap its 900s default and ~2x
+headroom. It only surfaced under probe runs at `--timeout-gemini-pro 420`
+(→ 405s internal). Worth classifying properly anyway:
+- **Classification.** A print-timeout now stamps `failure_kind=print_timeout`
+  and `timed_out=true`, so `append_runlog.sh` files it as `status=timed_out` and
+  the analyzer's timeout-rate warning fires with the correct remedy (raise the
+  budget). Previously it was a bare `failed` with a null failure_kind — one step
+  away from the `empty_output` bucket, whose documented remedy is "re-run `agy
+  login`", i.e. exactly the wrong advice. `run_reviewers.sh` also prints the
+  internal timeout value and the 300-400s expectation on stderr when it fires.
+- **Forensics.** `retry_reviewer` re-runs the lap in place, so attempt 2 used to
+  overwrite the only copy of attempt 1's stdout/stderr/meta/agy.log — the reason
+  this flake could not be diagnosed from the artifacts of the run that showed
+  it. Each attempt now also writes `<slug>.attempt<N>.{stdout,stderr,meta.json,agy.log}`.
+
+Regression tests: `run_tests.sh` pins the `print_timeout` stamp, `timed_out=true`,
+that it is not misfiled as `empty_output`, that an unrelated rc=1 does NOT claim
+it, the runlog status mapping, and the attempt-stamped meta.
+
+**Red herring 2 — a slow lap needing a bigger budget.** The default-budget run
+that finally exposed the real cause failed BOTH attempts in 67s and 126s, far
+inside the 885s internal timeout. Duration was never the constraint.
+
 The section below is kept as the record of the abandoned approach.
 
 ## Fix (proposed, NOT verified live)
