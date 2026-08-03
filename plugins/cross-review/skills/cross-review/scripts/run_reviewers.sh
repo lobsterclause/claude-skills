@@ -888,6 +888,20 @@ $json_findings_suffix"
   return "$rc"
 }
 
+# agy_soft_denied <agy_log> <stderr_file> — true when agy produced nothing
+# because headless print mode auto-denied a tool confirmation it could not
+# prompt for (agy >=1.1.3). Matched on ASCII-only substrings: agy's stderr
+# renders an em-dash mid-sentence, so anchoring on the punctuation would be
+# encoding-fragile. Either channel alone is sufficient — which one carries the
+# message varies by agy build.
+agy_soft_denied() {
+  local log="$1" err="$2"
+  [[ -f "$log" ]] && grep -q 'soft-denying tool confirmation' "$log" 2>/dev/null && return 0
+  [[ -f "$err" ]] && grep -q 'permission that headless mode cannot prompt for' "$err" 2>/dev/null && return 0
+  [[ -f "$log" ]] && grep -q 'permission that headless mode cannot prompt for' "$log" 2>/dev/null && return 0
+  return 1
+}
+
 # run_agy_reviewer: shared body for the two Gemini-family laps. Both run on the
 # `agy` (Antigravity) CLI; they differ only in slug, --model, and timeout.
 # POLICY: no OpenRouter fallback for first-party laps — on quota/panic the lap
@@ -929,6 +943,15 @@ run_agy_reviewer() {
   # bump the timeout.
   local start end rc
   start=$(date +%s)
+  # --add-dir (below): agy's sandbox starts the model in its OWN scratch dir
+  # (~/.gemini/antigravity-cli/scratch), NOT the repo. Without the repo in the
+  # workspace the model can't see any file and goes hunting with `find` /
+  # `git rev-parse` — a "command" permission request that headless mode
+  # soft-denies, killing the whole run at 0 bytes (2026-07-31 repro; see
+  # docs/investigation-agy-empty-output.md). Handing it the repo root removes
+  # the reason to shell out at all.
+  local repo_root
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   local diff_summary diff_full
   diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
   # Embed the actual diff instead of just making the model go fetch it: agy
@@ -956,7 +979,7 @@ Full diff (unified context, against $base):
 $diff_full
 \`\`\`
 
-The full diff is included above — you do NOT need to run git or any other shell command to see the changes. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
+The full diff is included above. HARD CONSTRAINT: you are running headless with no interactive permission prompt, so ANY shell/terminal command you attempt that is not pre-approved is auto-denied and immediately terminates your run with zero output — the whole review is lost. Do NOT run git, jq, printf, echo, or any other shell command, not even to orient yourself or to validate your own output, and do NOT go looking for the repository — it is already mounted in your workspace at $repo_root. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools (read/view/search-file) only — those are a different permission category and are not gated this way. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
 
   # argv guard (issue #7): Linux caps a single argv element at ~128KB
   # (MAX_ARG_STRLEN). Embedding the full diff (not just --stat) makes this
@@ -983,6 +1006,7 @@ The full diff is included above — you do NOT need to run git or any other shel
   run_with_timeout "$timeout_budget" agy \
     --model "$model" \
     --sandbox \
+    --add-dir "$repo_root" \
     --print-timeout "$agy_internal_timeout" \
     --log-file "$out/${slug}.agy.log" \
     -p "$full_prompt" \
@@ -1007,19 +1031,26 @@ The full diff is included above — you do NOT need to run git or any other shel
   #   agy_panic       — Go SIGSEGV in agy's RunCommandHandler (upstream bug,
   #                     seen on agy ≤1.0.15); exit 2, ~20-45s, empty output.
   #                     Flaky, so the agy retry is still worth one attempt.
-  #   empty_output    — rc=0, 0 bytes, no quota line. Historically blamed on
-  #                     expired `agy login` auth; as of agy 1.1.3+ the far
-  #                     more common cause is a soft-denied Bash/RunCommand
-  #                     tool confirmation in headless print mode (stderr:
-  #                     `jetski: no output produced — a tool required the
-  #                     "command" permission that headless mode cannot
-  #                     prompt for`). See
+  #   headless_permission_denied
+  #                   — rc=0, 0 bytes, and agy's own log/stderr names the
+  #                     cause: a Bash/RunCommand tool confirmation was
+  #                     soft-denied because headless print mode can't prompt
+  #                     (agy ≥1.1.3). stderr: `jetski: no output produced — a
+  #                     tool required the "command" permission that headless
+  #                     mode cannot prompt for`; log:
+  #                     `Print mode: soft-denying tool confirmation`. See
   #                     docs/investigation-agy-empty-output.md. The prompt
-  #                     above now embeds the full diff precisely to avoid
-  #                     needing that tool call in the first place — if this
-  #                     still fires, check .agy.log for
-  #                     `soft-denying tool confirmation` before assuming
-  #                     auth expiry.
+  #                     above embeds the full diff precisely so no such tool
+  #                     call is needed — if this still fires, the reviewer
+  #                     reached for a shell anyway; tighten the prompt's
+  #                     "you do NOT need to run git" line rather than
+  #                     re-running `agy login`. Split out from empty_output
+  #                     (2026-07-20) because the two have opposite remedies
+  #                     and conflating them got the Gemini seats written off
+  #                     as dead when they were merely gagged.
+  #   empty_output    — rc=0, 0 bytes, no quota line, no permission line.
+  #                     THIS is the one that usually means expired `agy
+  #                     login` auth. Re-auth before suspecting anything else.
   local failure_kind="" quota_resets_in=""
   local agy_log="$out/${slug}.agy.log"
   if [[ $rc -eq 0 && "$bytes" -eq 0 || $rc -ne 0 ]]; then
@@ -1035,6 +1066,12 @@ The full diff is included above — you do NOT need to run git or any other shel
       rc=3
     elif [[ $rc -ne 0 && -f "$agy_log" ]] && grep -q 'panic: runtime error' "$agy_log" 2>/dev/null; then
       failure_kind="agy_panic"
+    elif [[ $rc -eq 0 && "$bytes" -eq 0 ]] && agy_soft_denied "$agy_log" "$out/${slug}.stderr"; then
+      # Gagged, not dead: the seat is authed and in quota, but a tool call it
+      # made couldn't be confirmed in headless mode. Distinct remedy from
+      # empty_output — see the classification comment above.
+      failure_kind="headless_permission_denied"
+      rc=5
     elif [[ $rc -eq 0 && "$bytes" -eq 0 ]]; then
       failure_kind="empty_output"
       rc=5
@@ -1233,7 +1270,93 @@ cleanup_pids() {
     kill "$p" 2>/dev/null || true
   done
 }
-trap cleanup_pids EXIT INT TERM
+
+# ---- agy shell gate ---------------------------------------------------------
+# agy ≥1.1.3 soft-denies any "command" permission it cannot prompt for in
+# headless mode, and ONE soft-denied command ends the conversation at 0 bytes —
+# the whole review is lost. Both Gemini laps reliably reach for a shell
+# (`git rev-parse`, `find`, `printf | jq`, `git diff > /tmp/x.patch`,
+# `bash tests/run_tests.sh` were all observed on 2026-07-31), so a
+# settings.json allow-list is whack-a-mole: the first command outside it is
+# fatal. Instead we install a PreToolUse hook that answers every `run_command`
+# with allow + an overwrite that swaps the command line for a harmless `echo`.
+# No permission is ever requested (the run survives) and no reviewer-authored
+# command ever executes (the read-only guarantee holds, unlike
+# --dangerously-skip-permissions).
+#
+# agy discovers hooks at <workspace-root>/.agents/hooks.json ONLY — a temp cwd
+# is not scanned (verified: "loaded 0 named hooks") — so the file has to live in
+# the repo under review for the duration of the laps. It is installed once
+# before dispatch (both laps run concurrently and share it) and removed by the
+# same trap that reaps the reviewer pids.
+agy_gate_repo_root=""
+agy_gate_file=""
+agy_gate_backup=""
+agy_gate_made_dir=""
+
+install_agy_shell_gate() {
+  local gate
+  gate="$script_dir/agy_shell_gate.sh"
+  if [[ ! -x "$gate" ]]; then
+    echo "agy shell gate not found/executable at $gate — the agy laps will die on their first tool call" >&2
+    return 0
+  fi
+  # The gate rewrites every command to `echo`, but agy still permission-checks
+  # the rewritten line — so `command(echo)` has to be allow-listed or the laps
+  # die at 0 bytes exactly as before. Warn loudly rather than editing a global
+  # config behind the user's back.
+  local agy_settings="$HOME/.gemini/antigravity-cli/settings.json"
+  if [[ -f "$agy_settings" ]] && ! grep -q 'command(echo)' "$agy_settings" 2>/dev/null; then
+    echo "WARN: $agy_settings has no \"command(echo)\" rule under permissions.allow — the agy laps will fail with failure_kind=headless_permission_denied. Add: {\"permissions\": {\"allow\": [\"command(echo)\"]}}" >&2
+  fi
+  agy_gate_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  agy_gate_file="$agy_gate_repo_root/.agents/hooks.json"
+  if [[ ! -d "$agy_gate_repo_root/.agents" ]]; then
+    mkdir -p "$agy_gate_repo_root/.agents" 2>/dev/null || { agy_gate_file=""; return 0; }
+    agy_gate_made_dir=1
+  fi
+  if [[ -f "$agy_gate_file" ]]; then
+    agy_gate_backup="$out/agy_hooks.json.orig"
+    cp "$agy_gate_file" "$agy_gate_backup" || { agy_gate_file=""; return 0; }
+  fi
+  if [[ -n "$agy_gate_backup" ]] && command -v jq >/dev/null 2>&1; then
+    # Preserve the repo's own hooks — merge ours in under its own key.
+    jq --arg cmd "$gate" '. + {"cross-review-shell-gate": {"PreToolUse": [{"matcher": "run_command", "hooks": [{"type": "command", "command": $cmd, "timeout": 10}]}]}}' \
+      "$agy_gate_backup" >"$agy_gate_file" 2>/dev/null || cp "$agy_gate_backup" "$agy_gate_file"
+  else
+    cat >"$agy_gate_file" <<EOF
+{
+  "cross-review-shell-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          { "type": "command", "command": "$gate", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+EOF
+  fi
+}
+
+remove_agy_shell_gate() {
+  [[ -n "$agy_gate_file" ]] || return 0
+  if [[ -n "$agy_gate_backup" && -f "$agy_gate_backup" ]]; then
+    mv "$agy_gate_backup" "$agy_gate_file" 2>/dev/null || true
+  else
+    rm -f "$agy_gate_file" 2>/dev/null || true
+    [[ -n "$agy_gate_made_dir" ]] && rmdir "$agy_gate_repo_root/.agents" 2>/dev/null || true
+  fi
+  agy_gate_file=""
+}
+
+cleanup_run() {
+  cleanup_pids
+  remove_agy_shell_gate
+}
+trap cleanup_run EXIT INT TERM
 
 IFS=',' read -ra raw_requested <<<"$reviewers"
 # Dedup. Without this, `--reviewers codex,codex` spawns two processes writing
@@ -1261,6 +1384,15 @@ done
 # NOTE: antigravity + gemini-pro both hit Google via agy — the stagger matters
 # more now that two reviewers share one provider, auth state, and rate limit.
 stagger_s=2
+
+# Install the PreToolUse gate before dispatch if either Gemini lap is in the
+# roster — both laps run concurrently and share the one hooks.json.
+for r in "${requested[@]}"; do
+  if [[ "$r" == "antigravity" || "$r" == "gemini-pro" ]] && command -v agy >/dev/null 2>&1; then
+    install_agy_shell_gate
+    break
+  fi
+done
 
 for r in "${requested[@]}"; do
   case "$r" in

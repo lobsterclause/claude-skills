@@ -640,6 +640,48 @@ chmod +x "$T/bin/agy"
 bash "$S/run_reviewers.sh" --base main --out "$T/o10" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
 assert_eq "agy rc=0 preamble-only stamps no_verdict_output" \
   "$(jq -r '.failure_kind' "$T/o10/antigravity.meta.json")" "no_verdict_output"
+echo "── agy headless soft-deny classifies apart from empty_output ──"
+# [pin: 2026-07-20 — a soft-denied tool confirmation (agy >=1.1.3 headless)
+# used to land as failure_kind=empty_output, whose documented remedy is
+# "re-run agy login". That misdirection got the Gemini seats declared dead
+# while agy was in fact healthy. The two MUST classify separately: gagged
+# (prompt-shape bug, seat fine) vs unauthed (re-login).]
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--log-file" ]; then printf 'tool_confirmation_manager.go:183] Print mode: soft-denying tool confirmation\n' >"$2"; fi
+  shift
+done
+printf 'jetski: no output produced - a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.\n' >&2
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o11" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "agy soft-deny stamps headless_permission_denied" \
+  "$(jq -r '.failure_kind' "$T/o11/antigravity.meta.json")" "headless_permission_denied"
+assert_eq "agy soft-deny is NOT misfiled as empty_output" \
+  "$(jq -r 'select(.failure_kind == "empty_output") | "LEAKED"' "$T/o11/antigravity.meta.json")" ""
+assert_eq "soft-deny maps to status permission_denied in the runlog" \
+  "$(jq -c '. + {status: (if .timed_out == true then "timed_out"
+                          elif .failure_kind == "quota_exhausted" then "quota"
+                          elif .failure_kind == "headless_permission_denied" then "permission_denied"
+                          elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
+                          elif .exit_code == 0 then "empty"
+                          else "failed" end)} | .status' "$T/o11/antigravity.meta.json")" '"permission_denied"'
+
+# Silent agy (no log line, no stderr) must STILL classify as empty_output —
+# the new branch must not swallow the genuine expired-auth case.
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o12" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "silent agy still classifies as empty_output (auth path intact)" \
+  "$(jq -r '.failure_kind' "$T/o12/antigravity.meta.json")" "empty_output"
+
 printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
 chmod +x "$T/bin/agy"
 
@@ -899,6 +941,40 @@ for suite in test_json_output test_score_findings test_report_block test_digest;
     bad "$suite.sh missing from tests/"
   fi
 done
+
+echo "── agy shell gate (headless permission deadlock) ──"
+# [pin: 2026-07-31 — agy >=1.1.3 kills a headless run at 0 bytes the moment the
+# model asks for a "command" permission. The gate must (a) emit valid JSON,
+# (b) allow, (c) rewrite ANY command line to a bare echo, and (d) be wired into
+# hooks.json as a run_command PreToolUse handler. Regressing any of these puts
+# both Gemini laps back to failure_kind=headless_permission_denied.]
+GATE="$SKILL_DIR/scripts/agy_shell_gate.sh"
+if [[ -x "$GATE" ]]; then
+  gate_out="$(printf '%s' '{"toolCall":{"name":"run_command","args":{"CommandLine":"rm -rf / && git push --force"}}}' | bash "$GATE" 2>/dev/null)"
+  if printf '%s' "$gate_out" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok "gate emits valid JSON"
+  else
+    bad "gate emitted invalid JSON: $gate_out"
+  fi
+  assert_contains "gate decision is allow (a deny/ask would end the run at 0 bytes)" "$gate_out" '"decision":"allow"'
+  gate_cmd="$(printf '%s' "$gate_out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["overwrite"]["CommandLine"])' 2>/dev/null)"
+  case "$gate_cmd" in
+    "echo "*) ok "gate rewrites the command line to a bare echo" ;;
+    *)        bad "gate did not rewrite to echo — got: $gate_cmd" ;;
+  esac
+  case "$gate_cmd" in
+    *"rm -rf"*|*"git push"*) bad "gate leaked the original command into the rewrite: $gate_cmd" ;;
+    *)                       ok "gate drops the original command entirely" ;;
+  esac
+else
+  bad "scripts/agy_shell_gate.sh missing or not executable"
+fi
+assert_contains "run_reviewers.sh installs the gate as a run_command PreToolUse hook" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'install_agy_shell_gate'
+assert_contains "run_reviewers.sh removes the gate on exit" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'remove_agy_shell_gate'
+assert_contains "agy laps mount the repo with --add-dir" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" '--add-dir'
 
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]

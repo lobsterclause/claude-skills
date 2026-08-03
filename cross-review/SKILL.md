@@ -41,6 +41,18 @@ Prints JSON like `{"codex": true, "antigravity": true, "gemini-pro": true, "kimi
 
 Do not proceed with zero reviewers. (The standalone `gemini` CLI is no longer used — it was retired in the 2026-06-18 Gemini-CLI consumer sunset; both Gemini reviewers now run on `agy`.)
 
+> **Do not retire the Gemini seats on a `gemini` CLI error.** Running `gemini` by hand now fails with `IneligibleTierError: This client is no longer supported for Gemini Code Assist for individuals` (`reasonCode: UNSUPPORTED_CLIENT`, `tierId: free-tier`). That is the **retired client** refusing to start — it says nothing about the seats this skill actually uses, and the error text itself names the migration target (`antigravity.google`) that `agy` already is. Verified live 2026-07-20: with `gemini` in that state, `agy -p` returns normal output and `agy models` lists Gemini 3.5 Flash + Gemini 3.1 Pro. **The only authority on Gemini-seat availability is `detect_reviewers.sh`** (which probes `agy`, never `gemini`). If it reports `"antigravity": true` / `"gemini-pro": true`, the seats are live — do not hand-drop the round to fewer reviewers.
+>
+> Corollary for the failure path: an agy lap that returns zero bytes is **not** automatically a dead seat. Check `failure_kind` in its `meta.json` — `headless_permission_denied` means the seat is authed and in quota but a tool confirmation was auto-denied; only bare `empty_output` points at expired `agy login`.
+
+> **`command(echo)` must be allow-listed for the agy laps to work at all.** agy ≥1.1.3 kills a headless run at 0 bytes the instant the model asks for a "command" permission, and both Gemini models always reach for a shell. `run_reviewers.sh` neutralises that with a `PreToolUse` hook (`scripts/agy_shell_gate.sh`, installed as a temporary `<repo>/.agents/hooks.json` and removed on exit) that rewrites every command to a harmless `echo` — but the rewritten line is still permission-checked, so `~/.gemini/antigravity-cli/settings.json` needs:
+>
+> ```json
+> { "permissions": { "allow": ["command(echo)"] } }
+> ```
+>
+> That single rule is the whole global footprint — no `--dangerously-skip-permissions`, no broad read-only allow-list (tried; it fails on the first unlisted command). `run_reviewers.sh` prints a WARN when the rule is missing. Full write-up: `docs/investigation-agy-empty-output.md`.
+
 ### 1.5 Pre-run health check (recent runlog)
 
 Before spending tokens on a fresh round, glance at the last 10 runs to see if any reviewer is currently degraded. The analyzer surfaces only what's actionable — silent in the common case.
