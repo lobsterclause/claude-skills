@@ -59,7 +59,20 @@ trap 'rm -rf "$work"' EXIT
 
 n=0
 shopt -s nullglob
-files=("$raw"/*.stdout)
+# Exclude the attempt-stamped forensic copies (<slug>.attempt<N>.stdout, written
+# by run_agy_reviewer so a retry stops destroying the evidence of why attempt 1
+# failed). They are the SAME reviewer's output under a different filename: merged
+# as-is they would double-count that reviewer's findings and manufacture
+# "convergence" between <slug> and <slug>.attempt1 (spotted in PR #41 pass 3,
+# where the merge reported `unparsed: gemini-pro.attempt1` as its own reviewer).
+files=()
+for _f in "$raw"/*.stdout; do
+  case "$(basename "$_f")" in
+    *.attempt[0-9]*.stdout) continue ;;
+  esac
+  files+=("$_f")
+done
+[[ ${#files[@]} -eq 0 ]] && files=("$raw"/*.stdout)
 shopt -u nullglob
 # Sorted, deterministic iteration order (glob order is filesystem-dependent).
 # Bash-3.2-compatible (macOS default /bin/bash lacks mapfile/readarray): split

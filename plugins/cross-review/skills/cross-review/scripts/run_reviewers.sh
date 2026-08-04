@@ -138,37 +138,20 @@ timeout_gemini_pro=""
 timeout_kimi=""
 timeout_glm=""
 
-# Model IDs — passed verbatim to `agy --model`. These MUST match an `agy models`
-# display name exactly; agy silently falls back to its default (Flash) on an
-# unrecognized string rather than erroring (verified on agy 1.0.9, 2026-06-18).
-# Overridable per-reviewer via reviewer_profiles.json `.model` (resolved below).
-antigravity_model="Gemini 3.5 Flash (High)"
-gemini_pro_model="Gemini 3.1 Pro (High)"
-
-# OpenRouter model ids (exact slugs verified against
-# https://openrouter.ai/api/v1/models, 2026-07-01; qwen/devstral/laguna/kat
-# verified 2026-07-02). Overridable via
-# reviewer_profiles.json `.model` (resolved below).
-glm_model="z-ai/glm-5.2"
-deepseek_model="deepseek/deepseek-v4-flash"
-mimo_model="xiaomi/mimo-v2.5"
-minimax_model="minimax/minimax-m3"
-qwen_model="qwen/qwen3-coder-next"
-devstral_model="mistralai/devstral-2512"
-laguna_model="poolside/laguna-m.1"
-kat_model="kwaipilot/kat-coder-pro-v2"
-north_model="cohere/north-mini-code:free"
-nemotron_model="nvidia/nemotron-3-ultra-550b-a55b:free"
-# spark model id verified against https://openrouter.ai/meta/muse-spark-1.1, 2026-07-19.
-spark_model="meta/muse-spark-1.1"
-# kimi27 rides the DIRECT Moonshot platform API (OpenAI-compatible), not
-# OpenRouter — a deliberate rotation seat (2026-07-03, per Gabriel) on the
-# same billing rail as the kimi baseline. The first-party no-OR-fallback
-# policy above is untouched: this is not a fallback lane for kimi.
-kimi27_model="kimi-k2.7-code"
-# kimi3 is the same direct-Moonshot rotation seat pattern as kimi27, added
-# 2026-07-18 for Moonshot's K3 flagship release (2026-07-16).
-kimi3_model="kimi-k3"
+# MODEL IDS LIVE IN EXACTLY ONE PLACE: references/reviewer_profiles.json
+# `.model`. This script deliberately keeps NO fallback copy. It used to carry a
+# literal per reviewer that the profile then overrode — so the literals were
+# never actually used, silently rotted, and reading them misled anyone trying to
+# fix a model rename here. Both `poolside/laguna-m.1` and
+# `mistralai/devstral-2512` were delisted upstream while still named in this
+# file (PR #41). A missing `.model` now skips that reviewer loudly; a stale one
+# is worse than none, because agy silently serves its default on an unknown
+# string and OpenRouter answers 404 mid-round.
+#
+# The names below are the API-lane reviewers whose model comes from the profile.
+# Resolution happens after profile_get is defined, further down.
+model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
+                        devstral laguna kat north nemotron spark kimi27 kimi3)
 
 # Antigravity installs `agy` to $HOME/.local/bin. That directory isn't always
 # on $PATH for non-interactive shells (notably bash invocations from other
@@ -240,24 +223,13 @@ profile_get() {
 }
 profile_timeout() { profile_get "$1" timeout_s; }
 
-# Let reviewer_profiles.json `.model` override the built-in model strings, so an
-# agy model rename can be fixed without editing this script. Fall back to the
-# built-in default if the profile lacks a (non-empty) model.
-_am="$(profile_get antigravity model)"; [[ -n "$_am" ]] && antigravity_model="$_am"
-_gm="$(profile_get gemini-pro model)";  [[ -n "$_gm" ]] && gemini_pro_model="$_gm"
-_zm="$(profile_get glm model)";         [[ -n "$_zm" ]] && glm_model="$_zm"
-_dm="$(profile_get deepseek model)";    [[ -n "$_dm" ]] && deepseek_model="$_dm"
-_mm="$(profile_get mimo model)";        [[ -n "$_mm" ]] && mimo_model="$_mm"
-_xm="$(profile_get minimax model)";     [[ -n "$_xm" ]] && minimax_model="$_xm"
-_qw="$(profile_get qwen model)";        [[ -n "$_qw" ]] && qwen_model="$_qw"
-_dv="$(profile_get devstral model)";    [[ -n "$_dv" ]] && devstral_model="$_dv"
-_lg="$(profile_get laguna model)";      [[ -n "$_lg" ]] && laguna_model="$_lg"
-_kt="$(profile_get kat model)";         [[ -n "$_kt" ]] && kat_model="$_kt"
-_nm="$(profile_get north model)";       [[ -n "$_nm" ]] && north_model="$_nm"
-_vm="$(profile_get nemotron model)";    [[ -n "$_vm" ]] && nemotron_model="$_vm"
-_sp="$(profile_get spark model)";       [[ -n "$_sp" ]] && spark_model="$_sp"
-_k7="$(profile_get kimi27 model)";      [[ -n "$_k7" ]] && kimi27_model="$_k7"
-_k3="$(profile_get kimi3 model)";       [[ -n "$_k3" ]] && kimi3_model="$_k3"
+# Resolve every model string from the profile — the single source of truth (see
+# the note at the top of this file). A reviewer whose profile has no `.model`
+# ends up with an empty variable; run_agy_reviewer/run_openrouter_reviewer then
+# refuse to run it and say which file to edit, rather than guessing.
+for _r in "${model_backed_reviewers[@]}"; do
+  printf -v "${_r//-/_}_model" '%s' "$(profile_get "$_r" model)"
+done
 
 codex_profile="$(profile_timeout codex)"
 antigravity_profile="$(profile_timeout antigravity)"
@@ -721,6 +693,15 @@ run_openrouter_reviewer() {
   local slug="$1" model="$2" timeout_budget="$3"
   local endpoint="${4:-https://openrouter.ai/api/v1/chat/completions}"
   local cli="${5:-openrouter}"
+  # Model strings come only from reviewer_profiles.json; an empty one means the
+  # profile is missing `.model`. Fail loudly here instead of POSTing "" and
+  # reading a 404 as reviewer unreliability.
+  if [[ -z "$model" ]]; then
+    echo "$slug: no model configured — add \"model\" to references/reviewer_profiles.json (this script keeps no fallback copy)" >&2
+    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured"}\n' \
+      "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$cli" >"$out/${slug}.meta.json"
+    return 2
+  fi
   local key
   if [[ "$cli" == "moonshot" ]]; then
     if ! key="$(moonshot_key)"; then
@@ -934,6 +915,13 @@ agy_print_timeout() {
 #   $3 timeout_budget (seconds)
 run_agy_reviewer() {
   local slug="$1" model="$2" timeout_budget="$3"
+
+  if [[ -z "$model" ]]; then
+    echo "$slug: no model configured — add \"model\" to references/reviewer_profiles.json (this script keeps no fallback copy)" >&2
+    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured"}\n' \
+      "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "agy" >"$out/${slug}.meta.json"
+    return 2
+  fi
 
   # Quota sentinel: the two laps share one Google "Individual quota" (resets on
   # a ~2-day cadence — it will NOT recover within this run). If the sibling lap
@@ -1497,10 +1485,23 @@ install_agy_shell_gate() {
     # gate over the only backup, and this run's own cleanup would then restore
     # the gate permanently — reintroducing the exact bug the refcount fixes
     # (codex P1, PR #41 pass 2). An existing .orig always wins.
-    if [[ -f "$agy_gate_backup" ]]; then
+    # Which file is the user's? Decide from CONTENT, not from the mere presence
+    # of a backup: after a crash the user may have repaired hooks.json
+    # themselves, and blindly preferring the orphaned .orig would restore the
+    # older file over their newer one (codex P1, PR #41 pass 3). The on-disk
+    # file is the stale gate only if it still carries our rule.
+    local current_is_gate=""
+    if [[ -f "$agy_gate_file" ]] && grep -q 'cross-review-shell-gate' "$agy_gate_file" 2>/dev/null; then
+      current_is_gate=1
+    fi
+    if [[ -f "$agy_gate_backup" && ( -n "$current_is_gate" || ! -f "$agy_gate_file" ) ]]; then
+      # Crashed holder: hooks.json is its gate (or it removed the file), so
+      # .orig is still the user's real content. Keep the backup as-is.
       _agy_gate_write "$gate" "$agy_gate_file" "$agy_gate_backup" || \
         echo "WARN: could not install the agy shell gate at $agy_gate_file — the agy laps will fail with headless_permission_denied" >&2
     elif [[ -f "$agy_gate_file" ]]; then
+      # The current file is the user's — including the case where they edited
+      # it after a crash left an orphaned .orig behind. It becomes the original.
       cp "$agy_gate_file" "$agy_gate_backup" || { _agy_gate_unlock; agy_gate_file=""; return 0; }
       _agy_gate_write "$gate" "$agy_gate_file" "$agy_gate_backup" || \
         echo "WARN: could not install the agy shell gate at $agy_gate_file — the agy laps will fail with headless_permission_denied" >&2
@@ -1579,6 +1580,17 @@ done
 # NOTE: antigravity + gemini-pro both hit Google via agy — the stagger matters
 # more now that two reviewers share one provider, auth state, and rate limit.
 stagger_s=2
+
+# Warn about model slugs that have been delisted upstream before spending a
+# round on them. Advisory and cached (24h) — a dead slug otherwise shows up as a
+# 1-second 404 that reads like reviewer flakiness rather than stale config.
+for r in "${requested[@]}"; do
+  case "$r" in
+    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark)
+      bash "$script_dir/validate_or_models.sh" --no-fetch 2>&1 >/dev/null | head -5 >&2 || true
+      break ;;
+  esac
+done
 
 # Install the PreToolUse gate before dispatch if either Gemini lap is in the
 # roster — both laps run concurrently and share the one hooks.json.

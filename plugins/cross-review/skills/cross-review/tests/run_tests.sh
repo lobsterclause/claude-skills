@@ -992,6 +992,78 @@ for suite in test_json_output test_score_findings test_report_block test_digest;
   fi
 done
 
+echo "── model slugs have exactly one source of truth ──"
+# [pin: 2026-08-03 — run_reviewers.sh used to carry a literal `<slug>_model=`
+# per reviewer that reviewer_profiles.json then overrode. The literals were
+# therefore never used, rotted silently, and misled anyone fixing a rename in
+# the wrong file: poolside/laguna-m.1 and mistralai/devstral-2512 were both
+# delisted upstream while still named in the script. There must be no second
+# copy, and a reviewer with no profile model must fail loudly, not guess.]
+assert_eq "run_reviewers.sh carries no model-slug literals" \
+  "$(grep -cE '^[a-z0-9_]+_model="' "$SKILL_DIR/scripts/run_reviewers.sh" || true)" "0"
+assert_contains "models resolve from reviewer_profiles.json" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'profile_get "$_r" model'
+
+# A profile with no `.model` must skip the reviewer with a named failure_kind
+# rather than POSTing an empty model and reading the 404 as unreliability.
+jq 'del(.glm.model)' "$SKILL_DIR/references/reviewer_profiles.json" >"$T/profiles_nomodel.json"
+cp "$SKILL_DIR/references/reviewer_profiles.json" "$T/profiles.bak"
+cp "$T/profiles_nomodel.json" "$SKILL_DIR/references/reviewer_profiles.json"
+OPENROUTER_API_KEY=test-key bash "$S/run_reviewers.sh" --base main --out "$T/o17" --reviewers glm --timeout 60 >/dev/null 2>"$T/o17.err" || true
+cp "$T/profiles.bak" "$SKILL_DIR/references/reviewer_profiles.json"
+assert_eq "a reviewer with no profile model stamps no_model_configured" \
+  "$(jq -r '.failure_kind' "$T/o17/glm.meta.json" 2>/dev/null)" "no_model_configured"
+assert_contains "the skip names the file to edit" \
+  "$(cat "$T/o17.err")" "reviewer_profiles.json"
+
+echo "── delisted OpenRouter slugs are caught before the round ──"
+# [pin: 2026-08-03 — poolside/laguna-m.1 was delisted upstream and burned a
+# round as a 1s 404 that looked like reviewer flakiness. The validator turns
+# that into a preflight warning.]
+val_home="$T/valhome"
+mkdir -p "$val_home/.cross-review/cache"
+printf 'z-ai/glm-5.2\npoolside/laguna-s-2.1\n' >"$val_home/.cross-review/cache/or_models.txt"
+cat >"$T/val_profiles.json" <<'JSON'
+{
+  "glm":    { "cli": "openrouter", "model": "z-ai/glm-5.2" },
+  "laguna": { "cli": "openrouter", "model": "poolside/laguna-s-2.1" },
+  "ghost":  { "cli": "openrouter", "model": "vendor/deleted-model-9" },
+  "codex":  { "cli": "codex", "model": "n/a" }
+}
+JSON
+val_out="$(HOME="$val_home" OPENROUTER_API_KEY=test-key bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" 2>&1 >/dev/null)"
+assert_contains "validator warns about a delisted slug" "$val_out" "vendor/deleted-model-9"
+assert_eq "validator stays silent about live slugs" \
+  "$(printf '%s' "$val_out" | grep -c 'glm-5.2' || true)" "0"
+assert_eq "validator ignores non-OpenRouter lanes" \
+  "$(printf '%s' "$val_out" | grep -c 'codex' || true)" "0"
+assert_eq "--no-fetch with a cold cache is silent and exits 0" \
+  "$(HOME="$T/coldhome" OPENROUTER_API_KEY=test-key bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" --no-fetch 2>&1; echo "rc=$?")" "rc=0"
+assert_contains "the dispatch preflight never fetches (no HTTP in front of the reviewers)" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'validate_or_models.sh" --no-fetch'
+val_json="$(HOME="$val_home" OPENROUTER_API_KEY=test-key bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" --json 2>/dev/null)"
+assert_eq "validator reports the missing count in --json" \
+  "$(printf '%s' "$val_json" | jq -r '.missing')" "1"
+HOME="$val_home" OPENROUTER_API_KEY=test-key bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" --strict >/dev/null 2>&1
+assert_eq "--strict exits 1 when a slug is missing" "$?" "1"
+# Offline / no key must never block a round.
+assert_eq "no key → validator exits 0 and says nothing" \
+  "$(HOME="$T/emptyhome" OPENROUTER_API_KEY= bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" 2>&1; echo "rc=$?")" "rc=0"
+
+echo "── attempt-stamped artifacts never merge as a second reviewer ──"
+# [pin: 2026-08-03 — per-attempt forensics write <slug>.attempt<N>.stdout into
+# the same raw/ dir. merge_raw_findings globbed *.stdout, so those counted as
+# their own reviewer: for a JSON-emitting lane that would double-count findings
+# and manufacture convergence between <slug> and <slug>.attempt1.]
+mkdir -p "$T/rawdup"
+printf '{"findings":[{"severity":"High","file":"a.ts","line":1,"snippet":"x","claim":"dup me"}]}\n' >"$T/rawdup/spark.stdout"
+cp "$T/rawdup/spark.stdout" "$T/rawdup/spark.attempt1.stdout"
+bash "$SKILL_DIR/scripts/merge_raw_findings.sh" --raw "$T/rawdup" --out "$T/rawdup/merged.json" >/dev/null 2>&1 || true
+assert_eq "the same finding from an attempt copy is not merged twice" \
+  "$(jq '.findings | length' "$T/rawdup/merged.json" 2>/dev/null)" "1"
+assert_eq "sources name the reviewer once, not the attempt file too" \
+  "$(jq -r '.findings[0].sources | length' "$T/rawdup/merged.json" 2>/dev/null)" "1"
+
 echo "── agy shell gate is concurrency-safe (shared repo state) ──"
 # [pin: codex P2, PR #41 pass 1 — install/remove used to be a plain
 # backup-and-replace of the repo's shared .agents/hooks.json. Two runs against

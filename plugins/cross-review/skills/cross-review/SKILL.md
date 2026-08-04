@@ -59,7 +59,10 @@ Before spending tokens on a fresh round, glance at the last 10 runs to see if an
 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/analyze_runlog.sh --recent 10 --mode warn
+bash ~/.claude/skills/cross-review/scripts/validate_or_models.sh
 ```
+
+`validate_or_models.sh` checks every `cli: "openrouter"` model slug in `reviewer_profiles.json` against OpenRouter's live catalog (24h cache) and WARNs about any that have been delisted. A dead slug otherwise costs a whole round: the seat 404s in about a second and drops out, which reads as reviewer flakiness rather than stale config — `poolside/laguna-m.1` did exactly that on 2026-08-03, and `mistralai/devstral-2512` was silently queued to do the same. Fix the `model` field in the profile (the ONLY place slugs live) and re-run. This step is also what warms the cache: `run_reviewers.sh` re-checks at dispatch with `--no-fetch`, so no HTTP ever runs in front of the reviewers.
 
 If a warning prints (e.g. *"WARN: gemini-pro timed out 35% of last 10 runs — consider --timeout-gemini-pro 1100"*), surface it to the user and ask whether to apply the suggested override for this run. Do not auto-apply — surface-and-confirm only. If no warning, proceed silently.
 
