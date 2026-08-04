@@ -78,6 +78,50 @@ assert_eq "never-run reviewer gets rookie prior" \
 assert_eq "rookie flag set" \
   "$(jq -r '.[] | select(.reviewer=="nemotron") | .rookie' <<<"$LB")" "true"
 
+echo "── leaderboard.sh (zero-findings loophole: decaying telemetry-only prior) ──"
+# [pin: 2026-08-03, verified live — kat had 9/9 ok runs, p50 4s, ZERO findings
+# data ever, and scored 75 (reliability×0.75), ranking ABOVE kimi (score 65,
+# 39 runs, 22 real findings). The flat 0.75 discount was meant as a soft prior
+# for UNDER-OBSERVED reviewers to get drawn and earn real data — not a
+# permanent haven for sustained non-engagement. A reviewer that reliably
+# returns nothing in 4s must not outrank one that actually finds bugs.]
+KATLOG="$T/kat-runlog.jsonl"
+cat >"$KATLOG" <<'EOF'
+{"ts":"2026-07-25T01:00:00Z","reviewers":{"kat":{"status":"ok","exit_code":0,"duration_s":3,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T02:00:00Z","reviewers":{"kat":{"status":"ok","exit_code":0,"duration_s":4,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T03:00:00Z","reviewers":{"kat":{"status":"ok","exit_code":0,"duration_s":4,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T04:00:00Z","reviewers":{"kat":{"status":"ok","exit_code":0,"duration_s":4,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T05:00:00Z","reviewers":{"kat":{"status":"ok","exit_code":0,"duration_s":5,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T06:00:00Z","reviewers":{"kat":{"status":"ok","exit_code":0,"duration_s":3,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T07:00:00Z","reviewers":{"kat":{"status":"ok","exit_code":0,"duration_s":4,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T08:00:00Z","reviewers":{"kat":{"status":"ok","exit_code":0,"duration_s":5,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T09:00:00Z","reviewers":{"kat":{"status":"ok","exit_code":0,"duration_s":4,"output_bytes":40,"timeout_budget_s":300}}}
+EOF
+KATLB="$(CROSS_REVIEW_RUNLOG="$KATLOG" bash "$S/leaderboard.sh" --mode json)"
+assert_eq "T1 setup: kat-shaped reviewer has 9/9 ok attempts" \
+  "$(jq -r '.[] | select(.reviewer=="kat") | .attempts' <<<"$KATLB")" "9"
+assert_eq "T1 setup: kat-shaped reviewer p50 matches real shape (4s)" \
+  "$(jq -r '.[] | select(.reviewer=="kat") | .p50_duration_s' <<<"$KATLB")" "4"
+KATSCORE="$(jq -r '.[] | select(.reviewer=="kat") | .score' <<<"$KATLB")"
+if [[ "$KATSCORE" =~ ^-?[0-9]+$ ]] && [[ "$KATSCORE" -lt 50 ]]; then
+  ok "T1: >=8 ok runs with zero findings data ever scores below rookie prior 50 (got $KATSCORE)"
+else
+  bad "T1: >=8 ok runs with zero findings data ever scores below rookie prior 50 (got: '$KATSCORE' want: <50)"
+fi
+
+# T2: a genuine under-observed rookie (<=3 ok runs, no findings data) must
+# keep the soft prior — new seats earning their first few runs must not be
+# nuked by the decay meant for sustained non-engagement.
+ROOKIELOG="$T/rookie-runlog.jsonl"
+cat >"$ROOKIELOG" <<'EOF'
+{"ts":"2026-07-25T01:00:00Z","reviewers":{"spark":{"status":"ok","exit_code":0,"duration_s":30,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T02:00:00Z","reviewers":{"spark":{"status":"ok","exit_code":0,"duration_s":32,"output_bytes":40,"timeout_budget_s":300}}}
+{"ts":"2026-07-25T03:00:00Z","reviewers":{"spark":{"status":"ok","exit_code":0,"duration_s":31,"output_bytes":40,"timeout_budget_s":300}}}
+EOF
+ROOKIELB="$(CROSS_REVIEW_RUNLOG="$ROOKIELOG" bash "$S/leaderboard.sh" --mode json)"
+assert_eq "T2: under-observed rookie (<=3 ok runs, no findings) keeps rel×0.75" \
+  "$(jq -r '.[] | select(.reviewer=="spark") | .score' <<<"$ROOKIELB")" "75"
+
 echo "── append_runlog.sh (status classification + enrichment) ──"
 # [pin: fugu pass-1 High FALSIFIED — missing meta must be skipped, not failed]
 RUN="$T/run1"; mkdir -p "$RUN/raw"
