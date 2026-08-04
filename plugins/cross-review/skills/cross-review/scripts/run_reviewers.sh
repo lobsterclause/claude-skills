@@ -73,9 +73,10 @@
 # is exempt: `codex exec review --base` does its own diffing internally and
 # never gets a text-embedded diff to swap out (see the review_prompt note
 # above run_codex). agy-lap exception (antigravity/gemini-pro): agy's -p is
-# argv-only, so snapshots over the 90KB argv budget are refused with a
-# stderr WARN and that lap falls back to the raw diff — never silently
-# truncated (see the size gate in run_agy_reviewer). Omitting --snapshot-dir
+# argv-only, so a snapshot whose ASSEMBLED prompt would exceed the 100KB
+# argv guard is refused with a stderr WARN and that lap falls back to the
+# raw diff — never silently truncated (in practice keep agy snapshots under
+# ~90KB; see the size gate in run_agy_reviewer). Omitting --snapshot-dir
 # reproduces today's behavior byte-for-byte.
 #
 # Writes:
@@ -1040,29 +1041,27 @@ run_agy_reviewer() {
   if snapshot_path="$(snapshot_for "$slug")"; then
     using_snapshot=true
   fi
-  # agy-only snapshot size gate: agy's -p is argv-only (no stdin or prompt-file
-  # mode — references/cli_flags.md; stdin must stay closed or agy blocks), and
-  # the argv guard below truncates the assembled prompt at 100KB. Silently
-  # truncating a snapshot would break --snapshot-dir's "passed whole" contract
-  # (cross-review 2026-08-03, codex High), so an oversized snapshot is refused
-  # LOUDLY here and the lap falls back to the raw-diff path, whose truncation
-  # behavior is pre-existing and documented. 90KB leaves ~10KB headroom for
-  # the prompt scaffolding around the content block.
-  local agy_snapshot_max=90000 snapshot_bytes=0
-  if [[ "$using_snapshot" == true ]]; then
-    snapshot_bytes="$(wc -c < "$snapshot_path" 2>/dev/null | tr -d ' ')"
-    if [[ "${snapshot_bytes:-0}" -gt "$agy_snapshot_max" ]]; then
-      echo "$slug: snapshot $(basename "$snapshot_path") is ${snapshot_bytes} bytes — exceeds the ${agy_snapshot_max}-byte agy argv budget (MAX_ARG_STRLEN; agy has no stdin/file prompt mode), falling back to the raw diff" >&2
-      using_snapshot=false
-    fi
-  fi
   # Context block uses the same XML-ish <snapshot>/<diff> tag scheme as
   # run_kimi and run_openrouter_reviewer, with the closing-tag defuse: a
   # markdown fence closes early when the embedded content itself contains a
   # triple-backtick line — which diffs and snapshots legitimately do — and an
   # early-closed fence doubles as a prompt-injection surface (cross-review
   # 2026-08-03, kimi+nemotron convergent Medium).
+  #
+  # The while-loop is the agy-only snapshot size gate. agy's -p is argv-only
+  # (no stdin or prompt-file mode — references/cli_flags.md; stdin must stay
+  # closed or agy blocks), and the argv guard below truncates the assembled
+  # prompt at 100KB. Silently truncating a snapshot would break
+  # --snapshot-dir's "passed whole" contract (cross-review 2026-08-03, codex
+  # High), so the gate measures the FULL assembled prompt — not the snapshot
+  # file against an assumed scaffolding headroom, which both refuses
+  # snapshots that actually fit and admits ones the guard then silently
+  # truncates (pass-2, codex P1) — and on overflow refuses the snapshot
+  # LOUDLY, then loops once more to rebuild on the raw-diff path, whose
+  # truncation behavior is pre-existing and documented. Runs at most twice.
   local context_label context_tag_open context_tag_close context_intro
+  local full_prompt
+  while :; do
   if [[ "$using_snapshot" == true ]]; then
     diff_full="$(cat "$snapshot_path" 2>/dev/null || true)"
     # Defuse a literal closing tag inside untrusted snapshot content — same
@@ -1095,7 +1094,6 @@ run_agy_reviewer() {
     context_tag_close="</diff>"
     context_intro="The full diff is included above."
   fi
-  local full_prompt
   full_prompt="$review_prompt
 
 Changed files (diff --stat against $base):
@@ -1107,6 +1105,14 @@ $diff_full
 $context_tag_close
 
 $context_intro HARD CONSTRAINT: you are running headless with no interactive permission prompt, so ANY shell/terminal command you attempt that is not pre-approved is auto-denied and immediately terminates your run with zero output — the whole review is lost. Do NOT run git, jq, printf, echo, or any other shell command, not even to orient yourself or to validate your own output, and do NOT go looking for the repository — it is already mounted in your workspace at $repo_root. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools (read/view/search-file) only — those are a different permission category and are not gated this way. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
+
+  if [[ "$using_snapshot" == true && ${#full_prompt} -gt 100000 ]]; then
+    echo "$slug: snapshot $(basename "$snapshot_path") makes the assembled prompt ${#full_prompt} bytes — exceeds the 100KB argv guard (agy -p is argv-only; MAX_ARG_STRLEN), falling back to the raw diff" >&2
+    using_snapshot=false
+    continue
+  fi
+  break
+  done
 
   # argv guard (issue #7): Linux caps a single argv element at ~128KB
   # (MAX_ARG_STRLEN). Embedding the full diff (not just --stat) makes this
