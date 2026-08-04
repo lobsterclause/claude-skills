@@ -11,10 +11,28 @@
 #   noise       = dropped / findings                (findings the fact-check
 #                                                    pass disproved from the diff)
 #   with findings data:  score = 100*(0.45*reliability + 0.35*signal + 0.20*(1-noise))
-#   telemetry-only:      score = 100*reliability*0.75      (quality unknown → discount)
+#   telemetry-only:      score = 100*reliability*multiplier   (quality unknown →
+#                                                    discount; multiplier starts
+#                                                    at 0.75 for <=3 ok runs and
+#                                                    decays 0.06/ok-run beyond
+#                                                    that, floor 0.15 — a soft
+#                                                    prior for UNDER-OBSERVED
+#                                                    reviewers, not a permanent
+#                                                    haven for reviewers that
+#                                                    reliably return nothing;
+#                                                    see 2026-08-03 kat pin below)
 #   never attempted:     score = 50                        (rookie prior — optimistic
 #                                                    init so new reviewers get drawn
 #                                                    and earn real data)
+#
+# [pin: 2026-08-03 — kat had 9/9 ok runs, p50 4s, ZERO findings data ever and
+# scored a flat 75 (reliability×0.75), ranking ABOVE kimi (score 65, 39 runs,
+# 22 real findings). A reviewer that reliably returns nothing in 4 seconds
+# must not outrank one that actually finds bugs — the flat discount only
+# decays a reviewer once it's had a real chance to accumulate findings data
+# and hasn't (see "telemetry-only" branch in score_reviewer below). Reviewers
+# that WERE enriched (findings_total present, even 0) are not decayed by this
+# path — they were actually reviewed and legitimately found nothing.]
 #
 # KNOWN LIMITATION: signal rewards agreeing with the crowd — a reviewer that
 # uniquely finds real bugs scores low on signal until others corroborate.
@@ -135,11 +153,24 @@ score_reviewer() {
     | ($attempts | map(.duration_s // 0) | sort) as $durs
     | ($durs | length) as $dn
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
+    # Telemetry-only multiplier: 0.75 is a soft prior for reviewers not yet
+    # observed enough to score on findings quality. Left flat, it became a
+    # permanent haven for reviewers that reliably return NOTHING — see the
+    # 2026-08-03 kat pin at the top of this file. It decays 0.06 per ok run
+    # beyond the first 3, floored at 0.15, so sustained findings-free
+    # engagement (>=8 ok runs) drops the score below the rookie prior (50).
+    # Only applies when NO attempt has ever been enriched ($scored empty) —
+    # a reviewer that WAS enriched and genuinely found nothing
+    # (findings_total: 0 recorded) was actually reviewed and is not decayed.
+    | (if $ok > 3 then (0.75 - 0.06 * ($ok - 3)) else 0.75 end) as $telemetry_mult_raw
+    | (if $telemetry_mult_raw < 0.15 then 0.15 else $telemetry_mult_raw end) as $telemetry_mult
     | (if $n == 0 then 50
        elif $findings > 0 then
          (100 * (0.45 * $rel
                  + 0.35 * ($convergent / $findings)
                  + 0.20 * (1 - ($dropped / $findings)))) | round
+       elif ($scored | length) == 0 then
+         (100 * $rel * $telemetry_mult) | round
        else (100 * $rel * 0.75) | round
        end) as $score
     | { reviewer: $r,
@@ -178,7 +209,8 @@ case "$mode" in
     '
     echo "──"
     echo "  score = 45% reliability + 35% cross-provider convergence + 20% fact-check survival"
-    echo "  (telemetry-only reviewers: reliability × 0.75 · never-run reviewers: rookie prior 50)"
+    echo "  (telemetry-only, never enriched: reliability × decaying prior — 0.75 for <=3 ok"
+    echo "   runs, -0.06/run beyond that, floor 0.15 · never-run reviewers: rookie prior 50)"
     ;;
   *)
     echo "unknown mode: $mode (use table|json)" >&2
