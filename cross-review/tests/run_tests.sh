@@ -1037,6 +1037,21 @@ wait "$gate_p3" "$gate_p4" 2>/dev/null || true
 assert_eq "overlapping runs leave no stale gate behind" \
   "$([[ -f "$REPO/.agents/hooks.json" ]] && echo LEFTOVER || echo clean)" "clean"
 
+# (c2) crash recovery: when every registered holder is dead, hooks.json on disk
+#      is the dead run's GATE and .cross-review-gate.orig is the user's real
+#      file. The new run must not mistake the gate for the original, or its own
+#      cleanup restores the gate permanently.
+#      [pin: codex P1, PR #41 pass 2]
+mkdir -p "$REPO/.agents"
+printf '{"my-own-hook": {"PreToolUse": []}}\n' >"$REPO/.agents/.cross-review-gate.orig"
+crash_orig_sum="$(shasum "$REPO/.agents/.cross-review-gate.orig" | awk '{print $1}')"
+printf '{"cross-review-shell-gate": {"PreToolUse": []}}\n' >"$REPO/.agents/hooks.json"
+printf '999999\n' >"$REPO/.agents/.cross-review-gate.holders"   # PID that cannot be alive
+bash "$S/run_reviewers.sh" --base main --out "$T/oc6" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "crash recovery restores the user's ORIGINAL hooks.json, not the stale gate" \
+  "$(shasum "$REPO/.agents/hooks.json" 2>/dev/null | awk '{print $1}')" "$crash_orig_sum"
+rm -rf "$REPO/.agents"
+
 # (c) a live holder must keep the gate installed — the last run out restores.
 mkdir -p "$REPO/.agents"
 sleep 120 & gate_live_pid=$!

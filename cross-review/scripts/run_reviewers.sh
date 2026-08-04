@@ -1377,7 +1377,14 @@ _agy_gate_lock() {
   until mkdir "$agy_gate_lockdir" 2>/dev/null; do
     # Reclaim a lock abandoned by a crashed run rather than blocking forever.
     if [[ -n "$(find "$agy_gate_lockdir" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then
-      rmdir "$agy_gate_lockdir" 2>/dev/null || true
+      # Rename, then delete. `mv` of a directory is atomic, so when two runs
+      # both see the same stale lock exactly one wins the rename; the loser
+      # falls back to waiting instead of deleting a lock the winner has just
+      # re-taken (kimi Medium, PR #41 pass 2). Deleting in place would have
+      # that second run remove a live lock.
+      if mv "$agy_gate_lockdir" "$agy_gate_lockdir.stale.$$" 2>/dev/null; then
+        rm -rf "$agy_gate_lockdir.stale.$$" 2>/dev/null || true
+      fi
       continue
     fi
     sleep 0.2
@@ -1484,13 +1491,24 @@ install_agy_shell_gate() {
   local live=""
   [[ -f "$agy_gate_holders" ]] && live="$(_agy_gate_live_holders "$agy_gate_holders")"
   if [[ -z "$live" ]]; then
-    # First live holder: preserve the repo's own hooks.json, then write the gate.
-    rm -f "$agy_gate_backup" 2>/dev/null || true
-    if [[ -f "$agy_gate_file" ]]; then
+    # First live holder. THE ORDER MATTERS: when every registered holder has
+    # crashed, hooks.json is that dead run's GATE and .orig is the user's real
+    # file. Treating the on-disk hooks.json as the original there would copy the
+    # gate over the only backup, and this run's own cleanup would then restore
+    # the gate permanently — reintroducing the exact bug the refcount fixes
+    # (codex P1, PR #41 pass 2). An existing .orig always wins.
+    if [[ -f "$agy_gate_backup" ]]; then
+      _agy_gate_write "$gate" "$agy_gate_file" "$agy_gate_backup" || \
+        echo "WARN: could not install the agy shell gate at $agy_gate_file — the agy laps will fail with headless_permission_denied" >&2
+    elif [[ -f "$agy_gate_file" ]]; then
       cp "$agy_gate_file" "$agy_gate_backup" || { _agy_gate_unlock; agy_gate_file=""; return 0; }
-      _agy_gate_write "$gate" "$agy_gate_file" "$agy_gate_backup" || true
+      _agy_gate_write "$gate" "$agy_gate_file" "$agy_gate_backup" || \
+        echo "WARN: could not install the agy shell gate at $agy_gate_file — the agy laps will fail with headless_permission_denied" >&2
     else
-      _agy_gate_write "$gate" "$agy_gate_file" || true
+      # A failed write here is silent otherwise, and an absent gate means every
+      # agy lap dies at 0 bytes (deepseek Medium, PR #41 pass 2).
+      _agy_gate_write "$gate" "$agy_gate_file" || \
+        echo "WARN: could not install the agy shell gate at $agy_gate_file — the agy laps will fail with headless_permission_denied" >&2
     fi
   fi
   printf '%s\n%s\n' "$live" "$$" | grep -v '^$' >"$agy_gate_holders" 2>/dev/null || true
