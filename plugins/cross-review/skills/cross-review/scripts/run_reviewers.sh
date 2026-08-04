@@ -902,6 +902,13 @@ agy_soft_denied() {
   return 1
 }
 
+# NOTE ON THE STRING MATCHERS BELOW: agy_soft_denied/agy_print_timeout key off
+# agy's human-readable output, verified against agy 1.1.8-1.1.10. A future
+# wording change does not break the run — it degrades that failure back to the
+# generic empty_output/failed bucket, which reads as "re-auth" when the truth is
+# something else. If a lap starts failing with a null failure_kind, diff agy's
+# current stderr against these strings before believing the bucket (kimi Low,
+# PR #41 pass 1).
 # agy_print_timeout <stderr_file> — true when agy gave up waiting for the model
 # and exited on its OWN --print-timeout rather than being killed by the wrapper.
 # Signature (verified 2026-08-03, agy 1.1.8): rc=1, 0 bytes stdout, stderr is
@@ -1350,6 +1357,85 @@ agy_gate_repo_root=""
 agy_gate_file=""
 agy_gate_backup=""
 agy_gate_made_dir=""
+agy_gate_lockdir=""
+agy_gate_holders=""
+
+# The gate file is shared repo state, so install/remove are reference-counted
+# under a lock. Without that, two runs against the SAME repo corrupt each other:
+# run A installs, run B backs up A's temporary gate as if it were the user's
+# file, A exits and restores the real original (killing B's gate mid-review),
+# then B exits and restores A's temporary gate PERMANENTLY — leaving a stale
+# hook that rewrites every command to `echo` for every agy session in that repo.
+# (codex P2, PR #41 pass 1. Ordinary rounds each get their own worktree so the
+# repo root differs, but direct invocations and splitstream shards sharing a
+# checkout are exposed.) The lock is an atomic mkdir — flock is not portable to
+# the macOS default bash. The holders file names the live runs; the last one out
+# restores. Both files live beside hooks.json so any holder can finish the job
+# if the run that installed died.
+_agy_gate_lock() {
+  local n=0
+  until mkdir "$agy_gate_lockdir" 2>/dev/null; do
+    # Reclaim a lock abandoned by a crashed run rather than blocking forever.
+    if [[ -n "$(find "$agy_gate_lockdir" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then
+      rmdir "$agy_gate_lockdir" 2>/dev/null || true
+      continue
+    fi
+    sleep 0.2
+    n=$((n + 1))
+    [[ $n -gt 150 ]] && return 1   # 30s
+  done
+  return 0
+}
+
+_agy_gate_unlock() { rmdir "$agy_gate_lockdir" 2>/dev/null || true; }
+
+# Drop PIDs whose process is gone — a crashed holder must not pin the gate in
+# the repo forever.
+_agy_gate_live_holders() {
+  local pid
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+  done <"$1" 2>/dev/null
+}
+
+# Emit the gate hooks.json. With jq (always, not just when merging — the
+# heredoc path used to interpolate $gate into JSON unescaped, so a path with a
+# quote or backslash produced invalid JSON and the gate silently failed to
+# install: kimi27 Medium, PR #41 pass 1). The heredoc survives only as the
+# no-jq fallback, where that limitation is unavoidable and now documented.
+_agy_gate_write() {
+  local gate="$1" dest="$2" merge_from="${3:-}"
+  local rule='{"cross-review-shell-gate": {"PreToolUse": [{"matcher": "run_command", "hooks": [{"type": "command", "command": $cmd, "timeout": 10}]}]}}'
+  if command -v jq >/dev/null 2>&1; then
+    if [[ -n "$merge_from" && -f "$merge_from" ]]; then
+      jq --arg cmd "$gate" ". + $rule" "$merge_from" >"$dest" 2>/dev/null && return 0
+      cp "$merge_from" "$dest" 2>/dev/null || true
+      return 1
+    fi
+    jq -n --arg cmd "$gate" "$rule" >"$dest" 2>/dev/null && return 0
+    return 1
+  fi
+  case "$gate" in
+    *'"'*|*'\'*)
+      echo "WARN: no jq and the gate path contains a quote or backslash ($gate) — cannot emit valid hooks.json; the agy laps will fail with headless_permission_denied. Install jq." >&2
+      return 1 ;;
+  esac
+  cat >"$dest" <<EOF
+{
+  "cross-review-shell-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          { "type": "command", "command": "$gate", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+EOF
+}
 
 install_agy_shell_gate() {
   local gate
@@ -1379,46 +1465,68 @@ install_agy_shell_gate() {
     fi
   fi
   agy_gate_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-  agy_gate_file="$agy_gate_repo_root/.agents/hooks.json"
-  if [[ ! -d "$agy_gate_repo_root/.agents" ]]; then
-    mkdir -p "$agy_gate_repo_root/.agents" 2>/dev/null || { agy_gate_file=""; return 0; }
+  local agents_dir="$agy_gate_repo_root/.agents"
+  agy_gate_file="$agents_dir/hooks.json"
+  if [[ ! -d "$agents_dir" ]]; then
+    mkdir -p "$agents_dir" 2>/dev/null || { agy_gate_file=""; return 0; }
     agy_gate_made_dir=1
   fi
-  if [[ -f "$agy_gate_file" ]]; then
-    agy_gate_backup="$out/agy_hooks.json.orig"
-    cp "$agy_gate_file" "$agy_gate_backup" || { agy_gate_file=""; return 0; }
+  agy_gate_lockdir="$agents_dir/.cross-review-gate.lock"
+  agy_gate_holders="$agents_dir/.cross-review-gate.holders"
+  agy_gate_backup="$agents_dir/.cross-review-gate.orig"
+
+  if ! _agy_gate_lock; then
+    echo "WARN: another cross-review run has held the agy gate lock at $agy_gate_lockdir for 30s — skipping gate install; the agy laps in this round will likely fail with headless_permission_denied" >&2
+    agy_gate_file=""
+    return 0
   fi
-  if [[ -n "$agy_gate_backup" ]] && command -v jq >/dev/null 2>&1; then
-    # Preserve the repo's own hooks — merge ours in under its own key.
-    jq --arg cmd "$gate" '. + {"cross-review-shell-gate": {"PreToolUse": [{"matcher": "run_command", "hooks": [{"type": "command", "command": $cmd, "timeout": 10}]}]}}' \
-      "$agy_gate_backup" >"$agy_gate_file" 2>/dev/null || cp "$agy_gate_backup" "$agy_gate_file"
-  else
-    cat >"$agy_gate_file" <<EOF
-{
-  "cross-review-shell-gate": {
-    "PreToolUse": [
-      {
-        "matcher": "run_command",
-        "hooks": [
-          { "type": "command", "command": "$gate", "timeout": 10 }
-        ]
-      }
-    ]
-  }
-}
-EOF
+
+  local live=""
+  [[ -f "$agy_gate_holders" ]] && live="$(_agy_gate_live_holders "$agy_gate_holders")"
+  if [[ -z "$live" ]]; then
+    # First live holder: preserve the repo's own hooks.json, then write the gate.
+    rm -f "$agy_gate_backup" 2>/dev/null || true
+    if [[ -f "$agy_gate_file" ]]; then
+      cp "$agy_gate_file" "$agy_gate_backup" || { _agy_gate_unlock; agy_gate_file=""; return 0; }
+      _agy_gate_write "$gate" "$agy_gate_file" "$agy_gate_backup" || true
+    else
+      _agy_gate_write "$gate" "$agy_gate_file" || true
+    fi
   fi
+  printf '%s\n%s\n' "$live" "$$" | grep -v '^$' >"$agy_gate_holders" 2>/dev/null || true
+  _agy_gate_unlock
 }
 
 remove_agy_shell_gate() {
   [[ -n "$agy_gate_file" ]] || return 0
-  if [[ -n "$agy_gate_backup" && -f "$agy_gate_backup" ]]; then
-    mv "$agy_gate_backup" "$agy_gate_file" 2>/dev/null || true
+  local file="$agy_gate_file"
+  agy_gate_file=""   # idempotent: a second call is a no-op even if we bail below
+  _agy_gate_lock || {
+    echo "WARN: could not take the agy gate lock to clean up $file — remove it by hand if it is still there" >&2
+    return 0
+  }
+  local live="" me="$$"
+  [[ -f "$agy_gate_holders" ]] && live="$(_agy_gate_live_holders "$agy_gate_holders" | grep -v "^${me}$" || true)"
+  if [[ -n "$live" ]]; then
+    # Another run is still reviewing — leave its gate alone.
+    printf '%s\n' "$live" >"$agy_gate_holders" 2>/dev/null || true
+    _agy_gate_unlock
+    return 0
+  fi
+  rm -f "$agy_gate_holders" 2>/dev/null || true
+  if [[ -f "$agy_gate_backup" ]]; then
+    # A failed restore silently leaves the user's hooks.json replaced by the
+    # gate, so fall back to cp and say so rather than swallowing it (kimi Low,
+    # PR #41 pass 1).
+    if ! mv "$agy_gate_backup" "$file" 2>/dev/null; then
+      cp "$agy_gate_backup" "$file" 2>/dev/null && rm -f "$agy_gate_backup" 2>/dev/null || \
+        echo "WARN: could not restore your original $file — a copy is at $agy_gate_backup" >&2
+    fi
   else
-    rm -f "$agy_gate_file" 2>/dev/null || true
+    rm -f "$file" 2>/dev/null || true
     [[ -n "$agy_gate_made_dir" ]] && rmdir "$agy_gate_repo_root/.agents" 2>/dev/null || true
   fi
-  agy_gate_file=""
+  _agy_gate_unlock
 }
 
 cleanup_run() {

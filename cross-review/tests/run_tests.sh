@@ -992,27 +992,104 @@ for suite in test_json_output test_score_findings test_report_block test_digest;
   fi
 done
 
+echo "── agy shell gate is concurrency-safe (shared repo state) ──"
+# [pin: codex P2, PR #41 pass 1 — install/remove used to be a plain
+# backup-and-replace of the repo's shared .agents/hooks.json. Two runs against
+# the same repo would interleave: A installs, B backs up A's temporary gate as
+# if it were the user's file, A restores the real original (killing B's gate
+# mid-review), B restores A's temporary gate PERMANENTLY — leaving a hook that
+# rewrites every command to `echo` for every agy session in that repo. The fix
+# is a lock + holder refcount; these tests pin the two outcomes that matter.]
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-3.1-pro-high\n"; exit 0; fi
+sleep 2
+printf 'shim review: no findings\n'
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+
+# (a) with a pre-existing hooks.json, two overlapping runs must both finish and
+#     leave the user's file byte-identical.
+mkdir -p "$REPO/.agents"
+printf '{"my-own-hook": {"PreToolUse": []}}\n' >"$REPO/.agents/hooks.json"
+gate_orig_sum="$(shasum "$REPO/.agents/hooks.json" | awk '{print $1}')"
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc1" --reviewers antigravity --timeout 60 >/dev/null 2>&1 ) &
+gate_p1=$!
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc2" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 ) &
+gate_p2=$!
+wait "$gate_p1" "$gate_p2" 2>/dev/null || true
+assert_eq "overlapping runs leave the repo's own hooks.json untouched" \
+  "$(shasum "$REPO/.agents/hooks.json" 2>/dev/null | awk '{print $1}')" "$gate_orig_sum"
+assert_eq "no gate rule is left behind in the user's hooks.json" \
+  "$(grep -c 'cross-review-shell-gate' "$REPO/.agents/hooks.json" 2>/dev/null || true)" "0"
+assert_eq "no holder/lock residue after both runs" \
+  "$(ls -A "$REPO/.agents" 2>/dev/null | grep -c 'cross-review-gate' || true)" "0"
+rm -f "$REPO/.agents/hooks.json"; rmdir "$REPO/.agents" 2>/dev/null || true
+
+# (b) with no pre-existing hooks.json, two overlapping runs must remove the
+#     gate entirely — a stale gate silently neuters every agy session there.
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc3" --reviewers antigravity --timeout 60 >/dev/null 2>&1 ) &
+gate_p3=$!
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc4" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 ) &
+gate_p4=$!
+wait "$gate_p3" "$gate_p4" 2>/dev/null || true
+assert_eq "overlapping runs leave no stale gate behind" \
+  "$([[ -f "$REPO/.agents/hooks.json" ]] && echo LEFTOVER || echo clean)" "clean"
+
+# (c) a live holder must keep the gate installed — the last run out restores.
+mkdir -p "$REPO/.agents"
+sleep 120 & gate_live_pid=$!
+printf '%s\n' "$gate_live_pid" >"$REPO/.agents/.cross-review-gate.holders"
+printf '{"cross-review-shell-gate": {"PreToolUse": []}}\n' >"$REPO/.agents/hooks.json"
+bash "$S/run_reviewers.sh" --base main --out "$T/oc5" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "a run does not tear down a gate another live run is using" \
+  "$([[ -f "$REPO/.agents/hooks.json" ]] && echo kept || echo REMOVED)" "kept"
+kill "$gate_live_pid" 2>/dev/null || true
+rm -rf "$REPO/.agents"
+
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\nprintf "shim review: no findings\\n"\n' >"$T/bin/agy"
+chmod +x "$T/bin/agy"
+
+echo "── agy gate message survives an apostrophe (shell quoting) ──"
+# [pin: kimi Medium, PR #41 pass 1 — the message used to be hand-wrapped in bare
+# single quotes, so editing it to contain an apostrophe would emit a malformed
+# command line. Mutate the message and prove the emitted command is still valid.]
+sed "s/^msg='SHELL DISABLED:/msg='don'\\''t run this; SHELL DISABLED:/" \
+  "$SKILL_DIR/scripts/agy_shell_gate.sh" >"$T/gate_apos.sh"
+chmod +x "$T/gate_apos.sh"
+apos_out="$(printf '%s' '{"toolCall":{}}' | bash "$T/gate_apos.sh" 2>/dev/null)"
+apos_cmd="$(printf '%s' "$apos_out" | jq -r '.overwrite.CommandLine' 2>/dev/null)"
+assert_eq "gate JSON still parses with an apostrophe in the message" \
+  "$(printf '%s' "$apos_out" | jq -r '.decision' 2>/dev/null)" "allow"
+if bash -n -c "$apos_cmd" 2>/dev/null; then
+  ok "generated echo is valid shell with an apostrophe in the message"
+else
+  bad "an apostrophe in the gate message produces a malformed command line"
+fi
+
 echo "── agy model detection survives the models-listing rename ──"
 # [pin: 2026-08-03 — agy 1.1.10 changed `agy models` from display names
 # ("Gemini 3.1 Pro (High)") to slugs ("gemini-3.1-pro-high"). The detection
 # grep matched only the old shape, so gemini-pro silently false-negatived out
 # of every roster while the lap itself was perfectly healthy. Both shapes must
 # match, in detect_reviewers.sh AND select_roster.sh.]
-det_cache="$HOME/.cross-review/cache/agy_models.txt"
-det_saved=""
-if [[ -f "$det_cache" ]]; then det_saved="$T/agy_models.saved"; cp "$det_cache" "$det_saved"; fi
+# Run the probe against a throwaway HOME so the fixtures never touch the real
+# ~/.cross-review/cache — an interrupted run used to leave a fake model listing
+# behind that later rounds would trust (kimi27 Low, PR #41 pass 1).
+det_home="$T/dethome"
+det_cache="$det_home/.cross-review/cache/agy_models.txt"
 mkdir -p "$(dirname "$det_cache")"
 for shape in "Gemini 3.1 Pro (High)" "gemini-3.1-pro-high"; do
   printf 'gemini-3.5-flash-high\n%s\n' "$shape" >"$det_cache"
   assert_eq "detect_reviewers sees gemini-pro in '$shape' listing" \
-    "$(PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "true"
+    "$(HOME="$det_home" PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "true"
 done
 # A listing with no Pro entry at all must still report false — the match must
 # not have been widened into "always true".
 printf 'gemini-3.5-flash-high\ngemini-3.6-flash-low\n' >"$det_cache"
 assert_eq "detect_reviewers reports gemini-pro false when no Pro model is listed" \
-  "$(PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "false"
-if [[ -n "$det_saved" ]]; then cp "$det_saved" "$det_cache"; else rm -f "$det_cache"; fi
+  "$(HOME="$det_home" PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "false"
 assert_contains "select_roster matches the slug shape too" \
   "$(cat "$SKILL_DIR/scripts/select_roster.sh")" 'gemini[ ._-]?3'
 

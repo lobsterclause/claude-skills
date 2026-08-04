@@ -41,5 +41,10 @@ msg='SHELL DISABLED: this is a read-only code review running headless, so no she
 # escalated one the model sometimes picks (verified 2026-08-03). Those two
 # rules are the entire global footprint of this fix; run_reviewers.sh warns
 # when either is absent.
+# Shell-quote the message for the `echo` agy will run (every embedded single
+# quote becomes '\'' — the message is static today, but hand-wrapping it in
+# bare single quotes made an apostrophe a latent syntax break: kimi Medium,
+# PR #41 pass 1), then JSON-escape the result for the hook payload.
+shell_quoted="'$(printf '%s' "$msg" | sed "s/'/'\\\\''/g")'"
 printf '{"decision":"allow","reason":"read-only review sandbox: run_command is disabled","overwrite":{"CommandLine":"echo %s"}}\n' \
-  "$(printf '%s' "'$msg'" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  "$(printf '%s' "$shell_quoted" | sed 's/\\/\\\\/g; s/"/\\"/g')"
