@@ -82,7 +82,10 @@ if has agy; then
     fi
   fi
   if [[ -s "$models_cache" ]]; then
-    if grep -qi 'Gemini 3.1 Pro' "$models_cache"; then gemini_pro=true; fi
+    # agy 1.1.10 changed `agy models` output from display names
+    # ("Gemini 3.1 Pro (High)") to slugs ("gemini-3.1-pro-high"), which
+    # false-negatived gemini-pro out of every roster. Match either shape.
+    if grep -Eqi 'gemini[ ._-]?3\.1[ ._-]?pro' "$models_cache"; then gemini_pro=true; fi
   else
     gemini_pro=true
   fi

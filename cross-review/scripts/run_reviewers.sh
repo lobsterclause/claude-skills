@@ -138,37 +138,20 @@ timeout_gemini_pro=""
 timeout_kimi=""
 timeout_glm=""
 
-# Model IDs — passed verbatim to `agy --model`. These MUST match an `agy models`
-# display name exactly; agy silently falls back to its default (Flash) on an
-# unrecognized string rather than erroring (verified on agy 1.0.9, 2026-06-18).
-# Overridable per-reviewer via reviewer_profiles.json `.model` (resolved below).
-antigravity_model="Gemini 3.5 Flash (High)"
-gemini_pro_model="Gemini 3.1 Pro (High)"
-
-# OpenRouter model ids (exact slugs verified against
-# https://openrouter.ai/api/v1/models, 2026-07-01; qwen/devstral/laguna/kat
-# verified 2026-07-02). Overridable via
-# reviewer_profiles.json `.model` (resolved below).
-glm_model="z-ai/glm-5.2"
-deepseek_model="deepseek/deepseek-v4-flash"
-mimo_model="xiaomi/mimo-v2.5"
-minimax_model="minimax/minimax-m3"
-qwen_model="qwen/qwen3-coder-next"
-devstral_model="mistralai/devstral-2512"
-laguna_model="poolside/laguna-m.1"
-kat_model="kwaipilot/kat-coder-pro-v2"
-north_model="cohere/north-mini-code:free"
-nemotron_model="nvidia/nemotron-3-ultra-550b-a55b:free"
-# spark model id verified against https://openrouter.ai/meta/muse-spark-1.1, 2026-07-19.
-spark_model="meta/muse-spark-1.1"
-# kimi27 rides the DIRECT Moonshot platform API (OpenAI-compatible), not
-# OpenRouter — a deliberate rotation seat (2026-07-03, per Gabriel) on the
-# same billing rail as the kimi baseline. The first-party no-OR-fallback
-# policy above is untouched: this is not a fallback lane for kimi.
-kimi27_model="kimi-k2.7-code"
-# kimi3 is the same direct-Moonshot rotation seat pattern as kimi27, added
-# 2026-07-18 for Moonshot's K3 flagship release (2026-07-16).
-kimi3_model="kimi-k3"
+# MODEL IDS LIVE IN EXACTLY ONE PLACE: references/reviewer_profiles.json
+# `.model`. This script deliberately keeps NO fallback copy. It used to carry a
+# literal per reviewer that the profile then overrode — so the literals were
+# never actually used, silently rotted, and reading them misled anyone trying to
+# fix a model rename here. Both `poolside/laguna-m.1` and
+# `mistralai/devstral-2512` were delisted upstream while still named in this
+# file (PR #41). A missing `.model` now skips that reviewer loudly; a stale one
+# is worse than none, because agy silently serves its default on an unknown
+# string and OpenRouter answers 404 mid-round.
+#
+# The names below are the API-lane reviewers whose model comes from the profile.
+# Resolution happens after profile_get is defined, further down.
+model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
+                        devstral laguna kat north nemotron spark kimi27 kimi3)
 
 # Antigravity installs `agy` to $HOME/.local/bin. That directory isn't always
 # on $PATH for non-interactive shells (notably bash invocations from other
@@ -240,24 +223,13 @@ profile_get() {
 }
 profile_timeout() { profile_get "$1" timeout_s; }
 
-# Let reviewer_profiles.json `.model` override the built-in model strings, so an
-# agy model rename can be fixed without editing this script. Fall back to the
-# built-in default if the profile lacks a (non-empty) model.
-_am="$(profile_get antigravity model)"; [[ -n "$_am" ]] && antigravity_model="$_am"
-_gm="$(profile_get gemini-pro model)";  [[ -n "$_gm" ]] && gemini_pro_model="$_gm"
-_zm="$(profile_get glm model)";         [[ -n "$_zm" ]] && glm_model="$_zm"
-_dm="$(profile_get deepseek model)";    [[ -n "$_dm" ]] && deepseek_model="$_dm"
-_mm="$(profile_get mimo model)";        [[ -n "$_mm" ]] && mimo_model="$_mm"
-_xm="$(profile_get minimax model)";     [[ -n "$_xm" ]] && minimax_model="$_xm"
-_qw="$(profile_get qwen model)";        [[ -n "$_qw" ]] && qwen_model="$_qw"
-_dv="$(profile_get devstral model)";    [[ -n "$_dv" ]] && devstral_model="$_dv"
-_lg="$(profile_get laguna model)";      [[ -n "$_lg" ]] && laguna_model="$_lg"
-_kt="$(profile_get kat model)";         [[ -n "$_kt" ]] && kat_model="$_kt"
-_nm="$(profile_get north model)";       [[ -n "$_nm" ]] && north_model="$_nm"
-_vm="$(profile_get nemotron model)";    [[ -n "$_vm" ]] && nemotron_model="$_vm"
-_sp="$(profile_get spark model)";       [[ -n "$_sp" ]] && spark_model="$_sp"
-_k7="$(profile_get kimi27 model)";      [[ -n "$_k7" ]] && kimi27_model="$_k7"
-_k3="$(profile_get kimi3 model)";       [[ -n "$_k3" ]] && kimi3_model="$_k3"
+# Resolve every model string from the profile — the single source of truth (see
+# the note at the top of this file). A reviewer whose profile has no `.model`
+# ends up with an empty variable; run_agy_reviewer/run_openrouter_reviewer then
+# refuse to run it and say which file to edit, rather than guessing.
+for _r in "${model_backed_reviewers[@]}"; do
+  printf -v "${_r//-/_}_model" '%s' "$(profile_get "$_r" model)"
+done
 
 codex_profile="$(profile_timeout codex)"
 antigravity_profile="$(profile_timeout antigravity)"
@@ -721,6 +693,15 @@ run_openrouter_reviewer() {
   local slug="$1" model="$2" timeout_budget="$3"
   local endpoint="${4:-https://openrouter.ai/api/v1/chat/completions}"
   local cli="${5:-openrouter}"
+  # Model strings come only from reviewer_profiles.json; an empty one means the
+  # profile is missing `.model`. Fail loudly here instead of POSTing "" and
+  # reading a 404 as reviewer unreliability.
+  if [[ -z "$model" ]]; then
+    echo "$slug: no model configured — add \"model\" to references/reviewer_profiles.json (this script keeps no fallback copy)" >&2
+    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured"}\n' \
+      "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$cli" >"$out/${slug}.meta.json"
+    return 2
+  fi
   local key
   if [[ "$cli" == "moonshot" ]]; then
     if ! key="$(moonshot_key)"; then
@@ -888,6 +869,43 @@ $json_findings_suffix"
   return "$rc"
 }
 
+# agy_soft_denied <agy_log> <stderr_file> — true when agy produced nothing
+# because headless print mode auto-denied a tool confirmation it could not
+# prompt for (agy >=1.1.3). Matched on ASCII-only substrings: agy's stderr
+# renders an em-dash mid-sentence, so anchoring on the punctuation would be
+# encoding-fragile. Either channel alone is sufficient — which one carries the
+# message varies by agy build.
+agy_soft_denied() {
+  local log="$1" err="$2"
+  [[ -f "$log" ]] && grep -q 'soft-denying tool confirmation' "$log" 2>/dev/null && return 0
+  [[ -f "$err" ]] && grep -q 'permission that headless mode cannot prompt for' "$err" 2>/dev/null && return 0
+  [[ -f "$log" ]] && grep -q 'permission that headless mode cannot prompt for' "$log" 2>/dev/null && return 0
+  return 1
+}
+
+# NOTE ON THE STRING MATCHERS BELOW: agy_soft_denied/agy_print_timeout key off
+# agy's human-readable output, verified against agy 1.1.8-1.1.10. A future
+# wording change does not break the run — it degrades that failure back to the
+# generic empty_output/failed bucket, which reads as "re-auth" when the truth is
+# something else. If a lap starts failing with a null failure_kind, diff agy's
+# current stderr against these strings before believing the bucket (kimi Low,
+# PR #41 pass 1).
+# agy_print_timeout <stderr_file> — true when agy gave up waiting for the model
+# and exited on its OWN --print-timeout rather than being killed by the wrapper.
+# Signature (verified 2026-08-03, agy 1.1.8): rc=1, 0 bytes stdout, stderr is
+# exactly `Error: timeout waiting for response`, and coreutils `timeout` never
+# fires (so rc is 1, not 124, and the old code left failure_kind=null). This is
+# the gemini-pro "attempt 1 empty, attempt 2 fine" flake: Gemini 3.1 Pro at High
+# effort routinely needs 300-400s on a 100KB prompt, so a budget whose internal
+# timeout lands near that mark loses the race intermittently. The remedy is a
+# bigger --timeout-gemini-pro, NOT re-auth — which is exactly what the
+# empty_output bucket would have told the operator to do.
+agy_print_timeout() {
+  local err="$1"
+  [[ -f "$err" ]] && grep -q 'timeout waiting for response' "$err" 2>/dev/null && return 0
+  return 1
+}
+
 # run_agy_reviewer: shared body for the two Gemini-family laps. Both run on the
 # `agy` (Antigravity) CLI; they differ only in slug, --model, and timeout.
 # POLICY: no OpenRouter fallback for first-party laps — on quota/panic the lap
@@ -897,6 +915,13 @@ $json_findings_suffix"
 #   $3 timeout_budget (seconds)
 run_agy_reviewer() {
   local slug="$1" model="$2" timeout_budget="$3"
+
+  if [[ -z "$model" ]]; then
+    echo "$slug: no model configured — add \"model\" to references/reviewer_profiles.json (this script keeps no fallback copy)" >&2
+    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured"}\n' \
+      "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "agy" >"$out/${slug}.meta.json"
+    return 2
+  fi
 
   # Quota sentinel: the two laps share one Google "Individual quota" (resets on
   # a ~2-day cadence — it will NOT recover within this run). If the sibling lap
@@ -929,6 +954,15 @@ run_agy_reviewer() {
   # bump the timeout.
   local start end rc
   start=$(date +%s)
+  # --add-dir (below): agy's sandbox starts the model in its OWN scratch dir
+  # (~/.gemini/antigravity-cli/scratch), NOT the repo. Without the repo in the
+  # workspace the model can't see any file and goes hunting with `find` /
+  # `git rev-parse` — a "command" permission request that headless mode
+  # soft-denies, killing the whole run at 0 bytes (2026-07-31 repro; see
+  # docs/investigation-agy-empty-output.md). Handing it the repo root removes
+  # the reason to shell out at all.
+  local repo_root
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   local diff_summary diff_full
   diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
   # Embed the actual diff instead of just making the model go fetch it: agy
@@ -956,7 +990,7 @@ Full diff (unified context, against $base):
 $diff_full
 \`\`\`
 
-The full diff is included above — you do NOT need to run git or any other shell command to see the changes. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
+The full diff is included above. HARD CONSTRAINT: you are running headless with no interactive permission prompt, so ANY shell/terminal command you attempt that is not pre-approved is auto-denied and immediately terminates your run with zero output — the whole review is lost. Do NOT run git, jq, printf, echo, or any other shell command, not even to orient yourself or to validate your own output, and do NOT go looking for the repository — it is already mounted in your workspace at $repo_root. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools (read/view/search-file) only — those are a different permission category and are not gated this way. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
 
   # argv guard (issue #7): Linux caps a single argv element at ~128KB
   # (MAX_ARG_STRLEN). Embedding the full diff (not just --stat) makes this
@@ -980,19 +1014,46 @@ The full diff is included above — you do NOT need to run git or any other shel
     agy_internal_timeout="${timeout_budget}s"
   fi
 
+  # Per-attempt artifacts: retry_reviewer re-runs this function in place, so a
+  # single canonical path means attempt 2 overwrites the only evidence of why
+  # attempt 1 failed. Write the agy log to an attempt-stamped path and copy
+  # stdout/stderr/log alongside it, then mirror the log to the canonical name
+  # the classifier below greps.
+  local attempt_n="${CROSS_REVIEW_ATTEMPT:-1}"
+  local agy_log_path="$out/${slug}.attempt${attempt_n}.agy.log"
   run_with_timeout "$timeout_budget" agy \
     --model "$model" \
     --sandbox \
+    --add-dir "$repo_root" \
     --print-timeout "$agy_internal_timeout" \
-    --log-file "$out/${slug}.agy.log" \
+    --log-file "$agy_log_path" \
     -p "$full_prompt" \
     >"$out/${slug}.stdout" 2>"$out/${slug}.stderr" </dev/null
   rc=$?
+  cp -f "$agy_log_path" "$out/${slug}.agy.log" 2>/dev/null || true
+  cp -f "$out/${slug}.stdout" "$out/${slug}.attempt${attempt_n}.stdout" 2>/dev/null || true
+  cp -f "$out/${slug}.stderr" "$out/${slug}.attempt${attempt_n}.stderr" 2>/dev/null || true
   end=$(date +%s)
   local timed_out="false"
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
   local bytes
   bytes=$(output_bytes_of "$out/${slug}.stdout")
+
+  # Silent-fallback guard. `agy --model` does NOT error on a string it does not
+  # recognise — it quietly serves the default (Flash), so a renamed model would
+  # turn the deep Pro lap into a second Flash lap with nobody the wiser and the
+  # round would lose the provider diversity it is paying for. agy 1.1.10 already
+  # renamed the `agy models` listing out from under the detection grep, so this
+  # is a live risk, not a hypothetical. Read back what agy actually resolved;
+  # only warn when the log names a DIFFERENT model, so a future log-format
+  # change degrades to silence rather than false alarms.
+  local resolved_model=""
+  if [[ -f "$agy_log_path" ]]; then
+    resolved_model="$(grep -o 'Resolving model .*' "$agy_log_path" 2>/dev/null | tail -1 | sed 's/^Resolving model //')"
+    if [[ -n "$resolved_model" && "$resolved_model" != "$model" ]]; then
+      echo "WARN: $slug asked agy for \"$model\" but agy resolved \"$resolved_model\" — agy silently falls back to its default on an unrecognised model string. Check \`agy models\` and update the model strings in run_reviewers.sh." >&2
+    fi
+  fi
 
   # Classify the failure from agy's own log. On the observed failure modes
   # (2026-07-01) stdout AND stderr are both empty — the .agy.log is the only
@@ -1007,19 +1068,32 @@ The full diff is included above — you do NOT need to run git or any other shel
   #   agy_panic       — Go SIGSEGV in agy's RunCommandHandler (upstream bug,
   #                     seen on agy ≤1.0.15); exit 2, ~20-45s, empty output.
   #                     Flaky, so the agy retry is still worth one attempt.
-  #   empty_output    — rc=0, 0 bytes, no quota line. Historically blamed on
-  #                     expired `agy login` auth; as of agy 1.1.3+ the far
-  #                     more common cause is a soft-denied Bash/RunCommand
-  #                     tool confirmation in headless print mode (stderr:
-  #                     `jetski: no output produced — a tool required the
-  #                     "command" permission that headless mode cannot
-  #                     prompt for`). See
-  #                     docs/investigation-agy-empty-output.md. The prompt
-  #                     above now embeds the full diff precisely to avoid
-  #                     needing that tool call in the first place — if this
-  #                     still fires, check .agy.log for
-  #                     `soft-denying tool confirmation` before assuming
-  #                     auth expiry.
+  #   headless_permission_denied
+  #                   — rc=0, 0 bytes, and agy's own log/stderr names the
+  #                     cause: a Bash/RunCommand tool confirmation was
+  #                     soft-denied because headless print mode can't prompt
+  #                     (agy ≥1.1.3). stderr: `jetski: no output produced — a
+  #                     tool required the "command" permission that headless
+  #                     mode cannot prompt for`; log:
+  #                     `Print mode: soft-denying tool confirmation`. See
+  #                     docs/investigation-agy-empty-output.md. The PreToolUse
+  #                     gate installed before dispatch exists precisely so this
+  #                     can never fire — if it does, the gate failed to install
+  #                     (check the WARN about `command(echo)` in
+  #                     ~/.gemini/antigravity-cli/settings.json) rather than
+  #                     re-running `agy login`. Split out from empty_output
+  #                     (2026-07-20) because the two have opposite remedies
+  #                     and conflating them got the Gemini seats written off
+  #                     as dead when they were merely gagged.
+  #   print_timeout   — rc=1, 0 bytes, stderr `Error: timeout waiting for
+  #                     response`. agy's OWN --print-timeout expired, so
+  #                     coreutils `timeout` never fired and rc is 1 rather than
+  #                     124. Remedy is a bigger budget, not re-auth; meta marks
+  #                     timed_out=true so the runlog's timeout-rate warning
+  #                     picks it up.
+  #   empty_output    — rc=0, 0 bytes, no quota line, no permission line.
+  #                     THIS is the one that usually means expired `agy
+  #                     login` auth. Re-auth before suspecting anything else.
   local failure_kind="" quota_resets_in=""
   local agy_log="$out/${slug}.agy.log"
   if [[ $rc -eq 0 && "$bytes" -eq 0 || $rc -ne 0 ]]; then
@@ -1035,6 +1109,19 @@ The full diff is included above — you do NOT need to run git or any other shel
       rc=3
     elif [[ $rc -ne 0 && -f "$agy_log" ]] && grep -q 'panic: runtime error' "$agy_log" 2>/dev/null; then
       failure_kind="agy_panic"
+    elif [[ "$bytes" -eq 0 ]] && agy_print_timeout "$out/${slug}.stderr"; then
+      # agy hit its own --print-timeout. Report it as a timeout (it is one) so
+      # the runlog's timeout-rate warning fires and the operator raises the
+      # budget, instead of chasing an auth problem that does not exist.
+      failure_kind="print_timeout"
+      timed_out="true"
+      echo "$slug: agy gave up at its internal print-timeout (${agy_internal_timeout}) with no output — raise --timeout-${slug} if this recurs (Gemini 3.1 Pro at High effort often needs 300-400s)" >&2
+    elif [[ $rc -eq 0 && "$bytes" -eq 0 ]] && agy_soft_denied "$agy_log" "$out/${slug}.stderr"; then
+      # Gagged, not dead: the seat is authed and in quota, but a tool call it
+      # made couldn't be confirmed in headless mode. Distinct remedy from
+      # empty_output — see the classification comment above.
+      failure_kind="headless_permission_denied"
+      rc=5
     elif [[ $rc -eq 0 && "$bytes" -eq 0 ]]; then
       failure_kind="empty_output"
       rc=5
@@ -1051,11 +1138,13 @@ The full diff is included above — you do NOT need to run git or any other shel
     failure_kind="no_verdict_output"
     rc=5
   fi
-  local fk_json="null" qr_json="null"
+  local fk_json="null" qr_json="null" rm_json="null"
+  [[ -n "$resolved_model" ]] && rm_json="\"$resolved_model\""
   [[ -n "$failure_kind" ]] && fk_json="\"$failure_kind\""
   [[ -n "$quota_resets_in" ]] && qr_json="\"$quota_resets_in\""
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" >"$out/${slug}.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s, "model_resolved": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$rm_json" >"$out/${slug}.meta.json"
+  cp -f "$out/${slug}.meta.json" "$out/${slug}.attempt${attempt_n}.meta.json" 2>/dev/null || true
   # No fallback: a failed agy lap stays failed (failure_kind says why). Roster
   # rotation compensates across runs; the leaderboard's reliability signal
   # naturally down-weights a quota-dead lap until it recovers.
@@ -1233,7 +1322,237 @@ cleanup_pids() {
     kill "$p" 2>/dev/null || true
   done
 }
-trap cleanup_pids EXIT INT TERM
+
+# ---- agy shell gate ---------------------------------------------------------
+# agy ≥1.1.3 soft-denies any "command" permission it cannot prompt for in
+# headless mode, and ONE soft-denied command ends the conversation at 0 bytes —
+# the whole review is lost. Both Gemini laps reliably reach for a shell
+# (`git rev-parse`, `find`, `printf | jq`, `git diff > /tmp/x.patch`,
+# `bash tests/run_tests.sh` were all observed on 2026-07-31), so a
+# settings.json allow-list is whack-a-mole: the first command outside it is
+# fatal. Instead we install a PreToolUse hook that answers every `run_command`
+# with allow + an overwrite that swaps the command line for a harmless `echo`.
+# No permission is ever requested (the run survives) and no reviewer-authored
+# command ever executes (the read-only guarantee holds, unlike
+# --dangerously-skip-permissions).
+#
+# agy discovers hooks at <workspace-root>/.agents/hooks.json ONLY — a temp cwd
+# is not scanned (verified: "loaded 0 named hooks") — so the file has to live in
+# the repo under review for the duration of the laps. It is installed once
+# before dispatch (both laps run concurrently and share it) and removed by the
+# same trap that reaps the reviewer pids.
+agy_gate_repo_root=""
+agy_gate_file=""
+agy_gate_backup=""
+agy_gate_made_dir=""
+agy_gate_lockdir=""
+agy_gate_holders=""
+
+# The gate file is shared repo state, so install/remove are reference-counted
+# under a lock. Without that, two runs against the SAME repo corrupt each other:
+# run A installs, run B backs up A's temporary gate as if it were the user's
+# file, A exits and restores the real original (killing B's gate mid-review),
+# then B exits and restores A's temporary gate PERMANENTLY — leaving a stale
+# hook that rewrites every command to `echo` for every agy session in that repo.
+# (codex P2, PR #41 pass 1. Ordinary rounds each get their own worktree so the
+# repo root differs, but direct invocations and splitstream shards sharing a
+# checkout are exposed.) The lock is an atomic mkdir — flock is not portable to
+# the macOS default bash. The holders file names the live runs; the last one out
+# restores. Both files live beside hooks.json so any holder can finish the job
+# if the run that installed died.
+_agy_gate_lock() {
+  local n=0
+  until mkdir "$agy_gate_lockdir" 2>/dev/null; do
+    # Reclaim a lock abandoned by a crashed run rather than blocking forever.
+    if [[ -n "$(find "$agy_gate_lockdir" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then
+      # Rename, then delete. `mv` of a directory is atomic, so when two runs
+      # both see the same stale lock exactly one wins the rename; the loser
+      # falls back to waiting instead of deleting a lock the winner has just
+      # re-taken (kimi Medium, PR #41 pass 2). Deleting in place would have
+      # that second run remove a live lock.
+      if mv "$agy_gate_lockdir" "$agy_gate_lockdir.stale.$$" 2>/dev/null; then
+        rm -rf "$agy_gate_lockdir.stale.$$" 2>/dev/null || true
+      fi
+      continue
+    fi
+    sleep 0.2
+    n=$((n + 1))
+    [[ $n -gt 150 ]] && return 1   # 30s
+  done
+  return 0
+}
+
+_agy_gate_unlock() { rmdir "$agy_gate_lockdir" 2>/dev/null || true; }
+
+# Drop PIDs whose process is gone — a crashed holder must not pin the gate in
+# the repo forever.
+_agy_gate_live_holders() {
+  local pid
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+  done <"$1" 2>/dev/null
+}
+
+# Emit the gate hooks.json. With jq (always, not just when merging — the
+# heredoc path used to interpolate $gate into JSON unescaped, so a path with a
+# quote or backslash produced invalid JSON and the gate silently failed to
+# install: kimi27 Medium, PR #41 pass 1). The heredoc survives only as the
+# no-jq fallback, where that limitation is unavoidable and now documented.
+_agy_gate_write() {
+  local gate="$1" dest="$2" merge_from="${3:-}"
+  local rule='{"cross-review-shell-gate": {"PreToolUse": [{"matcher": "run_command", "hooks": [{"type": "command", "command": $cmd, "timeout": 10}]}]}}'
+  if command -v jq >/dev/null 2>&1; then
+    if [[ -n "$merge_from" && -f "$merge_from" ]]; then
+      jq --arg cmd "$gate" ". + $rule" "$merge_from" >"$dest" 2>/dev/null && return 0
+      cp "$merge_from" "$dest" 2>/dev/null || true
+      return 1
+    fi
+    jq -n --arg cmd "$gate" "$rule" >"$dest" 2>/dev/null && return 0
+    return 1
+  fi
+  case "$gate" in
+    *'"'*|*'\'*)
+      echo "WARN: no jq and the gate path contains a quote or backslash ($gate) — cannot emit valid hooks.json; the agy laps will fail with headless_permission_denied. Install jq." >&2
+      return 1 ;;
+  esac
+  cat >"$dest" <<EOF
+{
+  "cross-review-shell-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          { "type": "command", "command": "$gate", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+EOF
+}
+
+install_agy_shell_gate() {
+  local gate
+  gate="$script_dir/agy_shell_gate.sh"
+  if [[ ! -x "$gate" ]]; then
+    echo "agy shell gate not found/executable at $gate — the agy laps will die on their first tool call" >&2
+    return 0
+  fi
+  # The gate rewrites every command to `echo`, but agy still permission-checks
+  # the rewritten line — so `echo` has to be allow-listed or the laps die at 0
+  # bytes exactly as before. BOTH rule kinds are required: agy asks for
+  # `command(<target>)` for an ordinary shell step and `unsandboxed(<target>)`
+  # when the model escalates outside the sandbox. Missing the second one is
+  # what produced the "gemini-pro fails, retry sometimes works" flake — the
+  # escalation is the model's choice, so it only bites some runs (verified
+  # 2026-08-03: stderr `a tool required the "unsandboxed" permission`). Warn
+  # loudly rather than editing a global config behind the user's back.
+  local agy_settings="$HOME/.gemini/antigravity-cli/settings.json"
+  if [[ -f "$agy_settings" ]]; then
+    local missing_rules=""
+    grep -q 'command(echo)' "$agy_settings" 2>/dev/null || missing_rules="command(echo)"
+    if ! grep -q 'unsandboxed(echo)' "$agy_settings" 2>/dev/null; then
+      missing_rules="${missing_rules:+$missing_rules, }unsandboxed(echo)"
+    fi
+    if [[ -n "$missing_rules" ]]; then
+      echo "WARN: $agy_settings is missing permissions.allow rule(s): $missing_rules — agy laps will fail with failure_kind=headless_permission_denied. Add: {\"permissions\": {\"allow\": [\"command(echo)\", \"unsandboxed(echo)\"]}}" >&2
+    fi
+  fi
+  agy_gate_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  local agents_dir="$agy_gate_repo_root/.agents"
+  agy_gate_file="$agents_dir/hooks.json"
+  if [[ ! -d "$agents_dir" ]]; then
+    mkdir -p "$agents_dir" 2>/dev/null || { agy_gate_file=""; return 0; }
+    agy_gate_made_dir=1
+  fi
+  agy_gate_lockdir="$agents_dir/.cross-review-gate.lock"
+  agy_gate_holders="$agents_dir/.cross-review-gate.holders"
+  agy_gate_backup="$agents_dir/.cross-review-gate.orig"
+
+  if ! _agy_gate_lock; then
+    echo "WARN: another cross-review run has held the agy gate lock at $agy_gate_lockdir for 30s — skipping gate install; the agy laps in this round will likely fail with headless_permission_denied" >&2
+    agy_gate_file=""
+    return 0
+  fi
+
+  local live=""
+  [[ -f "$agy_gate_holders" ]] && live="$(_agy_gate_live_holders "$agy_gate_holders")"
+  if [[ -z "$live" ]]; then
+    # First live holder. THE ORDER MATTERS: when every registered holder has
+    # crashed, hooks.json is that dead run's GATE and .orig is the user's real
+    # file. Treating the on-disk hooks.json as the original there would copy the
+    # gate over the only backup, and this run's own cleanup would then restore
+    # the gate permanently — reintroducing the exact bug the refcount fixes
+    # (codex P1, PR #41 pass 2). An existing .orig always wins.
+    # Which file is the user's? Decide from CONTENT, not from the mere presence
+    # of a backup: after a crash the user may have repaired hooks.json
+    # themselves, and blindly preferring the orphaned .orig would restore the
+    # older file over their newer one (codex P1, PR #41 pass 3). The on-disk
+    # file is the stale gate only if it still carries our rule.
+    local current_is_gate=""
+    if [[ -f "$agy_gate_file" ]] && grep -q 'cross-review-shell-gate' "$agy_gate_file" 2>/dev/null; then
+      current_is_gate=1
+    fi
+    if [[ -f "$agy_gate_backup" && ( -n "$current_is_gate" || ! -f "$agy_gate_file" ) ]]; then
+      # Crashed holder: hooks.json is its gate (or it removed the file), so
+      # .orig is still the user's real content. Keep the backup as-is.
+      _agy_gate_write "$gate" "$agy_gate_file" "$agy_gate_backup" || \
+        echo "WARN: could not install the agy shell gate at $agy_gate_file — the agy laps will fail with headless_permission_denied" >&2
+    elif [[ -f "$agy_gate_file" ]]; then
+      # The current file is the user's — including the case where they edited
+      # it after a crash left an orphaned .orig behind. It becomes the original.
+      cp "$agy_gate_file" "$agy_gate_backup" || { _agy_gate_unlock; agy_gate_file=""; return 0; }
+      _agy_gate_write "$gate" "$agy_gate_file" "$agy_gate_backup" || \
+        echo "WARN: could not install the agy shell gate at $agy_gate_file — the agy laps will fail with headless_permission_denied" >&2
+    else
+      # A failed write here is silent otherwise, and an absent gate means every
+      # agy lap dies at 0 bytes (deepseek Medium, PR #41 pass 2).
+      _agy_gate_write "$gate" "$agy_gate_file" || \
+        echo "WARN: could not install the agy shell gate at $agy_gate_file — the agy laps will fail with headless_permission_denied" >&2
+    fi
+  fi
+  printf '%s\n%s\n' "$live" "$$" | grep -v '^$' >"$agy_gate_holders" 2>/dev/null || true
+  _agy_gate_unlock
+}
+
+remove_agy_shell_gate() {
+  [[ -n "$agy_gate_file" ]] || return 0
+  local file="$agy_gate_file"
+  agy_gate_file=""   # idempotent: a second call is a no-op even if we bail below
+  _agy_gate_lock || {
+    echo "WARN: could not take the agy gate lock to clean up $file — remove it by hand if it is still there" >&2
+    return 0
+  }
+  local live="" me="$$"
+  [[ -f "$agy_gate_holders" ]] && live="$(_agy_gate_live_holders "$agy_gate_holders" | grep -v "^${me}$" || true)"
+  if [[ -n "$live" ]]; then
+    # Another run is still reviewing — leave its gate alone.
+    printf '%s\n' "$live" >"$agy_gate_holders" 2>/dev/null || true
+    _agy_gate_unlock
+    return 0
+  fi
+  rm -f "$agy_gate_holders" 2>/dev/null || true
+  if [[ -f "$agy_gate_backup" ]]; then
+    # A failed restore silently leaves the user's hooks.json replaced by the
+    # gate, so fall back to cp and say so rather than swallowing it (kimi Low,
+    # PR #41 pass 1).
+    if ! mv "$agy_gate_backup" "$file" 2>/dev/null; then
+      cp "$agy_gate_backup" "$file" 2>/dev/null && rm -f "$agy_gate_backup" 2>/dev/null || \
+        echo "WARN: could not restore your original $file — a copy is at $agy_gate_backup" >&2
+    fi
+  else
+    rm -f "$file" 2>/dev/null || true
+    [[ -n "$agy_gate_made_dir" ]] && rmdir "$agy_gate_repo_root/.agents" 2>/dev/null || true
+  fi
+  _agy_gate_unlock
+}
+
+cleanup_run() {
+  cleanup_pids
+  remove_agy_shell_gate
+}
+trap cleanup_run EXIT INT TERM
 
 IFS=',' read -ra raw_requested <<<"$reviewers"
 # Dedup. Without this, `--reviewers codex,codex` spawns two processes writing
@@ -1261,6 +1580,26 @@ done
 # NOTE: antigravity + gemini-pro both hit Google via agy — the stagger matters
 # more now that two reviewers share one provider, auth state, and rate limit.
 stagger_s=2
+
+# Warn about model slugs that have been delisted upstream before spending a
+# round on them. Advisory and cached (24h) — a dead slug otherwise shows up as a
+# 1-second 404 that reads like reviewer flakiness rather than stale config.
+for r in "${requested[@]}"; do
+  case "$r" in
+    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark)
+      bash "$script_dir/validate_or_models.sh" --no-fetch 2>&1 >/dev/null | head -5 >&2 || true
+      break ;;
+  esac
+done
+
+# Install the PreToolUse gate before dispatch if either Gemini lap is in the
+# roster — both laps run concurrently and share the one hooks.json.
+for r in "${requested[@]}"; do
+  if [[ "$r" == "antigravity" || "$r" == "gemini-pro" ]] && command -v agy >/dev/null 2>&1; then
+    install_agy_shell_gate
+    break
+  fi
+done
 
 for r in "${requested[@]}"; do
   case "$r" in

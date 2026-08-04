@@ -176,12 +176,16 @@ reviewer_obj() {
   # misclassified as "ok". "quota" next: the agy laps stamp
   # failure_kind=quota_exhausted when the shared Gemini Individual quota is
   # the cause — that's a wait-for-reset condition, not a timeout/auth issue,
-  # and the analyzer warns on it differently. || fallback handles malformed
+  # and the analyzer warns on it differently. "permission_denied" likewise
+  # gets its own status: a headless soft-denied tool confirmation is a
+  # prompt-shape bug in this repo, NOT a dead/ineligible seat, and must not
+  # be read as a reason to retire the reviewer. || fallback handles malformed
   # meta.json (OOM, kill mid-write, garbage); we prefer "failed" telemetry
   # over silently dropping the entire pass when the final --argjson rejects
   # empty input.
   jq -c '. + {status: (if .timed_out == true then "timed_out"
                        elif .failure_kind == "quota_exhausted" then "quota"
+                       elif .failure_kind == "headless_permission_denied" then "permission_denied"
                        elif .failure_kind == "degenerate_output" then "degenerate"
                        elif .failure_kind == "no_verdict_output" then "no_verdict"
                        elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"

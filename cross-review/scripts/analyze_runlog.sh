@@ -200,7 +200,7 @@ emit_warning() {
     elif .timeout_rate > 30 and (.to_suspect // 0) > 0 then
       "  NOTE: \($rv) raw timeout rate \(.timeout_rate)% over last \(.total) runs is sleep-contaminated (clean rate \(.clean_timeout_rate // 0)%) — no tuning action; re-evaluate after clean rounds"
     elif .empty_rate > 40 then
-      "  WARN: \($rv) empty-output rate \(.empty_rate)% over last \(.total) runs — quota or auth, not a timeout fix: check failure_kind in meta.json and the .agy.log tail (Individual quota → wait/fallback; otherwise re-run `agy login`)"
+      "  WARN: \($rv) empty-output rate \(.empty_rate)% over last \(.total) runs — not a timeout fix. Read failure_kind in meta.json before acting: quota_exhausted → wait for reset; headless_permission_denied → prompt-shape bug in this repo, the seat is healthy, do NOT retire it; empty_output → re-run `agy login`"
     elif .reliability != null and .reliability < 60 then
       "  WARN: \($rv) reliability \(.reliability)% over last \(.total) runs (ok=\(.ok), timeout=\(.timed_out), empty=\(.empty), failed=\(.failed), quota=\(.quota // 0))\($sleep_note)"
     else empty end

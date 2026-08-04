@@ -1,7 +1,6 @@
 {
   "$schema": "./reviewer_profiles.schema.md",
-  "_doc": "Per-reviewer behavioral profile. Read by run_reviewers.sh (timeout, retry, model), the SKILL.md synthesis step (severity_priors, synthesis_weight), and analyze_runlog.sh (suggests edits to this file). Tune values here, not in scattered defaults. Edit notes/specialization freely; numeric tuning is best driven by analyze_runlog.sh suggestions over real runs. NOTE: antigravity and gemini-pro are BOTH served by Google's `agy` (Antigravity) CLI as of the 2026-06-18 Gemini-CLI sunset — the only difference is the --model value. The `model` field here MUST be the exact display-name string `agy models` prints (e.g. \"Gemini 3.1 Pro (High)\"); agy silently falls back to its default (Flash) on an unrecognized model string instead of erroring.",
-
+  "_doc": "Per-reviewer behavioral profile. Read by run_reviewers.sh (timeout, retry, model), the SKILL.md synthesis step (severity_priors, synthesis_weight), and analyze_runlog.sh (suggests edits to this file). Tune values here, not in scattered defaults. Edit notes/specialization freely; numeric tuning is best driven by analyze_runlog.sh suggestions over real runs. NOTE: antigravity and gemini-pro are BOTH served by Google's `agy` (Antigravity) CLI as of the 2026-06-18 Gemini-CLI sunset \u2014 the only difference is the --model value. The `model` field here MUST be the exact display-name string `agy models` prints (e.g. \"Gemini 3.1 Pro (High)\"); agy silently falls back to its default (Flash) on an unrecognized model string instead of erroring.",
   "codex": {
     "timeout_s": 300,
     "provider": "openai",
@@ -14,10 +13,9 @@
       "P3": "skip_unless_convergent"
     },
     "synthesis_weight": 1.0,
-    "specialization": "general — fast-or-fail; agentic file roaming with built-in review prompt",
-    "notes": "Reliable in observed runs (4/4 most rounds). Treat solo P1 as near-certain real. Output sometimes truncates on very long sessions — surface the truncation in the runlog rather than retrying."
+    "specialization": "general \u2014 fast-or-fail; agentic file roaming with built-in review prompt",
+    "notes": "Reliable in observed runs (4/4 most rounds). Treat solo P1 as near-certain real. Output sometimes truncates on very long sessions \u2014 surface the truncation in the runlog rather than retrying."
   },
-
   "antigravity": {
     "timeout_s": 600,
     "provider": "google",
@@ -33,9 +31,8 @@
     },
     "synthesis_weight": 0.85,
     "specialization": "architecture, side-effects, cross-file reasoning; agentic file-reading via Google's `agy` CLI on Gemini 3.5 Flash. Fast lap of the Gemini fleet. Rotation-pool member (not a baseline).",
-    "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.5 Flash (High)\"` — must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones — weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing — quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. NO FALLBACK (policy 2026-07-01): on quota/panic the lap drops out of the round; roster rotation covers the gap and the leaderboard down-weights it until it recovers."
+    "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.5 Flash (High)\"` \u2014 must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones \u2014 weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing \u2014 quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. NO FALLBACK (policy 2026-07-01): on quota/panic the lap drops out of the round; roster rotation covers the gap and the leaderboard down-weights it until it recovers."
   },
-
   "gemini-pro": {
     "timeout_s": 900,
     "provider": "google",
@@ -51,9 +48,8 @@
     },
     "synthesis_weight": 1.0,
     "specialization": "deep reasoning, multi-step logic, architectural and semantic-drift findings the Flash lap misses. Slower and more expensive than antigravity (Flash). Deep lap of the Gemini fleet. Rotation-pool member (not a baseline).",
-    "notes": "Same `agy` CLI as antigravity, just pinned to `--model \"Gemini 3.1 Pro (High)\"`. Previously routed through the standalone `gemini` CLI (-m gemini-3.1-pro-preview); migrated to agy in the 2026-06-18 sunset since agy now hosts Gemini 3.1 Pro and exposes --model. Pro is a preview tier — surface model-availability errors to the user, don't auto-retry. NOTE: antigravity + gemini-pro are the SAME provider (Google) — their agreement is NOT independent the way codex/kimi convergence is; treat Flash+Pro overlap as one provider's vote, not two. Pro triggers agy's SIGSEGV panic (RunCommandHandler nil-deref, agy ≤1.0.15) far more than Flash — it roams files/commands harder; exit 2 + ~20-45s + empty output = the panic, not your diff. Quota semantics: same as antigravity (check failure_kind). NO FALLBACK (policy 2026-07-01) — a failed lap drops out; rotation + leaderboard handle it."
+    "notes": "Same `agy` CLI as antigravity, just pinned to `--model \"Gemini 3.1 Pro (High)\"`. Previously routed through the standalone `gemini` CLI (-m gemini-3.1-pro-preview); migrated to agy in the 2026-06-18 sunset since agy now hosts Gemini 3.1 Pro and exposes --model. Pro is a preview tier \u2014 surface model-availability errors to the user, don't auto-retry. NOTE: antigravity + gemini-pro are the SAME provider (Google) \u2014 their agreement is NOT independent the way codex/kimi convergence is; treat Flash+Pro overlap as one provider's vote, not two. Pro triggers agy's SIGSEGV panic (RunCommandHandler nil-deref, agy \u22641.0.15) far more than Flash \u2014 it roams files/commands harder; exit 2 + ~20-45s + empty output = the panic, not your diff. Quota semantics: same as antigravity (check failure_kind). NO FALLBACK (policy 2026-07-01) \u2014 a failed lap drops out; rotation + leaderboard handle it."
   },
-
   "kimi": {
     "timeout_s": 600,
     "provider": "moonshot",
@@ -68,9 +64,8 @@
     },
     "synthesis_weight": 0.85,
     "specialization": "single-turn correctness, race conditions, defensive guards; reasons on the diff as given without tools",
-    "notes": "Strong on the diff-as-given. Frequent Low/nit output is skip-worthy unless convergent. China-origin provider — surface for security-sensitive repos."
+    "notes": "Strong on the diff-as-given. Frequent Low/nit output is skip-worthy unless convergent. China-origin provider \u2014 surface for security-sensitive repos."
   },
-
   "kimi27": {
     "timeout_s": 600,
     "provider": "moonshot",
@@ -87,9 +82,8 @@
     "synthesis_weight": 0.75,
     "draw_boost": 1.0,
     "specialization": "single-turn diff reasoning on Moonshot's code-specialized k2.7; rotation-pool member on the DIRECT Moonshot platform API (same billing rail as the kimi baseline, NOT OpenRouter).",
-    "notes": "Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it would be drawn frequently while earning leaderboard data. Retired to draw_boost 1.0 on 2026-07-12 after reaching 10 sampled runs (score 72, 7/16 findings convergent) — now competes on the same footing as the rest of the pool. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) — surface for security-sensitive repos."
+    "notes": "Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it would be drawn frequently while earning leaderboard data. Retired to draw_boost 1.0 on 2026-07-12 after reaching 10 sampled runs (score 72, 7/16 findings convergent) \u2014 now competes on the same footing as the rest of the pool. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) \u2014 surface for security-sensitive repos."
   },
-
   "kimi3": {
     "timeout_s": 600,
     "provider": "moonshot",
@@ -106,9 +100,8 @@
     "synthesis_weight": 0.75,
     "draw_boost": 2.5,
     "specialization": "single-turn diff reasoning on Moonshot's flagship Kimi K3 (2.8T MoE, 16/896 experts active, 1M context); rotation-pool member on the DIRECT Moonshot platform API (same billing rail as the kimi baseline and kimi27, NOT OpenRouter).",
-    "notes": "Kimi K3 via the direct Moonshot platform API (api.moonshot.ai/v1, model id `kimi-k3`, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-18 per Gabriel, two days after Moonshot's 2026-07-16 K3 release — draw_boost 2.5 so it's drawn frequently while it earns leaderboard data; retire the boost after ~10 sampled runs per the kimi27 precedent. Full open weights weren't out yet at add-time (expected 2026-07-27) — this seat hits the hosted API, not local weights. Same provider as kimi/kimi27: kimi+kimi27+kimi3 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) — surface for security-sensitive repos."
+    "notes": "Kimi K3 via the direct Moonshot platform API (api.moonshot.ai/v1, model id `kimi-k3`, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-18 per Gabriel, two days after Moonshot's 2026-07-16 K3 release \u2014 draw_boost 2.5 so it's drawn frequently while it earns leaderboard data; retire the boost after ~10 sampled runs per the kimi27 precedent. Full open weights weren't out yet at add-time (expected 2026-07-27) \u2014 this seat hits the hosted API, not local weights. Same provider as kimi/kimi27: kimi+kimi27+kimi3 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) \u2014 surface for security-sensitive repos."
   },
-
   "glm": {
     "timeout_s": 600,
     "provider": "zhipu",
@@ -124,9 +117,8 @@
     },
     "synthesis_weight": 0.8,
     "specialization": "single-turn diff reasoning; independent provider vote (Zhipu). Rotation-pool member.",
-    "notes": "GLM 5.2 via the OpenRouter chat-completions API — no CLI, no agentic tools; the diff is inlined (8000-line cap, same as kimi). Requires an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key); without one the wrapper skips it. Added 2026-07-01; verified live (caught a planted one-line bug as Critical on its first run). Priors start conservative (mirroring kimi); let leaderboard.sh data drive tuning. China-origin provider (Zhipu), routed through OpenRouter (US) — surface both for security-sensitive repos."
+    "notes": "GLM 5.2 via the OpenRouter chat-completions API \u2014 no CLI, no agentic tools; the diff is inlined (8000-line cap, same as kimi). Requires an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key); without one the wrapper skips it. Added 2026-07-01; verified live (caught a planted one-line bug as Critical on its first run). Priors start conservative (mirroring kimi); let leaderboard.sh data drive tuning. China-origin provider (Zhipu), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
   },
-
   "deepseek": {
     "timeout_s": 600,
     "provider": "deepseek",
@@ -142,9 +134,8 @@
     },
     "synthesis_weight": 0.8,
     "specialization": "single-turn diff reasoning, fast tier; independent provider vote (DeepSeek). Rotation-pool member. Also the designated OpenRouter substitute for the fact-check pass when agy is down.",
-    "notes": "DeepSeek V4 Flash via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (DeepSeek), routed through OpenRouter (US) — surface both for security-sensitive repos."
+    "notes": "DeepSeek V4 Flash via OpenRouter. Added 2026-07-01, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (DeepSeek), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
   },
-
   "mimo": {
     "timeout_s": 600,
     "provider": "xiaomi",
@@ -160,9 +151,8 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning; independent provider vote (Xiaomi). Rotation-pool member.",
-    "notes": "Xiaomi MiMo v2.5 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Xiaomi), routed through OpenRouter (US) — surface both for security-sensitive repos. 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets — see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data — re-evaluate after clean rounds."
+    "notes": "Xiaomi MiMo v2.5 via OpenRouter. Added 2026-07-01, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (Xiaomi), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos. 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets \u2014 see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data \u2014 re-evaluate after clean rounds."
   },
-
   "minimax": {
     "timeout_s": 600,
     "provider": "minimax",
@@ -178,9 +168,8 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning; independent provider vote (MiniMax). Rotation-pool member.",
-    "notes": "MiniMax M3 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (MiniMax), routed through OpenRouter (US) — surface both for security-sensitive repos."
+    "notes": "MiniMax M3 via OpenRouter. Added 2026-07-01, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (MiniMax), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
   },
-
   "qwen": {
     "timeout_s": 600,
     "provider": "alibaba",
@@ -196,14 +185,13 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning; independent provider vote (Alibaba). Rotation-pool member.",
-    "notes": "Qwen3 Coder Next via OpenRouter ($0.11/M in, $0.80/M out; code-specialized MoE). Added 2026-07-02 filling fugu's seat, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Alibaba), routed through OpenRouter (US) — surface both for security-sensitive repos."
+    "notes": "Qwen3 Coder Next via OpenRouter ($0.11/M in, $0.80/M out; code-specialized MoE). Added 2026-07-02 filling fugu's seat, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (Alibaba), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
   },
-
   "devstral": {
     "timeout_s": 600,
     "provider": "mistral",
     "cli": "openrouter",
-    "model": "mistralai/devstral-2512",
+    "model": "mistralai/mistral-large-2512",
     "retry_policy": "retry_on_transient",
     "prompt_style": "diff_only_no_tools",
     "severity_priors": {
@@ -214,14 +202,13 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning; independent provider vote (Mistral). Rotation-pool member.",
-    "notes": "Devstral 2 via OpenRouter ($0.40/M in, $2/M out; Mistral's agentic-coding model). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. France-origin provider (Mistral), routed through OpenRouter (US)."
+    "notes": "Devstral 2 via OpenRouter ($0.40/M in, $2/M out; Mistral's agentic-coding model). Added 2026-07-02, rookie \u2014 priors conservative until leaderboard data accumulates. France-origin provider (Mistral), routed through OpenRouter (US). Repointed 2026-08-03: mistralai/devstral-2512 was delisted from OpenRouter and Mistral has no current Devstral route; this seat exists for lab diversity (France), so it now rides mistral-large-2512, 262k context, $0.50/$1.50 per M."
   },
-
   "laguna": {
     "timeout_s": 600,
     "provider": "poolside",
     "cli": "openrouter",
-    "model": "poolside/laguna-m.1",
+    "model": "poolside/laguna-s-2.1",
     "retry_policy": "retry_on_transient",
     "prompt_style": "diff_only_no_tools",
     "severity_priors": {
@@ -232,9 +219,8 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning; independent provider vote (Poolside). Rotation-pool member.",
-    "notes": "Poolside Laguna M.1 via OpenRouter ($0.20/M in, $0.40/M out; code-only lab; a :free route also exists but paid chosen for rate-limit reliability). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. US-origin provider (Poolside), routed through OpenRouter (US)."
+    "notes": "Poolside Laguna M.1 via OpenRouter ($0.20/M in, $0.40/M out; code-only lab; a :free route also exists but paid chosen for rate-limit reliability). Added 2026-07-02, rookie \u2014 priors conservative until leaderboard data accumulates. US-origin provider (Poolside), routed through OpenRouter (US). Repointed 2026-08-03: poolside/laguna-m.1 was delisted from OpenRouter (404 'No endpoints found'); laguna-s-2.1 is the current generation, 1M context, $0.09/$0.18 per M."
   },
-
   "kat": {
     "timeout_s": 600,
     "provider": "kuaishou",
@@ -250,9 +236,8 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning; independent provider vote (Kuaishou). Rotation-pool member.",
-    "notes": "KAT-Coder-Pro V2 via OpenRouter ($0.30/M in, $1.20/M out; Kuaishou's enterprise coding model). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Kuaishou), routed through OpenRouter (US) — surface both for security-sensitive repos."
+    "notes": "KAT-Coder-Pro V2 via OpenRouter ($0.30/M in, $1.20/M out; Kuaishou's enterprise coding model). Added 2026-07-02, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (Kuaishou), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
   },
-
   "north": {
     "timeout_s": 600,
     "provider": "cohere",
@@ -267,10 +252,9 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.75,
-    "specialization": "single-turn diff reasoning, code-tuned; independent provider vote (Cohere). Rotation-pool member. FREE tier — zero marginal cost.",
-    "notes": "Cohere North Mini Code (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid — check the route's terms for security-sensitive repos. Canada-origin provider (Cohere). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets — see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data — re-evaluate after clean rounds."
+    "specialization": "single-turn diff reasoning, code-tuned; independent provider vote (Cohere). Rotation-pool member. FREE tier \u2014 zero marginal cost.",
+    "notes": "Cohere North Mini Code (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid \u2014 check the route's terms for security-sensitive repos. Canada-origin provider (Cohere). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets \u2014 see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data \u2014 re-evaluate after clean rounds."
   },
-
   "nemotron": {
     "timeout_s": 600,
     "provider": "nvidia",
@@ -285,10 +269,9 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.75,
-    "specialization": "single-turn diff reasoning, large-parameter tier; independent provider vote (NVIDIA). Rotation-pool member. FREE tier — zero marginal cost.",
-    "notes": "NVIDIA Nemotron 3 Ultra 550B (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid — check the route's terms for security-sensitive repos. US-origin provider (NVIDIA). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets — see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data — re-evaluate after clean rounds."
+    "specialization": "single-turn diff reasoning, large-parameter tier; independent provider vote (NVIDIA). Rotation-pool member. FREE tier \u2014 zero marginal cost.",
+    "notes": "NVIDIA Nemotron 3 Ultra 550B (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid \u2014 check the route's terms for security-sensitive repos. US-origin provider (NVIDIA). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets \u2014 see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data \u2014 re-evaluate after clean rounds."
   },
-
   "spark": {
     "timeout_s": 600,
     "provider": "meta",
@@ -304,9 +287,8 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning; independent provider vote (Meta). Rotation-pool member.",
-    "notes": "Meta Muse Spark 1.1 via OpenRouter ($1.25/M in, $4.25/M out; Meta Superintelligence Labs' first paid model, multimodal/agentic-oriented natively but run here diff-only-no-tools like the rest of the OR pool). Added 2026-07-19, rookie — priors conservative until leaderboard data accumulates. US-origin provider (Meta), routed through OpenRouter (US)."
+    "notes": "Meta Muse Spark 1.1 via OpenRouter ($1.25/M in, $4.25/M out; Meta Superintelligence Labs' first paid model, multimodal/agentic-oriented natively but run here diff-only-no-tools like the rest of the OR pool). Added 2026-07-19, rookie \u2014 priors conservative until leaderboard data accumulates. US-origin provider (Meta), routed through OpenRouter (US)."
   },
-
   "_synthesis_rules": {
     "skip_unless_convergent": "Drop a single-reviewer finding at this severity unless another reviewer flagged the same file/area.",
     "trust_if_convergent": "Promote/keep when 2+ reviewers agree; downgrade or verify when solo.",
@@ -314,7 +296,7 @@
     "high_precision": "Solo finding still ranks; treat as near-certain real.",
     "medium_precision": "Solo finding ranks but apply judgment; convergence boosts confidence.",
     "synthesis_weight_use": "Tie-breaker when reviewers disagree on severity. Higher weight wins. Also used by analyze_runlog.sh to compute weighted reliability scores.",
-    "provider_independence": "antigravity and gemini-pro share the Google/Gemini provider — count their agreement as a single provider vote when judging convergence. True independent convergence means agreement ACROSS providers; each profile carries an explicit `provider` field (openai, google, moonshot, zhipu, deepseek, xiaomi, minimax, sakana, cohere, nvidia). OpenRouter is a ROUTER, not a provider: glm through OpenRouter is the Zhipu vote, nemotron is the NVIDIA vote, etc. With a rotating roster, 3+ distinct-provider agreement is the near-certain tier.",
-    "rotation": "codex and kimi are fixed baselines (`baseline: true`) — always on. Everything else is drawn per-round by select_roster.sh, weighted by leaderboard.sh scores (see those scripts for the formula). NO OpenRouter fallbacks for first-party reviewers (codex/gemini/claude — policy 2026-07-01): a failed lap drops out and rotation covers the gap."
+    "provider_independence": "antigravity and gemini-pro share the Google/Gemini provider \u2014 count their agreement as a single provider vote when judging convergence. True independent convergence means agreement ACROSS providers; each profile carries an explicit `provider` field (openai, google, moonshot, zhipu, deepseek, xiaomi, minimax, sakana, cohere, nvidia). OpenRouter is a ROUTER, not a provider: glm through OpenRouter is the Zhipu vote, nemotron is the NVIDIA vote, etc. With a rotating roster, 3+ distinct-provider agreement is the near-certain tier.",
+    "rotation": "codex and kimi are fixed baselines (`baseline: true`) \u2014 always on. Everything else is drawn per-round by select_roster.sh, weighted by leaderboard.sh scores (see those scripts for the formula). NO OpenRouter fallbacks for first-party reviewers (codex/gemini/claude \u2014 policy 2026-07-01): a failed lap drops out and rotation covers the gap."
   }
 }

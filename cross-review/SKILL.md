@@ -41,13 +41,28 @@ Prints JSON like `{"codex": true, "antigravity": true, "gemini-pro": true, "kimi
 
 Do not proceed with zero reviewers. (The standalone `gemini` CLI is no longer used — it was retired in the 2026-06-18 Gemini-CLI consumer sunset; both Gemini reviewers now run on `agy`.)
 
+> **Do not retire the Gemini seats on a `gemini` CLI error.** Running `gemini` by hand now fails with `IneligibleTierError: This client is no longer supported for Gemini Code Assist for individuals` (`reasonCode: UNSUPPORTED_CLIENT`, `tierId: free-tier`). That is the **retired client** refusing to start — it says nothing about the seats this skill actually uses, and the error text itself names the migration target (`antigravity.google`) that `agy` already is. Verified live 2026-07-20: with `gemini` in that state, `agy -p` returns normal output and `agy models` lists Gemini 3.5 Flash + Gemini 3.1 Pro. **The only authority on Gemini-seat availability is `detect_reviewers.sh`** (which probes `agy`, never `gemini`). If it reports `"antigravity": true` / `"gemini-pro": true`, the seats are live — do not hand-drop the round to fewer reviewers.
+>
+> Corollary for the failure path: an agy lap that returns zero bytes is **not** automatically a dead seat. Check `failure_kind` in its `meta.json` — `headless_permission_denied` means the seat is authed and in quota but a tool confirmation was auto-denied; `print_timeout` (rc=1, stderr `Error: timeout waiting for response`) means agy's own `--print-timeout` expired and the remedy is a bigger `--timeout-<slug>`, since Gemini 3.1 Pro at High effort routinely needs 300-400s; only bare `empty_output` points at expired `agy login`. Each attempt's artifacts are kept at `<slug>.attempt<N>.{stdout,stderr,meta.json,agy.log}` — read attempt 1's when a lap only succeeded on retry.
+
+> **`command(echo)` must be allow-listed for the agy laps to work at all.** agy ≥1.1.3 kills a headless run at 0 bytes the instant the model asks for a "command" permission, and both Gemini models always reach for a shell. `run_reviewers.sh` neutralises that with a `PreToolUse` hook (`scripts/agy_shell_gate.sh`, installed as a temporary `<repo>/.agents/hooks.json` and removed on exit) that rewrites every command to a harmless `echo` — but the rewritten line is still permission-checked, so `~/.gemini/antigravity-cli/settings.json` needs:
+>
+> ```json
+> { "permissions": { "allow": ["command(echo)", "unsandboxed(echo)"] } }
+> ```
+>
+> Both rules are needed — agy asks for `command(<target>)` for an ordinary shell step and `unsandboxed(<target>)` when the model escalates outside the sandbox, and the escalation is the model's own choice (so missing the second rule reads as an intermittent flake). Those two rules are the whole global footprint — no `--dangerously-skip-permissions`, no broad read-only allow-list (tried; it fails on the first unlisted command). `run_reviewers.sh` prints a WARN when the rule is missing. Full write-up: `docs/investigation-agy-empty-output.md`.
+
 ### 1.5 Pre-run health check (recent runlog)
 
 Before spending tokens on a fresh round, glance at the last 10 runs to see if any reviewer is currently degraded. The analyzer surfaces only what's actionable — silent in the common case.
 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/analyze_runlog.sh --recent 10 --mode warn
+bash ~/.claude/skills/cross-review/scripts/validate_or_models.sh
 ```
+
+`validate_or_models.sh` checks every `cli: "openrouter"` model slug in `reviewer_profiles.json` against OpenRouter's live catalog (24h cache) and WARNs about any that have been delisted. A dead slug otherwise costs a whole round: the seat 404s in about a second and drops out, which reads as reviewer flakiness rather than stale config — `poolside/laguna-m.1` did exactly that on 2026-08-03, and `mistralai/devstral-2512` was silently queued to do the same. Fix the `model` field in the profile (the ONLY place slugs live) and re-run. This step is also what warms the cache: `run_reviewers.sh` re-checks at dispatch with `--no-fetch`, so no HTTP ever runs in front of the reviewers.
 
 If a warning prints (e.g. *"WARN: gemini-pro timed out 35% of last 10 runs — consider --timeout-gemini-pro 1100"*), surface it to the user and ask whether to apply the suggested override for this run. Do not auto-apply — surface-and-confirm only. If no warning, proceed silently.
 

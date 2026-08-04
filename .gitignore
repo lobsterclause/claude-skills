@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 .claude/worktrees/
+
+# cross-review runtime state (written by the installed skill, which is a
+# symlink to this directory) — history, not source.
+cross-review/runlog.jsonl
+cross-review/finding_events.jsonl
+cross-review/iteration-*/
+**/*.bak-*

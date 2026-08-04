@@ -640,6 +640,98 @@ chmod +x "$T/bin/agy"
 bash "$S/run_reviewers.sh" --base main --out "$T/o10" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
 assert_eq "agy rc=0 preamble-only stamps no_verdict_output" \
   "$(jq -r '.failure_kind' "$T/o10/antigravity.meta.json")" "no_verdict_output"
+echo "── agy headless soft-deny classifies apart from empty_output ──"
+# [pin: 2026-07-20 — a soft-denied tool confirmation (agy >=1.1.3 headless)
+# used to land as failure_kind=empty_output, whose documented remedy is
+# "re-run agy login". That misdirection got the Gemini seats declared dead
+# while agy was in fact healthy. The two MUST classify separately: gagged
+# (prompt-shape bug, seat fine) vs unauthed (re-login).]
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--log-file" ]; then printf 'tool_confirmation_manager.go:183] Print mode: soft-denying tool confirmation\n' >"$2"; fi
+  shift
+done
+printf 'jetski: no output produced - a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.\n' >&2
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o11" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "agy soft-deny stamps headless_permission_denied" \
+  "$(jq -r '.failure_kind' "$T/o11/antigravity.meta.json")" "headless_permission_denied"
+assert_eq "agy soft-deny is NOT misfiled as empty_output" \
+  "$(jq -r 'select(.failure_kind == "empty_output") | "LEAKED"' "$T/o11/antigravity.meta.json")" ""
+assert_eq "soft-deny maps to status permission_denied in the runlog" \
+  "$(jq -c '. + {status: (if .timed_out == true then "timed_out"
+                          elif .failure_kind == "quota_exhausted" then "quota"
+                          elif .failure_kind == "headless_permission_denied" then "permission_denied"
+                          elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
+                          elif .exit_code == 0 then "empty"
+                          else "failed" end)} | .status' "$T/o11/antigravity.meta.json")" '"permission_denied"'
+
+echo "── agy internal print-timeout classifies apart from empty_output/failed ──"
+# [pin: 2026-08-03 — Gemini 3.1 Pro at High effort needs 300-400s on a 100KB
+# prompt. When agy's own --print-timeout expires first it exits rc=1 with 0
+# bytes and stderr "Error: timeout waiting for response"; coreutils `timeout`
+# never fires, so this used to land as a bare failed run with failure_kind=null
+# and timed_out=false — invisible to the runlog's timeout-rate warning, and one
+# step away from the empty_output "go re-auth" misdirection. It is a timeout:
+# it must say so, and the remedy is a bigger budget.]
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+printf 'Error: timeout waiting for response\n' >&2
+exit 1
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o13" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "agy print-timeout stamps print_timeout" \
+  "$(jq -r '.failure_kind' "$T/o13/antigravity.meta.json")" "print_timeout"
+assert_eq "agy print-timeout marks timed_out=true so the runlog warning sees it" \
+  "$(jq -r '.timed_out' "$T/o13/antigravity.meta.json")" "true"
+assert_eq "agy print-timeout is NOT misfiled as empty_output" \
+  "$(jq -r 'select(.failure_kind == "empty_output") | "LEAKED"' "$T/o13/antigravity.meta.json")" ""
+assert_eq "print-timeout maps to status timed_out in the runlog" \
+  "$(jq -c '. + {status: (if .timed_out == true then "timed_out"
+                          elif .failure_kind == "quota_exhausted" then "quota"
+                          elif .failure_kind == "headless_permission_denied" then "permission_denied"
+                          elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
+                          elif .exit_code == 0 then "empty"
+                          else "failed" end)} | .status' "$T/o13/antigravity.meta.json")" '"timed_out"'
+
+# A non-timeout nonzero exit must NOT be swallowed by the print_timeout branch.
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+printf 'Error: something else entirely\n' >&2
+exit 1
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o14" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "unrelated agy failure does not claim print_timeout" \
+  "$(jq -r '.failure_kind' "$T/o14/antigravity.meta.json")" "null"
+assert_eq "unrelated agy failure stays timed_out=false" \
+  "$(jq -r '.timed_out' "$T/o14/antigravity.meta.json")" "false"
+
+# Per-attempt artifacts must survive the retry that overwrites the canonical
+# paths — without them attempt 1's cause is unknowable (this flake took a
+# rebuild of the evidence trail to diagnose).
+assert_eq "attempt-stamped meta.json is preserved for forensics" \
+  "$(jq -r '.failure_kind' "$T/o13/antigravity.attempt1.meta.json" 2>/dev/null)" "print_timeout"
+
+# Silent agy (no log line, no stderr) must STILL classify as empty_output —
+# the new branch must not swallow the genuine expired-auth case.
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o12" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "silent agy still classifies as empty_output (auth path intact)" \
+  "$(jq -r '.failure_kind' "$T/o12/antigravity.meta.json")" "empty_output"
+
 printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
 chmod +x "$T/bin/agy"
 
@@ -900,13 +992,287 @@ for suite in test_json_output test_score_findings test_report_block test_digest;
   fi
 done
 
+echo "── model slugs have exactly one source of truth ──"
+# [pin: 2026-08-03 — run_reviewers.sh used to carry a literal `<slug>_model=`
+# per reviewer that reviewer_profiles.json then overrode. The literals were
+# therefore never used, rotted silently, and misled anyone fixing a rename in
+# the wrong file: poolside/laguna-m.1 and mistralai/devstral-2512 were both
+# delisted upstream while still named in the script. There must be no second
+# copy, and a reviewer with no profile model must fail loudly, not guess.]
+assert_eq "run_reviewers.sh carries no model-slug literals" \
+  "$(grep -cE '^[a-z0-9_]+_model="' "$SKILL_DIR/scripts/run_reviewers.sh" || true)" "0"
+assert_contains "models resolve from reviewer_profiles.json" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'profile_get "$_r" model'
+
+# A profile with no `.model` must skip the reviewer with a named failure_kind
+# rather than POSTing an empty model and reading the 404 as unreliability.
+jq 'del(.glm.model)' "$SKILL_DIR/references/reviewer_profiles.json" >"$T/profiles_nomodel.json"
+cp "$SKILL_DIR/references/reviewer_profiles.json" "$T/profiles.bak"
+cp "$T/profiles_nomodel.json" "$SKILL_DIR/references/reviewer_profiles.json"
+OPENROUTER_API_KEY=test-key bash "$S/run_reviewers.sh" --base main --out "$T/o17" --reviewers glm --timeout 60 >/dev/null 2>"$T/o17.err" || true
+cp "$T/profiles.bak" "$SKILL_DIR/references/reviewer_profiles.json"
+assert_eq "a reviewer with no profile model stamps no_model_configured" \
+  "$(jq -r '.failure_kind' "$T/o17/glm.meta.json" 2>/dev/null)" "no_model_configured"
+assert_contains "the skip names the file to edit" \
+  "$(cat "$T/o17.err")" "reviewer_profiles.json"
+
+echo "── delisted OpenRouter slugs are caught before the round ──"
+# [pin: 2026-08-03 — poolside/laguna-m.1 was delisted upstream and burned a
+# round as a 1s 404 that looked like reviewer flakiness. The validator turns
+# that into a preflight warning.]
+val_home="$T/valhome"
+mkdir -p "$val_home/.cross-review/cache"
+printf 'z-ai/glm-5.2\npoolside/laguna-s-2.1\n' >"$val_home/.cross-review/cache/or_models.txt"
+cat >"$T/val_profiles.json" <<'JSON'
+{
+  "glm":    { "cli": "openrouter", "model": "z-ai/glm-5.2" },
+  "laguna": { "cli": "openrouter", "model": "poolside/laguna-s-2.1" },
+  "ghost":  { "cli": "openrouter", "model": "vendor/deleted-model-9" },
+  "codex":  { "cli": "codex", "model": "n/a" }
+}
+JSON
+val_out="$(HOME="$val_home" OPENROUTER_API_KEY=test-key bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" 2>&1 >/dev/null)"
+assert_contains "validator warns about a delisted slug" "$val_out" "vendor/deleted-model-9"
+assert_eq "validator stays silent about live slugs" \
+  "$(printf '%s' "$val_out" | grep -c 'glm-5.2' || true)" "0"
+assert_eq "validator ignores non-OpenRouter lanes" \
+  "$(printf '%s' "$val_out" | grep -c 'codex' || true)" "0"
+assert_eq "--no-fetch with a cold cache is silent and exits 0" \
+  "$(HOME="$T/coldhome" OPENROUTER_API_KEY=test-key bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" --no-fetch 2>&1; echo "rc=$?")" "rc=0"
+assert_contains "the dispatch preflight never fetches (no HTTP in front of the reviewers)" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'validate_or_models.sh" --no-fetch'
+val_json="$(HOME="$val_home" OPENROUTER_API_KEY=test-key bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" --json 2>/dev/null)"
+assert_eq "validator reports the missing count in --json" \
+  "$(printf '%s' "$val_json" | jq -r '.missing')" "1"
+HOME="$val_home" OPENROUTER_API_KEY=test-key bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" --strict >/dev/null 2>&1
+assert_eq "--strict exits 1 when a slug is missing" "$?" "1"
+# Offline / no key must never block a round.
+assert_eq "no key → validator exits 0 and says nothing" \
+  "$(HOME="$T/emptyhome" OPENROUTER_API_KEY= bash "$SKILL_DIR/scripts/validate_or_models.sh" --profiles "$T/val_profiles.json" 2>&1; echo "rc=$?")" "rc=0"
+
+echo "── attempt-stamped artifacts never merge as a second reviewer ──"
+# [pin: 2026-08-03 — per-attempt forensics write <slug>.attempt<N>.stdout into
+# the same raw/ dir. merge_raw_findings globbed *.stdout, so those counted as
+# their own reviewer: for a JSON-emitting lane that would double-count findings
+# and manufacture convergence between <slug> and <slug>.attempt1.]
+mkdir -p "$T/rawdup"
+printf '{"findings":[{"severity":"High","file":"a.ts","line":1,"snippet":"x","claim":"dup me"}]}\n' >"$T/rawdup/spark.stdout"
+cp "$T/rawdup/spark.stdout" "$T/rawdup/spark.attempt1.stdout"
+bash "$SKILL_DIR/scripts/merge_raw_findings.sh" --raw "$T/rawdup" --out "$T/rawdup/merged.json" >/dev/null 2>&1 || true
+assert_eq "the same finding from an attempt copy is not merged twice" \
+  "$(jq '.findings | length' "$T/rawdup/merged.json" 2>/dev/null)" "1"
+assert_eq "sources name the reviewer once, not the attempt file too" \
+  "$(jq -r '.findings[0].sources | length' "$T/rawdup/merged.json" 2>/dev/null)" "1"
+
+echo "── agy shell gate is concurrency-safe (shared repo state) ──"
+# [pin: codex P2, PR #41 pass 1 — install/remove used to be a plain
+# backup-and-replace of the repo's shared .agents/hooks.json. Two runs against
+# the same repo would interleave: A installs, B backs up A's temporary gate as
+# if it were the user's file, A restores the real original (killing B's gate
+# mid-review), B restores A's temporary gate PERMANENTLY — leaving a hook that
+# rewrites every command to `echo` for every agy session in that repo. The fix
+# is a lock + holder refcount; these tests pin the two outcomes that matter.]
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-3.1-pro-high\n"; exit 0; fi
+sleep 2
+printf 'shim review: no findings\n'
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+
+# (a) with a pre-existing hooks.json, two overlapping runs must both finish and
+#     leave the user's file byte-identical.
+mkdir -p "$REPO/.agents"
+printf '{"my-own-hook": {"PreToolUse": []}}\n' >"$REPO/.agents/hooks.json"
+gate_orig_sum="$(shasum "$REPO/.agents/hooks.json" | awk '{print $1}')"
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc1" --reviewers antigravity --timeout 60 >/dev/null 2>&1 ) &
+gate_p1=$!
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc2" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 ) &
+gate_p2=$!
+wait "$gate_p1" "$gate_p2" 2>/dev/null || true
+assert_eq "overlapping runs leave the repo's own hooks.json untouched" \
+  "$(shasum "$REPO/.agents/hooks.json" 2>/dev/null | awk '{print $1}')" "$gate_orig_sum"
+assert_eq "no gate rule is left behind in the user's hooks.json" \
+  "$(grep -c 'cross-review-shell-gate' "$REPO/.agents/hooks.json" 2>/dev/null || true)" "0"
+assert_eq "no holder/lock residue after both runs" \
+  "$(ls -A "$REPO/.agents" 2>/dev/null | grep -c 'cross-review-gate' || true)" "0"
+rm -f "$REPO/.agents/hooks.json"; rmdir "$REPO/.agents" 2>/dev/null || true
+
+# (b) with no pre-existing hooks.json, two overlapping runs must remove the
+#     gate entirely — a stale gate silently neuters every agy session there.
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc3" --reviewers antigravity --timeout 60 >/dev/null 2>&1 ) &
+gate_p3=$!
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc4" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 ) &
+gate_p4=$!
+wait "$gate_p3" "$gate_p4" 2>/dev/null || true
+assert_eq "overlapping runs leave no stale gate behind" \
+  "$([[ -f "$REPO/.agents/hooks.json" ]] && echo LEFTOVER || echo clean)" "clean"
+
+# (c2) crash recovery: when every registered holder is dead, hooks.json on disk
+#      is the dead run's GATE and .cross-review-gate.orig is the user's real
+#      file. The new run must not mistake the gate for the original, or its own
+#      cleanup restores the gate permanently.
+#      [pin: codex P1, PR #41 pass 2]
+mkdir -p "$REPO/.agents"
+printf '{"my-own-hook": {"PreToolUse": []}}\n' >"$REPO/.agents/.cross-review-gate.orig"
+crash_orig_sum="$(shasum "$REPO/.agents/.cross-review-gate.orig" | awk '{print $1}')"
+printf '{"cross-review-shell-gate": {"PreToolUse": []}}\n' >"$REPO/.agents/hooks.json"
+printf '999999\n' >"$REPO/.agents/.cross-review-gate.holders"   # PID that cannot be alive
+bash "$S/run_reviewers.sh" --base main --out "$T/oc6" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "crash recovery restores the user's ORIGINAL hooks.json, not the stale gate" \
+  "$(shasum "$REPO/.agents/hooks.json" 2>/dev/null | awk '{print $1}')" "$crash_orig_sum"
+rm -rf "$REPO/.agents"
+
+# (c) a live holder must keep the gate installed — the last run out restores.
+mkdir -p "$REPO/.agents"
+sleep 120 & gate_live_pid=$!
+printf '%s\n' "$gate_live_pid" >"$REPO/.agents/.cross-review-gate.holders"
+printf '{"cross-review-shell-gate": {"PreToolUse": []}}\n' >"$REPO/.agents/hooks.json"
+bash "$S/run_reviewers.sh" --base main --out "$T/oc5" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+assert_eq "a run does not tear down a gate another live run is using" \
+  "$([[ -f "$REPO/.agents/hooks.json" ]] && echo kept || echo REMOVED)" "kept"
+kill "$gate_live_pid" 2>/dev/null || true
+rm -rf "$REPO/.agents"
+
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\nprintf "shim review: no findings\\n"\n' >"$T/bin/agy"
+chmod +x "$T/bin/agy"
+
+echo "── agy gate message survives an apostrophe (shell quoting) ──"
+# [pin: kimi Medium, PR #41 pass 1 — the message used to be hand-wrapped in bare
+# single quotes, so editing it to contain an apostrophe would emit a malformed
+# command line. Mutate the message and prove the emitted command is still valid.]
+sed "s/^msg='SHELL DISABLED:/msg='don'\\''t run this; SHELL DISABLED:/" \
+  "$SKILL_DIR/scripts/agy_shell_gate.sh" >"$T/gate_apos.sh"
+chmod +x "$T/gate_apos.sh"
+apos_out="$(printf '%s' '{"toolCall":{}}' | bash "$T/gate_apos.sh" 2>/dev/null)"
+apos_cmd="$(printf '%s' "$apos_out" | jq -r '.overwrite.CommandLine' 2>/dev/null)"
+assert_eq "gate JSON still parses with an apostrophe in the message" \
+  "$(printf '%s' "$apos_out" | jq -r '.decision' 2>/dev/null)" "allow"
+if bash -n -c "$apos_cmd" 2>/dev/null; then
+  ok "generated echo is valid shell with an apostrophe in the message"
+else
+  bad "an apostrophe in the gate message produces a malformed command line"
+fi
+
+echo "── agy model detection survives the models-listing rename ──"
+# [pin: 2026-08-03 — agy 1.1.10 changed `agy models` from display names
+# ("Gemini 3.1 Pro (High)") to slugs ("gemini-3.1-pro-high"). The detection
+# grep matched only the old shape, so gemini-pro silently false-negatived out
+# of every roster while the lap itself was perfectly healthy. Both shapes must
+# match, in detect_reviewers.sh AND select_roster.sh.]
+# Run the probe against a throwaway HOME so the fixtures never touch the real
+# ~/.cross-review/cache — an interrupted run used to leave a fake model listing
+# behind that later rounds would trust (kimi27 Low, PR #41 pass 1).
+det_home="$T/dethome"
+det_cache="$det_home/.cross-review/cache/agy_models.txt"
+mkdir -p "$(dirname "$det_cache")"
+for shape in "Gemini 3.1 Pro (High)" "gemini-3.1-pro-high"; do
+  printf 'gemini-3.5-flash-high\n%s\n' "$shape" >"$det_cache"
+  assert_eq "detect_reviewers sees gemini-pro in '$shape' listing" \
+    "$(HOME="$det_home" PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "true"
+done
+# A listing with no Pro entry at all must still report false — the match must
+# not have been widened into "always true".
+printf 'gemini-3.5-flash-high\ngemini-3.6-flash-low\n' >"$det_cache"
+assert_eq "detect_reviewers reports gemini-pro false when no Pro model is listed" \
+  "$(HOME="$det_home" PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "false"
+assert_contains "select_roster matches the slug shape too" \
+  "$(cat "$SKILL_DIR/scripts/select_roster.sh")" 'gemini[ ._-]?3'
+
+echo "── agy silent model fallback is surfaced, not swallowed ──"
+# [pin: 2026-08-03 — `agy --model` NEVER errors on an unrecognised string; it
+# quietly serves the default (Flash). A renamed model would turn the deep Pro
+# lap into a second Flash lap and the round would silently lose its provider
+# diversity. The resolved model must be read back from agy's own log.]
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-3.1-pro-high\n"; exit 0; fi
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--log-file" ]; then printf 'model_resolver.go:73] Resolving model Gemini 3.5 Flash (High)\n' >"$2"; fi
+  shift
+done
+printf 'shim review: no findings\n'
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o15" --reviewers gemini-pro --timeout 60 >/dev/null 2>"$T/o15.err" || true
+assert_eq "meta records the model agy actually resolved" \
+  "$(jq -r '.model_resolved' "$T/o15/gemini-pro.meta.json")" "Gemini 3.5 Flash (High)"
+assert_contains "a silent Flash fallback on the Pro lap warns loudly" \
+  "$(cat "$T/o15.err")" "but agy resolved"
+# Matching model => no warning, and the field still round-trips.
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-3.1-pro-high\n"; exit 0; fi
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--log-file" ]; then printf 'model_resolver.go:73] Resolving model Gemini 3.1 Pro (High)\n' >"$2"; fi
+  shift
+done
+printf 'shim review: no findings\n'
+exit 0
+SHIM
+chmod +x "$T/bin/agy"
+bash "$S/run_reviewers.sh" --base main --out "$T/o16" --reviewers gemini-pro --timeout 60 >/dev/null 2>"$T/o16.err" || true
+assert_eq "no fallback warning when agy resolves the requested model" \
+  "$(grep -c 'but agy resolved' "$T/o16.err" || true)" "0"
+assert_eq "matching resolution is still recorded in meta" \
+  "$(jq -r '.model_resolved' "$T/o16/gemini-pro.meta.json")" "Gemini 3.1 Pro (High)"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+chmod +x "$T/bin/agy"
+
+echo "── agy shell gate (headless permission deadlock) ──"
+# [pin: 2026-07-31 — agy >=1.1.3 kills a headless run at 0 bytes the moment the
+# model asks for a "command" permission. The gate must (a) emit valid JSON,
+# (b) allow, (c) rewrite ANY command line to a bare echo, and (d) be wired into
+# hooks.json as a run_command PreToolUse handler. Regressing any of these puts
+# both Gemini laps back to failure_kind=headless_permission_denied.]
+GATE="$SKILL_DIR/scripts/agy_shell_gate.sh"
+if [[ -x "$GATE" ]]; then
+  gate_out="$(printf '%s' '{"toolCall":{"name":"run_command","args":{"CommandLine":"rm -rf / && git push --force"}}}' | bash "$GATE" 2>/dev/null)"
+  if printf '%s' "$gate_out" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    ok "gate emits valid JSON"
+  else
+    bad "gate emitted invalid JSON: $gate_out"
+  fi
+  assert_contains "gate decision is allow (a deny/ask would end the run at 0 bytes)" "$gate_out" '"decision":"allow"'
+  gate_cmd="$(printf '%s' "$gate_out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["overwrite"]["CommandLine"])' 2>/dev/null)"
+  case "$gate_cmd" in
+    "echo "*) ok "gate rewrites the command line to a bare echo" ;;
+    *)        bad "gate did not rewrite to echo — got: $gate_cmd" ;;
+  esac
+  case "$gate_cmd" in
+    *"rm -rf"*|*"git push"*) bad "gate leaked the original command into the rewrite: $gate_cmd" ;;
+    *)                       ok "gate drops the original command entirely" ;;
+  esac
+else
+  bad "scripts/agy_shell_gate.sh missing or not executable"
+fi
+assert_contains "run_reviewers.sh installs the gate as a run_command PreToolUse hook" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'install_agy_shell_gate'
+assert_contains "run_reviewers.sh removes the gate on exit" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'remove_agy_shell_gate'
+assert_contains "agy laps mount the repo with --add-dir" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" '--add-dir'
+# [pin: 2026-08-03 — `command(echo)` alone is NOT enough. agy asks for
+# `unsandboxed(<target>)` whenever the model escalates a step outside the
+# sandbox, and the gate's rewritten echo inherits that request kind. Missing
+# rule = intermittent 0-byte laps that look like a flake.]
+assert_contains "preflight warns about the unsandboxed(echo) rule too" \
+  "$(cat "$SKILL_DIR/scripts/run_reviewers.sh")" 'unsandboxed(echo)'
+assert_contains "SKILL.md documents both echo allow-rules" \
+  "$(cat "$SKILL_DIR/SKILL.md")" 'unsandboxed(echo)'
+
 echo "── dual-copy identity (repo context only) ──"
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
 COPY_A="$REPO_ROOT/cross-review"
 COPY_B="$REPO_ROOT/plugins/cross-review/skills/cross-review"
 if [[ -n "$REPO_ROOT" && -d "$COPY_A" && -d "$COPY_B" ]]; then
-  if diff -r --exclude 'runlog.jsonl*' --exclude 'iteration-1' --exclude '*.bak*' --exclude '.DS_Store' "$COPY_A" "$COPY_B" >/dev/null 2>&1; then
+  # runlog.jsonl / finding_events.jsonl are runtime state, not source: the
+  # installed skill is a symlink to COPY_A, so its history lands there and
+  # would otherwise read as drift on every run (2026-08-03).
+  if diff -r --exclude 'runlog.jsonl*' --exclude 'finding_events.jsonl' --exclude 'iteration-1' --exclude '*.bak*' --exclude '.DS_Store' "$COPY_A" "$COPY_B" >/dev/null 2>&1; then
     ok "root copy ≡ plugin copy"
   else
     bad "root copy and plugin copy have drifted — sync before merging"
