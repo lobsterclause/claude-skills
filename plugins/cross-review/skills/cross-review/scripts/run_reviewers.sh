@@ -1060,7 +1060,7 @@ run_agy_reviewer() {
   # LOUDLY, then loops once more to rebuild on the raw-diff path, whose
   # truncation behavior is pre-existing and documented. Runs at most twice.
   local context_label context_tag_open context_tag_close context_intro
-  local full_prompt
+  local full_prompt prompt_bytes
   while :; do
   if [[ "$using_snapshot" == true ]]; then
     diff_full="$(cat "$snapshot_path" 2>/dev/null || true)"
@@ -1106,8 +1106,12 @@ $context_tag_close
 
 $context_intro HARD CONSTRAINT: you are running headless with no interactive permission prompt, so ANY shell/terminal command you attempt that is not pre-approved is auto-denied and immediately terminates your run with zero output — the whole review is lost. Do NOT run git, jq, printf, echo, or any other shell command, not even to orient yourself or to validate your own output, and do NOT go looking for the repository — it is already mounted in your workspace at $repo_root. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools (read/view/search-file) only — those are a different permission category and are not gated this way. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
 
-  if [[ "$using_snapshot" == true && ${#full_prompt} -gt 100000 ]]; then
-    echo "$slug: snapshot $(basename "$snapshot_path") makes the assembled prompt ${#full_prompt} bytes — exceeds the 100KB argv guard (agy -p is argv-only; MAX_ARG_STRLEN), falling back to the raw diff" >&2
+  # ${#var} counts CHARACTERS under a UTF-8 locale, but argv limits are BYTE
+  # limits — multibyte-heavy content undercounts by up to 4× (cross-review
+  # pass-3, codex P1). Both this gate and the argv guard below measure bytes.
+  prompt_bytes="$(printf %s "$full_prompt" | wc -c | tr -d ' ')"
+  if [[ "$using_snapshot" == true && "${prompt_bytes:-0}" -gt 100000 ]]; then
+    echo "$slug: snapshot $(basename "$snapshot_path") makes the assembled prompt ${prompt_bytes} bytes — exceeds the 100KB argv guard (agy -p is argv-only; MAX_ARG_STRLEN), falling back to the raw diff" >&2
     using_snapshot=false
     continue
   fi
@@ -1118,11 +1122,11 @@ $context_intro HARD CONSTRAINT: you are running headless with no interactive per
   # (MAX_ARG_STRLEN). Embedding the full diff (not just --stat) makes this
   # guard load-bearing rather than defensive-only on large diffs — it still
   # truncates loudly instead of dying opaquely on E2BIG.
-  if [[ ${#full_prompt} -gt 100000 ]]; then
-    echo "$slug: prompt is ${#full_prompt} bytes — truncating to 100KB to stay under the argv limit (trim references/review_prompt.txt)" >&2
-    full_prompt="${full_prompt:0:100000}
+  if [[ "${prompt_bytes:-0}" -gt 100000 ]]; then
+    echo "$slug: prompt is ${prompt_bytes} bytes — truncating to 100KB to stay under the argv limit (trim references/review_prompt.txt)" >&2
+    full_prompt="$(printf %s "$full_prompt" | head -c 100000)
 
-[NOTE: prompt truncated at 100KB by the argv-size guard — the tail of the instructions above may be missing.]"
+[NOTE: prompt truncated at 100KB by the argv-size guard — the tail of the instructions above may be missing; the cut may split a multibyte character.]"
   fi
 
   # In-CLI timeout runs 15s UNDER the wrapper budget so agy exits cleanly and

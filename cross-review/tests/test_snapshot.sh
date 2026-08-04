@@ -269,6 +269,38 @@ assert_contains "95KB snapshot fits the assembled budget and is injected whole" 
 assert_not_contains "no fallback WARN fires for a snapshot that fits" \
   "$(cat "$T/o6.log" 2>/dev/null || echo MISSING_LOG)" "falling back to the raw diff"
 
+echo "── agy snapshot gate counts BYTES, not characters (multibyte content) ──"
+# [pin: cross-review pass-3, codex P1 — bash \${#var} counts CHARACTERS under
+# a UTF-8 locale, so a multibyte-heavy snapshot (e.g. CJK or em-dash-dense
+# docs) undercounts against the 100KB ARGV limit, which is a BYTE limit:
+# 40,000 em-dashes are 40K chars but 120K bytes. A char-counting gate admits
+# it; the argv guard (same bug) then also admits it; agy gets a >100KB argv.
+# Both guards must measure bytes.]
+SNAP5="$T/snap5"; mkdir -p "$SNAP5"
+MB_LINE="$(printf '\xe2\x80\x94%.0s' $(seq 1 100))"
+{
+  printf 'SNAPSHOT_ONLY_MARKER_agy_mb_f2a19\n'
+  for _ in $(seq 1 400); do printf '%s\n' "$MB_LINE"; done
+} >"$SNAP5/snapshot-antigravity.md"
+MB_BYTES="$(wc -c < "$SNAP5/snapshot-antigravity.md" | tr -d ' ')"
+if [[ "$MB_BYTES" -gt 100000 ]]; then
+  ok "fixture sanity: multibyte snapshot is ${MB_BYTES} bytes (>100000)"
+else
+  bad "fixture sanity: multibyte snapshot only ${MB_BYTES} bytes — fixture broken"
+fi
+write_agy_shim "$T/agy_prompt_mb.txt"
+(
+  cd "$REPO" || exit 1
+  bash "$S/run_reviewers.sh" --base main --out "$T/o7" \
+    --reviewers antigravity --snapshot-dir "$SNAP5" \
+    --timeout-antigravity 30 >"$T/o7.log" 2>&1
+)
+AGY_PROMPT_MB="$(cat "$T/agy_prompt_mb.txt" 2>/dev/null || echo MISSING_CAPTURE)"
+assert_not_contains "multibyte snapshot over 100K BYTES is refused despite being under 100K chars" \
+  "$AGY_PROMPT_MB" "SNAPSHOT_ONLY_MARKER_agy_mb_f2a19"
+assert_contains "multibyte overflow falls back to the raw diff loudly" \
+  "$(cat "$T/o7.log" 2>/dev/null || echo MISSING_LOG)" "exceeds the 100KB argv guard"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]
