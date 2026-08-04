@@ -991,6 +991,7 @@ for suite in test_json_output test_score_findings test_report_block test_digest;
     bad "$suite.sh missing from tests/"
   fi
 done
+for suite in test_snapshot; do [[ -f "$SKILL_DIR/tests/$suite.sh" ]] && { bash "$SKILL_DIR/tests/$suite.sh" >"$T/$suite.log" 2>&1 && ok "$suite suite green ($(grep -oE '[0-9]+ passed' "$T/$suite.log" | tail -1))" || bad "$suite suite failed — tail: $(tail -3 "$T/$suite.log" | tr '\n' ' ')"; } || bad "$suite.sh missing from tests/"; done
 
 echo "── model slugs have exactly one source of truth ──"
 # [pin: 2026-08-03 — run_reviewers.sh used to carry a literal `<slug>_model=`

@@ -51,6 +51,7 @@
 #                    [--timeout-codex <sec>] [--timeout-antigravity <sec>]
 #                    [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>]
 #                    [--timeout-glm <sec>]
+#                    [--snapshot-dir <dir>]
 #
 # No --reviewers → select_roster.sh chooses the round's roster (codex + kimi
 # baselines, ≥3 total, leaderboard-weighted rotation picks). Explicit
@@ -61,6 +62,18 @@
 # need more headroom. Default policy: codex=300, antigravity=600, gemini-pro=900,
 # kimi=600. The previous 300s blanket cap truncated dense-logic diffs
 # (see PR #1985 postmortem).
+#
+# --snapshot-dir <dir>: for each dispatched reviewer <r> that builds its own
+# text prompt (kimi, the OpenRouter pool, and the two agy laps), if
+# <dir>/snapshot-<r>.md, .xml, or .txt exists (first match wins, in that
+# order), that reviewer's code-context block uses the snapshot file's
+# contents INSTEAD OF the raw git diff — no 8000-line cap, passed whole
+# (snapshots are already token-budgeted upstream, e.g. by repomix-handoff).
+# Reviewers without a matching file keep the raw-diff path unchanged. codex
+# is exempt: `codex exec review --base` does its own diffing internally and
+# never gets a text-embedded diff to swap out (see the review_prompt note
+# above run_codex). Omitting --snapshot-dir reproduces today's behavior
+# byte-for-byte.
 #
 # Writes:
 #   <out>/codex.stdout         — codex review (stderr merged)
@@ -118,6 +131,12 @@ export PATH
 
 base=""
 out=""
+# Empty default: no per-reviewer snapshots. When set via --snapshot-dir, a
+# reviewer whose slug has a matching $snapshot_dir/snapshot-<r>.{md,xml,txt}
+# file gets that file's contents as its code-context block INSTEAD of the
+# raw diff (see snapshot_for() below and SKILL.md step 2.5). Reviewers
+# without a matching file keep the raw-diff path unchanged.
+snapshot_dir=""
 # Empty default: resolved after arg parsing. If --reviewers is not passed,
 # select_roster.sh picks the round's roster (codex+kimi baselines + weighted
 # rotation picks); if the selector is missing, fall back to the fixed classic
@@ -181,12 +200,13 @@ while [[ $# -gt 0 ]]; do
     --timeout-gemini-pro) need_val --timeout-gemini-pro "$#"; timeout_gemini_pro="$2"; shift 2 ;;
     --timeout-kimi)       need_val --timeout-kimi       "$#"; timeout_kimi="$2";       shift 2 ;;
     --timeout-glm)        need_val --timeout-glm        "$#"; timeout_glm="$2";        shift 2 ;;
+    --snapshot-dir)       need_val --snapshot-dir       "$#"; snapshot_dir="$2";       shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--snapshot-dir <dir>]" >&2
   exit 2
 fi
 
@@ -540,6 +560,26 @@ wall_over_budget() {
   if [[ "$dur" -gt $(( budget + 60 )) ]]; then echo "true"; else echo "false"; fi
 }
 
+# snapshot_for <reviewer-slug> — prints the path to that reviewer's
+# repomix-handoff snapshot under $snapshot_dir (checked in .md, .xml, .txt
+# order — first match wins) and returns 0, or returns 1 with nothing printed
+# when --snapshot-dir wasn't passed or no file matches. Callers (run_kimi,
+# run_agy_reviewer, run_openrouter_reviewer) use this to decide whether to
+# embed the snapshot instead of the raw diff. codex is deliberately not a
+# caller — see the review_prompt note above run_codex for why.
+snapshot_for() {
+  local r="$1" ext f
+  [[ -n "$snapshot_dir" ]] || return 1
+  for ext in md xml txt; do
+    f="$snapshot_dir/snapshot-$r.$ext"
+    if [[ -f "$f" ]]; then
+      printf '%s' "$f"
+      return 0
+    fi
+  done
+  return 1
+}
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompt_file="$script_dir/../references/review_prompt.txt"
 
@@ -720,20 +760,48 @@ run_openrouter_reviewer() {
   # context budget). GLM 5.2 and the OpenRouter Gemini models all take 200k+
   # tokens; 8000 diff lines stays well inside that.
   local diff_line_cap=8000
-  diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -n "$diff_line_cap" || true)"
-  total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
-    truncated=true
-    truncation_note="
-
-[WARNING: diff truncated to first $diff_line_cap of $total_lines lines. Your review will be INCOMPLETE — the tail of the patch is not shown. Note this limitation in your findings.]"
-  else
+  local snapshot_path="" using_snapshot=false
+  if snapshot_path="$(snapshot_for "$slug")"; then
+    using_snapshot=true
+  fi
+  if [[ "$using_snapshot" == true ]]; then
+    # Pre-built by repomix-handoff and already token-budgeted upstream — skip
+    # the line cap and truncation note, pass it whole (SKILL.md step 2.5).
+    diff_full="$(cat "$snapshot_path" 2>/dev/null || true)"
+    total_lines=0
     truncated=false
     truncation_note=""
+  else
+    diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -n "$diff_line_cap" || true)"
+    total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
+      truncated=true
+      truncation_note="
+
+[WARNING: diff truncated to first $diff_line_cap of $total_lines lines. Your review will be INCOMPLETE — the tail of the patch is not shown. Note this limitation in your findings.]"
+    else
+      truncated=false
+      truncation_note=""
+    fi
   fi
-  # Defuse a literal </diff> inside untrusted patch content (same
-  # prompt-injection guard as run_kimi).
-  diff_full="${diff_full//<\/diff>/< \/diff>}"
+  local context_label context_tag_open context_tag_close context_intro
+  if [[ "$using_snapshot" == true ]]; then
+    # Defuse a literal closing tag inside untrusted snapshot content (same
+    # prompt-injection guard as the raw-diff </diff> defuse below).
+    diff_full="${diff_full//<\/snapshot>/< \/snapshot>}"
+    context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
+    context_tag_open="<snapshot>"
+    context_tag_close="</snapshot>"
+    context_intro="Base your review ONLY on the code context snapshot below."
+  else
+    # Defuse a literal </diff> inside untrusted patch content (same
+    # prompt-injection guard as run_kimi).
+    diff_full="${diff_full//<\/diff>/< \/diff>}"
+    context_label="Full diff:"
+    context_tag_open="<diff>"
+    context_tag_close="</diff>"
+    context_intro="Base your review ONLY on the diff below."
+  fi
   local doc_note doc_file_list
   # Uncapped, rename-clean, and source-path-preserving by construction — see
   # doc_narrative_risk's comment for why --name-status, not the capped/
@@ -744,15 +812,15 @@ run_openrouter_reviewer() {
   local full_prompt
   full_prompt="$review_prompt
 
-You have no file-reading or shell tools. Base your review ONLY on the diff below.${truncation_note}${doc_note}
+You have no file-reading or shell tools. ${context_intro}${truncation_note}${doc_note}
 
 Changed files (diff --stat against $base):
 $diff_summary
 
-Full diff:
-<diff>
+$context_label
+$context_tag_open
 $diff_full
-</diff>
+$context_tag_close
 
 $json_findings_suffix"
 
@@ -965,32 +1033,50 @@ run_agy_reviewer() {
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   local diff_summary diff_full
   diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
-  # Embed the actual diff instead of just making the model go fetch it: agy
-  # 1.1.3+ soft-denies Bash/RunCommand tool confirmations in headless print
-  # mode (see docs/investigation-agy-empty-output.md) — a reviewer told to
-  # "use your file-reading tools to inspect the actual changes" reaches for
-  # `git diff` via Bash, gets silently denied, and the conversation ends with
-  # zero output (rc=0, 0 bytes — classified downstream as empty_output/rc=5).
-  # We already have full shell permission here, so fetch the diff ourselves
-  # and hand it over as text. This doesn't require guessing agy's
-  # permissions.allow syntax and doesn't touch its global settings.json.
-  # unified=50 keeps real context without ballooning the argv-guard below;
-  # a reviewer that still wants more (a file's surrounding code, imports)
-  # can use its native Read/Glob tools — those are a different permission
-  # category than "command" and aren't gated the same way in headless mode.
-  diff_full="$(git diff --unified=50 "$base"...HEAD 2>/dev/null || true)"
+  local snapshot_path="" using_snapshot=false
+  if snapshot_path="$(snapshot_for "$slug")"; then
+    using_snapshot=true
+  fi
+  # context_label/fence/intro: mirror this function's existing markdown-fence
+  # treatment of the diff (agy has no diff/snapshot content collision guard
+  # today — see run_kimi's <diff> comment for why that matters more there —
+  # so a snapshot gets the exact same, unmodified fencing, just relabeled).
+  local context_label context_fence="\`\`\`diff" context_intro
+  if [[ "$using_snapshot" == true ]]; then
+    diff_full="$(cat "$snapshot_path" 2>/dev/null || true)"
+    context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
+    context_fence="\`\`\`snapshot"
+    context_intro="A pre-built code context snapshot is included above (already token-budgeted upstream)."
+  else
+    # Embed the actual diff instead of just making the model go fetch it: agy
+    # 1.1.3+ soft-denies Bash/RunCommand tool confirmations in headless print
+    # mode (see docs/investigation-agy-empty-output.md) — a reviewer told to
+    # "use your file-reading tools to inspect the actual changes" reaches for
+    # `git diff` via Bash, gets silently denied, and the conversation ends with
+    # zero output (rc=0, 0 bytes — classified downstream as empty_output/rc=5).
+    # We already have full shell permission here, so fetch the diff ourselves
+    # and hand it over as text. This doesn't require guessing agy's
+    # permissions.allow syntax and doesn't touch its global settings.json.
+    # unified=50 keeps real context without ballooning the argv-guard below;
+    # a reviewer that still wants more (a file's surrounding code, imports)
+    # can use its native Read/Glob tools — those are a different permission
+    # category than "command" and aren't gated the same way in headless mode.
+    diff_full="$(git diff --unified=50 "$base"...HEAD 2>/dev/null || true)"
+    context_label="Full diff (unified context, against $base):"
+    context_intro="The full diff is included above."
+  fi
   local full_prompt
   full_prompt="$review_prompt
 
 Changed files (diff --stat against $base):
 $diff_summary
 
-Full diff (unified context, against $base):
-\`\`\`diff
+$context_label
+$context_fence
 $diff_full
 \`\`\`
 
-The full diff is included above. HARD CONSTRAINT: you are running headless with no interactive permission prompt, so ANY shell/terminal command you attempt that is not pre-approved is auto-denied and immediately terminates your run with zero output — the whole review is lost. Do NOT run git, jq, printf, echo, or any other shell command, not even to orient yourself or to validate your own output, and do NOT go looking for the repository — it is already mounted in your workspace at $repo_root. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools (read/view/search-file) only — those are a different permission category and are not gated this way. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
+$context_intro HARD CONSTRAINT: you are running headless with no interactive permission prompt, so ANY shell/terminal command you attempt that is not pre-approved is auto-denied and immediately terminates your run with zero output — the whole review is lost. Do NOT run git, jq, printf, echo, or any other shell command, not even to orient yourself or to validate your own output, and do NOT go looking for the repository — it is already mounted in your workspace at $repo_root. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools (read/view/search-file) only — those are a different permission category and are not gated this way. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
 
   # argv guard (issue #7): Linux caps a single argv element at ~128KB
   # (MAX_ARG_STRLEN). Embedding the full diff (not just --stat) makes this
@@ -1219,25 +1305,55 @@ run_kimi() {
   # produce invalid UTF-8; head -n respects line boundaries. 8000 lines keeps
   # us well under k2.5's 256K-token context even for verbose diffs.
   diff_line_cap=8000
-  diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -n "$diff_line_cap" || true)"
+  local snapshot_path="" using_snapshot=false
+  if snapshot_path="$(snapshot_for kimi)"; then
+    using_snapshot=true
+  fi
   local total_lines
-  total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
-    truncated=true
-    truncation_note="
-
-[WARNING: diff truncated to first $diff_line_cap of $total_lines lines. Your review will be INCOMPLETE — the tail of the patch is not shown. Note this limitation in your findings.]"
-  else
+  if [[ "$using_snapshot" == true ]]; then
+    # Pre-built by repomix-handoff and already token-budgeted upstream — skip
+    # the line cap and truncation note, pass it whole (SKILL.md step 2.5).
+    diff_full="$(cat "$snapshot_path" 2>/dev/null || true)"
+    total_lines=0
     truncated=false
     truncation_note=""
+  else
+    diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -n "$diff_line_cap" || true)"
+    total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
+      truncated=true
+      truncation_note="
+
+[WARNING: diff truncated to first $diff_line_cap of $total_lines lines. Your review will be INCOMPLETE — the tail of the patch is not shown. Note this limitation in your findings.]"
+    else
+      truncated=false
+      truncation_note=""
+    fi
   fi
-  # Wrap the diff in an XML-ish tag rather than a markdown fence. Diffs can
-  # legitimately contain triple-backtick lines (e.g. doc changes that add a
-  # fenced code block), which close the fence prematurely and corrupt the
-  # prompt. <diff>...</diff> has no such collision surface.
-  # Defuse a literal </diff> inside untrusted patch content so a malicious diff
-  # can't close the fence early and inject instructions (prompt-injection "inj").
-  diff_full="${diff_full//<\/diff>/< \/diff>}"
+  # Wrap the context block in an XML-ish tag rather than a markdown fence.
+  # Diffs (and snapshots built from them) can legitimately contain
+  # triple-backtick lines (e.g. doc changes that add a fenced code block),
+  # which close a markdown fence prematurely and corrupt the prompt.
+  # <diff>...</diff> / <snapshot>...</snapshot> has no such collision surface.
+  local context_label context_tag_open context_tag_close context_intro
+  if [[ "$using_snapshot" == true ]]; then
+    # Defuse a literal closing tag inside untrusted snapshot content so it
+    # can't close the fence early and inject instructions — same guard as
+    # the raw-diff </diff> defuse below (prompt-injection "inj").
+    diff_full="${diff_full//<\/snapshot>/< \/snapshot>}"
+    context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
+    context_tag_open="<snapshot>"
+    context_tag_close="</snapshot>"
+    context_intro="Base your review ONLY on the code context snapshot below."
+  else
+    # Defuse a literal </diff> inside untrusted patch content so a malicious
+    # diff can't close the fence early and inject instructions.
+    diff_full="${diff_full//<\/diff>/< \/diff>}"
+    context_label="Full diff:"
+    context_tag_open="<diff>"
+    context_tag_close="</diff>"
+    context_intro="Base your review ONLY on the diff below."
+  fi
   local doc_note doc_file_list
   # Uncapped, rename-clean, and source-path-preserving by construction — see
   # doc_narrative_risk's comment for why --name-status, not the capped/
@@ -1248,15 +1364,15 @@ run_kimi() {
   local full_prompt
   full_prompt="$review_prompt
 
-Do NOT use any file-reading or shell tools. Base your review ONLY on the diff below.${truncation_note}${doc_note}
+Do NOT use any file-reading or shell tools. ${context_intro}${truncation_note}${doc_note}
 
 Changed files (diff --stat against $base):
 $diff_summary
 
-Full diff:
-<diff>
+$context_label
+$context_tag_open
 $diff_full
-</diff>
+$context_tag_close
 
 Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
 

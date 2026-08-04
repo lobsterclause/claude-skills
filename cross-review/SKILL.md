@@ -121,7 +121,7 @@ Mint `run_id="$(basename "$run_dir")"` now — `worktree.sh` already builds `run
 
 ### 2.5. (Optional) Bound the input with `repomix-handoff`
 
-For large diffs (`warn_large_diff: true`), or when a reviewer has a tighter context window than the diff allows, you may want to feed a token-budgeted snapshot to the CLIs instead of letting them ingest the full raw diff. This is **not** wired into `run_reviewers.sh` — the wrapper always reads the raw diff. To use a snapshot, you (the model) must produce it here and then **explicitly** include its contents in the reviewer prompt you build.
+For large diffs (`warn_large_diff: true`), or when a reviewer has a tighter context window than the diff allows, you may want to feed a token-budgeted snapshot to the CLIs instead of letting them ingest the full raw diff. Produce the snapshot(s) here, then pass `--snapshot-dir "$run_dir"` to `run_reviewers.sh` (step 3) — it auto-injects each matching `snapshot-<reviewer>.*` file into that reviewer's prompt in place of the raw diff.
 
 This is a sibling skill, not a hard dependency. If `repomix-handoff` is missing, skip this step and continue with the default raw-diff flow.
 
@@ -139,7 +139,7 @@ if [ -x ~/.claude/skills/repomix-handoff/scripts/detect_repomix.sh ] && \
 fi
 ```
 
-If you produce snapshots, **you must explicitly include each snapshot's contents in the reviewer prompt you build** — `run_reviewers.sh` will not pick them up automatically. For codex/antigravity/gemini-pro/kimi today, that means reading `$run_dir/snapshot-<reviewer>.*` into the prompt body before invoking the wrapper (or feeding via the reviewer's native file-input flag where supported; see `references/cli_flags.md`).
+`--snapshot-dir "$run_dir"` auto-injects snapshots for kimi, the OpenRouter pool, and the two agy laps (antigravity/gemini-pro): for each dispatched reviewer `<r>`, `run_reviewers.sh` looks for `$run_dir/snapshot-<r>.md`, then `.xml`, then `.txt` (first match wins) and, if found, uses that file's contents as the code-context block instead of the raw diff — same fencing and prompt-injection defusal treatment as the raw-diff path, and no 8000-line cap (snapshots are already token-budgeted upstream). A reviewer with no matching file keeps the normal raw-diff path unchanged, so you don't need a snapshot for every reviewer in the roster. **codex is the one exception**: `codex exec review --base` does its own diffing internally and has no text-embedded diff to swap out, so a `snapshot-codex.*` file is ignored — if you need to bound codex's input too, drop `--base` and build a custom prompt by hand (see `references/cli_flags.md`).
 
 The reviewer presets in `repomix-handoff` already bake in safe defaults (if it lacks the `antigravity`/`gemini-pro` keys, fall back to its `gemini` preset — same Google-Gemini context budget):
 
@@ -153,8 +153,6 @@ The reviewer presets in `repomix-handoff` already bake in safe defaults (if it l
 | claude      | XML      | 200k |
 
 **Skip this step** if `warn_secrets: true` is still unresolved — bound or unbound, packed snapshots still contain whatever you pack.
-
-> **Future work:** a `--snapshot-dir` flag on `run_reviewers.sh` that auto-injects per-reviewer snapshots would close this manual gap. Tracked separately, not on this PR.
 
 ### 2.6. (Optional) Enrich the reviewer prompt with `/impact` and `ast-grep scan`
 
