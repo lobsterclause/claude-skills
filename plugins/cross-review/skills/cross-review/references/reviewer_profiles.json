@@ -85,7 +85,7 @@
     "notes": "Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it would be drawn frequently while earning leaderboard data. Retired to draw_boost 1.0 on 2026-07-12 after reaching 10 sampled runs (score 72, 7/16 findings convergent) \u2014 now competes on the same footing as the rest of the pool. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) \u2014 surface for security-sensitive repos."
   },
   "kimi3": {
-    "timeout_s": 600,
+    "timeout_s": 700,
     "provider": "moonshot",
     "cli": "moonshot",
     "model": "kimi-k3",
@@ -150,7 +150,9 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.75,
+    "draw_boost": 0.2,
     "specialization": "single-turn diff reasoning; independent provider vote (Xiaomi). Rotation-pool member.",
+    "bench_note": "2026-08-03: benched \u2014 5/8 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
     "notes": "Xiaomi MiMo v2.5 via OpenRouter. Added 2026-07-01, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (Xiaomi), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos. 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets \u2014 see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data \u2014 re-evaluate after clean rounds."
   },
   "minimax": {
@@ -184,7 +186,9 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.75,
+    "draw_boost": 0.2,
     "specialization": "single-turn diff reasoning; independent provider vote (Alibaba). Rotation-pool member.",
+    "bench_note": "2026-08-03: benched \u2014 4/5 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
     "notes": "Qwen3 Coder Next via OpenRouter ($0.11/M in, $0.80/M out; code-specialized MoE). Added 2026-07-02 filling fugu's seat, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (Alibaba), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
   },
   "devstral": {
@@ -201,7 +205,9 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.75,
+    "draw_boost": 0.2,
     "specialization": "single-turn diff reasoning; independent provider vote (Mistral). Rotation-pool member.",
+    "bench_note": "2026-08-03: benched \u2014 2/2 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
     "notes": "Devstral 2 via OpenRouter ($0.40/M in, $2/M out; Mistral's agentic-coding model). Added 2026-07-02, rookie \u2014 priors conservative until leaderboard data accumulates. France-origin provider (Mistral), routed through OpenRouter (US). Repointed 2026-08-03: mistralai/devstral-2512 was delisted from OpenRouter and Mistral has no current Devstral route; this seat exists for lab diversity (France), so it now rides mistral-large-2512, 262k context, $0.50/$1.50 per M."
   },
   "laguna": {
@@ -218,7 +224,9 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.75,
+    "draw_boost": 0.2,
     "specialization": "single-turn diff reasoning; independent provider vote (Poolside). Rotation-pool member.",
+    "bench_note": "2026-08-03: benched \u2014 3/4 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs. Note: the shard brief that generated this bench also cited a delisted OpenRouter slug (poolside/laguna-m.1, 404s) as a factor, but that was already repointed to laguna-s-2.1 by commit b14ae15 before this change branched \u2014 see the `model`/`notes` fields below, which already reflect the fix. This bench_note therefore rests on the disproven-findings evidence alone.",
     "notes": "Poolside Laguna M.1 via OpenRouter ($0.20/M in, $0.40/M out; code-only lab; a :free route also exists but paid chosen for rate-limit reliability). Added 2026-07-02, rookie \u2014 priors conservative until leaderboard data accumulates. US-origin provider (Poolside), routed through OpenRouter (US). Repointed 2026-08-03: poolside/laguna-m.1 was delisted from OpenRouter (404 'No endpoints found'); laguna-s-2.1 is the current generation, 1M context, $0.09/$0.18 per M."
   },
   "kat": {
@@ -252,7 +260,9 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.75,
+    "draw_boost": 0.2,
     "specialization": "single-turn diff reasoning, code-tuned; independent provider vote (Cohere). Rotation-pool member. FREE tier \u2014 zero marginal cost.",
+    "bench_note": "2026-08-03: benched \u2014 3/3 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
     "notes": "Cohere North Mini Code (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid \u2014 check the route's terms for security-sensitive repos. Canada-origin provider (Cohere). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets \u2014 see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data \u2014 re-evaluate after clean rounds."
   },
   "nemotron": {

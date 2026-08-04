@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# test_profiles.sh — standalone offline fixture test for
+# references/reviewer_profiles.json. NO network, no reviewer CLIs, no tokens.
+#
+# Mirrors run_tests.sh's fixture/assertion conventions (assert_eq/assert_contains,
+# mktemp -d + trap cleanup) but is intentionally NOT wired into run_tests.sh —
+# the parent orchestrating session wires it in later (collision avoidance; see
+# tests/test_digest.sh / tests/test_score_findings.sh for the same pattern).
+#
+# Added 2026-08-03 alongside benching the disproven-heavy rotation tail
+# (north, laguna, devstral, qwen, mimo) via draw_boost + bench_note, and the
+# kimi3 timeout_s 600 -> 700 bump. Asserts the profile file stays internally
+# consistent as those knobs keep moving.
+#
+# Run:  bash tests/test_profiles.sh
+# Exit: 0 all green, 1 any failure.
+
+set -uo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PROFILES="$SKILL_DIR/references/reviewer_profiles.json"
+
+PASS=0
+FAIL=0
+ok()  { echo "  ok   $1"; PASS=$((PASS + 1)); }
+bad() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
+assert_eq() {
+  if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (got: '$2' want: '$3')"; fi
+}
+
+command -v jq >/dev/null 2>&1 || { echo "jq required to run these tests" >&2; exit 1; }
+[[ -f "$PROFILES" ]] || { echo "FATAL: $PROFILES missing"; exit 1; }
+
+echo "── reviewer_profiles.json parses as valid JSON ──"
+if jq empty "$PROFILES" >/dev/null 2>&1; then
+  ok "reviewer_profiles.json is valid JSON"
+else
+  bad "reviewer_profiles.json failed to parse — aborting remaining checks"
+  echo
+  echo "══ $PASS passed, $FAIL failed ══"
+  exit 1
+fi
+
+echo "── benched seats: draw_boost <= 0.3 wherever bench_note is present ──"
+# A bench is a draw-side demotion, not a removal — draw_boost must stay low
+# (<= 0.3) for every profile that carries a bench_note. This also guards
+# against a future bench_note being added without its accompanying draw_boost.
+OVER_BOOSTED="$(jq -r '
+  to_entries[]
+  | select(.value | type == "object")
+  | select(.value.bench_note != null)
+  | select((.value.draw_boost // 999) > 0.3)
+  | .key
+' "$PROFILES")"
+assert_eq "no benched profile exceeds draw_boost 0.3" "$OVER_BOOSTED" ""
+
+echo "── kimi3.timeout_s bumped to 700 (p95 574s was within 10% of the old 600s budget) ──"
+assert_eq "kimi3.timeout_s == 700" "$(jq -r '.kimi3.timeout_s' "$PROFILES")" "700"
+
+echo "── kimi3.draw_boost untouched (still bringing up leaderboard data) ──"
+assert_eq "kimi3.draw_boost == 2.5 (unchanged by this bench)" "$(jq -r '.kimi3.draw_boost' "$PROFILES")" "2.5"
+
+echo "── the five disproven-heavy tail seats each carry a bench_note ──"
+for seat in north laguna devstral qwen mimo; do
+  note="$(jq -r --arg s "$seat" '.[$s].bench_note // "MISSING"' "$PROFILES")"
+  if [[ "$note" != "MISSING" && -n "$note" ]]; then
+    ok "$seat carries a bench_note"
+  else
+    bad "$seat is missing bench_note"
+  fi
+  boost="$(jq -r --arg s "$seat" '.[$s].draw_boost // "MISSING"' "$PROFILES")"
+  assert_eq "$seat.draw_boost == 0.2" "$boost" "0.2"
+done
+
+echo
+echo "══ $PASS passed, $FAIL failed ══"
+[[ "$FAIL" -eq 0 ]]
