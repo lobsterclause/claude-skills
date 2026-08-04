@@ -1024,18 +1024,17 @@ printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings
 echo "── standalone suites: json-output / score / report-block / digest ──"
 # Each standalone suite exits 0 all-green, 1 on any failure; fold into this
 # harness as one assertion per suite so CI stays a single entrypoint.
-for suite in test_json_output test_score_findings test_report_block test_digest; do
+for suite in test_json_output test_score_findings test_report_block test_digest test_snapshot test_profiles; do
   if [[ -f "$SKILL_DIR/tests/$suite.sh" ]]; then
     if bash "$SKILL_DIR/tests/$suite.sh" >"$T/$suite.log" 2>&1; then
       ok "$suite suite green ($(grep -oE '[0-9]+ passed' "$T/$suite.log" | tail -1))"
     else
-      bad "$suite suite failed — tail: $(tail -3 "$T/$suite.log" | tr '\n' ' ')"
+      bad "$suite suite failed — FAILs: $(grep -E '^  FAIL' "$T/$suite.log" | head -3 | tr '\n' ' ') tail: $(tail -1 "$T/$suite.log")"
     fi
   else
     bad "$suite.sh missing from tests/"
   fi
 done
-for suite in test_snapshot; do [[ -f "$SKILL_DIR/tests/$suite.sh" ]] && { bash "$SKILL_DIR/tests/$suite.sh" >"$T/$suite.log" 2>&1 && ok "$suite suite green ($(grep -oE '[0-9]+ passed' "$T/$suite.log" | tail -1))" || bad "$suite suite failed — tail: $(tail -3 "$T/$suite.log" | tr '\n' ' ')"; } || bad "$suite.sh missing from tests/"; done
 
 echo "── model slugs have exactly one source of truth ──"
 # [pin: 2026-08-03 — run_reviewers.sh used to carry a literal `<slug>_model=`
