@@ -193,8 +193,14 @@ assert_contains "agy snapshot block opens with <snapshot> (XML tags, not a markd
   "$AGY_PROMPT_INJ" "<snapshot>"
 assert_not_contains "agy snapshot no longer uses the \`\`\`snapshot markdown fence" \
   "$AGY_PROMPT_INJ" '```snapshot'
-assert_contains "literal </snapshot> inside snapshot content is defused (< \\/snapshot> — same form run_kimi/run_openrouter_reviewer produce)" \
-  "$AGY_PROMPT_INJ" '< \/snapshot>'
+# Defuse output is bash-version-dependent (bash 3.2 keeps the replacement's
+# backslash: "< \/snapshot>"; bash 5 drops it: "< /snapshot>") — both forms
+# neutralize the tag, so assert the invariant that matters instead of the
+# literal: the embedded closing tag is gone, leaving exactly ONE </snapshot>
+# in the prompt (the real fence close).
+SNAP_CLOSE_COUNT="$(printf %s "$AGY_PROMPT_INJ" | grep -o '</snapshot>' | wc -l | tr -d ' ')"
+assert_eq "embedded </snapshot> is defused — exactly one closing tag remains (the real one)" \
+  "$SNAP_CLOSE_COUNT" "1"
 
 write_agy_shim "$T/agy_prompt_rawdiff.txt"
 (
@@ -211,9 +217,12 @@ assert_contains "agy raw-diff still carries the diff content" \
   "$AGY_PROMPT_RAW" "RAW_DIFF_ONLY_MARKER_7f3a91"
 # [pin: cross-review pass-2, nemotron Medium — the raw-diff path's defuse had
 # no test, so a regression would ship silently. The fixture diff contains a
-# literal </diff> line; it must arrive defused.]
-assert_contains "literal </diff> inside raw diff content is defused (< \\/diff>)" \
-  "$AGY_PROMPT_RAW" '< \/diff>'
+# literal </diff> line; it must arrive defused. Defused form is
+# bash-version-dependent (see the </snapshot> note above), so assert the
+# invariant: exactly ONE </diff> remains — the real fence close.]
+DIFF_CLOSE_COUNT="$(printf %s "$AGY_PROMPT_RAW" | grep -o '</diff>' | wc -l | tr -d ' ')"
+assert_eq "embedded </diff> in raw diff content is defused — exactly one closing tag remains" \
+  "$DIFF_CLOSE_COUNT" "1"
 
 echo "── agy oversized snapshot: loud fallback to raw diff, never silent truncation ──"
 # [pin: combined cross-review of PRs #42/#43/#45 — codex High: the argv guard
