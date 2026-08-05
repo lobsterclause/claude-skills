@@ -240,9 +240,13 @@ score_reviewer() {
         | .finding_id as $fid | .run_id as $rid
         | ($drop_keys   | any(.fid == $fid and .rid == $rid)) as $is_dropped
         | ($unanch_keys | any(.fid == $fid and .rid == $rid)) as $is_unanch
-        | ((.all_sources // []) | map($provmap[.] // .) | unique) as $provs
+        # null sources are legal upstream (score_findings.sh filters them the
+        # same way; fingerprint may emit reviewer:null events) — filter before
+        # indexing $provmap or jq dies with "Cannot index object with null".
+        | ((.all_sources // []) | map(select(type == "string"))) as $srcs
+        | ($srcs | map($provmap[.] // .) | unique) as $provs
         | (($provs - [$rprov]) | length == 0) as $is_solo
-        | ((.all_sources // []) | map(. as $s | $baselines | index($s) != null) | any) as $has_baseline
+        | ($srcs | map(. as $s | $baselines | index($s) != null) | any) as $has_baseline
         | (if $is_solo then 1.0 elif $has_baseline then 0.7 else 0.85 end) as $tier
         | (if $is_dropped then 0
            else ($tier * (if $is_unanch then 0.5 else 1 end)) end) as $credit

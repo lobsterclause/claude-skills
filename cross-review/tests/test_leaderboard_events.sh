@@ -73,7 +73,7 @@ cat > "$EVENTS" <<'EOF'
 {"event":"proposed","reviewer":"devstral","all_sources":["devstral"],"severity":"High","file":"e.ts","claim":"dv high","finding_id":"f-d1","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
 {"event":"anchored","resolved":false,"sources":["devstral"],"file":"e.ts","start_line":0,"end_line":0,"side":"new","finding_id":"f-d1","run_id":"fix-r1","ts":"2026-08-04T01:11:00Z"}
 {"event":"proposed","reviewer":"kimi3","all_sources":["kimi3","kimi"],"severity":"Medium","file":"f.ts","claim":"k3 med","finding_id":"f-k1","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
-{"event":"proposed","reviewer":"nemotron","all_sources":["nemotron","glm"],"severity":"Medium","file":"g.ts","claim":"ne med","finding_id":"f-ne1","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"nemotron","all_sources":["nemotron",null,"glm"],"severity":"Medium","file":"g.ts","claim":"ne med","finding_id":"f-ne1","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
 {"event":"proposed","reviewer":"north","all_sources":["north"],"severity":"Critical","file":"z.ts","claim":"stale round","finding_id":"f-n9","run_id":"fix-r0","ts":"2026-08-01T01:10:00Z"}
 EOF
 
@@ -118,6 +118,9 @@ assert_eq "kimi3: kimi-only corroboration counts as provider-solo (100)" \
 
 echo "── baseline-incremental tier: multi-provider without a baseline ──"
 # nemotron + glm (nvidia + zhipu, no codex/kimi) → 0.85 credit → 94.75 → 95.
+# The null in nemotron's all_sources is the codex-P1 regression pin from
+# PR #47: null sources are legal upstream and must be filtered, not indexed
+# ($provmap[null] kills the whole jq scorer).
 assert_eq "nemotron: no-baseline corroboration earns 0.85 credit (95)" \
   "$(field nemotron score)" "95"
 
