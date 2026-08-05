@@ -10,8 +10,8 @@
 # `proposed`. Later stages (human_accepted/human_rejected, fix_applied/
 # fix_verified/fix_failed, regression_detected) have no automated emitter yet
 # — append them by hand or from a future step. This script only appends;
-# nothing reads or aggregates the ledger yet (that's a future phase, not
-# built here — leaderboard.sh and select_roster.sh are unchanged by this).
+# leaderboard.sh reads the ledger (joined to runlog entries by run_id) to
+# score reviewers per-finding — see its events-path scoring docs.
 #
 # Usage:
 #   append_finding_event.sh --event <name> --finding-id <id> --run-id <id>
