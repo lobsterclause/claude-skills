@@ -5,6 +5,30 @@
 #
 # Scoring (documented here, implemented once below — keep in sync):
 #   reliability = ok / attempts                     (delivered a review at all)
+#
+#   EVENTS PATH (v2, preferred): when finding_events.jsonl has `proposed`
+#   events for this reviewer joined (by run_id) to the runlog window, score
+#   per-finding instead of per-aggregate-count:
+#     sev_w    = Critical 5 / High 3 / Medium 2 / Low 1 (unknown 1)
+#     credit   = 0 if factcheck_dropped, else tier * (0.5 if anchored
+#                resolved=false else 1), where tier is:
+#                  1.0  provider-solo (no OTHER provider in all_sources —
+#                       same-provider corroboration, e.g. kimi+kimi3, is
+#                       still one Moonshot vote → solo)
+#                  0.85 multi-provider but no baseline (codex/kimi) aboard
+#                  0.7  corroborated by a baseline
+#     value    = sum(sev_w * credit) / sum(sev_w)
+#     survival = 1 - sum(sev_w over dropped) / sum(sev_w)
+#     score    = 100*(0.45*reliability + 0.35*value + 0.20*survival)
+#   This is the unique-discovery credit + severity weighting the old formula
+#   couldn't express: a solo-but-real Critical now outscores a pile of
+#   corroborated Lows, and a disproven Critical hurts 5x more than a
+#   disproven Low. Known trade-off: solo findings that fact-check can't
+#   actively disprove keep full solo credit — watch ev_dropped/ev_solo per
+#   reviewer before trusting a solo-heavy score.
+#
+#   COUNTS FALLBACK (v1): reviewers with no window events keep the old
+#   aggregate-count formula:
 #   signal      = convergent / findings             (cross-PROVIDER convergence
 #                                                    is our best precision proxy
 #                                                    absent ground truth)
@@ -34,9 +58,12 @@
 # that WERE enriched (findings_total present, even 0) are not decayed by this
 # path — they were actually reviewed and legitimately found nothing.]
 #
-# KNOWN LIMITATION: signal rewards agreeing with the crowd — a reviewer that
-# uniquely finds real bugs scores low on signal until others corroborate.
-# That's the price of having no ground truth; don't tune a reviewer out of the
+# KNOWN LIMITATION (v1 counts fallback only): signal rewards agreeing with
+# the crowd — a reviewer that uniquely finds real bugs scores low on signal
+# until others corroborate. The events path above fixes this (provider-solo
+# findings earn MORE credit, not less), but entries older than the events
+# ledger — and any round run without --emit-events — still score on the
+# counts fallback, where the caveat stands: don't tune a reviewer out of the
 # fleet on signal alone, look at its actual findings first.
 #
 # The per-reviewer findings counts come from append_runlog.sh --findings
@@ -52,7 +79,14 @@
 # JSON fields per reviewer: reviewer, provider, attempts, ok, quota,
 # reliability_pct, findings, convergent, dropped, latest_status, rookie, score,
 # sleep_excluded (timed_out samples whose wall clock overran the enforced
-# budget — machine slept mid-run; dropped from the attempt set, see below).
+# budget — machine slept mid-run; dropped from the attempt set, see below),
+# plus the events-path fields: score_basis ("events" | "counts" | "telemetry"
+# | "rookie"), ev_findings, ev_solo, ev_dropped, ev_unanchored (all 0 when
+# the reviewer scored on a non-events basis).
+#
+# The events ledger path defaults to finding_events.jsonl next to the runlog;
+# CROSS_REVIEW_FINDING_EVENTS overrides it (fixture tests only, same contract
+# as CROSS_REVIEW_RUNLOG).
 
 set -uo pipefail
 
@@ -90,6 +124,28 @@ if [[ -f "$runlog" ]]; then
   structured=$(jq -c 'select(.reviewers != null)' "$runlog" 2>/dev/null | tail -n "$recent")
 fi
 
+# Events ledger, joined to the window by run_id. Entries older than the
+# run_id field (or rounds run without --emit-events) simply contribute no
+# events — their reviewers score on the counts fallback.
+events_file="${CROSS_REVIEW_FINDING_EVENTS:-$skill_dir/finding_events.jsonl}"
+window_run_ids="$(printf '%s\n' "$structured" | jq -c -s '[.[] | .run_id // empty] | unique' 2>/dev/null)"
+window_events="[]"
+if [[ -f "$events_file" && -n "$window_run_ids" && "$window_run_ids" != "[]" ]]; then
+  window_events="$(jq -c -s --argjson rids "$window_run_ids" \
+    '[.[] | select(.run_id as $x | $rids | index($x) != null)]' \
+    "$events_file" 2>/dev/null)"
+  [[ -n "$window_events" ]] || window_events="[]"
+fi
+
+# Baseline seats (codex/kimi unless the profile file says otherwise) — a
+# finding corroborated by a baseline is the 0.7 credit tier.
+baselines='["codex","kimi"]'
+if [[ -f "$profile_file" ]]; then
+  b="$(jq -c '[to_entries[] | select(.value | type == "object")
+               | select(.value.baseline == true) | .key]' "$profile_file" 2>/dev/null)"
+  [[ -n "$b" && "$b" != "[]" ]] && baselines="$b"
+fi
+
 # provider_of <reviewer> — profile `.provider` wins, else the built-in map.
 provider_of() {
   local r="$1" p=""
@@ -122,7 +178,9 @@ provider_of() {
 
 score_reviewer() {
   local r="$1" provider="$2"
-  printf '%s\n' "$structured" | jq -s --arg r "$r" --arg provider "$provider" '
+  printf '%s\n' "$structured" | jq -s --arg r "$r" --arg provider "$provider" \
+    --argjson events "$window_events" --argjson provmap "$provmap" \
+    --argjson baselines "$baselines" '
     map(.reviewers[$r] // {status:"skipped"}) as $rs
     # Sleep-killed timeouts (2026-07-03): a timed_out sample whose wall-clock
     # duration overran the ENFORCED budget by >60s means the machine slept
@@ -164,7 +222,45 @@ score_reviewer() {
     # (findings_total: 0 recorded) was actually reviewed and is not decayed.
     | (if $ok > 3 then (0.75 - 0.06 * ($ok - 3)) else 0.75 end) as $telemetry_mult_raw
     | (if $telemetry_mult_raw < 0.15 then 0.15 else $telemetry_mult_raw end) as $telemetry_mult
+    # ── events path (v2): per-finding severity + unique-discovery credit ──
+    # unique_by guards against a re-emitted (finding_id, run_id) pair; distinct
+    # passes of the same PR mint distinct run_ids and legitimately count twice.
+    | ($events | map(select(.event == "proposed" and .reviewer == $r))
+               | unique_by([.finding_id, .run_id])) as $props
+    | ($events | map(select(.event == "factcheck_dropped")
+                     | {fid: .finding_id, rid: .run_id})) as $drop_keys
+    | ($events | map(select(.event == "anchored" and .resolved == false)
+                     | {fid: .finding_id, rid: .run_id})) as $unanch_keys
+    | ($provmap[$r] // "unknown") as $rprov
+    | ($props | map(
+        (if .severity == "Critical" then 5
+         elif .severity == "High" then 3
+         elif .severity == "Medium" then 2
+         else 1 end) as $w
+        | .finding_id as $fid | .run_id as $rid
+        | ($drop_keys   | any(.fid == $fid and .rid == $rid)) as $is_dropped
+        | ($unanch_keys | any(.fid == $fid and .rid == $rid)) as $is_unanch
+        | ((.all_sources // []) | map($provmap[.] // .) | unique) as $provs
+        | (($provs - [$rprov]) | length == 0) as $is_solo
+        | ((.all_sources // []) | map(. as $s | $baselines | index($s) != null) | any) as $has_baseline
+        | (if $is_solo then 1.0 elif $has_baseline then 0.7 else 0.85 end) as $tier
+        | (if $is_dropped then 0
+           else ($tier * (if $is_unanch then 0.5 else 1 end)) end) as $credit
+        | {w: $w, credit: $credit, dropped: $is_dropped,
+           solo: $is_solo, unanch: $is_unanch}
+      )) as $evs
+    | ($evs | length) as $ev_n
+    | ($evs | map(.w) | add // 0) as $tw
+    | ($evs | map(.w * .credit) | add // 0) as $cw
+    | ($evs | map(select(.dropped) | .w) | add // 0) as $dw
+    | ($evs | map(select(.solo))    | length) as $ev_solo
+    | ($evs | map(select(.dropped)) | length) as $ev_dropped
+    | ($evs | map(select(.unanch))  | length) as $ev_unanchored
     | (if $n == 0 then 50
+       elif $ev_n > 0 then
+         (100 * (0.45 * $rel
+                 + 0.35 * ($cw / $tw)
+                 + 0.20 * (1 - ($dw / $tw)))) | round
        elif $findings > 0 then
          (100 * (0.45 * $rel
                  + 0.35 * ($convergent / $findings)
@@ -173,6 +269,11 @@ score_reviewer() {
          (100 * $rel * $telemetry_mult) | round
        else (100 * $rel * 0.75) | round
        end) as $score
+    | (if $n == 0 then "rookie"
+       elif $ev_n > 0 then "events"
+       elif $findings > 0 then "counts"
+       elif ($scored | length) == 0 then "telemetry"
+       else "counts" end) as $basis
     | { reviewer: $r,
         provider: $provider,
         attempts: $n,
@@ -187,9 +288,21 @@ score_reviewer() {
         avg_cost_usd: $avg_cost,
         sleep_excluded: $sleep_excluded,
         rookie: ($n == 0),
+        score_basis: $basis,
+        ev_findings: $ev_n,
+        ev_solo: $ev_solo,
+        ev_dropped: $ev_dropped,
+        ev_unanchored: $ev_unanchored,
         score: $score }
   '
 }
+
+# reviewer -> provider map, passed into the jq scorer so all_sources can be
+# collapsed to provider votes ("claude" is the parent session's own flag).
+provmap='{"claude":"anthropic"}'
+for r in "${REVIEWERS[@]}"; do
+  provmap="$(jq -c --arg r "$r" --arg p "$(provider_of "$r")" '. + {($r): $p}' <<<"$provmap")"
+done
 
 rows=""
 for r in "${REVIEWERS[@]}"; do
@@ -205,11 +318,14 @@ case "$mode" in
     echo "── cross-review leaderboard (window: last $recent structured runs) ──"
     printf '%s' "$rows" | jq -s -r '
       sort_by(-.score) | to_entries[] |
-      "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if (.value.sleep_excluded // 0) > 0 then " (sleep-excl ×\(.value.sleep_excluded))" else "" end)\(if .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)"
+      "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if (.value.sleep_excluded // 0) > 0 then " (sleep-excl ×\(.value.sleep_excluded))" else "" end)\(if .value.score_basis == "events" then "  ·  ev: \(.value.ev_findings) findings, \(.value.ev_solo) solo, \(.value.ev_dropped) disproven\(if (.value.ev_unanchored // 0) > 0 then ", \(.value.ev_unanchored) unanchored" else "" end)" elif .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)"
     '
     echo "──"
-    echo "  score = 45% reliability + 35% cross-provider convergence + 20% fact-check survival"
-    echo "  (telemetry-only, never enriched: reliability × decaying prior — 0.75 for <=3 ok"
+    echo "  score = 45% reliability + 35% finding value + 20% fact-check survival"
+    echo "  (\"ev:\" rows score per-finding from finding_events.jsonl — severity-weighted,"
+    echo "   solo discoveries 1.0 > no-baseline corroboration 0.85 > baseline-corroborated 0.7,"
+    echo "   unanchored ×0.5, disproven 0 · rows without events use aggregate convergence counts"
+    echo "   · telemetry-only, never enriched: reliability × decaying prior — 0.75 for <=3 ok"
     echo "   runs, -0.06/run beyond that, floor 0.15 · never-run reviewers: rookie prior 50)"
     ;;
   *)
