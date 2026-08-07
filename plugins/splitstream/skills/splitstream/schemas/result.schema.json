@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/lobsterclause/splitstream-skill/schemas/result.schema.json",
+  "title": "Splitstream worker result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "round_id", "shard_id", "status", "branch", "changed_paths", "proof", "summary", "follow_ups"],
+  "properties": {
+    "version": {"const": 1},
+    "round_id": {"type": "string", "minLength": 1},
+    "shard_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["committed", "no_work_needed", "stated_target_not_reproducible", "blocked", "errored"]},
+    "branch": {"type": "string", "minLength": 1},
+    "commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
+    "worktree_path": {"type": ["string", "null"]},
+    "changed_paths": {"type": "array", "items": {"type": "string"}},
+    "proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "outcome", "evidence"],
+      "properties": {
+        "mode": {"enum": ["regression-test", "existing-suite", "static-check", "visual-evidence", "manual-contract"]},
+        "command": {"type": ["string", "null"]},
+        "outcome": {"enum": ["passed", "failed", "not-applicable", "blocked"]},
+        "evidence": {"type": "string"},
+        "baseline": {"type": ["string", "null"]}
+      }
+    },
+    "summary": {"type": "string", "minLength": 1},
+    "follow_ups": {"type": "array", "items": {"type": "string"}},
+    "elapsed_seconds": {"type": "number", "minimum": 0},
+    "budget_seconds": {"type": "number", "exclusiveMinimum": 0}
+  }
+}
