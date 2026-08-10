@@ -3,6 +3,16 @@
 #
 # Usage:
 #   post_comment.sh --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>]
+#                   [--head-sha <sha>]
+#
+# --head-sha stamps the record with the commit that was actually reviewed, and
+# compares it against the PR's live head at post time. Without it a review
+# comment reads as authoritative about whatever the PR contains *now*, which is
+# how a confirmed finding got silently discarded: on kindred-mama-ai#3207 the
+# head moved four times in one session, one push reverted a two-provider P1 fix
+# and deleted its regression test, and the posted record never said which
+# commit it covered. The same PR was merged 19 minutes BEFORE its review
+# posted, so this also flags an already-merged PR.
 #
 # - summary:  one consolidated `gh pr comment` on the PR conversation
 # - file:     write only; no GitHub call (findings already on disk at --findings path)
@@ -16,6 +26,7 @@ pr=""
 mode="summary"
 findings=""
 pass="1"
+head_sha=""
 
 need_val() {
   local flag="$1"
@@ -32,12 +43,13 @@ while [[ $# -gt 0 ]]; do
     --mode)     need_val --mode     "$#"; mode="$2";     shift 2 ;;
     --findings) need_val --findings "$#"; findings="$2"; shift 2 ;;
     --pass)     need_val --pass     "$#"; pass="$2";     shift 2 ;;
+    --head-sha) need_val --head-sha "$#"; head_sha="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$findings" ]]; then
-  echo "usage: $0 --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>]" >&2
+  echo "usage: $0 --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>] [--head-sha <sha>]" >&2
   exit 2
 fi
 
@@ -81,9 +93,33 @@ case "$mode" in
       done
     fi
     [[ -z "$roster_line" ]] && roster_line="external reviewers"
+
+    # Provenance + staleness. A review record is read long after it is posted,
+    # so it must say what it covered. Every query below fails OPEN: if `gh` or
+    # `jq` is unavailable the comment still posts, just without the banner.
+    provenance=""
+    [[ -n "$head_sha" ]] && provenance="Reviewed \`${head_sha:0:9}\`."
+    staleness=""
+    if command -v jq >/dev/null 2>&1; then
+      pr_meta="$(gh pr view "$pr" --json headRefOid,state 2>/dev/null || true)"
+      if [[ -n "$pr_meta" ]]; then
+        cur_sha="$(printf '%s' "$pr_meta" | jq -r '.headRefOid // ""' 2>/dev/null || true)"
+        pr_state="$(printf '%s' "$pr_meta" | jq -r '.state // ""' 2>/dev/null || true)"
+        if [[ "$pr_state" == "MERGED" ]]; then
+          staleness+="> [!WARNING]"$'\n'"> **This PR was already merged before the review finished.** Any finding below is describing code that is already on the base branch — it needs a follow-up PR, not a change here."$'\n\n'
+        elif [[ "$pr_state" == "CLOSED" ]]; then
+          staleness+="> [!WARNING]"$'\n'"> **This PR was closed before the review finished.**"$'\n\n'
+        fi
+        if [[ -n "$head_sha" && -n "$cur_sha" && "$cur_sha" != "$head_sha" ]]; then
+          staleness+="> [!WARNING]"$'\n'"> **Stale: the head moved during this review.** Reviewed \`${head_sha:0:9}\`, current head is \`${cur_sha:0:9}\`. Findings below may describe code that no longer exists, and fixes confirmed here may have been overwritten. Re-review before trusting this record."$'\n\n'
+        fi
+      fi
+    fi
+
     {
       printf '## Cross-review — pass %s\n\n' "$pass"
-      printf '_Automated review by %s. See the "Findings" collapsible for specifics._\n\n' "$roster_line"
+      [[ -n "$staleness" ]] && printf '%s' "$staleness"
+      printf '_Automated review by %s.%s See the "Findings" collapsible for specifics._\n\n' "$roster_line" "${provenance:+ $provenance}"
       printf '<details><summary>Findings</summary>\n\n'
       cat "$findings"
       printf '\n</details>\n'

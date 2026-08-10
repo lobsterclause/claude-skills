@@ -401,8 +401,22 @@ Write a PR-level record so future Claude runs (or human reviewers) can see what 
 bash ~/.claude/skills/cross-review/scripts/post_comment.sh \
   --pr <pr-number> \
   --mode <summary|file|none> \
-  --findings "$run_dir/findings.md"
+  --findings "$run_dir/findings.md" \
+  --head-sha "$(git -C "$worktree" rev-parse HEAD)"
 ```
+
+**Always pass `--head-sha`.** It stamps the record with the commit actually
+reviewed and compares it against the PR's live head at post time, emitting a
+warning banner when they differ or when the PR is already merged/closed. Both
+checks fail open — a missing `gh`/`jq` just drops the banner.
+
+This exists because a review record is read long after it is posted, and
+without the SHA it reads as authoritative about whatever the PR contains
+*now*. On kindred-mama-ai#3207 the head moved four times in one session; one
+push reverted a P1 that two independent providers had confirmed and deleted
+its regression test, while the posted record still looked definitive. The same
+PR was merged **19 minutes before its review finished**, so a reviewer opening
+that comment had no way to see that every finding in it was already shipped.
 
 **Modes:**
 
