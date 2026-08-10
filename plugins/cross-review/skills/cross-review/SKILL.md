@@ -418,6 +418,46 @@ its regression test, while the posted record still looked definitive. The same
 PR was merged **19 minutes before its review finished**, so a reviewer opening
 that comment had no way to see that every finding in it was already shipped.
 
+**Prefer `summary` whenever you have a PR number.** The stamp can only be read
+back off a comment that actually exists on GitHub — a review that lands only in
+`$run_dir/findings.md` is invisible to the merge gate below, and to everyone who
+was not in the session.
+
+### 7b. The gate that reads the stamp
+
+A stamp nothing reads is a sensor with nothing wired to it. Two readers exist:
+
+```bash
+# Is this PR's newest review record bound to the commit about to be merged?
+bash ~/.claude/skills/cross-review/scripts/merge_preflight.sh --pr <n> [--json]
+#   exit 0  clear · reviewed at head, or no record, or the check couldn't run
+#   exit 1  STALE · a record exists and covers a different commit
+```
+
+`hooks/merge_gate.sh` makes that binding on the agent. Wire it once in
+`~/.claude/settings.json` and `gh pr merge` is refused whenever the newest
+record covers a different commit:
+
+```json
+{ "hooks": { "PreToolUse": [
+    { "matcher": "Bash", "hooks": [
+        { "type": "command",
+          "command": "/Users/<you>/.claude/skills/cross-review/hooks/merge_gate.sh" } ] } ] } }
+```
+
+Two deliberate limits. It is **green when absent** — a PR with no cross-review
+comment is not blocked, because this is a safety net over reviews you already
+run, not a mandate that every PR be reviewed; making it a mandate is a policy
+decision, not a default. And it **fails open** on every ambiguity (no `gh`, no
+auth, API error, unparseable record), because a gate that blocks merges whenever
+GitHub hiccups gets switched off within a day and then protects nothing.
+
+It binds the agent, not the human: a person merging in their own terminal never
+touches the hook, and neither does automerge. Covering those needs a GitHub
+status check running the same comparison on `pull_request` + `issue_comment` —
+which, unlike a review-hold label, keeps no state to leak and self-heals (push a
+commit → red; re-review → green).
+
 **Modes:**
 
 - **summary** (default): one consolidated PR comment per pass via `gh pr comment`. Cheap (one API call), easy to scan in the PR timeline, good record for future Claude runs.

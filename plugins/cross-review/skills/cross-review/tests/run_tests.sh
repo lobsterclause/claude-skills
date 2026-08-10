@@ -1385,6 +1385,118 @@ assert_contains "still posts without --head-sha" "$(cat "$CR_TEST_CAPTURE")" "no
 rm -f "$T/bin/gh"
 
 echo
+echo "── merge gate reads the sha stamp ──"
+
+# The stamp post_comment.sh writes is only worth writing if something reads it
+# before a merge. merge_preflight.sh is that reader; hooks/merge_gate.sh makes
+# it binding on the agent. Both fail OPEN, so every assertion below is paired
+# with a control that proves the check can still say no.
+MG_FIX="$T/mg-fixture.json"
+MG_ARGS="$T/mg-gh-args"
+# The shim answers every query with the same fixture, so a verdict alone cannot
+# tell you WHICH PR was looked up. Record the arguments too.
+cat >"$T/bin/gh" <<SH
+#!/bin/sh
+printf ' %s' "\$@" >>"$MG_ARGS"
+printf '\n' >>"$MG_ARGS"
+cat "$MG_FIX" 2>/dev/null || true
+SH
+chmod +x "$T/bin/gh"
+
+# mg_pf <fixture-json> [args...] → sets MG_OUT / MG_RC
+mg_pf() {
+  local fixture="$1"; shift
+  printf '%s' "$fixture" >"$MG_FIX"
+  MG_OUT="$(bash "$S/merge_preflight.sh" --json "$@" 2>/dev/null)"
+  MG_RC=$?
+}
+mg_status() { printf '%s' "$MG_OUT" | jq -r '.status // ""' 2>/dev/null; }
+
+HEAD40='399df23d4d5945162d0c5ed623484d608337165d'
+REVIEWED_OLD='## Cross-review — pass 1\n\n_Automated review by codex + kimi. Reviewed `b81377350`. See below._'
+REVIEWED_NEW='## Cross-review — pass 2\n\n_Automated review by codex. Reviewed `399df23d4`. See below._'
+
+# 1. The whole point: a record bound to a different commit blocks the merge.
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_OLD\"}]}" --pr 3207
+assert_eq "stale review exits 1" "$MG_RC" "1"
+assert_eq "stale review reports status=stale" "$(mg_status)" "stale"
+
+# 2. CONTROL — reviewed at the current head. Without this, every assertion
+#    above would also pass on a script that blocks unconditionally.
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_NEW\"}]}" --pr 3207
+assert_eq "control: matching head exits 0" "$MG_RC" "0"
+assert_eq "control: matching head reports status=clear" "$(mg_status)" "clear"
+
+# 3. Green when absent — a PR nobody cross-reviewed is not blocked. This gate
+#    is a safety net over reviews already run, not a review mandate.
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[]}" --pr 3207
+assert_eq "no review record exits 0" "$MG_RC" "0"
+assert_eq "no review record reports status=unreviewed" "$(mg_status)" "unreviewed"
+
+# 4. A record posted before --head-sha existed carries no stamp to compare.
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"## Cross-review — pass 1\\n\\n_Automated review by codex._\"}]}" --pr 3207
+assert_eq "unstamped record reports status=unbound" "$(mg_status)" "unbound"
+assert_eq "unstamped record exits 0" "$MG_RC" "0"
+
+# 5. Newest record wins — this is what lets a re-review CLEAR a stale gate.
+#    Ordered oldest-first, as `gh pr view --json comments` returns them.
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_OLD\"},{\"body\":\"$REVIEWED_NEW\"}]}" --pr 3207
+assert_eq "a newer passing review clears an older stale one" "$(mg_status)" "clear"
+
+# 6. Nothing to gate on a PR that is already merged or closed.
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"MERGED\",\"comments\":[{\"body\":\"$REVIEWED_OLD\"}]}" --pr 3207
+assert_eq "merged PR is not gated" "$(mg_status)" "closed"
+
+# 7. Fail open: an unusable `gh pr view` response must never block a merge.
+mg_pf '' --pr 3207
+assert_eq "unreadable PR metadata exits 0" "$MG_RC" "0"
+assert_eq "unreadable PR metadata reports status=indeterminate" "$(mg_status)" "indeterminate"
+
+# 8. Usage error is distinct from both outcomes (rc 2, not 0 or 1).
+MG_OUT="$(bash "$S/merge_preflight.sh" --json 2>/dev/null)"; MG_RC=$?
+assert_eq "missing --pr exits 2" "$MG_RC" "2"
+
+# ── the hook that makes it binding ────────────────────────────────────────────
+MG_HOOK="$SKILL_DIR/hooks/merge_gate.sh"
+
+# mg_hook <fixture-json> <command> → prints the permission decision, or PASS
+mg_hook() {
+  printf '%s' "$1" >"$MG_FIX"
+  printf '{"tool_input":{"command":%s}}' "$(jq -Rn --arg c "$2" '$c')" \
+    | bash "$MG_HOOK" 2>/dev/null \
+    | jq -r '.hookSpecificOutput.permissionDecision // "PASS"' 2>/dev/null
+}
+MG_STALE="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_OLD\"}]}"
+MG_CLEAR="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_NEW\"}]}"
+
+assert_eq "hook denies a stale merge" \
+  "$(mg_hook "$MG_STALE" 'gh pr merge 3207 --squash --auto')" "deny"
+assert_eq "control: hook allows a merge reviewed at head" \
+  "$(mg_hook "$MG_CLEAR" 'gh pr merge 3207 --squash')" "PASS"
+assert_eq "hook ignores commands that are not a merge" \
+  "$(mg_hook "$MG_STALE" 'ls -la')" "PASS"
+
+# The literal string appears in any commit message or PR body that DISCUSSES
+# the gate — including the ones in this very PR. Matching raw text would make
+# the hook unable to describe itself.
+assert_eq "hook is not tripped by a heredoc quoting the command" \
+  "$(mg_hook "$MG_STALE" "$(printf 'git commit -F - <<EOF\nfix: explain why gh pr merge was blocked\nEOF')")" "PASS"
+assert_eq "hook is not tripped by the command quoted in --body" \
+  "$(mg_hook "$MG_STALE" 'gh pr create --body "run gh pr merge 3207 when green"')" "PASS"
+
+# The PR number does not have to come first. Assert on what the hook actually
+# looked up, not only on the verdict: with no number found it falls back to the
+# current branch, which this fixture would answer identically — so a verdict
+# alone would stay green on a hook that never parsed the number at all.
+: >"$MG_ARGS"
+assert_eq "hook finds the PR number after a flag" \
+  "$(mg_hook "$MG_STALE" 'gh pr merge --squash 3207')" "deny"
+assert_contains "hook looks up that number rather than the current branch" \
+  "$(cat "$MG_ARGS" 2>/dev/null)" " pr view 3207 "
+
+rm -f "$T/bin/gh"
+
+echo
 echo "── dual-copy identity (repo context only) ──"
 
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
