@@ -452,11 +452,25 @@ decision, not a default. And it **fails open** on every ambiguity (no `gh`, no
 auth, API error, unparseable record), because a gate that blocks merges whenever
 GitHub hiccups gets switched off within a day and then protects nothing.
 
-It binds the agent, not the human: a person merging in their own terminal never
-touches the hook, and neither does automerge. Covering those needs a GitHub
-status check running the same comparison on `pull_request` + `issue_comment` —
-which, unlike a review-hold label, keeps no state to leak and self-heals (push a
-commit → red; re-review → green).
+When a stale merge is genuinely intended — the delta is a rebase, a lockfile, a
+typo — prefix the command with `CROSS_REVIEW_MERGE_OVERRIDE=1`. That is an
+**auditability** mechanism, not a security boundary: an agent could write it
+unprompted, but it puts the bypass in the command the user approves instead of
+leaving the agent with an instruction no command could express.
+
+**What it cannot see.** The hook reads the command text, so `gh api -X PUT
+.../merge`, a merge inside a shell script, the GitHub web UI, and automerge all
+go around it. There is also a TOCTOU window: a push landing between the
+preflight read and GitHub handling the merge still merges unreviewed code.
+Closing that means adding `--match-head-commit <sha>` to the merge itself; the
+hook deliberately does not rewrite commands, because another `PreToolUse` hook
+may already return `updatedInput` and two rewriters would fight.
+
+Those gaps are why the hook should not be the only reader. A GitHub status
+check running the same comparison on `pull_request` + `issue_comment` covers
+every one of them, binds humans and automerge too, and — unlike a review-hold
+label — keeps no state to leak and self-heals (push a commit → red; re-review →
+green).
 
 **Modes:**
 

@@ -58,7 +58,7 @@ fi
 # `gh pr view` accepts a number, URL, or branch. Anything is fine here except
 # an empty string, which it would interpret as "the current branch's PR" and
 # silently answer a question nobody asked.
-gh_args=("$pr" --json comments,headRefOid,state)
+gh_args=("$pr" --json comments,headRefOid,state,number,url)
 [[ -n "$repo" ]] && gh_args+=(--repo "$repo")
 
 emit() {
@@ -103,29 +103,58 @@ if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
   emit closed 0 "PR #$pr is $pr_state — nothing left to gate."
 fi
 
-# The newest cross-review comment wins. Earlier passes are superseded by later
+# `gh pr view --json comments` issues `comments(first: 100)` — verified with
+# GH_DEBUG=api on gh 2.96.0. That is the OLDEST hundred, so past that mark the
+# newest review is simply absent and this script would reason about an obsolete
+# stamp. At exactly the cap, re-fetch the full list through the paginating REST
+# endpoint. Fails open like everything else: if the refetch cannot run, we keep
+# whatever the capped query returned.
+comments_json="$(printf '%s' "$pr_json" | jq -c '[.comments[]? | {body: (.body // "")}]' 2>/dev/null || printf '[]')"
+if [[ "$(printf '%s' "$comments_json" | jq 'length' 2>/dev/null || echo 0)" -ge 100 ]]; then
+  owner_repo="${repo:-}"
+  [[ -z "$owner_repo" ]] && owner_repo="$(printf '%s' "$pr_json" | jq -r '.url // ""' 2>/dev/null | sed -nE 's#^https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#p')"
+  pr_number="$(printf '%s' "$pr_json" | jq -r '.number // ""' 2>/dev/null || true)"
+  if [[ -n "$owner_repo" && -n "$pr_number" ]]; then
+    full="$(gh api --paginate --slurp "repos/$owner_repo/issues/$pr_number/comments" \
+              --jq '[.[][] | {body: (.body // "")}]' 2>/dev/null || true)"
+    [[ -n "$full" ]] && comments_json="$full"
+  fi
+fi
+
+# The newest **stamped** record wins. Earlier passes are superseded by later
 # ones by construction: pass 2 exists precisely because pass 1's findings were
-# addressed. Selecting the newest, rather than requiring all of them to match,
-# is what lets a re-review clear a stale gate.
+# addressed. Selecting the newest is what lets a re-review clear a stale gate.
 #
-# `## Cross-review` is post_comment.sh's own header (see its summary mode). It
-# is matched at the start of the body so that a human quoting the header inside
-# a discussion comment does not register as a review record.
-review_body="$(printf '%s' "$pr_json" \
-  | jq -r '[.comments[]? | select((.body // "") | startswith("## Cross-review"))] | last | .body // ""' \
+# Unstamped cross-review comments are skipped rather than selected. Taking the
+# newest comment of any kind meant one unstamped record — which post_comment.sh
+# still produces when `--head-sha` is omitted — reported `unbound` and switched
+# the gate off while a stale stamped record sat right behind it. A comment that
+# carries no SHA carries no information about coverage; it must not outvote one
+# that does.
+#
+# `## Cross-review` is post_comment.sh's own header (see its summary mode),
+# matched at the start of the body so a human quoting the header in a
+# discussion comment does not register as a review record.
+STAMP_RE='Reviewed `[0-9a-f]{7,40}`'
+review_body="$(printf '%s' "$comments_json" \
+  | jq -r --arg re "$STAMP_RE" \
+      '[.[] | .body | select(startswith("## Cross-review")) | select(test($re))] | last // ""' \
   2>/dev/null || true)"
 
 if [[ -z "$review_body" ]]; then
+  # Distinguish "nobody reviewed this" from "a review exists but predates the
+  # stamp" — same exit code, materially different things to tell a human.
+  any_review="$(printf '%s' "$comments_json" \
+    | jq -r '[.[] | .body | select(startswith("## Cross-review"))] | length' 2>/dev/null || echo 0)"
+  if [[ "${any_review:-0}" -gt 0 ]]; then
+    emit unbound 0 "PR #$pr has cross-review records but none carries a SHA stamp (posted before --head-sha existed) — cannot verify; not blocking."
+  fi
   emit unreviewed 0 "no cross-review record on PR #$pr — nothing to contradict the merge."
 fi
 
 # post_comment.sh prints the SHA abbreviated to 9 chars: Reviewed `abc123def`.
 reviewed_sha="$(printf '%s' "$review_body" \
   | sed -nE 's/.*Reviewed `([0-9a-f]{7,40})`.*/\1/p' | head -1)"
-
-if [[ -z "$reviewed_sha" ]]; then
-  emit unbound 0 "PR #$pr has a cross-review record with no SHA stamp (posted before --head-sha existed) — cannot verify; not blocking."
-fi
 
 # Compare on the stamp's own width. The stamp is abbreviated; headRefOid is not.
 n="${#reviewed_sha}"

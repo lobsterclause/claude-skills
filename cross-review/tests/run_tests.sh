@@ -1494,6 +1494,122 @@ assert_eq "hook finds the PR number after a flag" \
 assert_contains "hook looks up that number rather than the current branch" \
   "$(cat "$MG_ARGS" 2>/dev/null)" " pr view 3207 "
 
+# ── PR #50 review: every defect below was reproduced before it was fixed ─────
+# The theme is that a shell command has more shapes than a regex has branches,
+# so each of these asserts on the PR the hook RESOLVED, not just its verdict.
+
+# mg_lookup <fixture> <command> → what the hook passed to `gh pr view`
+mg_lookup() {
+  : >"$MG_ARGS"
+  mg_hook "$1" "$2" >/dev/null
+  sed -nE 's/.*pr view ([^ ]+) .*/\1/p' "$MG_ARGS" 2>/dev/null | head -1
+}
+
+# 1. [codex] The cheap bail-out matched the literal "gh pr merge", so one extra
+#    space skipped the gate entirely — before the whitespace-flexible regex ran.
+assert_eq "two spaces do not bypass the gate" \
+  "$(mg_hook "$MG_STALE" 'gh  pr merge 3207')" "deny"
+
+# 2. [antigravity] Per-line stripping left earlier lines in the token scan, so a
+#    number anywhere above the merge was read as the PR. Both directions are
+#    harmful: false block, and false CLEAR when the wrong PR happens to be fine.
+assert_eq "a number on an earlier line is not mistaken for the PR" \
+  "$(mg_lookup "$MG_STALE" "$(printf 'timeout 300 pnpm test\ngh pr merge 3207')")" "3207"
+
+# 3. [codex] Only the last merge in a compound command was checked, but the
+#    first one runs first.
+assert_eq "the first merge in a compound command is checked" \
+  "$(mg_lookup "$MG_STALE" 'gh pr merge 111 && gh pr merge 222')" "111"
+
+# 4. [codex] `--disable-auto` CANCELS a queued merge — it is the corrective
+#    action for a stale auto-merge, and the gate was refusing it.
+assert_eq "cancelling an auto-merge is not gated" \
+  "$(mg_hook "$MG_STALE" 'gh pr merge 3207 --disable-auto')" "PASS"
+
+# 5. [codex+antigravity, two providers] Quotes are still data at word-split
+#    time, so a quoted number was not recognised as a number at all.
+assert_eq "a quoted PR number is still a PR number" \
+  "$(mg_lookup "$MG_STALE" 'gh pr merge "3207"')" "3207"
+
+# 6. [codex+antigravity, two providers] Same for the repo value, where the
+#    consequence was worse: gh could not resolve '"o/r"', so the gate no-opped.
+assert_contains "a quoted --repo value loses its quotes" \
+  "$(: >"$MG_ARGS"; mg_hook "$MG_STALE" 'gh pr merge 3207 --repo "o/r"' >/dev/null; cat "$MG_ARGS")" \
+  " --repo o/r"
+
+# 7. [codex] `-R` is gh's documented short alias; ignoring it meant querying
+#    the right number in the wrong repository.
+assert_contains "the -R repo alias is honoured" \
+  "$(: >"$MG_ARGS"; mg_hook "$MG_STALE" 'gh pr merge -R o/r 3207' >/dev/null; cat "$MG_ARGS")" \
+  " --repo o/r"
+
+# 8. [antigravity+codex] `gh pr merge <branch>` is valid; the hook used to drop
+#    the branch and check whatever the shell happened to be on.
+assert_eq "a branch-name target is used as the PR reference" \
+  "$(mg_lookup "$MG_STALE" 'gh pr merge my-branch')" "my-branch"
+
+# 9. Flag-value awareness: the word after --match-head-commit is that flag's
+#    value, not the PR. A positional scan without a flag table gets this wrong.
+assert_eq "a flag's value is not mistaken for the PR reference" \
+  "$(mg_lookup "$MG_STALE" 'gh pr merge --match-head-commit 999 3207')" "3207"
+
+# 10. [codex] The refusal told the agent to get authorization, but no command
+#     could express it — so the instruction could only be followed by evading
+#     the matcher. The override is auditable, not secure: it is there so a user
+#     who says "it's just a rebase" can be obeyed in the open.
+assert_eq "an explicit override is honoured" \
+  "$(mg_hook "$MG_STALE" 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 3207')" "PASS"
+
+# 11. CONTROL for 1-10: the plain form must still deny. Every assertion above
+#     is about resolving the right PR; without this one they would all pass on
+#     a hook that resolved perfectly and then never blocked anything.
+assert_eq "control: the plain merge form still denies" \
+  "$(mg_hook "$MG_STALE" 'gh pr merge 3207')" "deny"
+
+# 12. CONTROL: both reviewers claimed a quoted mention would false-deny. It
+#     does not — the anchor requires a shell-ish character before `gh`. Pinned
+#     so the parser rework above cannot quietly introduce the bug they imagined.
+assert_eq "control: a quoted mention inside another command still passes" \
+  "$(mg_hook "$MG_STALE" "python3 -c \"print('gh pr merge 3207')\"")" "PASS"
+
+# ── preflight: the Critical ────────────────────────────────────────────────
+STAMPED='## Cross-review — pass 1\n\n_Reviewed `b81377350`._'
+UNSTAMPED='## Cross-review — pass 2\n\n_no stamp on this one._'
+
+# [antigravity] An unstamped record is not evidence of coverage, but `last`
+# selected it anyway and reported unbound — switching the gate off while a
+# stale stamped record sat right behind it. post_comment.sh produces exactly
+# this comment whenever --head-sha is omitted, which #49 explicitly supports.
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$STAMPED\"},{\"body\":\"$UNSTAMPED\"}]}" --pr 3207
+assert_eq "an unstamped later record cannot mask a stale one" "$(mg_status)" "stale"
+assert_eq "and it still exits 1" "$MG_RC" "1"
+
+# CONTROL: with no stamped record anywhere, unbound is still the right answer.
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$UNSTAMPED\"}]}" --pr 3207
+assert_eq "control: records with no stamp at all report unbound" "$(mg_status)" "unbound"
+
+# [codex, and independently confirmed with GH_DEBUG=api on gh 2.96.0]
+# `gh pr view --json comments` issues comments(first: 100) — the OLDEST
+# hundred. At the cap the newest review may be missing entirely, so refetch
+# through the paginating REST endpoint.
+BIG="$(jq -nc --arg b "$STAMPED" '[range(100) | {body: $b}]')"
+: >"$MG_ARGS"
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"number\":7,\"url\":\"https://github.com/o/r/pull/7\",\"comments\":$BIG}" --pr 7
+assert_contains "a capped comment list is refetched with pagination" \
+  "$(cat "$MG_ARGS" 2>/dev/null)" "api --paginate"
+
+# CONTROL: below the cap, no second API call — the refetch must not be
+# unconditional, or every run pays for it. The fixture carries `number` and
+# `url` deliberately: without them the refetch cannot run for lack of a repo to
+# query, and this control would pass on an unconditional refetch too.
+: >"$MG_ARGS"
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"number\":7,\"url\":\"https://github.com/o/r/pull/7\",\"comments\":[{\"body\":\"$STAMPED\"}]}" --pr 7
+if grep -q 'api --paginate' "$MG_ARGS" 2>/dev/null; then
+  bad "control: no pagination refetch under the 100-comment cap"
+else
+  ok "control: no pagination refetch under the 100-comment cap"
+fi
+
 rm -f "$T/bin/gh"
 
 echo
