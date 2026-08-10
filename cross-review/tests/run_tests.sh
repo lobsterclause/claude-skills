@@ -1598,6 +1598,50 @@ assert_eq "control: the plain merge form still denies" \
 assert_eq "control: a quoted mention inside another command still passes" \
   "$(mg_hook "$MG_STALE" "python3 -c \"print('gh pr merge 3207')\"")" "PASS"
 
+# ── PR #50 pass 2: bypasses the pass-1 fixes introduced or left behind ──────
+
+# [glm] `merge` had to be followed by whitespace or end-of-string, but the
+# newline mapping turned a bare `gh pr merge` into `gh pr merge;` — so the
+# plainest and most common form of the command matched nothing at all. Pass 1's
+# own control used `--squash`, which has a space after `merge`, and missed it.
+assert_eq "a bare merge before a newline is still gated" \
+  "$(mg_hook "$MG_STALE" "$(printf 'gh pr merge\n')")" "deny"
+assert_eq "a bare merge before a semicolon is still gated" \
+  "$(mg_hook "$MG_STALE" 'gh pr merge; echo done')" "deny"
+
+# [codex] Anchoring the match to a shell separator was a REGRESSION introduced
+# in pass 1: the original alternative included whitespace, so an environment
+# prefix or shell keyword used to be caught and then was not.
+assert_eq "an environment prefix does not bypass the gate" \
+  "$(mg_lookup "$MG_STALE" 'GH_REPO=o/r gh pr merge 3207')" "3207"
+assert_eq "a shell keyword prefix does not bypass the gate" \
+  "$(mg_lookup "$MG_STALE" 'if gh pr merge 3207; then echo hi; fi')" "3207"
+
+# [codex] -A is gh's documented alias for --author-email and consumes the next
+# token; without it the email resolved as the PR reference.
+assert_eq "the -A alias consumes its value" \
+  "$(mg_lookup "$MG_STALE" 'gh pr merge -A user@example.com 3207')" "3207"
+
+# [glm + codex, two providers] The override was a substring match anywhere, so
+# three things that authorize nothing disarmed the gate: a mention in an
+# unrelated command, a shell comment the shell never evaluates, and =10.
+assert_eq "a mention in an earlier command is not an override" \
+  "$(mg_hook "$MG_STALE" 'echo CROSS_REVIEW_MERGE_OVERRIDE=1; gh pr merge 3207')" "deny"
+assert_eq "a trailing comment is not an override" \
+  "$(mg_hook "$MG_STALE" 'gh pr merge 3207 # CROSS_REVIEW_MERGE_OVERRIDE=1 needed')" "deny"
+assert_eq "a longer value is not an override" \
+  "$(mg_hook "$MG_STALE" 'CROSS_REVIEW_MERGE_OVERRIDE=10 gh pr merge 3207')" "deny"
+
+# CONTROL for the three above: the real form must still work, or they would all
+# pass on a hook whose override never fires.
+assert_eq "control: the real override prefix still passes" \
+  "$(mg_hook "$MG_STALE" 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 3207')" "PASS"
+
+# CONTROL: accepting whitespace before `gh` widens the matcher; ordinary git
+# commands containing the word must stay untouched.
+assert_eq "control: git merge is not a gh pr merge" \
+  "$(mg_hook "$MG_STALE" 'git merge origin/master')" "PASS"
+
 # ── preflight: the Critical ────────────────────────────────────────────────
 STAMPED='## Cross-review — pass 1\n\n_Reviewed `b81377350`._'
 UNSTAMPED='## Cross-review — pass 2\n\n_no stamp on this one._'

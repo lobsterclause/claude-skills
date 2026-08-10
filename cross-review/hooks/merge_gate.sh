@@ -85,9 +85,22 @@ scrub() {
 # does, and mapping it to a space instead fused the lines into one nonsense
 # command (`... pnpm test gh pr merge 3242`) that the separator-anchored regex
 # then declined to match at all — turning a wrong-PR bug into a total bypass.
-cmd_only="$(scrub "$cmd" | tr '\n' ';')"
+#
+# Separators are then padded with spaces. `merge` had to be followed by
+# whitespace or end-of-string to match, so `gh pr merge` with nothing after it
+# — the plainest and most common form there is — became `gh pr merge;` after
+# the newline mapping and matched nothing at all. Padding turns that into
+# `gh pr merge ; ` so the existing anchor fires, and argument truncation at the
+# separator still works because the separator survives as its own token.
+cmd_only="$(scrub "$cmd" | tr '\n' ';' | sed -E 's/([;&|()])/ \1 /g')"
 
-MERGE_RE='(^|[;&|(])[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)'
+# Leading anchor accepts whitespace as well as a shell separator. Requiring a
+# separator meant an environment prefix or a shell keyword — `GH_REPO=o/r gh pr
+# merge 3207`, `if gh pr merge 3207; then` — put a space before `gh` and
+# sailed through. The cost is that a bare `echo gh pr merge 1` is also matched;
+# a false denial on a command that merges nothing is much cheaper than a false
+# allow on one that does.
+MERGE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)'
 printf '%s' "$cmd_only" | grep -qE "$MERGE_RE" || pass
 
 # An explicit, auditable escape hatch. This is NOT a security boundary — the
@@ -95,9 +108,14 @@ printf '%s' "$cmd_only" | grep -qE "$MERGE_RE" || pass
 # instruction the user actually gave ("the delta is a rebase, merge it") while
 # leaving the bypass visible in the command the user approves. Without one, the
 # refusal below told the agent to do something no command could express.
-case "$cmd_only" in
-  *CROSS_REVIEW_MERGE_OVERRIDE=1*) pass ;;
-esac
+#
+# It must sit immediately before the merge, as a real environment assignment.
+# A substring match anywhere accepted `echo CROSS_REVIEW_MERGE_OVERRIDE=1; gh
+# pr merge 3207`, a trailing `# CROSS_REVIEW_MERGE_OVERRIDE=1` comment that the
+# shell never evaluates, and the value `=10` — three ways to disarm the gate
+# without ever authorizing anything.
+OVERRIDE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*CROSS_REVIEW_MERGE_OVERRIDE=1[[:space:]]+gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)'
+printf '%s' "$cmd_only" | grep -qE "$OVERRIDE_RE" && pass
 
 dequote() {
   local s="$1"
@@ -131,7 +149,10 @@ parse_invocation() {
       --repo=*)       INV_REPO="$(dequote "${tok#--repo=}")" ;;
       -R=*)           INV_REPO="$(dequote "${tok#-R=}")" ;;
       -R?*)           INV_REPO="$(dequote "${tok#-R}")" ;;
-      -b|--body|-F|--body-file|-t|--subject|--author-email|--match-head-commit)
+      # Every gh-pr-merge option that consumes the NEXT token. `-A` is the
+      # documented alias for --author-email; omitting it made
+      # `gh pr merge -A user@example.com 3207` resolve the email as the PR.
+      -b|--body|-F|--body-file|-t|--subject|-A|--author-email|--match-head-commit)
                       expect=skipval ;;
       -*)             : ;;   # boolean flag
       # First positional is the PR reference: a number, a URL, or a branch
@@ -155,7 +176,7 @@ parse_invocation() {
 invocations="$(printf '%s' "$cmd_only" | awk '
   {
     s = $0
-    while (match(s, /(^|[;&|(])[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)/)) {
+    while (match(s, /(^|[;&|(]|[[:space:]])[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)/)) {
       s = substr(s, RSTART + RLENGTH)
       print "@" s
     }
