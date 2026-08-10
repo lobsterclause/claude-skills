@@ -458,19 +458,34 @@ typo — prefix the command with `CROSS_REVIEW_MERGE_OVERRIDE=1`. That is an
 unprompted, but it puts the bypass in the command the user approves instead of
 leaving the agent with an instruction no command could express.
 
-**What it cannot see.** The hook reads the command text, so `gh api -X PUT
-.../merge`, a merge inside a shell script, the GitHub web UI, and automerge all
-go around it. There is also a TOCTOU window: a push landing between the
-preflight read and GitHub handling the merge still merges unreviewed code.
-Closing that means adding `--match-head-commit <sha>` to the merge itself; the
-hook deliberately does not rewrite commands, because another `PreToolUse` hook
-may already return `updatedInput` and two rewriters would fight.
+**On a `clear` verdict it still asks for one thing:** that the merge carry
+`--match-head-commit <sha>`. A verdict is a statement about the head at read
+time, and a push landing before GitHub handles the merge would be merged
+unreviewed. Binding the merge makes GitHub itself refuse in that case — the
+difference between "was true a moment ago" and a guarantee. It is required only
+where there is something to bind to; an unreviewed PR is never forced to, or
+green-when-absent would quietly become a review mandate.
 
-Those gaps are why the hook should not be the only reader. A GitHub status
-check running the same comparison on `pull_request` + `issue_comment` covers
-every one of them, binds humans and automerge too, and — unlike a review-hold
-label — keeps no state to leak and self-heals (push a commit → red; re-review →
-green).
+`gh api ... repos/O/R/pulls/N/merge` is gated the same way. It merges a PR
+without ever saying `gh pr merge`, which makes it the first thing a blocked
+agent would reach for rather than an exotic edge case.
+
+**What it still cannot see.** It reads the command text, so a merge inside a
+shell script it cannot read, a GraphQL `mergePullRequest` mutation (the PR is a
+node ID there, with nothing to resolve), and the GitHub web UI all go around
+it — as does automerge, which is not an agent command at all.
+
+The hook never rewrites commands. Another `PreToolUse` hook may return
+`updatedInput` and two rewriters would fight — verified live here: rtk rewrites
+`gh pr merge` to `rtk gh pr merge` and returns `permissionDecision: "allow"`.
+Deny still wins over that allow (verified with an always-stale stub), and the
+whitespace leading anchor is what keeps `rtk gh …` matching at all.
+
+Those remaining gaps are why the hook should not be the only reader. A GitHub
+status check running the same comparison on `pull_request` + `issue_comment`
+covers every one of them, binds humans and automerge too, and — unlike a
+review-hold label — keeps no state to leak and self-heals (push a commit → red;
+re-review → green).
 
 **Modes:**
 

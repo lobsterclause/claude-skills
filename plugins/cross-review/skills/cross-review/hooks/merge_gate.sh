@@ -17,15 +17,20 @@
 # in their own terminal never touches this hook, and neither does automerge.
 # Covering those means a GitHub status check computing the same comparison.
 #
+# It covers both `gh pr merge` and `gh api ... repos/O/R/pulls/N/merge`, and
+# on a `clear` verdict it requires the merge to carry `--match-head-commit`
+# so GitHub itself refuses if the head moved after the check (TOCTOU).
+#
 # KNOWN LIMITS, stated rather than papered over:
-#  * It decides from the command text. `gh api -X PUT .../merge`, a merge
-#    inside a shell script, or the GitHub web UI all bypass it. The status
+#  * It decides from the command text. A merge inside a shell script it cannot
+#    read, a GraphQL `mergePullRequest` mutation (the PR is a node ID there,
+#    with nothing to resolve), or the GitHub web UI all bypass it. A status
 #    check is what covers those.
-#  * A push landing between preflight's read and GitHub handling the merge
-#    still merges unreviewed code (TOCTOU). Closing it means adding
-#    `--match-head-commit <sha>` to the merge itself; this hook deliberately
-#    does not rewrite the command, because another PreToolUse hook may already
-#    be returning `updatedInput` and two rewriters would fight.
+#  * It never rewrites the command, because another PreToolUse hook may return
+#    `updatedInput` and two rewriters would fight — verified live: rtk rewrites
+#    `gh pr merge` to `rtk gh pr merge` and returns permissionDecision "allow".
+#    Deny still wins over that allow (verified with an always-stale stub), and
+#    the whitespace leading anchor is what keeps `rtk gh …` matching at all.
 
 set -uo pipefail
 
@@ -101,7 +106,15 @@ cmd_only="$(scrub "$cmd" | tr '\n' ';' | sed -E 's/([;&|()])/ \1 /g')"
 # a false denial on a command that merges nothing is much cheaper than a false
 # allow on one that does.
 MERGE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)'
-printf '%s' "$cmd_only" | grep -qE "$MERGE_RE" || pass
+# `gh api ... repos/O/R/pulls/N/merge` merges a PR without ever saying
+# "gh pr merge". It was listed as a known limit rather than handled; an agent
+# that hits the deny below can reach for it in one step, which makes it the
+# most likely bypass in practice rather than the least.
+API_MERGE_RE='repos/[^/ ]+/[^/ ]+/pulls/[0-9]+/merge'
+if ! printf '%s' "$cmd_only" | grep -qE "$MERGE_RE" \
+   && ! printf '%s' "$cmd_only" | grep -qE "$API_MERGE_RE"; then
+  pass
+fi
 
 # An explicit, auditable escape hatch. This is NOT a security boundary — the
 # agent could write it unprompted — it is a way for the agent to carry out an
@@ -114,7 +127,7 @@ printf '%s' "$cmd_only" | grep -qE "$MERGE_RE" || pass
 # pr merge 3207`, a trailing `# CROSS_REVIEW_MERGE_OVERRIDE=1` comment that the
 # shell never evaluates, and the value `=10` — three ways to disarm the gate
 # without ever authorizing anything.
-OVERRIDE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*CROSS_REVIEW_MERGE_OVERRIDE=1[[:space:]]+gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)'
+OVERRIDE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*CROSS_REVIEW_MERGE_OVERRIDE=1[[:space:]]+(gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)|gh[[:space:]]+api[[:space:]])'
 printf '%s' "$cmd_only" | grep -qE "$OVERRIDE_RE" && pass
 
 dequote() {
@@ -129,9 +142,9 @@ dequote() {
 # Parse ONE `gh pr merge` invocation's arguments. Sets INV_PR / INV_REPO /
 # INV_SKIP. Flag-value aware, because a positional scan that does not know
 # which flags consume the next word mistakes that word for the PR reference.
-INV_PR=""; INV_REPO=""; INV_SKIP=0
+INV_PR=""; INV_REPO=""; INV_SKIP=0; INV_MATCH=0
 parse_invocation() {
-  INV_PR=""; INV_REPO=""; INV_SKIP=0
+  INV_PR=""; INV_REPO=""; INV_SKIP=0; INV_MATCH=0
   local expect="" tok
   set -f    # a token containing * or ? is data, not a glob
   for tok in $1; do
@@ -152,7 +165,11 @@ parse_invocation() {
       # Every gh-pr-merge option that consumes the NEXT token. `-A` is the
       # documented alias for --author-email; omitting it made
       # `gh pr merge -A user@example.com 3207` resolve the email as the PR.
-      -b|--body|-F|--body-file|-t|--subject|-A|--author-email|--match-head-commit)
+      # Binding the merge to a SHA is what closes the TOCTOU window, so note
+      # when the caller already did it.
+      --match-head-commit) INV_MATCH=1; expect=skipval ;;
+      --match-head-commit=*) INV_MATCH=1 ;;
+      -b|--body|-F|--body-file|-t|--subject|-A|--author-email)
                       expect=skipval ;;
       -*)             : ;;   # boolean flag
       # First positional is the PR reference: a number, a URL, or a branch
@@ -183,7 +200,24 @@ invocations="$(printf '%s' "$cmd_only" | awk '
   }')"
 
 verdict_json=""
-while IFS= read -r args; do
+unbound_json=""
+
+# REST merges first: one preflight per repos/O/R/pulls/N/merge in the command.
+while IFS= read -r spec; do
+  [[ -n "$spec" ]] || continue
+  api_repo="${spec%% *}"; api_pr="${spec##* }"
+  result="$(bash "$preflight" --pr "$api_pr" --repo "$api_repo" --json 2>/dev/null || true)"
+  [[ -n "$result" ]] || continue
+  if [[ "$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)" == "stale" ]]; then
+    verdict_json="$result"
+    break
+  fi
+done <<API
+$(printf '%s' "$cmd_only" | grep -oE "$API_MERGE_RE" \
+   | sed -E 's#repos/([^/ ]+/[^/ ]+)/pulls/([0-9]+)/merge#\1 \2#')
+API
+
+[[ -n "$verdict_json" ]] || while IFS= read -r args; do
   [[ -n "$args" ]] || continue
   args="${args#@}"
   # Arguments end at the next shell separator.
@@ -205,15 +239,50 @@ while IFS= read -r args; do
   fi
   [[ -n "$result" ]] || continue
 
-  if [[ "$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)" == "stale" ]]; then
+  inv_status="$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)"
+  if [[ "$inv_status" == "stale" ]]; then
     verdict_json="$result"
     break
+  fi
+  # A `clear` verdict says THIS commit was reviewed. Between that read and
+  # GitHub handling the merge, a push can land — and the merge would take the
+  # new head. `--match-head-commit` makes GitHub itself refuse in that case,
+  # which turns the check from "was true a moment ago" into a guarantee.
+  # Only enforced on `clear`: with no reviewed SHA there is nothing to bind to,
+  # and blocking there would break green-when-absent.
+  if [[ "$inv_status" == "clear" && "$INV_MATCH" -eq 0 && -z "$unbound_json" ]]; then
+    unbound_json="$result"
   fi
 done <<EOF
 $invocations
 EOF
 
-[[ -n "$verdict_json" ]] || pass
+deny() {
+  jq -n --arg r "$1" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: $r
+    }
+  }'
+  exit 0
+}
+
+if [[ -z "$verdict_json" ]]; then
+  [[ -n "$unbound_json" ]] || pass
+  u_head="$(printf '%s' "$unbound_json" | jq -r '.head // ""' 2>/dev/null || true)"
+  u_pr="$(printf '%s' "$unbound_json" | jq -r '.pr // ""' 2>/dev/null || true)"
+  [[ -n "$u_head" ]] || pass
+  deny "PR ${u_pr} is reviewed at its current head, but this merge is not bound to it.
+
+The review covers ${u_head:0:9}. Nothing stops a push from landing between this check and GitHub handling the merge, and the merge would take the new head — unreviewed. \`--match-head-commit\` makes GitHub refuse in exactly that case, which is the difference between 'was true a moment ago' and a guarantee.
+
+Re-run it as:
+
+  gh pr merge ${u_pr} --match-head-commit ${u_head} <your other flags>
+
+If GitHub then rejects it, the head moved and the review no longer covers what you were about to merge — which is the check working."
+fi
 
 reviewed="$(printf '%s' "$verdict_json" | jq -r '.reviewed // ""' 2>/dev/null || true)"
 head="$(printf '%s' "$verdict_json" | jq -r '.head // ""' 2>/dev/null || true)"
@@ -229,10 +298,4 @@ Do one of:
 
 Do not re-issue this command unchanged."
 
-jq -n --arg r "$reason" '{
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason: $r
-  }
-}'
+deny "$reason"

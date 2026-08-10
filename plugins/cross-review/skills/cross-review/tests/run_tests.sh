@@ -1497,8 +1497,10 @@ MG_CLEAR="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\"
 
 assert_eq "hook denies a stale merge" \
   "$(mg_hook "$MG_STALE" 'gh pr merge 3207 --squash --auto')" "deny"
-assert_eq "control: hook allows a merge reviewed at head" \
-  "$(mg_hook "$MG_CLEAR" 'gh pr merge 3207 --squash')" "PASS"
+# A merge reviewed at head is no longer waved through unconditionally: it must
+# also bind itself to that commit. See the TOCTOU block further down for why.
+assert_eq "control: hook allows a merge reviewed at head AND bound to it" \
+  "$(mg_hook "$MG_CLEAR" "gh pr merge 3207 --squash --match-head-commit $HEAD40")" "PASS"
 assert_eq "hook ignores commands that are not a merge" \
   "$(mg_hook "$MG_STALE" 'ls -la')" "PASS"
 
@@ -1641,6 +1643,55 @@ assert_eq "control: the real override prefix still passes" \
 # commands containing the word must stay untouched.
 assert_eq "control: git merge is not a gh pr merge" \
   "$(mg_hook "$MG_STALE" 'git merge origin/master')" "PASS"
+
+# ── PR #50 pass 3: the two findings that were documented instead of fixed ───
+# Both were codex P1s from pass 1. Writing a limitation into a comment is not
+# the same as handling it, and a KNOWN LIMITS block is where a finding goes to
+# be forgotten.
+
+MG_CLEAR_FULL="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"number\":50,\"url\":\"https://github.com/o/r/pull/50\",\"comments\":[{\"body\":\"$REVIEWED_NEW\"}]}"
+MG_NONE="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"number\":50,\"url\":\"https://github.com/o/r/pull/50\",\"comments\":[]}"
+
+# TOCTOU. A `clear` verdict is a statement about the head at read time. A push
+# landing before GitHub handles the merge would be merged unreviewed, so the
+# merge must assert the SHA itself — GitHub then refuses if it moved.
+assert_eq "a clear verdict still refuses an unbound merge" \
+  "$(mg_hook "$MG_CLEAR_FULL" 'gh pr merge 50 --squash')" "deny"
+# mg_reason <fixture> <command> → the text handed back to the agent
+mg_reason() {
+  printf '%s' "$1" >"$MG_FIX"
+  printf '{"tool_input":{"command":%s}}' "$(jq -Rn --arg c "$2" '$c')" \
+    | bash "$MG_HOOK" 2>/dev/null \
+    | jq -r '.hookSpecificOutput.permissionDecisionReason // ""' 2>/dev/null
+}
+# A refusal the agent cannot act on is the mistake this gate already made once
+# (the override that no command could express). Assert the fix is spelled out.
+assert_contains "and the refusal hands over the exact SHA to bind" \
+  "$(mg_reason "$MG_CLEAR_FULL" 'gh pr merge 50 --squash')" \
+  "--match-head-commit $HEAD40"
+
+# CONTROL ×2: both spellings of the flag must satisfy it, or the assertion
+# above would be indistinguishable from a hook that denies every merge.
+assert_eq "control: a bound merge passes" \
+  "$(mg_hook "$MG_CLEAR_FULL" "gh pr merge 50 --squash --match-head-commit $HEAD40")" "PASS"
+assert_eq "control: the =SHA spelling also passes" \
+  "$(mg_hook "$MG_CLEAR_FULL" "gh pr merge 50 --match-head-commit=$HEAD40")" "PASS"
+
+# CONTROL: binding is required only where there is something to bind TO.
+# Demanding it on an unreviewed PR would quietly convert green-when-absent
+# into a review mandate — the one thing this gate promises not to become.
+assert_eq "control: an unreviewed PR is not forced to bind" \
+  "$(mg_hook "$MG_NONE" 'gh pr merge 50 --squash')" "PASS"
+
+# The REST endpoint merges a PR without ever saying `gh pr merge`. It was the
+# first line of the KNOWN LIMITS block, which also makes it the first thing an
+# agent blocked by this gate would reach for.
+assert_eq "the REST merge endpoint is gated too" \
+  "$(mg_hook "$MG_STALE" 'gh api -X PUT repos/o/r/pulls/50/merge')" "deny"
+
+# CONTROL: reading a PR through the same CLI must stay untouched.
+assert_eq "control: a non-merge gh api call passes" \
+  "$(mg_hook "$MG_STALE" 'gh api repos/o/r/pulls/50')" "PASS"
 
 # ── preflight: the Critical ────────────────────────────────────────────────
 STAMPED='## Cross-review — pass 1\n\n_Reviewed `b81377350`._'
