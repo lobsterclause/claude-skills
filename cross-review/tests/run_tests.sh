@@ -1307,7 +1307,86 @@ assert_contains "preflight warns about the unsandboxed(echo) rule too" \
 assert_contains "SKILL.md documents both echo allow-rules" \
   "$(cat "$SKILL_DIR/SKILL.md")" 'unsandboxed(echo)'
 
+# ── post_comment.sh: SHA binding + staleness banner ────────────────────────
+# A review record is read long after it is posted. Without the reviewed SHA on
+# the comment it reads as authoritative about whatever the PR contains NOW —
+# which is how kindred-mama-ai#3207 lost a two-provider-confirmed fix (head
+# moved 4× in one session) and how its review posted 19 minutes AFTER the PR
+# had already merged.
+echo
+echo "── post_comment sha binding ──"
+
+cat >"$T/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "pr view") printf '%s\n' "${CR_TEST_PR_JSON:-}" ; exit 0 ;;
+  "pr comment")
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--body-file" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
+        shift
+      done
+      exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/gh"
+
+PC_FIND="$T/pc-findings.md"
+printf '# findings\n\nnothing to report\n' >"$PC_FIND"
+export CR_TEST_CAPTURE="$T/pc-capture.md"
+
+pc_run() {   # $1=pr json, rest=extra args
+  local json="$1"; shift
+  : >"$CR_TEST_CAPTURE"
+  CR_TEST_PR_JSON="$json" bash "$SKILL_DIR/scripts/post_comment.sh" \
+    --pr 3207 --mode summary --findings "$PC_FIND" "$@" >/dev/null 2>&1
+}
+
+# 1. Head moved during the review → loud staleness warning naming both SHAs.
+pc_run '{"headRefOid":"bdfafd698d9056568b3038b8b74f29cabc377b88","state":"OPEN"}' \
+  --head-sha b813773502f9ba4f3c9cdf78c494ee08b230adcb
+assert_contains "stale head is flagged" "$(cat "$CR_TEST_CAPTURE")" "the head moved during this review"
+# Banner-specific phrasing: a bare "b81377350" also appears in the provenance
+# line, so asserting the SHA alone passes even with the banner suppressed.
+assert_contains "stale banner pairs reviewed with current" "$(cat "$CR_TEST_CAPTURE")" "Reviewed \`b81377350\`, current head is"
+assert_contains "stale banner names the current sha" "$(cat "$CR_TEST_CAPTURE")" "bdfafd698"
+
+# 2. Already merged → the record says so instead of reading as actionable.
+pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"MERGED"}' \
+  --head-sha 399df23d4d5945162d0c5ed623484d608337165d
+assert_contains "merged-before-review is flagged" "$(cat "$CR_TEST_CAPTURE")" "already merged before the review finished"
+
+# 2b. Closed-but-not-merged gets its own banner. Without this the CLOSED
+#     branch could regress silently while the MERGED test stayed green.
+pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"CLOSED"}' \
+  --head-sha 399df23d4d5945162d0c5ed623484d608337165d
+assert_contains "closed-before-review is flagged" "$(cat "$CR_TEST_CAPTURE")" "closed before the review finished"
+
+# 3. CONTROL — head matches and PR is open: provenance, and NO warning. Without
+#    this the assertions above would pass on a script that always warns.
+pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"OPEN"}' \
+  --head-sha 399df23d4d5945162d0c5ed623484d608337165d
+assert_contains "matching head records provenance" "$(cat "$CR_TEST_CAPTURE")" "Reviewed \`399df23d4\`"
+if grep -qi "WARNING" "$CR_TEST_CAPTURE"; then
+  bad "control: no warning when head matches and PR is open"
+else
+  ok "control: no warning when head matches and PR is open"
+fi
+
+# 4. Fail-open: an unusable `gh pr view` response must not stop the post.
+pc_run '' --head-sha 399df23d4d5945162d0c5ed623484d608337165d
+assert_contains "posts anyway when PR metadata is unavailable" "$(cat "$CR_TEST_CAPTURE")" "nothing to report"
+
+# 5. Backwards compatible: no --head-sha at all still posts.
+pc_run '{"headRefOid":"abc","state":"OPEN"}'
+assert_contains "still posts without --head-sha" "$(cat "$CR_TEST_CAPTURE")" "nothing to report"
+
+rm -f "$T/bin/gh"
+
+echo
 echo "── dual-copy identity (repo context only) ──"
+
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
 COPY_A="$REPO_ROOT/cross-review"
