@@ -1382,6 +1382,32 @@ assert_contains "posts anyway when PR metadata is unavailable" "$(cat "$CR_TEST_
 pc_run '{"headRefOid":"abc","state":"OPEN"}'
 assert_contains "still posts without --head-sha" "$(cat "$CR_TEST_CAPTURE")" "nothing to report"
 
+# 6. The roster line is derived from raw/*.meta.json, and a retried agy lap
+#    leaves BOTH <slug>.meta.json and <slug>.attempt<N>.meta.json behind.
+#    merge_raw_findings.sh has excluded the attempt copies since PR #41; the
+#    roster line did not, and credited PR #50's review to five names for four
+#    reviewers. Same bug, second location.
+mkdir -p "$(dirname "$PC_FIND")/raw"
+: >"$(dirname "$PC_FIND")/raw/antigravity.meta.json"
+: >"$(dirname "$PC_FIND")/raw/antigravity.attempt1.meta.json"
+: >"$(dirname "$PC_FIND")/raw/codex.meta.json"
+: >"$(dirname "$PC_FIND")/raw/gemini-pro.agy-failed.meta.json"
+pc_run '{"headRefOid":"abc","state":"OPEN"}'
+# Grab the whole line. A `[^.]*` capture stops at the dot INSIDE
+# "antigravity.attempt1", so it can never contain the string the assertion
+# below looks for — it passed with the exclusion removed.
+PC_ROSTER="$(grep '_Automated review by' "$CR_TEST_CAPTURE" 2>/dev/null || true)"
+if [[ "$PC_ROSTER" == *"attempt1"* ]]; then
+  bad "a retried lap is not counted as an extra reviewer (got: $PC_ROSTER)"
+else
+  ok "a retried lap is not counted as an extra reviewer"
+fi
+# CONTROL: the real reviewers must still be listed — an exclusion that dropped
+# everything would satisfy the assertion above.
+assert_contains "the reviewers that ran are still named" "$PC_ROSTER" "antigravity"
+assert_contains "and so are the others" "$PC_ROSTER" "codex"
+rm -rf "$(dirname "$PC_FIND")/raw"
+
 rm -f "$T/bin/gh"
 
 echo

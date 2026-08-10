@@ -89,6 +89,14 @@ case "$mode" in
         [[ -f "$m" ]] || continue
         n="$(basename "$m" .meta.json)"
         [[ "$n" == *.agy-failed ]] && continue
+        # Same exclusion merge_raw_findings.sh makes, for the same reason: a
+        # retried agy lap leaves <slug>.attempt<N>.meta.json beside <slug>'s as
+        # forensic evidence, and counting both inflates the roster with a
+        # reviewer that never existed. PR #41 fixed this in the findings
+        # merger; the roster line kept the bug and credited PR #50's review to
+        # "antigravity.attempt1 + antigravity + codex + glm + kimi" — five
+        # names for four reviewers.
+        [[ "$n" == *.attempt[0-9]* ]] && continue
         roster_line="${roster_line:+$roster_line + }$n"
       done
     fi
