@@ -1307,8 +1307,6 @@ assert_contains "preflight warns about the unsandboxed(echo) rule too" \
 assert_contains "SKILL.md documents both echo allow-rules" \
   "$(cat "$SKILL_DIR/SKILL.md")" 'unsandboxed(echo)'
 
-echo "── dual-copy identity (repo context only) ──"
-
 # ── post_comment.sh: SHA binding + staleness banner ────────────────────────
 # A review record is read long after it is posted. Without the reviewed SHA on
 # the comment it reads as authoritative about whatever the PR contains NOW —
@@ -1359,6 +1357,12 @@ pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"MERGED
   --head-sha 399df23d4d5945162d0c5ed623484d608337165d
 assert_contains "merged-before-review is flagged" "$(cat "$CR_TEST_CAPTURE")" "already merged before the review finished"
 
+# 2b. Closed-but-not-merged gets its own banner. Without this the CLOSED
+#     branch could regress silently while the MERGED test stayed green.
+pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"CLOSED"}' \
+  --head-sha 399df23d4d5945162d0c5ed623484d608337165d
+assert_contains "closed-before-review is flagged" "$(cat "$CR_TEST_CAPTURE")" "closed before the review finished"
+
 # 3. CONTROL — head matches and PR is open: provenance, and NO warning. Without
 #    this the assertions above would pass on a script that always warns.
 pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"OPEN"}' \
@@ -1379,6 +1383,9 @@ pc_run '{"headRefOid":"abc","state":"OPEN"}'
 assert_contains "still posts without --head-sha" "$(cat "$CR_TEST_CAPTURE")" "nothing to report"
 
 rm -f "$T/bin/gh"
+
+echo
+echo "── dual-copy identity (repo context only) ──"
 
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
