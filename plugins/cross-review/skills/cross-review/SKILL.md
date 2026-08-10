@@ -418,6 +418,75 @@ its regression test, while the posted record still looked definitive. The same
 PR was merged **19 minutes before its review finished**, so a reviewer opening
 that comment had no way to see that every finding in it was already shipped.
 
+**Prefer `summary` whenever you have a PR number.** The stamp can only be read
+back off a comment that actually exists on GitHub — a review that lands only in
+`$run_dir/findings.md` is invisible to the merge gate below, and to everyone who
+was not in the session.
+
+### 7b. The gate that reads the stamp
+
+A stamp nothing reads is a sensor with nothing wired to it. Two readers exist:
+
+```bash
+# Is this PR's newest review record bound to the commit about to be merged?
+bash ~/.claude/skills/cross-review/scripts/merge_preflight.sh --pr <n> [--json]
+#   exit 0  clear · reviewed at head, or no record, or the check couldn't run
+#   exit 1  STALE · a record exists and covers a different commit
+```
+
+`hooks/merge_gate.sh` makes that binding on the agent. Wire it once in
+`~/.claude/settings.json` and `gh pr merge` is refused whenever the newest
+record covers a different commit:
+
+```json
+{ "hooks": { "PreToolUse": [
+    { "matcher": "Bash", "hooks": [
+        { "type": "command",
+          "command": "/Users/<you>/.claude/skills/cross-review/hooks/merge_gate.sh" } ] } ] } }
+```
+
+Two deliberate limits. It is **green when absent** — a PR with no cross-review
+comment is not blocked, because this is a safety net over reviews you already
+run, not a mandate that every PR be reviewed; making it a mandate is a policy
+decision, not a default. And it **fails open** on every ambiguity (no `gh`, no
+auth, API error, unparseable record), because a gate that blocks merges whenever
+GitHub hiccups gets switched off within a day and then protects nothing.
+
+When a stale merge is genuinely intended — the delta is a rebase, a lockfile, a
+typo — prefix the command with `CROSS_REVIEW_MERGE_OVERRIDE=1`. That is an
+**auditability** mechanism, not a security boundary: an agent could write it
+unprompted, but it puts the bypass in the command the user approves instead of
+leaving the agent with an instruction no command could express.
+
+**On a `clear` verdict it still asks for one thing:** that the merge carry
+`--match-head-commit <sha>`. A verdict is a statement about the head at read
+time, and a push landing before GitHub handles the merge would be merged
+unreviewed. Binding the merge makes GitHub itself refuse in that case — the
+difference between "was true a moment ago" and a guarantee. It is required only
+where there is something to bind to; an unreviewed PR is never forced to, or
+green-when-absent would quietly become a review mandate.
+
+`gh api ... repos/O/R/pulls/N/merge` is gated the same way. It merges a PR
+without ever saying `gh pr merge`, which makes it the first thing a blocked
+agent would reach for rather than an exotic edge case.
+
+**What it still cannot see.** It reads the command text, so a merge inside a
+shell script it cannot read, a GraphQL `mergePullRequest` mutation (the PR is a
+node ID there, with nothing to resolve), and the GitHub web UI all go around
+it — as does automerge, which is not an agent command at all.
+
+The hook never rewrites commands. Another `PreToolUse` hook may return
+`updatedInput` and two rewriters would fight — verified live here: rtk rewrites
+`gh pr merge` to `rtk gh pr merge` and returns `permissionDecision: "allow"`.
+Deny still wins over that allow (verified with an always-stale stub), and the
+whitespace leading anchor is what keeps `rtk gh …` matching at all.
+
+Those remaining gaps are why the hook should not be the only reader. A GitHub
+status check running the same comparison on `pull_request` + `issue_comment`
+covers every one of them, binds humans and automerge too, and — unlike a
+review-hold label — keeps no state to leak and self-heals (push a commit → red;
+re-review → green).
+
 **Modes:**
 
 - **summary** (default): one consolidated PR comment per pass via `gh pr comment`. Cheap (one API call), easy to scan in the PR timeline, good record for future Claude runs.
