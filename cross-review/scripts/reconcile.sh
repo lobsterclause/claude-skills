@@ -218,7 +218,11 @@ main() {
       # wrong-repo post is a review comment on a stranger's PR; the cost of this
       # line is nothing.
       if [[ -z "$repo" ]]; then
-        echo "SKIP PR #$pr — no repository recorded; refusing to post against the caller's cwd ($dir)" >&2
+        # Name both paths correctly: $dir is the run directory the row came
+        # from, and $PWD is what `gh pr comment <n>` would actually resolve the
+        # bare number against. Conflating them on a security-relevant refusal
+        # sends whoever reads this line to the wrong repository. (kimi3, #54.)
+        echo "SKIP PR #$pr — no repository recorded in $dir; refusing to post, because gh would resolve the bare PR number against the current directory ($PWD)" >&2
         continue
       fi
       echo "posting reconciled review for PR #$pr from $dir" >&2
