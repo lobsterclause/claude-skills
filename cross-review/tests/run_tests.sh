@@ -572,7 +572,51 @@ if [[ ! -d "$FAKETMP/cr-end-owned" ]]; then ok "end removes marker-owned legacy 
     bash "$S/worktree.sh" start --ref HEAD --id marker-test --base main >"$T/wt-start.json" 2>/dev/null )
 WT_PATH="$(jq -r '.worktree' "$T/wt-start.json")"
 if [[ -n "$WT_PATH" && -f "$WT_PATH/.cross-review-worktree" ]]; then ok "start drops ownership marker"; else bad "no marker in fresh worktree ($WT_PATH)"; fi
+
+# ── start records the reviewed SHA and writes context.json itself ──
+# Six real reviews (kindred-mama-ai #3214/#3252/#3264/#3269/#3276/#3280) landed
+# 68-676KB of reviewer output with no context.json, because writing it was prose
+# in SKILL.md that the caller skipped. A run that never recorded its SHA cannot
+# be reconciled afterwards at all — the stamp has nothing truthful to carry.
+WT_RUN="$(jq -r '.run_dir' "$T/wt-start.json")"
+if [[ -f "$WT_RUN/context.json" ]]; then ok "start writes context.json"; else bad "no context.json in $WT_RUN"; fi
+if jq -e . "$WT_RUN/context.json" >/dev/null 2>&1; then ok "context.json is valid JSON"; else bad "context.json is not parseable"; fi
+assert_eq "context.json head_sha == the commit actually checked out" \
+  "$(jq -r '.head_sha' "$WT_RUN/context.json")" "$(git -C "$REPO" rev-parse HEAD)"
+assert_eq "context.json base_sha == the base ref's commit" \
+  "$(jq -r '.base_sha' "$WT_RUN/context.json")" "$(git -C "$REPO" rev-parse main)"
+# stdout and the on-disk record must be the same bytes — two sources of truth
+# about what was reviewed is how a stamp ends up disagreeing with the run.
+if diff -q <(tr -d '\n' <"$T/wt-start.json") <(tr -d '\n' <"$WT_RUN/context.json") >/dev/null 2>&1; then
+  ok "context.json is byte-identical to start's stdout"
+else bad "context.json and stdout disagree"; fi
 CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$WT_PATH" >/dev/null 2>&1 || true
+
+# The repo field is written to a file that outlives the run, so a credential in
+# the remote URL must never reach it. Both fixtures carry the same password.
+OREPO="$T/repo-origin"; mkdir -p "$OREPO"
+( cd "$OREPO" && git init -q -b main 2>/dev/null || git -C "$OREPO" init -q
+  echo x >"$OREPO/f"; git -C "$OREPO" add .
+  git -C "$OREPO" -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+git -C "$OREPO" remote add origin 'https://user:s3cr3tpw@github.com/Owner/Name.git'
+( cd "$OREPO" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$T/runroot" \
+    bash "$S/worktree.sh" start --ref HEAD --id cred-test --base main >"$T/wt-cred.json" 2>/dev/null )
+CRED_RUN="$(jq -r '.run_dir' "$T/wt-cred.json")"
+assert_eq "credentialed remote reduces to owner/repo" \
+  "$(jq -r '.repo' "$CRED_RUN/context.json")" "Owner/Name"
+if grep -q 's3cr3tpw' "$CRED_RUN/context.json"; then bad "context.json leaked the remote credential"; else ok "context.json carries no credential"; fi
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-cred.json")" >/dev/null 2>&1 || true
+
+# A one-component remote puts the userinfo field where the owner would be —
+# the validating regex must reject it outright rather than record `pw@host/x`.
+git -C "$OREPO" remote set-url origin 'https://user:s3cr3tpw@github.com/justrepo'
+( cd "$OREPO" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$T/runroot" \
+    bash "$S/worktree.sh" start --ref HEAD --id cred2-test --base main >"$T/wt-cred2.json" 2>/dev/null )
+CRED2_RUN="$(jq -r '.run_dir' "$T/wt-cred2.json")"
+assert_eq "unparseable remote fails closed to empty repo" \
+  "$(jq -r '.repo' "$CRED2_RUN/context.json")" ""
+if grep -q 's3cr3tpw' "$CRED2_RUN/context.json"; then bad "one-component remote leaked the credential"; else ok "one-component remote leaks nothing"; fi
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-cred2.json")" >/dev/null 2>&1 || true
 
 echo "── run_with_timeout bash-watchdog fallback (issue #7) ──"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nsleep 30\n' >"$T/bin/kimi"
