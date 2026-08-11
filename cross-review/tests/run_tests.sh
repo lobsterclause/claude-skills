@@ -1938,6 +1938,97 @@ fi
 rm -f "$T/bin/gh"
 
 echo
+echo "── reconcile.sh: which runs never reached GitHub ──"
+# The six kindred-mama-ai drops (#3214/#3252/#3264/#3269/#3276/#3280) all have
+# reviewer output and no provenance, so they must classify as unattributable,
+# NOT droppable — re-posting them would mean stamping a guessed SHA.
+RR="$T/reconcile-runs"; mkdir -p "$RR"
+mkrun() {  # $1=name  $2=has_ctx  $3=head_sha  $4=has_output  $5=posted.json body
+  local d="$RR/$1"; mkdir -p "$d/raw"
+  [[ "$2" == "ctx" ]] && printf '{"head_sha":"%s","id":"pr-777","repo":"o/r"}\n' "$3" >"$d/context.json"
+  [[ "$4" == "out" ]] && printf 'reviewer said things\n' >"$d/raw/codex.stdout"
+  printf '# findings\n' >"$d/findings.md"
+  [[ -n "${5:-}" ]] && printf '%s\n' "$5" >"$d/posted.json"
+  printf '%s' "$d"
+}
+# Subshell: reconcile.sh sets -u, which must not leak into the suite.
+cls() { ( source "$SKILL_DIR/scripts/reconcile.sh"
+          [[ -n "${2:-}" ]] && repo_filter="$2"
+          classify_run "$1" ) | tr '\037' '|'; }
+
+D="$(mkrun full ctx aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa out)"
+assert_eq "review with provenance and no post is droppable" "$(cls "$D" | cut -d'|' -f1)" "droppable"
+assert_eq "and carries the PR it belongs to" "$(cls "$D" | cut -d'|' -f2)" "777"
+
+D="$(mkrun wasposted ctx bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb out '{"posted":true,"reason":"posted","comment_url":"https://x/1"}')"
+assert_eq "an already-posted review is not droppable" "$(cls "$D" | cut -d'|' -f1)" "posted"
+
+D="$(mkrun deliberate ctx cccccccccccccccccccccccccccccccccccccccc out '{"posted":false,"reason":"file-mode"}')"
+assert_eq "a deliberate file-mode run is not a drop" "$(cls "$D" | cut -d'|' -f1)" "deliberate"
+
+D="$(mkrun ghfailed ctx dddddddddddddddddddddddddddddddddddddddd out '{"posted":false,"reason":"gh-comment-failed"}')"
+assert_eq "a failed post IS droppable" "$(cls "$D" | cut -d'|' -f1)" "droppable"
+
+# The shape of the six real drops: reviewer output, no context.json.
+D="$(mkrun noprovenance noctx "" out)"
+assert_eq "reviewer output with no recorded SHA is unattributable" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
+assert_contains "and says why it cannot be posted" "$(cls "$D")" "no reviewed SHA recorded"
+
+# The fixture above is under-determined: it has no PR number EITHER, so it stays
+# unattributable via the PR check even with the head_sha guard deleted — a
+# mutant that removed that guard survived. The six real drops
+# (kindred-mama-ai-pr-3280-…) take their PR from the DIRECTORY NAME, so they
+# have a PR and no SHA. That is the combination the guard actually exists for:
+# without it they become droppable and --post stamps them with nothing.
+D="$(mkrun realdrop-pr-3280 noctx "" out)"
+assert_eq "a PR number without a recorded SHA is still unattributable" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
+assert_eq "and the PR is known even though the SHA is not" "$(cls "$D" | cut -d'|' -f2)" "3280"
+
+D="$(mkrun aborted ctx eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee noout)"
+assert_eq "a run with no reviewer output is not a drop" "$(cls "$D" | cut -d'|' -f1)" "unreviewed"
+
+# --repo filters on context.json's repo, not the directory name.
+assert_eq "non-matching repo is filtered out" \
+  "$(cls "$RR/full" "other/repo" | cut -d'|' -f1)" "filtered"
+
+# Exit code is the machine-readable half: 1 means there is something to fix.
+bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR" >/dev/null 2>&1
+assert_eq "exit 1 when droppable runs exist" "$?" "1"
+if bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR/full" >/dev/null 2>&1; then
+  ok "exit 0 when nothing is droppable"
+else bad "non-zero exit with no droppable runs"; fi
+# Capture first, then parse. This suite runs under `set -o pipefail`, and
+# reconcile.sh deliberately exits 1 when it finds droppable runs — so
+# `reconcile --json | jq` reports the LEFT side's status and the assertion fails
+# on perfectly valid JSON. Any command whose non-zero exit is a signal rather
+# than an error cannot be the left half of a pipe here.
+RECON_JSON="$(bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR" --json 2>/dev/null)"
+if printf '%s' "$RECON_JSON" | jq -e 'type=="array"' >/dev/null 2>&1; then
+  ok "--json emits a parseable array"
+else bad "--json output is not a JSON array"; fi
+assert_eq "--json reports every scanned run" \
+  "$(printf '%s' "$RECON_JSON" | jq 'length' 2>/dev/null)" "7"
+assert_eq "--json agrees with the text report on what is droppable" \
+  "$(printf '%s' "$RECON_JSON" | jq '[.[] | select(.state=="droppable")] | length' 2>/dev/null)" "2"
+# Report-only by default: scanning must never post. If the default ever flips,
+# this shim gets called and the marker file appears.
+: >"$T/reconcile-posted-marker"
+cat >"$T/bin/gh" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "pr comment" ] && echo called >>"$CR_RECON_MARKER"
+[ "$1 $2" = "auth status" ] && exit 0
+exit 0
+SH
+chmod +x "$T/bin/gh"
+export CR_RECON_MARKER="$T/reconcile-posted-marker"
+bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR" >/dev/null 2>&1
+assert_eq "a default scan posts nothing" "$(wc -c <"$CR_RECON_MARKER" | tr -d ' ')" "0"
+# Passing control: without this, "marker is empty" would also hold if reconcile
+# were broken and posted nothing under any flag.
+bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR" --post >/dev/null 2>&1
+if [[ -s "$CR_RECON_MARKER" ]]; then ok "control: --post does reach gh pr comment"; else bad "--post posted nothing — the default-scan test proves nothing"; fi
+unset CR_RECON_MARKER
+
 echo "── dual-copy identity (repo context only) ──"
 
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
