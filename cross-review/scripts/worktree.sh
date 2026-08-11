@@ -191,7 +191,10 @@ case "$cmd" in
     # afterwards can pick up a fetch that landed in between. This is the SHA the
     # review actually covers, which is the only one worth stamping.
     head_sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || true)"
-    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    # 40 hex for sha1, 64 for a repo created with --object-format=sha256.
+    # Hard-coding 40 would abort a review in a perfectly valid sha256 repo.
+    # (codex P2, PR #53.)
+    if [[ ! "$head_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
       # Can't-happen in practice — but a context.json with an empty head_sha is
       # precisely the silent hole this field exists to close, so fail loud
       # rather than record a run that can never be reconciled.
@@ -209,9 +212,13 @@ case "$cmd" in
     # that isn't a plain owner/repo — a one-component remote would otherwise
     # put the userinfo field in $(NF-1). Fails closed to "".
     origin_slug="$(git -C "$repo_root" remote get-url origin 2>/dev/null \
-      | sed -e 's#\.git$##' -e 's#/$##' \
+      | sed -e 's#/$##' -e 's#\.git$##' \
       | awk -F'[/:]' 'NF>=2 {printf "%s/%s", $(NF-1), $NF}' || true)"
-    [[ "$origin_slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || origin_slug=""
+    # The owner half forbids dots; the repo half allows them. Without that
+    # asymmetry `https://github.com/justrepo` reduces to "github.com/justrepo",
+    # which passes a symmetric regex and records a hostname as the owner.
+    # (minimax L, PR #53.)
+    [[ "$origin_slug" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || origin_slug=""
 
     # Escape rather than interpolate raw: context.json is machine-read by
     # reconciliation, and a filename containing a quote must not be able to

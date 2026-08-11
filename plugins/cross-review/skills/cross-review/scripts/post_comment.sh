@@ -23,6 +23,7 @@
 set -uo pipefail
 
 pr=""
+repo=""
 mode="summary"
 findings=""
 pass="1"
@@ -40,6 +41,7 @@ need_val() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pr)       need_val --pr       "$#"; pr="$2";       shift 2 ;;
+    --repo)     need_val --repo     "$#"; repo="$2";     shift 2 ;;
     --mode)     need_val --mode     "$#"; mode="$2";     shift 2 ;;
     --findings) need_val --findings "$#"; findings="$2"; shift 2 ;;
     --pass)     need_val --pass     "$#"; pass="$2";     shift 2 ;;
@@ -49,7 +51,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$findings" ]]; then
-  echo "usage: $0 --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>] [--head-sha <sha>]" >&2
+  echo "usage: $0 --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>] [--head-sha <sha>] [--repo owner/name]" >&2
   exit 2
 fi
 
@@ -70,10 +72,24 @@ fi
 # Fails open: an unwritable run dir must never cost the user a posted review.
 run_dir="$(dirname "$findings")"
 jsonesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+# Without --repo, `gh pr view 3280` resolves the number against whatever
+# repository the CALLER happens to be standing in. reconcile.sh scans a runs
+# root spanning many repos, so a reconciled post could land on a same-numbered
+# PR in the wrong project entirely. (codex P1, PR #53.)
+gh_repo=()
+[[ -n "$repo" ]] && gh_repo=(--repo "$repo")
+
 write_posted() {  # <true|false> <reason> [comment_url]
-  [[ -d "$run_dir" && -w "$run_dir" ]] || return 0
-  printf '{"posted": %s, "reason": "%s", "pr": "%s", "pass": "%s", "head_sha": "%s", "mode": "%s", "comment_url": "%s", "posted_at": "%s"}\n' \
-    "$1" "$(jsonesc "$2")" "$(jsonesc "$pr")" "$(jsonesc "$pass")" "$(jsonesc "$head_sha")" \
+  if [[ ! -d "$run_dir" || ! -w "$run_dir" ]]; then
+    # Say so. A silently absent marker is indistinguishable from "never tried
+    # to post", which is exactly what reconcile.sh reads as droppable — so an
+    # unwritable run dir could make it re-post a comment that already exists.
+    # (qwen M, codex P2, PR #53.)
+    echo "WARN: cannot write $run_dir/posted.json — this run's posting outcome will not be recorded" >&2
+    return 0
+  fi
+  printf '{"posted": %s, "reason": "%s", "pr": "%s", "repo": "%s", "pass": "%s", "head_sha": "%s", "mode": "%s", "comment_url": "%s", "posted_at": "%s"}\n' \
+    "$1" "$(jsonesc "$2")" "$(jsonesc "$pr")" "$(jsonesc "$repo")" "$(jsonesc "$pass")" "$(jsonesc "$head_sha")" \
     "$(jsonesc "$mode")" "$(jsonesc "${3:-}")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >"$run_dir/posted.json" 2>/dev/null || true
 }
@@ -135,7 +151,7 @@ case "$mode" in
     [[ -n "$head_sha" ]] && provenance="Reviewed \`${head_sha:0:9}\`."
     staleness=""
     if command -v jq >/dev/null 2>&1; then
-      pr_meta="$(gh pr view "$pr" --json headRefOid,state 2>/dev/null || true)"
+      pr_meta="$(gh pr view "$pr" ${gh_repo[@]+"${gh_repo[@]}"} --json headRefOid,state 2>/dev/null || true)"
       if [[ -n "$pr_meta" ]]; then
         cur_sha="$(printf '%s' "$pr_meta" | jq -r '.headRefOid // ""' 2>/dev/null || true)"
         pr_state="$(printf '%s' "$pr_meta" | jq -r '.state // ""' 2>/dev/null || true)"
@@ -165,7 +181,7 @@ case "$mode" in
     # Capture the URL gh prints so posted.json can point at the actual comment;
     # stderr still passes through untouched, and the URL is re-echoed so the
     # caller sees exactly what it saw before.
-    comment_url="$(gh pr comment "$pr" --body-file "$body_file")"
+    comment_url="$(gh pr comment "$pr" ${gh_repo[@]+"${gh_repo[@]}"} --body-file "$body_file")"
     rc=$?
     [[ -n "$comment_url" ]] && printf '%s\n' "$comment_url"
     if [[ "$rc" -eq 0 ]]; then

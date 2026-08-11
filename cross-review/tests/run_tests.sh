@@ -615,6 +615,25 @@ git -C "$OREPO" remote set-url origin 'https://user:s3cr3tpw@github.com/justrepo
 CRED2_RUN="$(jq -r '.run_dir' "$T/wt-cred2.json")"
 assert_eq "unparseable remote fails closed to empty repo" \
   "$(jq -r '.repo' "$CRED2_RUN/context.json")" ""
+
+# No credential at all, still only one path component: awk hands back
+# "github.com/justrepo", which a symmetric regex accepts and records a HOSTNAME
+# as the owner. GitHub owners cannot contain dots; repos can. (minimax L.)
+git -C "$OREPO" remote set-url origin 'https://github.com/justrepo'
+( cd "$OREPO" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$T/runroot" \
+    bash "$S/worktree.sh" start --ref HEAD --id host-owner --base main >"$T/wt-host.json" 2>/dev/null )
+assert_eq "a hostname is not accepted as the owner" \
+  "$(jq -r '.repo' "$(jq -r '.run_dir' "$T/wt-host.json")/context.json")" ""
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-host.json")" >/dev/null 2>&1 || true
+
+# A remote ending .git/ : stripping .git BEFORE the trailing slash leaves the
+# suffix behind, and "Owner/Name.git" passes the regex. (antigravity M.)
+git -C "$OREPO" remote set-url origin 'https://github.com/Owner/Name.git/'
+( cd "$OREPO" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$T/runroot" \
+    bash "$S/worktree.sh" start --ref HEAD --id trailing-slash --base main >"$T/wt-slash.json" 2>/dev/null )
+assert_eq "a trailing slash after .git still reduces to owner/repo" \
+  "$(jq -r '.repo' "$(jq -r '.run_dir' "$T/wt-slash.json")/context.json")" "Owner/Name"
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-slash.json")" >/dev/null 2>&1 || true
 if grep -q 's3cr3tpw' "$CRED2_RUN/context.json"; then bad "one-component remote leaked the credential"; else ok "one-component remote leaks nothing"; fi
 CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-cred2.json")" >/dev/null 2>&1 || true
 
@@ -1993,6 +2012,32 @@ D="$(mkrun realdrop-pr-3280 noctx "" out)"
 assert_eq "a PR number without a recorded SHA is still unattributable" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
 assert_eq "and the PR is known even though the SHA is not" "$(cls "$D" | cut -d'|' -f2)" "3280"
 
+# posted.json describes the ACTUAL attempt; context.json describes the run's
+# start. After an auto-fix pass they disagree, and reconciling from the stale
+# context SHA would stamp the recovered comment with the wrong commit — the
+# merge gate would then call a current review stale. (codex P1.)
+D="$RR/passdrift"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
+printf '{"head_sha":"1111111111111111111111111111111111111111","id":"pr-777","repo":"o/r"}\n' >"$D/context.json"
+printf '{"posted":false,"reason":"gh-comment-failed","pr":"999","repo":"other/proj","pass":"2","head_sha":"2222222222222222222222222222222222222222"}\n' >"$D/posted.json"
+assert_eq "the attempt's SHA wins over the run's start SHA" \
+  "$(cls "$D" | cut -d'|' -f3)" "2222222222222222222222222222222222222222"
+assert_eq "the attempt's PR wins over the id-derived one" "$(cls "$D" | cut -d'|' -f2)" "999"
+assert_eq "the attempt's repo is carried" "$(cls "$D" | cut -d'|' -f4)" "other/proj"
+assert_eq "the attempt's pass number is carried" "$(cls "$D" | cut -d'|' -f5)" "2"
+
+# An id that merely CONTAINS a PR-looking substring must not redirect a
+# recovered comment to that PR. (codex P1.)
+D="$RR/looseid"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
+printf '{"head_sha":"3333333333333333333333333333333333333333","id":"feature-x-pr-456","repo":"o/r"}\n' >"$D/context.json"
+assert_eq "an unanchored pr-NNN inside an id does not become the target PR" \
+  "$(cls "$D" | cut -d'|' -f2)" ""
+assert_eq "and with no PR it is unattributable, not droppable" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
+
+# A corrupt SHA is not provenance — worktree.sh validates on write, this is read.
+D="$RR/badsha"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
+printf '{"head_sha":"not-a-sha","id":"pr-777","repo":"o/r"}\n' >"$D/context.json"
+assert_eq "a malformed SHA is discarded rather than stamped" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
+
 D="$(mkrun aborted ctx eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee noout)"
 assert_eq "a run with no reviewer output is not a drop" "$(cls "$D" | cut -d'|' -f1)" "unreviewed"
 
@@ -2016,15 +2061,15 @@ if printf '%s' "$RECON_JSON" | jq -e 'type=="array"' >/dev/null 2>&1; then
   ok "--json emits a parseable array"
 else bad "--json output is not a JSON array"; fi
 assert_eq "--json reports every scanned run" \
-  "$(printf '%s' "$RECON_JSON" | jq 'length' 2>/dev/null)" "7"
+  "$(printf '%s' "$RECON_JSON" | jq 'length' 2>/dev/null)" "10"
 assert_eq "--json agrees with the text report on what is droppable" \
-  "$(printf '%s' "$RECON_JSON" | jq '[.[] | select(.state=="droppable")] | length' 2>/dev/null)" "2"
+  "$(printf '%s' "$RECON_JSON" | jq '[.[] | select(.state=="droppable")] | length' 2>/dev/null)" "3"
 # Report-only by default: scanning must never post. If the default ever flips,
 # this shim gets called and the marker file appears.
 : >"$T/reconcile-posted-marker"
 cat >"$T/bin/gh" <<'SH'
 #!/bin/bash
-[ "$1 $2" = "pr comment" ] && echo called >>"$CR_RECON_MARKER"
+[ "$1 $2" = "pr comment" ] && echo "$*" >>"$CR_RECON_MARKER"
 [ "$1 $2" = "auth status" ] && exit 0
 exit 0
 SH
@@ -2036,6 +2081,11 @@ assert_eq "a default scan posts nothing" "$(wc -c <"$CR_RECON_MARKER" | tr -d ' 
 # were broken and posted nothing under any flag.
 bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR" --post >/dev/null 2>&1
 if [[ -s "$CR_RECON_MARKER" ]]; then ok "control: --post does reach gh pr comment"; else bad "--post posted nothing — the default-scan test proves nothing"; fi
+# Without --repo, `gh pr view 999` resolves against whatever repo the caller is
+# standing in — and this scan spans every repo under the runs root. (codex P1.)
+if grep -q -- '--repo other/proj' "$CR_RECON_MARKER"; then
+  ok "--post targets the repo recorded by the attempt"
+else bad "--post invoked gh with no --repo — it can hit a same-numbered PR elsewhere"; fi
 unset CR_RECON_MARKER
 
 echo "── dual-copy identity (repo context only) ──"

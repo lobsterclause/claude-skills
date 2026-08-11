@@ -68,29 +68,51 @@ jqr() {  # jqr <file> <filter> — "" when the file is missing or unparseable.
 classify_run() {
   local d="$1"
   local ctx="$d/context.json" posted="$d/posted.json"
-  local head_sha pr repo id reason was_posted
+  local head_sha pr repo id reason was_posted pass
 
-  head_sha="$(jqr "$ctx" '.head_sha')"
-  repo="$(jqr "$ctx" '.repo')"
-  id="$(jqr "$ctx" '.id')"
+  # posted.json describes the ACTUAL posting attempt; context.json describes the
+  # run's start. They diverge as soon as the auto-fix loop commits and
+  # re-reviews: context.json still holds the pass-1 HEAD while the failed pass-2
+  # post recorded the commit it really covered. Reconciling from the stale value
+  # would stamp the recovered comment with the wrong commit, and the merge gate
+  # would then call a current review stale. Prefer the attempt. (codex P1, #53.)
+  head_sha="$(jqr "$posted" '.head_sha')"
+  [[ -z "$head_sha" ]] && head_sha="$(jqr "$ctx" '.head_sha')"
+  repo="$(jqr "$posted" '.repo')"
+  [[ -z "$repo" ]] && repo="$(jqr "$ctx" '.repo')"
+  pass="$(jqr "$posted" '.pass')"
+  [[ "$pass" =~ ^[0-9]+$ ]] || pass=""
 
-  # PR number from context.json's id ("pr-3280"), else from the run dir name.
-  pr=""
-  [[ "$id" =~ pr-([0-9]+) ]] && pr="${BASH_REMATCH[1]}"
-  [[ -z "$pr" && "$(basename "$d")" =~ -pr-([0-9]+) ]] && pr="${BASH_REMATCH[1]}"
+  # The attempt's own PR number beats anything parsed out of a name. `--id
+  # feature-x` is legal, and an id that merely CONTAINS "pr-456" would otherwise
+  # redirect a recovered comment to PR 456. Both fallbacks are anchored, and
+  # zero is not a PR. (codex P1 + qwen H, #53.)
+  pr="$(jqr "$posted" '.pr')"
+  if [[ ! "$pr" =~ ^[1-9][0-9]*$ ]]; then
+    pr=""
+    id="$(jqr "$ctx" '.id')"
+    [[ "$id" =~ ^pr-([1-9][0-9]*)(-.*)?$ ]] && pr="${BASH_REMATCH[1]}"
+    [[ -z "$pr" && "$(basename "$d")" =~ -pr-([1-9][0-9]*)(-|$) ]] && pr="${BASH_REMATCH[1]}"
+  fi
+
+  # A SHA that is not a SHA is not provenance. worktree.sh validates on write;
+  # this is the read side, because context.json is an ordinary file that a human
+  # or a corrupted run can edit. 7-64 hex covers abbreviated stamps through
+  # sha256 object ids. (minimax L, #53.)
+  [[ "$head_sha" =~ ^[0-9a-f]{7,64}$ ]] || head_sha=""
 
   if [[ -n "$repo_filter" && "$repo" != "$repo_filter" ]]; then
-    printf "filtered${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "repo=$repo"; return 0
+    printf "filtered${US}%s${US}%s${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$repo" "$pass" "repo=$repo"; return 0
   fi
 
   was_posted="$(jqr "$posted" '.posted')"
   reason="$(jqr "$posted" '.reason')"
 
   if [[ "$was_posted" == "true" ]]; then
-    printf "posted${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$(jqr "$posted" '.comment_url')"; return 0
+    printf "posted${US}%s${US}%s${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$repo" "$pass" "$(jqr "$posted" '.comment_url')"; return 0
   fi
   if [[ "$reason" == "file-mode" || "$reason" == "mode-none" ]]; then
-    printf "deliberate${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$reason"; return 0
+    printf "deliberate${US}%s${US}%s${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$repo" "$pass" "$reason"; return 0
   fi
 
   # No reviewer output means the run died before reviewing — there is nothing to
@@ -100,7 +122,7 @@ classify_run() {
     n_out="$(find "$d/raw" -maxdepth 1 -name '*.stdout' -size +0 2>/dev/null | wc -l | tr -d ' ')"
   fi
   if [[ "${n_out:-0}" -eq 0 ]]; then
-    printf "unreviewed${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "no reviewer output"; return 0
+    printf "unreviewed${US}%s${US}%s${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$repo" "$pass" "no reviewer output"; return 0
   fi
 
   # A post needs a PR, a body, and a SHA to stamp. Missing the SHA is the
@@ -112,10 +134,10 @@ classify_run() {
     [[ -z "$head_sha" ]] && why="no reviewed SHA recorded"
     [[ -z "$pr" ]] && why="${why:+$why; }no PR number"
     [[ ! -f "$d/findings.md" ]] && why="${why:+$why; }no findings.md"
-    printf "unattributable${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$why ($detail)"; return 0
+    printf "unattributable${US}%s${US}%s${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$repo" "$pass" "$why ($detail)"; return 0
   fi
 
-  printf "droppable${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$detail"
+  printf "droppable${US}%s${US}%s${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$repo" "$pass" "$detail"
 }
 
 main() {
@@ -123,9 +145,9 @@ main() {
   while IFS= read -r d; do
     [[ -d "$d" ]] || continue
     [[ "$limit" -gt 0 && "$n" -ge "$limit" ]] && break
-    local line state pr sha detail
+    local line state pr sha repo pass detail
     line="$(classify_run "$d")"
-    IFS="$US" read -r state pr sha detail <<<"$line"
+    IFS="$US" read -r state pr sha repo pass detail <<<"$line"
     [[ "$state" == "filtered" ]] && continue
     n=$((n + 1))
     [[ "$state" == "droppable" ]] && droppable=$((droppable + 1))
@@ -134,24 +156,28 @@ main() {
     # just rarer. `detail` comes from a JSON file on disk and `d` from the
     # filesystem, so neither is ours to trust. (kimi, PR #53.)
     detail="${detail//$US/ }"; d="${d//$US/ }"
-    rows+=("$state$US$pr$US$sha$US$detail$US$d")
+    rows+=("$state$US$pr$US$sha$US$repo$US$pass$US$detail$US$d")
   done < <(find "$runs_root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -r)
 
   if [[ "$as_json" -eq 1 ]]; then
+    # Without jq the loop below would print "[,,,]" — broken JSON a caller
+    # parses as garbage rather than as a failure. (antigravity L, #53.)
+    command -v jq >/dev/null 2>&1 || { echo "jq is required for --json mode" >&2; return 2; }
     printf '['
     local first=1 r
     for r in ${rows[@]+"${rows[@]}"}; do
-      IFS="$US" read -r state pr sha detail dir <<<"$r"
+      IFS="$US" read -r state pr sha repo pass detail dir <<<"$r"
       [[ "$first" -eq 1 ]] || printf ','
       first=0
-      jq -nc --arg s "$state" --arg p "$pr" --arg h "$sha" --arg d "$detail" --arg dir "$dir" \
-        '{state:$s, pr:$p, head_sha:$h, detail:$d, run_dir:$dir}'
+      jq -nc --arg s "$state" --arg p "$pr" --arg h "$sha" --arg r "$repo" \
+             --arg pa "$pass" --arg d "$detail" --arg dir "$dir" \
+        '{state:$s, pr:$p, head_sha:$h, repo:$r, pass:$pa, detail:$d, run_dir:$dir}'
     done
     printf ']\n'
   else
     local r
     for r in ${rows[@]+"${rows[@]}"}; do
-      IFS="$US" read -r state pr sha detail dir <<<"$r"
+      IFS="$US" read -r state pr sha repo pass detail dir <<<"$r"
       # Only the states worth a human's attention; posted/unreviewed are noise.
       case "$state" in
         droppable|unattributable)
@@ -164,15 +190,20 @@ main() {
   if [[ "$do_post" -eq 1 && "$droppable" -gt 0 ]]; then
     local r
     for r in ${rows[@]+"${rows[@]}"}; do
-      IFS="$US" read -r state pr sha detail dir <<<"$r"
+      IFS="$US" read -r state pr sha repo pass detail dir <<<"$r"
       [[ "$state" == "droppable" ]] || continue
       echo "posting reconciled review for PR #$pr from $dir" >&2
       # The stamp carries the SHA actually reviewed, so a late post is still a
       # truthful one — and if the head has moved since, post_comment.sh's own
       # staleness banner says so and the currency check goes red. That red is
       # the correct outcome, not a regression.
+      # --repo is load-bearing, not decoration: without it `gh pr view 3280`
+      # resolves against whatever repository the caller is standing in, and this
+      # scan spans every repo under the runs root. --pass keeps a recovered
+      # pass-2 comment from being relabelled pass 1. (codex P1 + P2, #53.)
       bash "$(dirname "${BASH_SOURCE[0]}")/post_comment.sh" \
-        --pr "$pr" --mode summary --findings "$dir/findings.md" --head-sha "$sha" >&2
+        --pr "$pr" --mode summary --findings "$dir/findings.md" --head-sha "$sha" \
+        ${repo:+--repo "$repo"} ${pass:+--pass "$pass"} >&2
     done
   fi
 

@@ -404,7 +404,8 @@ bash ~/.claude/skills/cross-review/scripts/post_comment.sh \
   --pr <pr-number> \
   --mode <summary|file|none> \
   --findings "$run_dir/findings.md" \
-  --head-sha "$(git -C "$worktree" rev-parse HEAD)"
+  --head-sha "$(jq -r .head_sha "$run_dir/context.json")" \
+  --repo "$(jq -r .repo "$run_dir/context.json")"
 ```
 
 **Always pass `--head-sha`.** It stamps the record with the commit actually
