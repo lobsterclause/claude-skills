@@ -1753,6 +1753,60 @@ mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"number\":7,\"url\":\"htt
 assert_contains "a capped comment list is refetched with pagination" \
   "$(cat "$MG_ARGS" 2>/dev/null)" "api --paginate"
 
+# ...but "the call was attempted" is not "the call worked", and that gap hid a
+# real bug for a whole release: `gh api --paginate --slurp --jq` is REJECTED by
+# gh ("the `--slurp` option is not supported with `--jq` or `--template`"), the
+# error went to /dev/null, and the branch silently fell back to the capped
+# list. The refetch never once paginated. The assertion above stayed green
+# throughout, because the shim answered every call identically.
+#
+# So: a shim that reproduces gh's actual constraint and answers the two calls
+# DIFFERENTLY, and an assertion on the verdict rather than on the argv.
+cat >"$T/mg-pages.json" <<JSON
+[[{"body":"$STAMPED"},{"body":"$REVIEWED_NEW"}]]
+JSON
+cat >"$T/bin/gh" <<SH
+#!/bin/sh
+printf ' %s' "\$@" >>"$MG_ARGS"
+printf '\n' >>"$MG_ARGS"
+slurp=0; usedjq=0; isapi=0
+for a in "\$@"; do
+  [ "\$a" = "--slurp" ] && slurp=1
+  [ "\$a" = "--jq" ] && usedjq=1
+  [ "\$a" = "api" ] && isapi=1
+done
+if [ "\$slurp" = 1 ] && [ "\$usedjq" = 1 ]; then
+  echo 'the \`--slurp\` option is not supported with \`--jq\` or \`--template\`' >&2
+  exit 1
+fi
+if [ "\$isapi" = 1 ]; then cat "$T/mg-pages.json"; else cat "$MG_FIX"; fi
+SH
+chmod +x "$T/bin/gh"
+
+# The capped view shows 100 STALE records; only the paginated refetch reveals
+# the newer passing one. A verdict of `clear` is therefore proof the refetch
+# both ran AND was read.
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"number\":7,\"url\":\"https://github.com/o/r/pull/7\",\"comments\":$BIG}" --pr 7
+assert_eq "the refetched comments are the ones actually judged" "$(mg_status)" "clear"
+
+# CONTROL: the refetch must not paper over a genuinely stale head. Same shim,
+# but the paginated pages carry only the stale record — the verdict must flip
+# back, or the assertion above would pass on a refetch that always says clear.
+cat >"$T/mg-pages.json" <<JSON
+[[{"body":"$STAMPED"}]]
+JSON
+mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"number\":7,\"url\":\"https://github.com/o/r/pull/7\",\"comments\":$BIG}" --pr 7
+assert_eq "control: a refetch that finds only stale records still fails" "$(mg_status)" "stale"
+
+# Restore the plain shim for the control below.
+cat >"$T/bin/gh" <<SH
+#!/bin/sh
+printf ' %s' "\$@" >>"$MG_ARGS"
+printf '\n' >>"$MG_ARGS"
+cat "$MG_FIX" 2>/dev/null || true
+SH
+chmod +x "$T/bin/gh"
+
 # CONTROL: below the cap, no second API call — the refetch must not be
 # unconditional, or every run pays for it. The fixture carries `number` and
 # `url` deliberately: without them the refetch cannot run for lack of a repo to

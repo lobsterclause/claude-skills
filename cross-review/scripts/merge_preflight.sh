@@ -115,9 +115,16 @@ if [[ "$(printf '%s' "$comments_json" | jq 'length' 2>/dev/null || echo 0)" -ge 
   [[ -z "$owner_repo" ]] && owner_repo="$(printf '%s' "$pr_json" | jq -r '.url // ""' 2>/dev/null | sed -nE 's#^https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#p')"
   pr_number="$(printf '%s' "$pr_json" | jq -r '.number // ""' 2>/dev/null || true)"
   if [[ -n "$owner_repo" && -n "$pr_number" ]]; then
-    full="$(gh api --paginate --slurp "repos/$owner_repo/issues/$pr_number/comments" \
-              --jq '[.[][] | {body: (.body // "")}]' 2>/dev/null || true)"
-    [[ -n "$full" ]] && comments_json="$full"
+    # `--slurp` is NOT compatible with `--jq`: gh exits with "the `--slurp`
+    # option is not supported with `--jq` or `--template`". Combining them made
+    # this branch a no-op — it always fell back to the capped list, so the
+    # pagination fix shipped in #50 never actually paginated. The test only
+    # asserted that `api --paginate` appeared in the recorded arguments, which
+    # is a statement about the call being ATTEMPTED, not about it working.
+    # Shape the JSON in a separate jq, never in gh's --jq.
+    full="$(gh api --paginate --slurp "repos/$owner_repo/issues/$pr_number/comments" 2>/dev/null \
+              | jq -c '[.[][] | {body: (.body // "")}]' 2>/dev/null || true)"
+    [[ -n "$full" && "$full" != "[]" ]] && comments_json="$full"
   fi
 fi
 
