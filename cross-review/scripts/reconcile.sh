@@ -17,9 +17,11 @@
 # States:
 #   posted          posted.json says the comment went up — nothing to do
 #   deliberate      caller asked for --mode file/none — not a drop, leave alone
-#   droppable       meant to post, didn't, and we know the SHA → --post can fix
-#   unattributable  meant to post, didn't, and the reviewed SHA was never
-#                   recorded → CANNOT be posted truthfully, needs a re-review
+#   droppable       meant to post, didn't, and we know the SHA, PR AND repo
+#                   → --post can fix
+#   unattributable  meant to post, didn't, and some part of the address is
+#                   missing (SHA, PR number, repository, or findings body)
+#                   → CANNOT be posted truthfully, needs a re-review
 #   unreviewed      no reviewer output — an aborted run, not a drop
 #
 # Exit codes: 0 nothing droppable, 1 droppable runs found, 2 usage error.
@@ -139,11 +141,20 @@ classify_run() {
   # A post needs a PR, a body, and a SHA to stamp. Missing the SHA is the
   # interesting case: the review is real but can never be attributed to a
   # commit, so re-posting it would be a guess wearing a stamp's authority.
+  #
+  # `repo` is part of that set. Without it --post calls `gh pr comment 266` with
+  # no --repo, and gh resolves the number against whatever repository the caller
+  # is standing in. Runs recorded before the repo field existed hit exactly this:
+  # a real Prosper-XO-Prototypes #266 drop would post into claude-skills #266
+  # from the wrong directory. The pass-2 --repo fix (codex P1, #53) only helps
+  # runs that RECORDED a repo; a post that cannot name its repository must not
+  # be attempted at all.
   local detail="${reason:-never reached post_comment.sh}"
-  if [[ -z "$head_sha" || -z "$pr" || ! -f "$d/findings.md" ]]; then
+  if [[ -z "$head_sha" || -z "$pr" || -z "$repo" || ! -f "$d/findings.md" ]]; then
     local why=""
     [[ -z "$head_sha" ]] && why="no reviewed SHA recorded"
     [[ -z "$pr" ]] && why="${why:+$why; }no PR number"
+    [[ -z "$repo" ]] && why="${why:+$why; }no repository recorded"
     [[ ! -f "$d/findings.md" ]] && why="${why:+$why; }no findings.md"
     printf "unattributable${US}%s${US}%s${US}%s${US}%s${US}%s\n" "$pr" "$head_sha" "$repo" "$pass" "$why ($detail)"; return 0
   fi
@@ -203,6 +214,13 @@ main() {
     for r in ${rows[@]+"${rows[@]}"}; do
       IFS="$US" read -r state pr sha repo pass detail dir <<<"$r"
       [[ "$state" == "droppable" ]] || continue
+      # Second gate, deliberately redundant with classify_run. The cost of a
+      # wrong-repo post is a review comment on a stranger's PR; the cost of this
+      # line is nothing.
+      if [[ -z "$repo" ]]; then
+        echo "SKIP PR #$pr — no repository recorded; refusing to post against the caller's cwd ($dir)" >&2
+        continue
+      fi
       echo "posting reconciled review for PR #$pr from $dir" >&2
       # The stamp carries the SHA actually reviewed, so a late post is still a
       # truthful one — and if the head has moved since, post_comment.sh's own
