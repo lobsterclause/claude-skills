@@ -1435,6 +1435,78 @@ pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"MERGED
   --head-sha 399df23d4d5945162d0c5ed623484d608337165d
 assert_contains "merged-before-review is flagged" "$(cat "$CR_TEST_CAPTURE")" "already merged before the review finished"
 
+# ── post_comment records the posting outcome ──
+# Six real reviews (kindred-mama-ai #3214/#3252/#3264/#3269/#3276/#3280) left
+# 68-676KB of reviewer output and nothing on GitHub. Nothing on disk said whether
+# posting was attempted, so "reviewed but dropped" was indistinguishable from
+# "never reviewed". Every terminal path now records which one it was.
+# Fresh dir per case — a leftover posted.json from a prior case would let these
+# pass without the code writing anything.
+pcp_run() {  # $1=case, $2=mode; echoes the run dir
+  local d="$T/pcp/$1"; mkdir -p "$d"
+  printf '# findings\n\nnothing\n' >"$d/findings.md"
+  CR_TEST_PR_JSON='{"headRefOid":"abc","state":"OPEN"}' \
+    bash "$SKILL_DIR/scripts/post_comment.sh" --pr 3207 --mode "$2" \
+      --findings "$d/findings.md" --head-sha deadbeefcafe1234567890 >/dev/null 2>&1
+  printf '%s' "$d"
+}
+
+# gh shim that emits a comment URL and can be made to fail on demand.
+cat >"$T/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") [ -n "${CR_TEST_GH_NOAUTH:-}" ] && exit 1; exit 0 ;;
+  "pr view") printf '%s\n' "${CR_TEST_PR_JSON:-}" ; exit 0 ;;
+  "pr comment")
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--body-file" ] && [ -n "${CR_TEST_CAPTURE:-}" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
+        shift
+      done
+      if [ -n "${CR_TEST_COMMENT_FAIL:-}" ]; then echo "rate limited" >&2; exit 1; fi
+      echo "https://github.com/o/r/pull/3207#issuecomment-999"
+      exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/gh"
+
+D="$(pcp_run posted summary)"
+if [[ -f "$D/posted.json" ]]; then ok "successful post writes posted.json"; else bad "no posted.json after a successful post"; fi
+if jq -e . "$D/posted.json" >/dev/null 2>&1; then ok "posted.json is valid JSON"; else bad "posted.json is not parseable"; fi
+assert_eq "successful post records posted=true" "$(jq -r '.posted' "$D/posted.json")" "true"
+assert_eq "successful post records the comment url" \
+  "$(jq -r '.comment_url' "$D/posted.json")" "https://github.com/o/r/pull/3207#issuecomment-999"
+assert_eq "successful post records the reviewed sha" \
+  "$(jq -r '.head_sha' "$D/posted.json")" "deadbeefcafe1234567890"
+
+# Explicit export/unset rather than a `VAR=1 func` prefix: bash does not
+# reliably scope assignments to a *function* call, so a leak would silently
+# arm the wrong case.
+export CR_TEST_COMMENT_FAIL=1
+D="$(pcp_run ghfail summary)"
+unset CR_TEST_COMMENT_FAIL
+assert_eq "a failed gh comment records posted=false" "$(jq -r '.posted' "$D/posted.json")" "false"
+assert_eq "and names the failure" "$(jq -r '.reason' "$D/posted.json")" "gh-comment-failed"
+
+export CR_TEST_GH_NOAUTH=1
+D="$(pcp_run noauth summary)"
+unset CR_TEST_GH_NOAUTH
+assert_eq "no-auth fallback is distinguishable from file mode" \
+  "$(jq -r '.reason' "$D/posted.json")" "gh-unavailable-or-no-pr"
+
+D="$(pcp_run filemode file)"
+assert_eq "deliberate file mode records its own reason" "$(jq -r '.reason' "$D/posted.json")" "file-mode"
+
+D="$(pcp_run nonemode none)"
+assert_eq "mode=none still leaves a record" "$(jq -r '.reason' "$D/posted.json")" "mode-none"
+
+# The whole point of the reason field: reconciliation must be able to tell a
+# review that MEANT to post from one that was asked to stay local.
+if [[ "$(jq -r '.reason' "$T/pcp/noauth/posted.json")" != "$(jq -r '.reason' "$T/pcp/filemode/posted.json")" ]]; then
+  ok "failed-to-post and asked-not-to-post are different reasons"
+else bad "both file-mode paths report the same reason"; fi
+unset CR_TEST_COMMENT_FAIL CR_TEST_GH_NOAUTH
+
 # 2b. Closed-but-not-merged gets its own banner. Without this the CLOSED
 #     branch could regress silently while the MERGED test stayed green.
 pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"CLOSED"}' \
