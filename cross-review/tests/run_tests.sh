@@ -2037,6 +2037,15 @@ assert_eq "an unanchored pr-NNN inside an id does not become the target PR" \
   "$(cls "$D" | cut -d'|' -f2)" ""
 assert_eq "and with no PR it is unattributable, not droppable" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
 
+# A run recorded before the repo field existed has a SHA, a PR and a body, but
+# no way to say WHICH repository. --post would then call `gh pr comment 266`
+# with no --repo and hit PR #266 in whatever repo the caller stands in. Three
+# real runs on this machine are in exactly that state. (Follow-up to #53.)
+D="$RR/norepo"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
+printf '{"head_sha":"4444444444444444444444444444444444444444","id":"pr-266"}\n' >"$D/context.json"
+assert_eq "a run with no recorded repository is not droppable" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
+assert_contains "and says the repository is what is missing" "$(cls "$D")" "no repository recorded"
+
 # A corrupt SHA is not provenance — worktree.sh validates on write, this is read.
 D="$RR/badsha"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
 printf '{"head_sha":"not-a-sha","id":"pr-777","repo":"o/r"}\n' >"$D/context.json"
@@ -2065,7 +2074,7 @@ if printf '%s' "$RECON_JSON" | jq -e 'type=="array"' >/dev/null 2>&1; then
   ok "--json emits a parseable array"
 else bad "--json output is not a JSON array"; fi
 assert_eq "--json reports every scanned run" \
-  "$(printf '%s' "$RECON_JSON" | jq 'length' 2>/dev/null)" "10"
+  "$(printf '%s' "$RECON_JSON" | jq 'length' 2>/dev/null)" "11"
 assert_eq "--json agrees with the text report on what is droppable" \
   "$(printf '%s' "$RECON_JSON" | jq '[.[] | select(.state=="droppable")] | length' 2>/dev/null)" "3"
 # Report-only by default: scanning must never post. If the default ever flips,
