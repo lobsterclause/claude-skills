@@ -857,24 +857,31 @@ $json_findings_suffix"
   rm -f "$prompt_tmp"
 
   local resp_file="$out/${slug}.response.json"
-  # The Authorization header goes through a 0600 curl --config file, NOT argv:
-  # argv is world-visible via `ps` for the duration of the call (same rationale
-  # as the kimi stdin-prompt rule). Kimi cross-review finding, PR #18 pass 1.
-  local auth_file="$out/.${slug}.curl-auth.$$"
-  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$key" >"$auth_file" )
+  # The Authorization header reaches curl on STDIN — never argv, never disk.
+  #
+  # Not argv: that is world-visible via `ps` for the duration of the call, same
+  # rationale as the kimi stdin-prompt rule (kimi finding, PR #18 pass 1).
+  #
+  # Not disk: it previously went through a 0600 `--config` file removed right
+  # after curl returned, which covers every path except the one that matters.
+  # When the lap is KILLED mid-call the `rm` never runs, and a live bearer
+  # token stays in the run dir indefinitely. Found 2026-08-10 after a failed
+  # kimi3 lap left one behind; 14 had accumulated across historical run dirs.
+  # Cleaning up more carefully was the smaller fix — writing the secret to a
+  # temp file at all is the failure mode, so stdin removes it outright.
   # X-Title is OpenRouter-specific attribution metadata — don't send it to
   # other OpenAI-compatible endpoints (kimi27 Low, its first sampled finding).
   local -a title_header=()
   [[ "$cli" == "openrouter" ]] && title_header=(-H "X-Title: cross-review")
-  curl -sS --max-time "$timeout_budget" \
-    --config "$auth_file" \
+  printf 'header = "Authorization: Bearer %s"\n' "$key" \
+  | curl -sS --max-time "$timeout_budget" \
+    --config - \
     -H "Content-Type: application/json" \
     ${title_header[@]+"${title_header[@]}"} \
     -d @"$body_file" \
     "$endpoint" \
     >"$resp_file" 2>"$out/${slug}.stderr"
   rc=$?
-  rm -f "$auth_file"
   # curl exits 28 on --max-time; normalize to 124 so meta.timed_out and the
   # retry policy treat it exactly like a coreutils timeout.
   [[ $rc -eq 28 ]] && rc=124

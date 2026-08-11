@@ -331,6 +331,40 @@ assert_eq "OR request asks for usage accounting" \
   "$(jq -r '.usage.include' "$T/o6/glm.request.json")" "true"
 rm -f "$T/bin/curl"
 
+# The bearer token must reach curl without ever touching argv or disk.
+#
+# Disk: it used to go through a 0600 `--config` file removed right after curl
+# returned — every path except a lap KILLED mid-call, where the rm never runs.
+# 14 live tokens had accumulated across run dirs before this was noticed.
+# Argv: `ps` is world-readable for the duration of the call (PR #18 pass 1).
+cat >"$T/bin/curl" <<SHIM
+#!/bin/sh
+cat >"$T/curl_stdin.txt"
+printf '%s\n' "\$@" >"$T/curl_argv.txt"
+cat "$T/canned_or_response.json"
+SHIM
+chmod +x "$T/bin/curl"
+: >"$T/curl_stdin.txt"; : >"$T/curl_argv.txt"
+bash "$S/run_reviewers.sh" --base main --out "$T/o6b" --reviewers glm >/dev/null 2>&1 || true
+
+if [[ -n "$(find "$T/o6b" -name '.*curl-auth*' 2>/dev/null)" ]]; then
+  bad "no auth file is left in the run dir"
+else
+  ok "no auth file is left in the run dir"
+fi
+
+# CONTROL ×2 — "no file on disk" and "not in argv" are both satisfied by a
+# build that stopped sending the header at all. Prove it still arrives, and
+# that it arrives by the intended route.
+assert_contains "the bearer token still reaches curl on stdin" \
+  "$(cat "$T/curl_stdin.txt" 2>/dev/null)" "Authorization: Bearer sk-or-test-shim"
+if grep -q 'sk-or-test-shim' "$T/curl_argv.txt" 2>/dev/null; then
+  bad "the token never appears in argv"
+else
+  ok "the token never appears in argv"
+fi
+rm -f "$T/bin/curl"
+
 # retry accumulates spend: attempt 1 charged but preamble-only (rc=5, retried),
 # attempt 2 charged and good — meta must carry the SUM, not the last attempt
 # [pin: codex P2, PR #28 pass 1 — leaderboard undercounted flaky-expensive]
