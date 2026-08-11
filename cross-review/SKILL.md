@@ -115,7 +115,9 @@ Reviewers shown a half-resolved state will hallucinate confidently about the bro
 
 If either warning fires, do **not** proceed silently. A skill that quietly sends sensitive content or bleeds tokens is worse than one that asks.
 
-Save the JSON to `$run_dir/context.json` and `cd` into `$worktree`. Future steps use `$run_dir` for outputs and `$worktree` as cwd.
+`worktree.sh start` writes that JSON to `$run_dir/context.json` itself — you do not need to. It records `head_sha` (the commit the worktree is actually on, which is what a later stamp must carry), plus `base_sha`, `ref`, `id`, `repo`, and `started_at`. `cd` into `$worktree`; future steps use `$run_dir` for outputs and `$worktree` as cwd.
+
+> This used to read "Save the JSON to `$run_dir/context.json`" — prose, which an agent can skip, and did. On 2026-08-11 six kindred-mama-ai PRs (#3214, #3252, #3264, #3269, #3276, #3280) had 68–676KB of real reviewer output on disk, no `context.json`, and no posted comment; nothing could tell them from PRs nobody reviewed. A run that never recorded its SHA cannot be reconciled afterwards at any price, so the script records it.
 
 Mint `run_id="$(basename "$run_dir")"` now — `worktree.sh` already builds `run_dir` from a globally-unique `<repo>-<id>-<ts>-<pid>` name, so its basename is a ready-made join key. Every finding-lifecycle event (step 4/4.5) and the runlog entry (step 9.5) for this pass carry this same `run_id`, so they can be joined later.
 
@@ -408,7 +410,27 @@ bash ~/.claude/skills/cross-review/scripts/post_comment.sh \
 **Always pass `--head-sha`.** It stamps the record with the commit actually
 reviewed and compares it against the PR's live head at post time, emitting a
 warning banner when they differ or when the PR is already merged/closed. Both
-checks fail open — a missing `gh`/`jq` just drops the banner.
+checks fail open — a missing `gh`/`jq` just drops the banner. Read it from
+`context.json` (`jq -r .head_sha "$run_dir/context.json"`) rather than
+re-resolving the ref, so the stamp matches what the reviewers actually saw.
+
+**Do not skip this step.** `post_comment.sh` writes `$run_dir/posted.json` on
+every terminal path — `posted`, `gh-comment-failed`, `gh-unavailable-or-no-pr`,
+`file-mode`, `mode-none` — so a drop is detectable afterwards. The absence of
+`posted.json` means the run never reached this step at all, which is how six
+real reviews went invisible. `scripts/reconcile.sh` reports those:
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/reconcile.sh          # report only
+bash ~/.claude/skills/cross-review/scripts/reconcile.sh --post   # opt-in, posts
+```
+
+It exits 1 when anything is droppable. Runs whose SHA was never recorded are
+reported as `unattributable` and are **not** posted — re-posting one would mean
+stamping a guessed commit, and the stamp's whole value is that it is not a
+guess. Those need a fresh review. `--post` is never the default: posting a
+comment is an outward-facing act, and a scan that does it as a side effect is
+the wrong shape regardless of how good the classification is.
 
 This exists because a review record is read long after it is posted, and
 without the SHA it reads as authoritative about whatever the PR contains
