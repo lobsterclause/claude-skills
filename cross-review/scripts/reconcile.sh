@@ -129,6 +129,11 @@ main() {
     [[ "$state" == "filtered" ]] && continue
     n=$((n + 1))
     [[ "$state" == "droppable" ]] && droppable=$((droppable + 1))
+    # A field containing the delimiter would re-split when the row is read back,
+    # shifting every later field — the same corruption the tab separator caused,
+    # just rarer. `detail` comes from a JSON file on disk and `d` from the
+    # filesystem, so neither is ours to trust. (kimi, PR #53.)
+    detail="${detail//$US/ }"; d="${d//$US/ }"
     rows+=("$state$US$pr$US$sha$US$detail$US$d")
   done < <(find "$runs_root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -r)
 

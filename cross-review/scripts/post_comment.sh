@@ -169,6 +169,13 @@ case "$mode" in
     rc=$?
     [[ -n "$comment_url" ]] && printf '%s\n' "$comment_url"
     if [[ "$rc" -eq 0 ]]; then
+      # gh prints the comment URL on success. Record it only if it looks like
+      # one — a garbled value sends anyone reading posted.json to a link that
+      # isn't there. Deliberately NOT a downgrade to posted=false: the comment
+      # did post, and calling that a failure would make reconcile.sh post it a
+      # second time. A missing URL costs a click; a duplicate review comment
+      # costs trust in the record. (kimi, PR #53 — accepted in weaker form.)
+      [[ "$comment_url" =~ ^https://[^[:space:]]+$ ]] || comment_url=""
       write_posted true "posted" "$comment_url"
       exit 0   # posted OK
     else

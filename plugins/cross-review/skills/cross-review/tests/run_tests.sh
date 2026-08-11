@@ -1463,6 +1463,7 @@ case "$1 $2" in
         shift
       done
       if [ -n "${CR_TEST_COMMENT_FAIL:-}" ]; then echo "rate limited" >&2; exit 1; fi
+      if [ -n "${CR_TEST_COMMENT_JUNK_URL:-}" ]; then echo "Warning: something odd"; exit 0; fi
       echo "https://github.com/o/r/pull/3207#issuecomment-999"
       exit 0 ;;
 esac
@@ -1487,6 +1488,14 @@ D="$(pcp_run ghfail summary)"
 unset CR_TEST_COMMENT_FAIL
 assert_eq "a failed gh comment records posted=false" "$(jq -r '.posted' "$D/posted.json")" "false"
 assert_eq "and names the failure" "$(jq -r '.reason' "$D/posted.json")" "gh-comment-failed"
+
+# A malformed URL must not be recorded, and must NOT downgrade posted to false:
+# the comment went up, and calling it a failure makes reconcile.sh post it twice.
+export CR_TEST_COMMENT_JUNK_URL=1
+D="$(pcp_run junkurl summary)"
+unset CR_TEST_COMMENT_JUNK_URL
+assert_eq "a garbled comment url is still a successful post" "$(jq -r '.posted' "$D/posted.json")" "true"
+assert_eq "and the garbled url is dropped rather than recorded" "$(jq -r '.comment_url' "$D/posted.json")" ""
 
 export CR_TEST_GH_NOAUTH=1
 D="$(pcp_run noauth summary)"
