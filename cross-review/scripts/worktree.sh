@@ -5,7 +5,8 @@
 #   start --ref <branch-or-sha> --id <slug> [--base <branch>]
 #     Creates $HOME/.cross-review/worktrees/cr-<slug>-<ts>-<pid>/ (detached worktree at <ref>)
 #     Creates $HOME/.cross-review/runs/<repo>-<slug>-<ts>-<pid>/ (stable output dir)
-#     Runs size + secret-path checks and emits a single JSON line.
+#     Runs size + secret-path checks, emits a single JSON line, and writes that
+#     same line to $run_dir/context.json.
 #
 #   end --worktree <path>
 #     Tears down the worktree. Idempotent. Run dir is NOT touched.
@@ -25,6 +26,14 @@
 #   the same --id cannot collide.
 # - Sweep uses -print0 + null-separated read; it must not word-split on paths
 #   containing spaces, since it calls `rm -rf "$dir"`.
+# - `start` records head_sha and writes context.json ITSELF. Both used to be the
+#   caller's job ("Save the JSON to $run_dir/context.json", SKILL.md) — prose an
+#   agent could skip, and did: on 2026-08-11 six kindred-mama-ai PRs (#3214,
+#   #3252, #3264, #3269, #3276, #3280) had 68-676KB of real reviewer output on
+#   disk, no context.json, and no posted review comment. Nothing downstream
+#   could tell those from PRs that were never reviewed, because the SHA under
+#   review was never written down anywhere. A run that cannot say which commit
+#   it covered cannot be reconciled later, so recording it is the script's job.
 
 set -euo pipefail
 
@@ -177,8 +186,54 @@ case "$cmd" in
       warn_secrets=true
     fi
 
-    printf '{"worktree": "%s", "run_dir": "%s", "size_files": %d, "size_lines": %d, "base": "%s", "warn_large_diff": %s, "warn_secrets": %s, "risky_files": "%s"}\n' \
-      "$worktree" "$run_dir" "$size_files" "$size_lines" "$base" "$warn_large" "$warn_secrets" "$risky_files"
+    # The exact commit the reviewers will read. Ask the worktree, not the ref:
+    # `--ref origin/foo` resolves at `worktree add` time, and re-resolving it
+    # afterwards can pick up a fetch that landed in between. This is the SHA the
+    # review actually covers, which is the only one worth stamping.
+    head_sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || true)"
+    # 40 hex for sha1, 64 for a repo created with --object-format=sha256.
+    # Hard-coding 40 would abort a review in a perfectly valid sha256 repo.
+    # (codex P2, PR #53.)
+    if [[ ! "$head_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+      # Can't-happen in practice — but a context.json with an empty head_sha is
+      # precisely the silent hole this field exists to close, so fail loud
+      # rather than record a run that can never be reconciled.
+      echo "could not resolve worktree HEAD (got: '$head_sha') — refusing to start an unattributable review" >&2
+      git worktree remove --force "$worktree" 2>/dev/null || true
+      rm -rf "$worktree"
+      exit 1
+    fi
+    base_sha="$(git -C "$repo_root" rev-parse "$base^{commit}" 2>/dev/null || true)"
+
+    # owner/repo only. The remote URL may embed a credential
+    # (https://x-access-token:TOKEN@github.com/...), and this string is written
+    # to a file that outlives the run, so it must never carry one. awk keeps
+    # only the last two path components, and the regex then rejects anything
+    # that isn't a plain owner/repo — a one-component remote would otherwise
+    # put the userinfo field in $(NF-1). Fails closed to "".
+    origin_slug="$(git -C "$repo_root" remote get-url origin 2>/dev/null \
+      | sed -e 's#/$##' -e 's#\.git$##' \
+      | awk -F'[/:]' 'NF>=2 {printf "%s/%s", $(NF-1), $NF}' || true)"
+    # The owner half forbids dots; the repo half allows them. Without that
+    # asymmetry `https://github.com/justrepo` reduces to "github.com/justrepo",
+    # which passes a symmetric regex and records a hostname as the owner.
+    # (minimax L, PR #53.)
+    [[ "$origin_slug" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || origin_slug=""
+
+    # Escape rather than interpolate raw: context.json is machine-read by
+    # reconciliation, and a filename containing a quote must not be able to
+    # truncate the record into malformed JSON that parses as "no run".
+    jsonesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+
+    json="$(printf '{"worktree": "%s", "run_dir": "%s", "size_files": %d, "size_lines": %d, "base": "%s", "base_sha": "%s", "head_sha": "%s", "ref": "%s", "id": "%s", "repo": "%s", "started_at": "%s", "warn_large_diff": %s, "warn_secrets": %s, "risky_files": "%s"}' \
+      "$(jsonesc "$worktree")" "$(jsonesc "$run_dir")" "$size_files" "$size_lines" \
+      "$(jsonesc "$base")" "$base_sha" "$head_sha" "$(jsonesc "$ref")" "$(jsonesc "$id")" \
+      "$origin_slug" "$ts" "$warn_large" "$warn_secrets" "$(jsonesc "$risky_files")")"
+
+    # Same bytes to both, so the caller's copy and the on-disk record can never
+    # disagree about what was reviewed.
+    printf '%s\n' "$json" >"$run_dir/context.json"
+    printf '%s\n' "$json"
     ;;
 
   end)

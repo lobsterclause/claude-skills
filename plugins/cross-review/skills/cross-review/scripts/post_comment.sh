@@ -23,6 +23,7 @@
 set -uo pipefail
 
 pr=""
+repo=""
 mode="summary"
 findings=""
 pass="1"
@@ -40,6 +41,7 @@ need_val() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pr)       need_val --pr       "$#"; pr="$2";       shift 2 ;;
+    --repo)     need_val --repo     "$#"; repo="$2";     shift 2 ;;
     --mode)     need_val --mode     "$#"; mode="$2";     shift 2 ;;
     --findings) need_val --findings "$#"; findings="$2"; shift 2 ;;
     --pass)     need_val --pass     "$#"; pass="$2";     shift 2 ;;
@@ -49,7 +51,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$findings" ]]; then
-  echo "usage: $0 --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>] [--head-sha <sha>]" >&2
+  echo "usage: $0 --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>] [--head-sha <sha>] [--repo owner/name]" >&2
   exit 2
 fi
 
@@ -58,15 +60,55 @@ if [[ ! -f "$findings" ]]; then
   exit 2
 fi
 
+# Every terminal path below records what happened to the record, in the run dir
+# next to findings.md. Absence of posted.json then means something specific and
+# useful: the run never reached post_comment.sh at all. That is the exact state
+# six kindred-mama-ai PRs were in on 2026-08-11 (#3214, #3252, #3264, #3269,
+# #3276, #3280) — real reviewer output on disk, nothing on GitHub, and no way to
+# tell them apart from PRs nobody reviewed. A reconciliation pass needs "meant
+# to post and didn't" to be distinguishable from "deliberately file-only", so
+# the reason is recorded rather than inferred.
+#
+# Fails open: an unwritable run dir must never cost the user a posted review.
+run_dir="$(dirname "$findings")"
+jsonesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+# Without --repo, `gh pr view 3280` resolves the number against whatever
+# repository the CALLER happens to be standing in. reconcile.sh scans a runs
+# root spanning many repos, so a reconciled post could land on a same-numbered
+# PR in the wrong project entirely. (codex P1, PR #53.)
+gh_repo=()
+[[ -n "$repo" ]] && gh_repo=(--repo "$repo")
+
+write_posted() {  # <true|false> <reason> [comment_url]
+  if [[ ! -d "$run_dir" || ! -w "$run_dir" ]]; then
+    # Say so. A silently absent marker is indistinguishable from "never tried
+    # to post", which is exactly what reconcile.sh reads as droppable — so an
+    # unwritable run dir could make it re-post a comment that already exists.
+    # (qwen M, codex P2, PR #53.)
+    echo "WARN: cannot write $run_dir/posted.json — this run's posting outcome will not be recorded" >&2
+    return 0
+  fi
+  printf '{"posted": %s, "reason": "%s", "pr": "%s", "repo": "%s", "pass": "%s", "head_sha": "%s", "mode": "%s", "comment_url": "%s", "posted_at": "%s"}\n' \
+    "$1" "$(jsonesc "$2")" "$(jsonesc "$pr")" "$(jsonesc "$repo")" "$(jsonesc "$pass")" "$(jsonesc "$head_sha")" \
+    "$(jsonesc "$mode")" "$(jsonesc "${3:-}")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >"$run_dir/posted.json" 2>/dev/null || true
+}
+
 if [[ "$mode" == "none" ]]; then
+  write_posted false "mode-none"
   exit 0
 fi
 
 # Fall back to file mode when there's no PR or no gh auth.
+# Remember WHY: a review that was meant to post and couldn't is a different
+# thing from one the caller asked to keep local, and only the first is worth
+# reconciling later.
+file_reason="file-mode"
 if [[ "$mode" == "summary" ]]; then
   if [[ -z "$pr" ]] || ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
     echo "gh unavailable or no PR number — falling back to file mode" >&2
     mode="file"
+    file_reason="gh-unavailable-or-no-pr"
   fi
 fi
 
@@ -109,7 +151,7 @@ case "$mode" in
     [[ -n "$head_sha" ]] && provenance="Reviewed \`${head_sha:0:9}\`."
     staleness=""
     if command -v jq >/dev/null 2>&1; then
-      pr_meta="$(gh pr view "$pr" --json headRefOid,state 2>/dev/null || true)"
+      pr_meta="$(gh pr view "$pr" ${gh_repo[@]+"${gh_repo[@]}"} --json headRefOid,state 2>/dev/null || true)"
       if [[ -n "$pr_meta" ]]; then
         cur_sha="$(printf '%s' "$pr_meta" | jq -r '.headRefOid // ""' 2>/dev/null || true)"
         pr_state="$(printf '%s' "$pr_meta" | jq -r '.state // ""' 2>/dev/null || true)"
@@ -136,11 +178,26 @@ case "$mode" in
     # mid-run, transient GitHub outage), degrade gracefully to file mode
     # rather than failing the whole review run. The findings.md is already
     # on disk at $findings — the user still has the record.
-    if gh pr comment "$pr" --body-file "$body_file"; then
+    # Capture the URL gh prints so posted.json can point at the actual comment;
+    # stderr still passes through untouched, and the URL is re-echoed so the
+    # caller sees exactly what it saw before.
+    comment_url="$(gh pr comment "$pr" ${gh_repo[@]+"${gh_repo[@]}"} --body-file "$body_file")"
+    rc=$?
+    [[ -n "$comment_url" ]] && printf '%s\n' "$comment_url"
+    if [[ "$rc" -eq 0 ]]; then
+      # gh prints the comment URL on success. Record it only if it looks like
+      # one — a garbled value sends anyone reading posted.json to a link that
+      # isn't there. Deliberately NOT a downgrade to posted=false: the comment
+      # did post, and calling that a failure would make reconcile.sh post it a
+      # second time. A missing URL costs a click; a duplicate review comment
+      # costs trust in the record. (kimi, PR #53 — accepted in weaker form.)
+      [[ "$comment_url" =~ ^https://[^[:space:]]+$ ]] || comment_url=""
+      write_posted true "posted" "$comment_url"
       exit 0   # posted OK
     else
       # Non-zero exit (issue #7 nit): a silent 0 here masked real auth/rate
       # problems. The findings file is the fallback record either way.
+      write_posted false "gh-comment-failed"
       echo "ACTION REQUIRED: gh pr comment failed (auth? rate limit? closed PR?) — findings preserved at: $findings" >&2
       exit 1
     fi
@@ -154,6 +211,7 @@ case "$mode" in
     ;;
   file)
     # Findings file already exists at $findings — nothing to do.
+    write_posted false "$file_reason"
     echo "findings saved to: $findings" >&2
     exit 0
     ;;

@@ -572,7 +572,70 @@ if [[ ! -d "$FAKETMP/cr-end-owned" ]]; then ok "end removes marker-owned legacy 
     bash "$S/worktree.sh" start --ref HEAD --id marker-test --base main >"$T/wt-start.json" 2>/dev/null )
 WT_PATH="$(jq -r '.worktree' "$T/wt-start.json")"
 if [[ -n "$WT_PATH" && -f "$WT_PATH/.cross-review-worktree" ]]; then ok "start drops ownership marker"; else bad "no marker in fresh worktree ($WT_PATH)"; fi
+
+# ── start records the reviewed SHA and writes context.json itself ──
+# Six real reviews (kindred-mama-ai #3214/#3252/#3264/#3269/#3276/#3280) landed
+# 68-676KB of reviewer output with no context.json, because writing it was prose
+# in SKILL.md that the caller skipped. A run that never recorded its SHA cannot
+# be reconciled afterwards at all — the stamp has nothing truthful to carry.
+WT_RUN="$(jq -r '.run_dir' "$T/wt-start.json")"
+if [[ -f "$WT_RUN/context.json" ]]; then ok "start writes context.json"; else bad "no context.json in $WT_RUN"; fi
+if jq -e . "$WT_RUN/context.json" >/dev/null 2>&1; then ok "context.json is valid JSON"; else bad "context.json is not parseable"; fi
+assert_eq "context.json head_sha == the commit actually checked out" \
+  "$(jq -r '.head_sha' "$WT_RUN/context.json")" "$(git -C "$REPO" rev-parse HEAD)"
+assert_eq "context.json base_sha == the base ref's commit" \
+  "$(jq -r '.base_sha' "$WT_RUN/context.json")" "$(git -C "$REPO" rev-parse main)"
+# stdout and the on-disk record must be the same bytes — two sources of truth
+# about what was reviewed is how a stamp ends up disagreeing with the run.
+if diff -q <(tr -d '\n' <"$T/wt-start.json") <(tr -d '\n' <"$WT_RUN/context.json") >/dev/null 2>&1; then
+  ok "context.json is byte-identical to start's stdout"
+else bad "context.json and stdout disagree"; fi
 CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$WT_PATH" >/dev/null 2>&1 || true
+
+# The repo field is written to a file that outlives the run, so a credential in
+# the remote URL must never reach it. Both fixtures carry the same password.
+OREPO="$T/repo-origin"; mkdir -p "$OREPO"
+( cd "$OREPO" && git init -q -b main 2>/dev/null || git -C "$OREPO" init -q
+  echo x >"$OREPO/f"; git -C "$OREPO" add .
+  git -C "$OREPO" -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+git -C "$OREPO" remote add origin 'https://user:s3cr3tpw@github.com/Owner/Name.git'
+( cd "$OREPO" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$T/runroot" \
+    bash "$S/worktree.sh" start --ref HEAD --id cred-test --base main >"$T/wt-cred.json" 2>/dev/null )
+CRED_RUN="$(jq -r '.run_dir' "$T/wt-cred.json")"
+assert_eq "credentialed remote reduces to owner/repo" \
+  "$(jq -r '.repo' "$CRED_RUN/context.json")" "Owner/Name"
+if grep -q 's3cr3tpw' "$CRED_RUN/context.json"; then bad "context.json leaked the remote credential"; else ok "context.json carries no credential"; fi
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-cred.json")" >/dev/null 2>&1 || true
+
+# A one-component remote puts the userinfo field where the owner would be —
+# the validating regex must reject it outright rather than record `pw@host/x`.
+git -C "$OREPO" remote set-url origin 'https://user:s3cr3tpw@github.com/justrepo'
+( cd "$OREPO" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$T/runroot" \
+    bash "$S/worktree.sh" start --ref HEAD --id cred2-test --base main >"$T/wt-cred2.json" 2>/dev/null )
+CRED2_RUN="$(jq -r '.run_dir' "$T/wt-cred2.json")"
+assert_eq "unparseable remote fails closed to empty repo" \
+  "$(jq -r '.repo' "$CRED2_RUN/context.json")" ""
+
+# No credential at all, still only one path component: awk hands back
+# "github.com/justrepo", which a symmetric regex accepts and records a HOSTNAME
+# as the owner. GitHub owners cannot contain dots; repos can. (minimax L.)
+git -C "$OREPO" remote set-url origin 'https://github.com/justrepo'
+( cd "$OREPO" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$T/runroot" \
+    bash "$S/worktree.sh" start --ref HEAD --id host-owner --base main >"$T/wt-host.json" 2>/dev/null )
+assert_eq "a hostname is not accepted as the owner" \
+  "$(jq -r '.repo' "$(jq -r '.run_dir' "$T/wt-host.json")/context.json")" ""
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-host.json")" >/dev/null 2>&1 || true
+
+# A remote ending .git/ : stripping .git BEFORE the trailing slash leaves the
+# suffix behind, and "Owner/Name.git" passes the regex. (antigravity M.)
+git -C "$OREPO" remote set-url origin 'https://github.com/Owner/Name.git/'
+( cd "$OREPO" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$T/runroot" \
+    bash "$S/worktree.sh" start --ref HEAD --id trailing-slash --base main >"$T/wt-slash.json" 2>/dev/null )
+assert_eq "a trailing slash after .git still reduces to owner/repo" \
+  "$(jq -r '.repo' "$(jq -r '.run_dir' "$T/wt-slash.json")/context.json")" "Owner/Name"
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-slash.json")" >/dev/null 2>&1 || true
+if grep -q 's3cr3tpw' "$CRED2_RUN/context.json"; then bad "one-component remote leaked the credential"; else ok "one-component remote leaks nothing"; fi
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-cred2.json")" >/dev/null 2>&1 || true
 
 echo "── run_with_timeout bash-watchdog fallback (issue #7) ──"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nsleep 30\n' >"$T/bin/kimi"
@@ -1391,6 +1454,87 @@ pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"MERGED
   --head-sha 399df23d4d5945162d0c5ed623484d608337165d
 assert_contains "merged-before-review is flagged" "$(cat "$CR_TEST_CAPTURE")" "already merged before the review finished"
 
+# ── post_comment records the posting outcome ──
+# Six real reviews (kindred-mama-ai #3214/#3252/#3264/#3269/#3276/#3280) left
+# 68-676KB of reviewer output and nothing on GitHub. Nothing on disk said whether
+# posting was attempted, so "reviewed but dropped" was indistinguishable from
+# "never reviewed". Every terminal path now records which one it was.
+# Fresh dir per case — a leftover posted.json from a prior case would let these
+# pass without the code writing anything.
+pcp_run() {  # $1=case, $2=mode; echoes the run dir
+  local d="$T/pcp/$1"; mkdir -p "$d"
+  printf '# findings\n\nnothing\n' >"$d/findings.md"
+  CR_TEST_PR_JSON='{"headRefOid":"abc","state":"OPEN"}' \
+    bash "$SKILL_DIR/scripts/post_comment.sh" --pr 3207 --mode "$2" \
+      --findings "$d/findings.md" --head-sha deadbeefcafe1234567890 >/dev/null 2>&1
+  printf '%s' "$d"
+}
+
+# gh shim that emits a comment URL and can be made to fail on demand.
+cat >"$T/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") [ -n "${CR_TEST_GH_NOAUTH:-}" ] && exit 1; exit 0 ;;
+  "pr view") printf '%s\n' "${CR_TEST_PR_JSON:-}" ; exit 0 ;;
+  "pr comment")
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--body-file" ] && [ -n "${CR_TEST_CAPTURE:-}" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
+        shift
+      done
+      if [ -n "${CR_TEST_COMMENT_FAIL:-}" ]; then echo "rate limited" >&2; exit 1; fi
+      if [ -n "${CR_TEST_COMMENT_JUNK_URL:-}" ]; then echo "Warning: something odd"; exit 0; fi
+      echo "https://github.com/o/r/pull/3207#issuecomment-999"
+      exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/gh"
+
+D="$(pcp_run posted summary)"
+if [[ -f "$D/posted.json" ]]; then ok "successful post writes posted.json"; else bad "no posted.json after a successful post"; fi
+if jq -e . "$D/posted.json" >/dev/null 2>&1; then ok "posted.json is valid JSON"; else bad "posted.json is not parseable"; fi
+assert_eq "successful post records posted=true" "$(jq -r '.posted' "$D/posted.json")" "true"
+assert_eq "successful post records the comment url" \
+  "$(jq -r '.comment_url' "$D/posted.json")" "https://github.com/o/r/pull/3207#issuecomment-999"
+assert_eq "successful post records the reviewed sha" \
+  "$(jq -r '.head_sha' "$D/posted.json")" "deadbeefcafe1234567890"
+
+# Explicit export/unset rather than a `VAR=1 func` prefix: bash does not
+# reliably scope assignments to a *function* call, so a leak would silently
+# arm the wrong case.
+export CR_TEST_COMMENT_FAIL=1
+D="$(pcp_run ghfail summary)"
+unset CR_TEST_COMMENT_FAIL
+assert_eq "a failed gh comment records posted=false" "$(jq -r '.posted' "$D/posted.json")" "false"
+assert_eq "and names the failure" "$(jq -r '.reason' "$D/posted.json")" "gh-comment-failed"
+
+# A malformed URL must not be recorded, and must NOT downgrade posted to false:
+# the comment went up, and calling it a failure makes reconcile.sh post it twice.
+export CR_TEST_COMMENT_JUNK_URL=1
+D="$(pcp_run junkurl summary)"
+unset CR_TEST_COMMENT_JUNK_URL
+assert_eq "a garbled comment url is still a successful post" "$(jq -r '.posted' "$D/posted.json")" "true"
+assert_eq "and the garbled url is dropped rather than recorded" "$(jq -r '.comment_url' "$D/posted.json")" ""
+
+export CR_TEST_GH_NOAUTH=1
+D="$(pcp_run noauth summary)"
+unset CR_TEST_GH_NOAUTH
+assert_eq "no-auth fallback is distinguishable from file mode" \
+  "$(jq -r '.reason' "$D/posted.json")" "gh-unavailable-or-no-pr"
+
+D="$(pcp_run filemode file)"
+assert_eq "deliberate file mode records its own reason" "$(jq -r '.reason' "$D/posted.json")" "file-mode"
+
+D="$(pcp_run nonemode none)"
+assert_eq "mode=none still leaves a record" "$(jq -r '.reason' "$D/posted.json")" "mode-none"
+
+# The whole point of the reason field: reconciliation must be able to tell a
+# review that MEANT to post from one that was asked to stay local.
+if [[ "$(jq -r '.reason' "$T/pcp/noauth/posted.json")" != "$(jq -r '.reason' "$T/pcp/filemode/posted.json")" ]]; then
+  ok "failed-to-post and asked-not-to-post are different reasons"
+else bad "both file-mode paths report the same reason"; fi
+unset CR_TEST_COMMENT_FAIL CR_TEST_GH_NOAUTH
+
 # 2b. Closed-but-not-merged gets its own banner. Without this the CLOSED
 #     branch could regress silently while the MERGED test stayed green.
 pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"CLOSED"}' \
@@ -1822,6 +1966,132 @@ fi
 rm -f "$T/bin/gh"
 
 echo
+echo "── reconcile.sh: which runs never reached GitHub ──"
+# The six kindred-mama-ai drops (#3214/#3252/#3264/#3269/#3276/#3280) all have
+# reviewer output and no provenance, so they must classify as unattributable,
+# NOT droppable — re-posting them would mean stamping a guessed SHA.
+RR="$T/reconcile-runs"; mkdir -p "$RR"
+mkrun() {  # $1=name  $2=has_ctx  $3=head_sha  $4=has_output  $5=posted.json body
+  local d="$RR/$1"; mkdir -p "$d/raw"
+  [[ "$2" == "ctx" ]] && printf '{"head_sha":"%s","id":"pr-777","repo":"o/r"}\n' "$3" >"$d/context.json"
+  [[ "$4" == "out" ]] && printf 'reviewer said things\n' >"$d/raw/codex.stdout"
+  printf '# findings\n' >"$d/findings.md"
+  [[ -n "${5:-}" ]] && printf '%s\n' "$5" >"$d/posted.json"
+  printf '%s' "$d"
+}
+# Subshell: reconcile.sh sets -u, which must not leak into the suite.
+cls() { ( source "$SKILL_DIR/scripts/reconcile.sh"
+          [[ -n "${2:-}" ]] && repo_filter="$2"
+          classify_run "$1" ) | tr '\037' '|'; }
+
+D="$(mkrun full ctx aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa out)"
+assert_eq "review with provenance and no post is droppable" "$(cls "$D" | cut -d'|' -f1)" "droppable"
+assert_eq "and carries the PR it belongs to" "$(cls "$D" | cut -d'|' -f2)" "777"
+
+D="$(mkrun wasposted ctx bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb out '{"posted":true,"reason":"posted","comment_url":"https://x/1"}')"
+assert_eq "an already-posted review is not droppable" "$(cls "$D" | cut -d'|' -f1)" "posted"
+
+D="$(mkrun deliberate ctx cccccccccccccccccccccccccccccccccccccccc out '{"posted":false,"reason":"file-mode"}')"
+assert_eq "a deliberate file-mode run is not a drop" "$(cls "$D" | cut -d'|' -f1)" "deliberate"
+
+D="$(mkrun ghfailed ctx dddddddddddddddddddddddddddddddddddddddd out '{"posted":false,"reason":"gh-comment-failed"}')"
+assert_eq "a failed post IS droppable" "$(cls "$D" | cut -d'|' -f1)" "droppable"
+
+# The shape of the six real drops: reviewer output, no context.json.
+D="$(mkrun noprovenance noctx "" out)"
+assert_eq "reviewer output with no recorded SHA is unattributable" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
+assert_contains "and says why it cannot be posted" "$(cls "$D")" "no reviewed SHA recorded"
+
+# The fixture above is under-determined: it has no PR number EITHER, so it stays
+# unattributable via the PR check even with the head_sha guard deleted — a
+# mutant that removed that guard survived. The six real drops
+# (kindred-mama-ai-pr-3280-…) take their PR from the DIRECTORY NAME, so they
+# have a PR and no SHA. That is the combination the guard actually exists for:
+# without it they become droppable and --post stamps them with nothing.
+D="$(mkrun realdrop-pr-3280 noctx "" out)"
+assert_eq "a PR number without a recorded SHA is still unattributable" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
+assert_eq "and the PR is known even though the SHA is not" "$(cls "$D" | cut -d'|' -f2)" "3280"
+
+# posted.json describes the ACTUAL attempt; context.json describes the run's
+# start. After an auto-fix pass they disagree, and reconciling from the stale
+# context SHA would stamp the recovered comment with the wrong commit — the
+# merge gate would then call a current review stale. (codex P1.)
+D="$RR/passdrift"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
+printf '{"head_sha":"1111111111111111111111111111111111111111","id":"pr-777","repo":"o/r"}\n' >"$D/context.json"
+printf '{"posted":false,"reason":"gh-comment-failed","pr":"999","repo":"other/proj","pass":"2","head_sha":"2222222222222222222222222222222222222222"}\n' >"$D/posted.json"
+assert_eq "the attempt's SHA wins over the run's start SHA" \
+  "$(cls "$D" | cut -d'|' -f3)" "2222222222222222222222222222222222222222"
+assert_eq "the attempt's PR wins over the id-derived one" "$(cls "$D" | cut -d'|' -f2)" "999"
+assert_eq "the attempt's repo is carried" "$(cls "$D" | cut -d'|' -f4)" "other/proj"
+assert_eq "the attempt's pass number is carried" "$(cls "$D" | cut -d'|' -f5)" "2"
+
+# An id that merely CONTAINS a PR-looking substring must not redirect a
+# recovered comment to that PR. (codex P1.)
+# Realistic directory name — worktree.sh builds <repo>-<slug>-<ts>-<pid>, so a
+# fixture called "looseid" cannot exercise the basename fallback at all. The
+# pass-2 version of this test used exactly that and passed while the hole was
+# wide open. (antigravity H, pass 3.)
+D="$RR/myrepo-feature-x-pr-456-20260811T000000-12345"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
+printf '{"head_sha":"3333333333333333333333333333333333333333","id":"feature-x-pr-456","repo":"o/r"}\n' >"$D/context.json"
+assert_eq "an unanchored pr-NNN inside an id does not become the target PR" \
+  "$(cls "$D" | cut -d'|' -f2)" ""
+assert_eq "and with no PR it is unattributable, not droppable" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
+
+# A corrupt SHA is not provenance — worktree.sh validates on write, this is read.
+D="$RR/badsha"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
+printf '{"head_sha":"not-a-sha","id":"pr-777","repo":"o/r"}\n' >"$D/context.json"
+assert_eq "a malformed SHA is discarded rather than stamped" "$(cls "$D" | cut -d'|' -f1)" "unattributable"
+
+D="$(mkrun aborted ctx eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee noout)"
+assert_eq "a run with no reviewer output is not a drop" "$(cls "$D" | cut -d'|' -f1)" "unreviewed"
+
+# --repo filters on context.json's repo, not the directory name.
+assert_eq "non-matching repo is filtered out" \
+  "$(cls "$RR/full" "other/repo" | cut -d'|' -f1)" "filtered"
+
+# Exit code is the machine-readable half: 1 means there is something to fix.
+bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR" >/dev/null 2>&1
+assert_eq "exit 1 when droppable runs exist" "$?" "1"
+if bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR/full" >/dev/null 2>&1; then
+  ok "exit 0 when nothing is droppable"
+else bad "non-zero exit with no droppable runs"; fi
+# Capture first, then parse. This suite runs under `set -o pipefail`, and
+# reconcile.sh deliberately exits 1 when it finds droppable runs — so
+# `reconcile --json | jq` reports the LEFT side's status and the assertion fails
+# on perfectly valid JSON. Any command whose non-zero exit is a signal rather
+# than an error cannot be the left half of a pipe here.
+RECON_JSON="$(bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR" --json 2>/dev/null)"
+if printf '%s' "$RECON_JSON" | jq -e 'type=="array"' >/dev/null 2>&1; then
+  ok "--json emits a parseable array"
+else bad "--json output is not a JSON array"; fi
+assert_eq "--json reports every scanned run" \
+  "$(printf '%s' "$RECON_JSON" | jq 'length' 2>/dev/null)" "10"
+assert_eq "--json agrees with the text report on what is droppable" \
+  "$(printf '%s' "$RECON_JSON" | jq '[.[] | select(.state=="droppable")] | length' 2>/dev/null)" "3"
+# Report-only by default: scanning must never post. If the default ever flips,
+# this shim gets called and the marker file appears.
+: >"$T/reconcile-posted-marker"
+cat >"$T/bin/gh" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "pr comment" ] && echo "$*" >>"$CR_RECON_MARKER"
+[ "$1 $2" = "auth status" ] && exit 0
+exit 0
+SH
+chmod +x "$T/bin/gh"
+export CR_RECON_MARKER="$T/reconcile-posted-marker"
+bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR" >/dev/null 2>&1
+assert_eq "a default scan posts nothing" "$(wc -c <"$CR_RECON_MARKER" | tr -d ' ')" "0"
+# Passing control: without this, "marker is empty" would also hold if reconcile
+# were broken and posted nothing under any flag.
+bash "$SKILL_DIR/scripts/reconcile.sh" --runs-root "$RR" --post >/dev/null 2>&1
+if [[ -s "$CR_RECON_MARKER" ]]; then ok "control: --post does reach gh pr comment"; else bad "--post posted nothing — the default-scan test proves nothing"; fi
+# Without --repo, `gh pr view 999` resolves against whatever repo the caller is
+# standing in — and this scan spans every repo under the runs root. (codex P1.)
+if grep -q -- '--repo other/proj' "$CR_RECON_MARKER"; then
+  ok "--post targets the repo recorded by the attempt"
+else bad "--post invoked gh with no --repo — it can hit a same-numbered PR elsewhere"; fi
+unset CR_RECON_MARKER
+
 echo "── dual-copy identity (repo context only) ──"
 
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
