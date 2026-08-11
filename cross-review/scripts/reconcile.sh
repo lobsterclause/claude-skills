@@ -91,8 +91,19 @@ classify_run() {
   if [[ ! "$pr" =~ ^[1-9][0-9]*$ ]]; then
     pr=""
     id="$(jqr "$ctx" '.id')"
-    [[ "$id" =~ ^pr-([1-9][0-9]*)(-.*)?$ ]] && pr="${BASH_REMATCH[1]}"
-    [[ -z "$pr" && "$(basename "$d")" =~ -pr-([1-9][0-9]*)(-|$) ]] && pr="${BASH_REMATCH[1]}"
+    if [[ -n "$id" ]]; then
+      # An id that exists and does not parse as pr-N means this run was not a PR
+      # review — and the directory name must NOT then be consulted. worktree.sh
+      # builds it as <repo>-<slug>-<ts>-<pid>, so `--id feature-x-pr-456` yields
+      # a basename containing "-pr-456-" and the guess posts to PR 456.
+      # (antigravity H, PR #53 pass 3 — the pass-2 fix anchored the id regex but
+      # left the basename fallback unconditional, so the hole stayed open.)
+      [[ "$id" =~ ^pr-([1-9][0-9]*)(-.*)?$ ]] && pr="${BASH_REMATCH[1]}"
+    elif [[ "$(basename "$d")" =~ -pr-([1-9][0-9]*)(-|$) ]]; then
+      # No context.json at all — the pre-provenance runs, where the directory
+      # name is the only surviving evidence of which PR this was.
+      pr="${BASH_REMATCH[1]}"
+    fi
   fi
 
   # A SHA that is not a SHA is not provenance. worktree.sh validates on write;

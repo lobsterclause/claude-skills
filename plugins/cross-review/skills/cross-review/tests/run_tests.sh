@@ -2027,7 +2027,11 @@ assert_eq "the attempt's pass number is carried" "$(cls "$D" | cut -d'|' -f5)" "
 
 # An id that merely CONTAINS a PR-looking substring must not redirect a
 # recovered comment to that PR. (codex P1.)
-D="$RR/looseid"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
+# Realistic directory name — worktree.sh builds <repo>-<slug>-<ts>-<pid>, so a
+# fixture called "looseid" cannot exercise the basename fallback at all. The
+# pass-2 version of this test used exactly that and passed while the hole was
+# wide open. (antigravity H, pass 3.)
+D="$RR/myrepo-feature-x-pr-456-20260811T000000-12345"; mkdir -p "$D/raw"; printf 'x\n' >"$D/raw/codex.stdout"; printf '# f\n' >"$D/findings.md"
 printf '{"head_sha":"3333333333333333333333333333333333333333","id":"feature-x-pr-456","repo":"o/r"}\n' >"$D/context.json"
 assert_eq "an unanchored pr-NNN inside an id does not become the target PR" \
   "$(cls "$D" | cut -d'|' -f2)" ""
