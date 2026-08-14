@@ -128,7 +128,50 @@ fi
 # shell never evaluates, and the value `=10` — three ways to disarm the gate
 # without ever authorizing anything.
 OVERRIDE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*CROSS_REVIEW_MERGE_OVERRIDE=1[[:space:]]+(gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)|gh[[:space:]]+api[[:space:]])'
-printf '%s' "$cmd_only" | grep -qE "$OVERRIDE_RE" && pass
+
+# The override is "an auditability mechanism, not a security boundary" (per
+# SKILL.md) — but until now it left no record anywhere except the shell
+# history of whoever ran it. Append a best-effort JSONL line before letting
+# the bypass through, so there is a trail of who overrode a stale-or-missing
+# review, when, and for what. This is pure logging: it must never change the
+# allow/deny decision, and a failure to write must never block the merge —
+# same fail-open philosophy as the rest of this hook.
+#
+# CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG mirrors CROSS_REVIEW_RUNLOG elsewhere
+# in this skill: production never sets it, fixture tests point it at a scratch
+# path instead of the user's real home directory.
+AUDIT_LOG="${CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG:-$HOME/.claude/skills/cross-review/merge_override_audit.jsonl}"
+log_override_audit() {
+  (
+    set +e
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+    repo="$(printf '%s' "$cmd_only" | grep -oE -- '(-R|--repo)[= ][^ ;&|)]+' 2>/dev/null | head -n1 | sed -E 's/^(-R|--repo)[= ]//')"
+    if [[ -z "$repo" ]]; then
+      repo="$(printf '%s' "$cmd_only" | grep -oE 'repos/[^/ ]+/[^/ ]+/pulls/[0-9]+/merge' 2>/dev/null | head -n1 | sed -E 's#repos/([^/ ]+/[^/ ]+)/pulls/.*#\1#')"
+    fi
+    if [[ -z "$repo" ]]; then
+      repo="$(git remote get-url origin 2>/dev/null | sed -E 's#^git@github\.com:##; s#^https://github\.com/##; s#\.git$##')"
+    fi
+    pr="$(printf '%s' "$cmd_only" | grep -oE 'pulls/[0-9]+/merge' 2>/dev/null | head -n1 | grep -oE '[0-9]+')"
+    if [[ -z "$pr" ]]; then
+      pr="$(printf '%s' "$cmd_only" | grep -oE 'gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+[0-9]+' 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"
+    fi
+    head_sha="$(git rev-parse HEAD 2>/dev/null)"
+    who="${USER:-$(whoami 2>/dev/null)}"
+    entry="$(jq -nc \
+      --arg ts "$ts" --arg repo "$repo" --arg pr "$pr" \
+      --arg head_sha "$head_sha" --arg command "$cmd" --arg user "$who" \
+      '{ts:$ts, repo:$repo, pr:$pr, head_sha:$head_sha, command:$command, user:$user}' 2>/dev/null)"
+    [[ -n "$entry" ]] || exit 0
+    mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null
+    printf '%s\n' "$entry" >>"$AUDIT_LOG" 2>/dev/null
+  ) || true
+}
+
+if printf '%s' "$cmd_only" | grep -qE "$OVERRIDE_RE"; then
+  log_override_audit
+  pass
+fi
 
 dequote() {
   local s="$1"
