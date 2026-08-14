@@ -366,8 +366,15 @@ Triage policy: fix Critical and High findings where the reviewer's suggested fix
 For each fix:
 1. Read the relevant files to understand the real context. The anchor pass already corrected `line` to the real hunk line (`anchor.start_line`) — trust that over the reviewer's original claim, and treat any still-unanchored finding as suspect.
 2. If the suggested fix depends on a design decision (e.g., "should this be null-coalesced or throw?", "should this be a union type or an enum?"), stop and ask the user. Don't guess on semantics — the point of opt-in auto-fix is to handle the mechanical cases, not make product decisions.
-3. Apply the change.
-4. Run local checks if cheap: `pnpm lint` on touched packages, relevant unit tests. Don't run the full suite between every fix — batch and run once at the end of the pass.
+3. **Suspicious-fix gate.** Before applying, run the proposed fix's diff through `verify_fix_safety.sh`:
+   ```bash
+   bash ~/.claude/skills/cross-review/scripts/verify_fix_safety.sh \
+     --diff "$fix_diff_file" --out "$run_dir/fix_safety.json" \
+     --finding-id "$finding_id"
+   ```
+   Anchor and factcheck verify the *finding* — where it points, and whether the diff contradicts the claim. Neither checks whether the reviewer's *suggested fix* is itself safe to auto-apply, which is exactly the gap a crafted diff can exploit: get reviewers to converge on a plausible-sounding but dangerous suggestion ("remove this redundant check", "this validation is now unnecessary", "this auth guard is dead code") and let it ride the already-verified pipeline straight to a commit. `verify_fix_safety.sh` is a deterministic, no-LLM pattern check over the fix's own diff — removed auth/permission guards, weakened input validation, disabled or deleted tests, broadened security-relevant regexes — and returns `{"safe": bool, "reason", "matched": [...]}`. On `safe:false`, treat it exactly like an `anchor.resolved:false` finding: hold for human confirmation, do not auto-commit. Its fail-safe direction is the opposite of factcheck's — ambiguity (empty/unreadable diff) defaults to `safe:false`, since this gate exists specifically to catch the case where everything else in the pipeline already said "proceed."
+4. Apply the change.
+5. Run local checks if cheap: `pnpm lint` on touched packages, relevant unit tests. Don't run the full suite between every fix — batch and run once at the end of the pass.
 
 When all Critical/High fixes for the pass are in, commit:
 
