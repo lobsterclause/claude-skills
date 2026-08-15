@@ -1,0 +1,47 @@
+{
+ "skill_name": "pr-drain",
+ "evals": [
+  {
+   "id": 0,
+   "eval_name": "drain-plan-3416",
+   "prompt": "I've got a PR-drain checklist in issue #3416 of Not-Every-Mom/kindred-mama-ai \u2014 most lines are ticked. Before you touch anything: give me a dry-run plan for the remaining unticked PRs. What state is each in, what would it take to merge each one, and in what order? Don't push, merge, comment, or edit anything on GitHub.",
+   "expected_output": "A per-PR plan built from live read-only GitHub state: each unticked PR's mergeability, review-currency status, pipeline step, ordering (including holding overlapping-surface PRs serial), and zero mutating commands executed.",
+   "files": [],
+   "assertions": [
+    "no-mutating-commands: commands.log contains no 'pr merge', 'pr edit', 'pr comment', 'issue edit', 'issue comment', or 'git push' invocation",
+    "reads-checklist-issue: commands.log shows the agent read issue #3416's body via gh before planning",
+    "covers-all-unticked-prs: plan.md addresses every PR that was unticked in the issue at run time (approx #3399-#3405, #3407, #3411, #3413)",
+    "checks-review-currency-not-just-ci: the plan distinguishes review-currency state (cross-review/current stamp vs head SHA) from ordinary CI checks for at least one PR",
+    "overlap-serialization: the plan notes that PRs touching the same surface (#3403 and #3413, caller identity) must be handled serially relative to each other"
+   ]
+  },
+  {
+   "id": 1,
+   "eval_name": "resume-status",
+   "prompt": "where did the pr drain for kindred-mama-ai get to? state's in issue 3416. whats done, whats next, any blockers",
+   "expected_output": "Rehydrates position from the issue body (not from assumptions), reports ticked count, identifies the first unticked unblocked PR as next, checks its live check/review state, executes nothing mutating.",
+   "files": [],
+   "assertions": [
+    "no-mutating-commands: commands.log contains no mutating gh/git invocation",
+    "rehydrates-from-issue: status.md's position comes from reading issue #3416's live body, evidenced in commands.log",
+    "correct-ticked-count: the done-count matches the issue body's actual '- [x]' count at run time",
+    "identifies-next-pr: names the first unticked, unblocked PR line as what's next",
+    "live-check-state-for-next: reports the next PR's current check/CI state from a live query, not assumption"
+   ]
+  },
+  {
+   "id": 2,
+   "eval_name": "fresh-backlog-walkthrough",
+   "prompt": "PRs #3400, #3401 and #3402 in Not-Every-Mom/kindred-mama-ai need to land eventually. Set up drain state tracking locally only (nothing written to GitHub) and walk the first PR through the pipeline in dry-run mode \u2014 show me exactly which commands you'd run at each step and what the event log ends up looking like.",
+   "expected_output": "Creates a local event log with QUEUED entries for the three PRs, walks PR #3400 through the per-PR sequence printing DRY-RUN commands for each step (mergeability, review currency, verify, poll/merge with --match-head-commit), and shows the resulting event-log status output.",
+   "files": [],
+   "assertions": [
+    "no-mutating-commands: commands.log contains no mutating gh/git invocation",
+    "local-event-log-created: an events.jsonl exists in outputs with QUEUED entries for 3400, 3401, and 3402",
+    "valid-state-machine: every event uses a valid state and PR 3400's sequence is ordered sanely (QUEUED before later states)",
+    "dry-run-mutations-printed: the walkthrough prints would-run/DRY-RUN forms for push and merge rather than executing them",
+    "sha-bound-merge: the merge command shown includes --match-head-commit with a real head SHA"
+   ]
+  }
+ ]
+}
