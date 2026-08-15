@@ -27,6 +27,7 @@ repo=""
 mode="summary"
 findings=""
 pass="1"
+pass_explicit=0
 head_sha=""
 
 need_val() {
@@ -44,7 +45,7 @@ while [[ $# -gt 0 ]]; do
     --repo)     need_val --repo     "$#"; repo="$2";     shift 2 ;;
     --mode)     need_val --mode     "$#"; mode="$2";     shift 2 ;;
     --findings) need_val --findings "$#"; findings="$2"; shift 2 ;;
-    --pass)     need_val --pass     "$#"; pass="$2";     shift 2 ;;
+    --pass)     need_val --pass     "$#"; pass="$2"; pass_explicit=1; shift 2 ;;
     --head-sha) need_val --head-sha "$#"; head_sha="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -143,6 +144,32 @@ if [[ -n "$head_sha" && ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
     head_sha="$expanded"
   else
     echo "WARN: --head-sha '$head_sha' is not a full 40-char sha and could not be expanded — posting with the prose stamp only" >&2
+  fi
+fi
+
+# Derive the pass number from what is already on the PR, unless told.
+#
+# `pass` defaulted to 1 and nothing computed it, so every caller that forgot
+# `--pass` stamped `pass=1` no matter how many rounds had run. On
+# kindred-mama-ai#3399 the second round posted a comment headed "pass 1" with
+# `pass=1` in the marker while its own body said "pass 2" — the prose was
+# written by a model that knew the round number, and the two machine-readable
+# fields were the ones that lied. A default that is silently wrong is worse
+# than a required flag, and worse than a derived value: the caller has no
+# reason to suspect it.
+#
+# Count the markers already posted and take the next number. Only the marker
+# counts — the prose heading is model-composed and has drifted before, which is
+# the whole reason the marker exists. Fails OPEN to the current default: if
+# `gh` or `jq` is unavailable, or the PR cannot be read, a wrong pass number
+# must never cost the user a posted review.
+if [[ "$mode" == "summary" && "$pass_explicit" -eq 0 && -n "$pr" ]] &&
+  command -v jq >/dev/null 2>&1; then
+  prior="$(gh pr view "$pr" ${gh_repo[@]+"${gh_repo[@]}"} --json comments \
+    --jq '[.comments[].body | capture("<!-- cross-review: sha=[0-9a-f]{40} pass=(?<n>[0-9]+) -->").n | tonumber] | max // 0' \
+    2>/dev/null || true)"
+  if [[ "$prior" =~ ^[0-9]+$ ]]; then
+    pass="$((prior + 1))"
   fi
 fi
 

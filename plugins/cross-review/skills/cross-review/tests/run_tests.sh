@@ -1459,6 +1459,68 @@ pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"MERGED
   --head-sha 399df23d4d5945162d0c5ed623484d608337165d
 assert_contains "merged-before-review is flagged" "$(cat "$CR_TEST_CAPTURE")" "already merged before the review finished"
 
+# ── post_comment derives the pass number from the PR ──
+# `pass` defaulted to 1 with nothing computing it, so a caller that omitted
+# --pass stamped pass=1 on every round. kindred-mama-ai#3399's second round
+# posted a comment headed "pass 1" carrying `pass=1`, while its own body said
+# "pass 2" — the model-written prose was right and both machine-readable
+# fields were wrong, which is the wrong way round for a field a gate reads.
+#
+# This stub runs the --jq filter for real rather than returning a canned
+# answer. The filter is the part that can be wrong, and a stub that returns
+# the number directly would pass against any filter at all.
+cat >"$T/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "pr view")
+      jqf=""
+      while [ $# -gt 0 ]; do [ "$1" = "--jq" ] && jqf="$2"; shift; done
+      if [ -n "$jqf" ]; then printf '%s\n' "${CR_TEST_PR_JSON:-}" | jq -r "$jqf"; else
+        printf '%s\n' "${CR_TEST_PR_JSON:-}"; fi
+      exit 0 ;;
+  "pr comment")
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--body-file" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
+        shift
+      done
+      exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/gh"
+
+PC_SHA=27ea01d42096c729c4afcc2d65f3e67503c0234f
+pc_json() {  # $@ = prior pass numbers already stamped on the PR
+  local c=""
+  for n in "$@"; do
+    c="${c:+$c,}{\"body\":\"<!-- cross-review: sha=$PC_SHA pass=$n -->\"}"
+  done
+  printf '{"headRefOid":"%s","state":"OPEN","comments":[%s]}' "$PC_SHA" "$c"
+}
+
+# 3. No prior record → this is pass 1.
+pc_run "$(pc_json)" --head-sha "$PC_SHA"
+assert_contains "first pass heads 1"  "$(cat "$CR_TEST_CAPTURE")" "## Cross-review — pass 1"
+assert_contains "first pass marks 1"  "$(cat "$CR_TEST_CAPTURE")" "sha=$PC_SHA pass=1 -->"
+
+# 4. Two rounds already posted → this is pass 3, in BOTH the heading and the
+#    marker. Asserting only the heading would pass while the gate-read field
+#    stayed wrong, which is exactly the bug.
+pc_run "$(pc_json 1 2)" --head-sha "$PC_SHA"
+assert_contains "third pass heads 3" "$(cat "$CR_TEST_CAPTURE")" "## Cross-review — pass 3"
+assert_contains "third pass marks 3" "$(cat "$CR_TEST_CAPTURE")" "sha=$PC_SHA pass=3 -->"
+
+# 5. An explicit --pass still wins. Reconciliation re-posts a past round and
+#    must be able to say which one it was.
+pc_run "$(pc_json 1 2)" --head-sha "$PC_SHA" --pass 7
+assert_contains "explicit --pass overrides" "$(cat "$CR_TEST_CAPTURE")" "sha=$PC_SHA pass=7 -->"
+
+# 6. Unreadable PR → fall back to 1 rather than refusing to post. A wrong pass
+#    number must never cost the user a posted review.
+pc_run 'not json at all' --head-sha "$PC_SHA"
+assert_contains "unreadable pr still posts" "$(cat "$CR_TEST_CAPTURE")" "sha=$PC_SHA pass=1 -->"
+
 # ── post_comment records the posting outcome ──
 # Six real reviews (kindred-mama-ai #3214/#3252/#3264/#3269/#3276/#3280) left
 # 68-676KB of reviewer output and nothing on GitHub. Nothing on disk said whether
