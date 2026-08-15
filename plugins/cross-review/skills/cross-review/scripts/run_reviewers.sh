@@ -1129,7 +1129,20 @@ run_codex() {
   local bytes
   bytes=$(output_bytes_of "$out/codex.stdout")
   local fk_json="null"
-  if [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/codex.stdout"; then
+  # Quota exhaustion reads as an ordinary rc=1 failure, which is how codex
+  # dropped out of NINE consecutive rounds on 2026-08-14 and seven more on
+  # 08-15 while `detect_reviewers.sh` kept reporting it available (it is on
+  # PATH; it just has no credits). Stamp it so the selector can bench the
+  # seat and the operator sees the reset time instead of a mystery rc=1.
+  if grep -qiE "hit your usage limit|purchase more credits|usage limit reached" \
+       "$out/codex.stdout" 2>/dev/null; then
+    local reset_eta
+    reset_eta="$(grep -oiE "try again at [^.]*" "$out/codex.stdout" 2>/dev/null | head -1)"
+    printf '%s\n' "${reset_eta:-reset time not reported}" >"$out/codex.quota_exhausted"
+    echo "codex: usage limit reached — baseline drops out of this round (${reset_eta:-reset time not reported})" >&2
+    fk_json='"quota_exhausted"'
+    [[ $rc -eq 0 ]] && rc=3
+  elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/codex.stdout"; then
     echo "codex: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
     rc=5
