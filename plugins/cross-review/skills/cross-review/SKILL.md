@@ -493,6 +493,38 @@ green-when-absent would quietly become a review mandate.
 without ever saying `gh pr merge`, which makes it the first thing a blocked
 agent would reach for rather than an exotic edge case.
 
+### The hook is only half of it — see `ci/`
+
+Both limits above are consequences of *where* the hook runs. A `PreToolUse`
+hook binds the agent that runs it and nothing else: it cannot see a merge
+inside a shell script, a GraphQL `mergePullRequest` mutation, the web UI, or
+automerge, and it never sees a human at all.
+
+`ci/` ships the other half — a commit status computed from PR state, so it
+covers all five. Three files (`cross-review-currency.sh`, its 115-case offline
+harness, and a workflow), two env knobs, no hardcoded branch or org names. See
+[ci/README.md](ci/README.md) to install it.
+
+The two gates make **opposite** choices about absence, on purpose. The hook is
+green when no record exists, because it is a net over reviews you already run.
+The CI gate is red, because it is meant to be a required check and a required
+check that says success when nothing ran does not report "unknown" — it reports
+"fine". In the origin repo, 37 of 40 open PRs rendered at the merge button
+exactly like the 2 that had genuinely been reviewed. Making it required is a
+policy decision with an escape hatch (`ci/README.md`), and turning it on blocks
+every unstamped PR at once.
+
+Both read the same stamp, and `scripts/post_comment.sh` writes it:
+
+```
+<!-- cross-review: sha=<40 hex> pass=<n> -->
+```
+
+That literal is a contract. `ci/test-cross-review-currency.sh` greps it out of
+`post_comment.sh` and renders it against the gate's regex, so the halves cannot
+drift apart silently — and `tests/run_tests.sh` invokes that harness, so the
+check is not advisory.
+
 **What it still cannot see.** It reads the command text, so a merge inside a
 shell script it cannot read, a GraphQL `mergePullRequest` mutation (the PR is a
 node ID there, with nothing to resolve), and the GitHub web UI all go around

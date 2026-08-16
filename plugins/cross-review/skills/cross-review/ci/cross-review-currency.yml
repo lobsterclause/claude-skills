@@ -1,0 +1,243 @@
+# ---------------------------------------------------------------------------
+# Cross-Review Currency — is the newest review record bound to the head that
+# is about to merge?
+#
+# INSTALLING THIS. Three files travel together; see ci/README.md in the
+# cross-review skill.
+#
+#   ci/cross-review-currency.sh       → scripts/cross-review-currency.sh
+#   ci/test-cross-review-currency.sh  → scripts/test-cross-review-currency.sh
+#   ci/cross-review-currency.yml      → .github/workflows/cross-review-currency.yml
+#
+# This workflow is deliberately thin. All decision logic lives in
+# scripts/cross-review-currency.sh so it can be unit-tested by
+# scripts/test-cross-review-currency.sh, run locally, and reviewed as code.
+# The gate that preceded it in the origin repo kept its logic in a `run:` block,
+# so its harness could only assert that certain lines appeared in the YAML —
+# a fidelity check, not a behaviour check, and it missed two real bypasses.
+#
+# WHY IT IS NOT ENOUGH TO HAVE THE HOOK
+#
+# The cross-review skill has a PreToolUse hook that refuses `gh pr merge` when
+# the record is stale. A hook binds only the agent that runs it: it cannot see
+# a merge inside a shell script, a GraphQL mergePullRequest mutation, the web
+# UI, or automerge. This check is computed from PR state, so it covers all
+# four — and it covers humans, who never touch the hook at all.
+#
+# WHY issue_comment IS A TRIGGER
+#
+# Re-running cross-review posts a comment; it does not push a commit. Without
+# this trigger a re-review could never clear a red check, and the only way out
+# would be an empty commit. With it, the check self-heals: push → red,
+# re-review → green.
+#
+# MAKE IT A REQUIRED CHECK, OR IT IS DECORATION — AND IT FAILS CLOSED
+#
+# The status context is `cross-review/current` (override with
+# CR_CURRENCY_CONTEXT). Whether it BLOCKS a merge is a branch-protection
+# setting this workflow cannot make for you.
+#
+# While it was advisory in the origin repo, reporting success for a PR nobody
+# had reviewed was a defensible default. The moment it became required that
+# default was a fail-open hole. Census of 40 open PRs on the day it was
+# promoted:
+#
+#   30 success — "no cross-review record on this PR"
+#    7 success — "record carries no SHA stamp — cannot verify currency"
+#    2 success — "reviewed at <sha>"   (genuinely reviewed and current)
+#    1 failure — stale stamp           (the gate working as designed)
+#
+# 37 of 40 rendered at the merge button exactly like the 2 that had really been
+# reviewed. Both fail-open states are FAILURES now.
+#
+# EXPECT THIS TO BLOCK EVERYTHING AT FIRST. Turning it on marks every open PR
+# without a stamped record unmergeable at once. That is the point, but it is a
+# policy change to schedule, not to spring on people — announce it, and lean on
+# the escape hatch below rather than reverting.
+#
+# The escape hatch for genuinely trivial PRs is the `cross-review-exempt`
+# label, applied by a human, plus a comment from THAT SAME human starting
+# `Cross-review exemption:` with a reason that names the head commit. All four
+# are required, the granting human is named in the status, and the exemption
+# expires the moment the head moves — GitHub keeps labels and comments across a
+# push, so an unbound exemption would have re-opened the very bypass this gate
+# closes, and one bound to a commit but not to a person left it self-serve:
+# anyone who could comment could re-affirm someone else's exemption onto
+# arbitrary new code.
+# See cross-review-currency.sh for the full rationale.
+# ---------------------------------------------------------------------------
+name: Cross-Review Currency
+
+on:
+  pull_request:
+    # `labeled` / `unlabeled` are here for the escape hatch. Without them a
+    # human could apply `cross-review-exempt` and watch the check stay red
+    # forever, with an empty commit as the only way out — the label containment
+    # would never fire.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  # `deleted` is here because the status this workflow writes outlives the
+  # comment it was computed from. A PR goes green because a cross-review record
+  # exists, or because an exemption justification exists; someone deletes that
+  # comment; without this trigger no run fires, the success status stays on the
+  # head, and the PR merges with neither a review nor a valid exemption.
+  #
+  # THE COST, WHICH IS REAL. Expect this to become one of your busiest
+  # workflows by run count — it fired 214 times in a fortnight in the origin
+  # repo, which was already over its Actions allowance. ubuntu-latest bills a
+  # one-minute minimum per JOB, on jobs that finish in seconds, so the rounding
+  # is the bill. A run whose jobs are all skipped by an `if` bills nothing, so
+  # the `currency` job below filters the deleted path on the comment body:
+  # deleting ordinary chatter starts a run that immediately skips, and only the
+  # deletions that can actually change the verdict cost a minute. created and
+  # edited stay unfiltered — a comment edited INTO a review record has to be
+  # able to turn the check green.
+  issue_comment:
+    types: [created, edited, deleted]
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+  issues: read
+
+# Keyed on the PR **and the event**, so a burst of comments still collapses to
+# the last verdict, but a comment no longer cancels the run a push started.
+#
+# WHY THE EVENT BELONGS IN THE KEY
+#
+# Both triggers shared one group with cancel-in-progress. Re-running
+# cross-review posts a comment, and that comment usually lands seconds after
+# the push it is reporting on — so the `synchronize` run was routinely
+# cancelled by the `issue_comment` run chasing it. The status still ended up
+# correct (the surviving run writes it), which is why this went unnoticed:
+# `cross-review/current` was green while a cancelled *check run* sat on the
+# PR forever. `gh pr checks` renders cancelled as **fail**, so a PR whose
+# every required status passed still read as failing. Observed on #3290,
+# #3291 and #3292 in one session.
+#
+# That is not cosmetic. Anything that reads `gh pr checks` rather than the
+# commit status — an automerge classifier, a human glancing at the list —
+# refuses to merge a green PR.
+#
+# The residual: a push-run and a comment-run can now overlap and both write
+# the status, so a slow push-run could land a staler verdict than the
+# comment-run that overtook it. Bounded and self-correcting — both compute
+# the same function of PR state, they finish seconds apart, and any later
+# event recomputes. A stale-by-seconds verdict that heals beats a permanent
+# false failure that does not.
+#
+# AND WHY THE IGNORED DELETIONS ARE SORTED INTO THEIR OWN GROUP
+#
+# `deleted` was added to issue_comment above, and for cost the deleted path is
+# filtered in the JOB-level `if`. But cancel-in-progress resolves at the
+# WORKFLOW level, before any job `if` runs. So a deletion that matters starts a
+# run, an ordinary chatter deletion arrives seconds later, shares
+# `cr-currency-<n>-issue_comment`, and CANCELS it — and then skips itself, so
+# nothing writes a replacement status. The qualifying comment is gone and the
+# previous success survives on the head: the cost filter silently disarmed the
+# trigger it was filtering.
+#
+# The third key segment fixes that by putting ignored deletions in their own
+# group. It repeats the job `if`'s body test, which is duplication, but it is
+# the only layer that runs early enough — GitHub gives no way to defer
+# cancellation until a job condition is known.
+#
+# WHAT STILL GETS CANCELLED, deliberately:
+#   - ignored deletions cancel each other. Harmless: every one of them skips.
+#   - relevant deletions cancel each other, and cancel a created/edited comment
+#     run on the same PR — all of them compute the same function of PR state,
+#     so the survivor writes the same verdict.
+#   - a comment run still never cancels a push run (the event segment), which
+#     is the #3290/#3291/#3292 property.
+#
+# COST: zero added runs. Narrowing the key was chosen over "let every deletion
+# recompute" precisely to avoid that: this repo is over its Actions allowance,
+# this is a top-three workflow at 214 runs a fortnight, and ubuntu-latest bills
+# a one-minute minimum per job. Chatter deletions still start a run whose only
+# job skips, and a skipped job bills nothing.
+concurrency:
+  group: cr-currency-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}-${{ (github.event.action == 'deleted' && !contains(github.event.comment.body, '## Cross-review') && !contains(github.event.comment.body, 'Cross-review exemption:')) && 'ignored' || 'live' }}
+  cancel-in-progress: true
+
+jobs:
+  # The harness must run on every change to the thing it tests. #3210 shipped
+  # 66 test cases with nothing invoking them — not Dagger, not verify.sh, not
+  # any workflow — so they were advisory: they ran when someone remembered.
+  # A check nobody runs is not a check.
+  self-test:
+    if: github.event_name == 'pull_request'
+    # Narrower than the workflow-level grant. This job runs a PR-authored test
+    # script; it has no reason to carry the `statuses: write` token the
+    # `currency` job needs. Least-privilege, not a trust boundary.
+    permissions:
+      contents: read
+    # OPTIONAL SELF-HOSTED LANE. This job is seconds of bash, and GitHub bills
+    # every hosted job a one-minute minimum, so on a repo that runs a lot of
+    # PRs the rounding dominates the bill. If you have a self-hosted lane, you
+    # can route SAME-REPO PRs onto it and leave forks on hosted runners:
+    #
+    #   runs-on: ${{ (github.event.pull_request.head.repo != null &&
+    #     github.event.pull_request.head.repo.full_name == github.repository)
+    #     && fromJSON('["self-hosted", "<your-label>"]') || 'ubuntu-latest' }}
+    #
+    # Two conditions on doing that, both learned the hard way. The fork
+    # fallback is not optional — a fork PR, or a deleted fork (null head.repo),
+    # must never put untrusted code on your runner. And the lane must not be a
+    # required check, so that a runner outage degrades to a pending status
+    # rather than a blocked merge.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit-test the currency logic
+        run: bash scripts/test-cross-review-currency.sh
+
+  currency:
+    # On a comment event, only PR comments are relevant — issue comments have
+    # no head commit to bind a status to. And on a DELETED comment, only the
+    # two bodies that can change the verdict are worth a billable minute: a
+    # cross-review record, or an exemption justification. Everything else skips
+    # here and costs nothing.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       (github.event.action != 'deleted' ||
+        contains(github.event.comment.body, '## Cross-review') ||
+        contains(github.event.comment.body, 'Cross-review exemption:')))
+    # ubuntu-latest UNCONDITIONALLY, and unlike the sibling job above this one
+    # is not a candidate for a self-hosted lane. The origin repo routed it to a
+    # small-job lane for cost, but those containers shipped neither `gh` nor
+    # `jq`, so the script could not evaluate anything and reported success
+    # without a verdict — a safety gate silently switched off by a cost
+    # optimisation, one commit after it had been hardened. It hid for a week.
+    #
+    # The job is two API calls. A hosted runner guaranteed to have both tools
+    # is worth more than the seconds saved. The script now also fails closed
+    # (exit 2) if it ever lands somewhere without them, so the regression
+    # cannot repeat silently — but do not re-create the conditions for it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report cross-review currency
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          # On pull_request the head SHA is in the payload; on issue_comment it
+          # is not, and the script fetches it.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          args=(--pr "$PR" --repo "$GITHUB_REPOSITORY" --post)
+          [[ -n "${HEAD_SHA:-}" ]] && args+=(--sha "$HEAD_SHA")
+          # A stale record is a red STATUS, not a failed run: the status is the
+          # product, and failing the job as well would just add a second red
+          # thing saying the same word less clearly.
+          # ...but ONLY exit 1 is swallowed. Exit 2 means the script could not
+          # run at all (missing gh/jq, bad arguments) and posted no status;
+          # letting `|| true` eat that turns a broken runner into a green job
+          # whose only symptom is a check stuck on "expected". That is how the
+          # smalljobs regression hid for a week.
+          bash scripts/cross-review-currency.sh "${args[@]}" || {
+            rc=$?
+            [[ $rc -eq 1 ]] || exit "$rc"
+          }
