@@ -317,11 +317,15 @@ The `id` here is just a local sequence number for this pass — `fingerprint_fin
 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/fingerprint_findings.sh \
-  --findings "$run_dir/findings.json" --project "$(basename "$(git -C "$worktree" rev-parse --show-toplevel)")" \
+  --findings "$run_dir/findings.json" --repo-root "$worktree" \
   --out "$run_dir/findings.fingerprinted.json" --emit-events "$run_id"
 ```
 
 Replaces each finding's `id` (the local "f1" sequence number, preserved as `local_id`) with a stable `f-<hash>` derived from `project|file|claim` — so the same real-world issue keeps the same id pass-to-pass, which nothing did before. `--emit-events` appends one `proposed` event per (finding × contributing reviewer) to `~/.claude/skills/cross-review/finding_events.jsonl`. Feed `findings.fingerprinted.json` — not the raw `findings.json` — into the anchor step below.
+
+`--repo-root` derives the `project` namespace from repo IDENTITY (the `origin` remote, normalized — protocol/credentials/`.git`-suffix stripped, host lowercased — or the absolute repo path when there's no remote), not from the checkout's directory basename. This closes a real collision: two different repos checked out under the same directory name (two clones both named `api`, say) used to mint identical `f-<hash>` ids for a same-file/same-claim finding and merge their lifecycle events in the one global `finding_events.jsonl` (issue #39). `--project <literal>` still works as a raw override if you need one (tests, or a namespace you want to force).
+
+**Namespace epoch, not a ledger rewrite:** this is a go-forward fix only. Nothing here rewrites your existing `~/.claude/skills/cross-review/finding_events.jsonl` — that's real production data and out of scope for a repo-level change. Findings fingerprinted before you pick up `--repo-root` keep whatever id they already have; only findings fingerprinted after get the new, collision-resistant id. If you have currently-open findings under the old basename-derived namespace that you want to keep tracking under their new id, run `scripts/migrate_finding_namespace.sh` by hand (it is never invoked automatically, and it never edits your ledger in place — it writes a remapped copy to `--out` for you to review and swap in yourself).
 
 ### 4.5 Verify findings — anchor + fact-check (recommended; required before auto-fix)
 
