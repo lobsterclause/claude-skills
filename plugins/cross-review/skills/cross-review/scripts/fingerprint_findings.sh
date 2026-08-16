@@ -28,7 +28,31 @@
 #
 # Usage:
 #   fingerprint_findings.sh --findings <findings.json> --out <out.json>
-#                            --project <name> [--emit-events <run_id>]
+#                            (--repo-root <path> | --project <name>)
+#                            [--emit-events <run_id>]
+#
+# --repo-root derives the fingerprint namespace from repo identity rather than
+# directory name (see derive_project() below) — prefer this over --project.
+# --project is kept as a raw override: tests want an exact literal namespace,
+# and it's an escape hatch if repo-identity derivation ever needs bypassing.
+# Exactly one of --repo-root / --project must be given.
+#
+# NAMESPACE EPOCH (issue #39): before this flag, --project was always
+# "$(basename "$(git rev-parse --show-toplevel)")" per SKILL.md — two
+# different repos checked out under the same directory name (e.g. two clones
+# both named "api") minted identical f-<hash> ids for the same-looking
+# finding, and both fed the one global finding_events.jsonl, merging their
+# lifecycles silently. --repo-root fixes this going forward by namespacing on
+# repo identity (remote URL, or absolute path with no remote) instead of the
+# directory basename. This is a deliberate epoch, NOT a ledger migration:
+# ids already written to a user's finding_events.jsonl under the old
+# basename-derived --project keep whatever id they have — nothing in this
+# repo rewrites that file (it's real production data, out of scope for a
+# repo-level fix). Only NEW findings fingerprinted after adopting
+# --repo-root get the new, collision-resistant id. See
+# scripts/migrate_finding_namespace.sh for an opt-in (never auto-run) remap
+# of an existing ledger, if a user wants continuity for currently-open
+# findings badly enough to run it by hand.
 #
 # findings.json shape (unchanged from SKILL.md's synthesis step):
 #   { "findings": [ {id, severity, file, line, snippet, claim, sources, ...} ] }
@@ -48,7 +72,11 @@
 
 set -uo pipefail
 
-findings="" ; out="" ; project="" ; emit_events_run_id=""
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib_project_namespace.sh
+source "$script_dir/lib_project_namespace.sh"
+
+findings="" ; out="" ; project="" ; repo_root="" ; emit_events_run_id=""
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
@@ -56,13 +84,23 @@ while [[ $# -gt 0 ]]; do
     --findings)     need_val "$1" "$#"; findings="$2";            shift 2 ;;
     --out)          need_val "$1" "$#"; out="$2";                 shift 2 ;;
     --project)      need_val "$1" "$#"; project="$2";             shift 2 ;;
+    --repo-root)    need_val "$1" "$#"; repo_root="$2";           shift 2 ;;
     --emit-events)  need_val "$1" "$#"; emit_events_run_id="$2";  shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
+if [[ -n "$project" && -n "$repo_root" ]]; then
+  echo "fingerprint: --project and --repo-root are mutually exclusive (pick one namespace source)" >&2
+  exit 2
+fi
+if [[ -n "$repo_root" ]]; then
+  [[ -d "$repo_root" ]] || { echo "fingerprint: --repo-root not a directory: $repo_root" >&2; exit 1; }
+  project="$(derive_project "$repo_root")"
+fi
+
 if [[ -z "$findings" || -z "$out" || -z "$project" ]]; then
-  echo "usage: $0 --findings <json> --out <json> --project <name> [--emit-events <run_id>]" >&2
+  echo "usage: $0 --findings <json> --out <json> (--repo-root <path> | --project <name>) [--emit-events <run_id>]" >&2
   exit 2
 fi
 [[ -f "$findings" ]] || { echo "fingerprint: findings file not found: $findings" >&2; exit 1; }
