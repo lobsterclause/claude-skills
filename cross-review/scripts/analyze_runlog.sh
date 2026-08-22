@@ -83,6 +83,10 @@ fi
 #   timed_out: status == "timed_out"
 #   empty: status == "empty" (ran rc=0 but produced 0 bytes)
 #   failed: status == "failed"
+#   fallback: status == "fallback" (primary lane died, OpenRouter rescue served
+#     the review). Counted as SERVED for reliability -- a usable review came
+#     back -- but warned on unconditionally, because the primary provider is
+#     down and only this bucket says so.
 #   p50_duration, p95_duration, current_timeout
 analyze_reviewer() {
   local r="$1"
@@ -95,6 +99,15 @@ analyze_reviewer() {
     | ($attempts | map(select(.status == "empty"))     | length) as $empty
     | ($attempts | map(select(.status == "failed"))    | length) as $failed
     | ($attempts | map(select(.status == "quota"))     | length) as $quota
+    # `fallback` is a status this analyzer MUST know about explicitly. It is
+    # emitted by append_runlog.sh when a first-party lane died and its
+    # or_fallback rescue succeeded. Before this bucket existed the value
+    # matched none of the arms above, so a rescued attempt landed in $total
+    # and in no outcome bucket -- inflating every rate denominator with no
+    # numerator, and reporting "nominal" for a reviewer whose own provider was
+    # 100% dead. Fourth instance of producer-invents-a-value /
+    # consumer-enumerates-the-old-set in this skill; see post_comment.sh.
+    | ($attempts | map(select(.status == "fallback"))  | length) as $fallback
     # Sleep-suspect filter (2026-07-03): when the machine sleeps mid-run,
     # gtimeout/curl timers freeze but the wall-clock duration_s keeps counting,
     # so a sample can log far past its ENFORCED budget (codex: 1024s vs 300s,
@@ -120,9 +133,15 @@ analyze_reviewer() {
         empty: $empty,
         failed: $failed,
         quota: $quota,
+        fallback: $fallback,
         sleep_suspect: $suspect,
         to_suspect: ($to - $clean_to),
-        reliability: (if $total == 0 then null else (($ok * 100) / $total | floor) end),
+        # Fallback counts as SERVED here: a usable review did come back, and
+        # reliability drives timeout tuning and the leaderboard draw, neither of
+        # which should punish a seat for the provider billing state. The
+        # degradation is carried by the unconditional WARN below instead, where
+        # it names the thing a human can actually fix.
+        reliability: (if $total == 0 then null else ((($ok + $fallback) * 100) / $total | floor) end),
         timeout_rate: (if $total == 0 then null else (($to * 100) / $total | floor) end),
         clean_timeout_rate: (if $cn == 0 then null else (($clean_to * 100) / $cn | floor) end),
         empty_rate:   (if $total == 0 then null else (($empty * 100) / $total | floor) end),
@@ -180,7 +199,18 @@ emit_warning() {
     | (if (.to_suspect // 0) > 0 then
          " [\(.to_suspect) of \(.timed_out) timeouts are sleep-suspect — wall clock overran the enforced budget, machine likely slept mid-run; discount before tuning]"
        else "" end) as $sleep_note
-    | if .total < 3 then empty   # not enough data
+    # The fallback WARN is deliberately placed ABOVE the `.total < 3` sample
+    # guard and above every rate-based branch. It is not a statistical signal
+    # to be confident about -- it is a report that a provider account is dead
+    # RIGHT NOW, and the user asked to be warned every time, not once a rate
+    # clears a threshold. Sample-gating it would reproduce the exact failure it
+    # exists to prevent: run_reviewers.sh writes "THE PRIMARY PROVIDER NEEDS
+    # ATTENTION" into the record at dispatch, and the pre-run health check --
+    # the only surface anyone consults BEFORE spending the next round -- would
+    # still answer "all reviewers nominal".
+    | if (.fallback // 0) > 0 then
+      "  WARN: \($rv) served \(.fallback) of last \(.total) runs through its OpenRouter FALLBACK — its own provider lane failed. THE PRIMARY PROVIDER NEEDS ATTENTION (billing/quota/auth); the rescue is a stopgap, not a healthy seat."
+    elif .total < 3 then empty   # not enough data
     elif (.quota // 0) > 0 then
       "  WARN: \($rv) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). If the seat has or_fallback configured it is re-run over OpenRouter and recorded as status \"fallback\" (never \"ok\"); otherwise rotation covers the gap"
     # Gate the timeout WARN on the sleep-CLEAN rate, matching
@@ -202,7 +232,7 @@ emit_warning() {
     elif .empty_rate > 40 then
       "  WARN: \($rv) empty-output rate \(.empty_rate)% over last \(.total) runs — not a timeout fix. Read failure_kind in meta.json before acting: quota_exhausted → wait for reset; headless_permission_denied → prompt-shape bug in this repo, the seat is healthy, do NOT retire it; empty_output → re-run `agy login`"
     elif .reliability != null and .reliability < 60 then
-      "  WARN: \($rv) reliability \(.reliability)% over last \(.total) runs (ok=\(.ok), timeout=\(.timed_out), empty=\(.empty), failed=\(.failed), quota=\(.quota // 0))\($sleep_note)"
+      "  WARN: \($rv) reliability \(.reliability)% over last \(.total) runs (ok=\(.ok), fallback=\(.fallback // 0), timeout=\(.timed_out), empty=\(.empty), failed=\(.failed), quota=\(.quota // 0))\($sleep_note)"
     else empty end
   '
 }
@@ -224,7 +254,7 @@ case "$mode" in
       echo "$stats" | jq -r '
         if .total == 0 then "  \(.reviewer): no data in window"
         else
-          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  quota=\(.quota // 0)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s\(if (.sleep_suspect // 0) > 0 then "  sleep_suspect=\(.sleep_suspect)" else "" end)"
+          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  fallback=\(.fallback // 0)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  quota=\(.quota // 0)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s\(if (.sleep_suspect // 0) > 0 then "  sleep_suspect=\(.sleep_suspect)" else "" end)"
         end'
     done
     echo ""

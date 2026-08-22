@@ -664,6 +664,51 @@ WARN_OUT="$(CROSS_REVIEW_RUNLOG="$WARNLOG" bash "$S/analyze_runlog.sh" --mode wa
 assert_contains "pool reviewer at 66% timeout rate warns" "$WARN_OUT" "north timed out"
 assert_contains "flag reviewer warning suggests --timeout-codex" "$WARN_OUT" "--timeout-codex"
 
+echo "── analyze_runlog.sh knows the `fallback` status it is fed ──"
+# [pin: 2026-08-22 — PR #66 taught append_runlog.sh to emit status "fallback"
+# for a first-party lane rescued over OpenRouter, but analyze_runlog.sh bucketed
+# only ok/timed_out/empty/failed/quota. A rescued attempt therefore landed in
+# $total and in NO outcome bucket: it inflated every rate denominator with no
+# numerator and rendered as "reliability 0% (ok=0, timeout=0, empty=0,
+# failed=0, quota=0)" — a warning that names no cause and no remedy, for a seat
+# whose provider account was 100% dead. Fourth instance of
+# producer-invents-a-value / consumer-enumerates-the-old-set (cf. .attempt<N>,
+# .agy-failed, .primary-failed in post_comment.sh).
+#
+# Two properties are pinned, and the SECOND is the one that matters:
+#   1. the bucket exists and is reported;
+#   2. the WARN fires with NO minimum sample size. The user asked to be warned
+#      *each time* a primary provider needs attention. Every other warning here
+#      is gated on `.total < 3` because it is a statistical claim; this one is a
+#      report of current fact, and sample-gating it would recreate the exact
+#      hole it closes — run_reviewers.sh writes "THE PRIMARY PROVIDER NEEDS
+#      ATTENTION" at dispatch, and the pre-run check would still say "nominal".]
+FBLOG="$T/fallback-runlog.jsonl"
+cat >"$FBLOG" <<'EOF'
+{"ts":"2026-08-22T01:00:00Z","reviewers":{"codex":{"status":"fallback","exit_code":0,"duration_s":80,"output_bytes":1863,"timeout_budget_s":900,"fallback":{"used":true,"succeeded":true,"reason":"account_limit","via_model":"openai/gpt-5.6-sol"}}}}
+EOF
+FB_OUT="$(CROSS_REVIEW_RUNLOG="$FBLOG" bash "$S/analyze_runlog.sh" --mode warn 2>&1)"
+assert_contains "single fallback run warns despite being below the 3-sample guard" "$FB_OUT" "OpenRouter FALLBACK"
+assert_contains "fallback warning names the actionable thing" "$FB_OUT" "PRIMARY PROVIDER NEEDS ATTENTION"
+FB_REP="$(CROSS_REVIEW_RUNLOG="$FBLOG" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
+assert_contains "report surfaces the fallback bucket next to ok" "$FB_REP" "fallback=1"
+# A rescue DID serve a usable review, so reliability must not collapse to 0% and
+# drag the leaderboard draw / timeout tuning down over a billing outage. The
+# degradation is carried by the WARN, which names something a human can fix.
+assert_contains "fallback counts as served for reliability" "$FB_REP" "reliability=100%"
+
+# Non-vacuity: the ordinary statuses must still bucket correctly, or the two
+# assertions above could pass against an analyzer that calls everything served.
+FBLOG2="$T/fallback-runlog-control.jsonl"
+cat >"$FBLOG2" <<'EOF'
+{"ts":"2026-08-22T01:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":50,"timeout_budget_s":600}}}
+{"ts":"2026-08-22T02:00:00Z","reviewers":{"glm":{"status":"failed","exit_code":1,"duration_s":2,"output_bytes":0,"timeout_budget_s":600}}}
+{"ts":"2026-08-22T03:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":11,"output_bytes":50,"timeout_budget_s":600}}}
+EOF
+FB_CTL="$(CROSS_REVIEW_RUNLOG="$FBLOG2" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
+assert_contains "control: ok/failed still bucket normally" "$FB_CTL" "ok=2/3"
+assert_contains "control: no fallback counted when none occurred" "$FB_CTL" "fallback=0"
+
 echo "── analyze_runlog.sh sleep-suspect samples (wall clock past enforced budget) ──"
 # [pin: 2026-07-03 — the Mac slept mid-round (pmset: Dark Wake Thermal
 # Emergency); gtimeout/curl timers freeze during system sleep while date +%s
