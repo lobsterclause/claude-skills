@@ -182,7 +182,7 @@ emit_warning() {
        else "" end) as $sleep_note
     | if .total < 3 then empty   # not enough data
     elif (.quota // 0) > 0 then
-      "  WARN: \($rv) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). No fallback by policy; roster rotation covers the gap"
+      "  WARN: \($rv) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). If the seat has or_fallback configured it is re-run over OpenRouter and recorded as status \"fallback\" (never \"ok\"); otherwise rotation covers the gap"
     # Gate the timeout WARN on the sleep-CLEAN rate, matching
     # suggest_timeout_bump: a window whose timeouts are all sleep-killed must
     # not demand action (minimax finding, PR #27 pass 1). When the raw rate is

@@ -183,7 +183,11 @@ reviewer_obj() {
   # meta.json (OOM, kill mid-write, garbage); we prefer "failed" telemetry
   # over silently dropping the entire pass when the final --argjson rejects
   # empty input.
-  # `fallback` comes BEFORE the exit_code==0 branch on purpose. A first-party
+  # `fallback` comes BEFORE the exit_code==0 branch on purpose, and requires
+  # `succeeded` -- a fallback that itself failed must fall through to the
+  # ordinary failure branches, not be recorded as a rescued round. Keying only
+  # on `used` scored a lane whose rescue also died as "fallback"; seen live on
+  # PR #66, where kimi's fallback returned rc=5 with 0 bytes. (codex, PR #66.) A first-party
   # lane that failed and was rescued over OpenRouter writes the FALLBACK run's
   # meta -- exit_code 0, real output -- so it would otherwise classify as "ok"
   # and the dead primary would look perfectly healthy forever, which is exactly
@@ -191,7 +195,8 @@ reviewer_obj() {
   # distinct status keeps reliability honest (leaderboard.sh counts only "ok"),
   # while the findings still earn their normal value credit.
   jq -c '. + {status: (if .timed_out == true then "timed_out"
-                       elif (.fallback.used // false) == true then "fallback"
+                       elif (.fallback.used // false) == true
+                            and (.fallback.succeeded // false) == true then "fallback"
                        elif .failure_kind == "quota_exhausted" then "quota"
                        elif .failure_kind == "headless_permission_denied" then "permission_denied"
                        elif .failure_kind == "degenerate_output" then "degenerate"

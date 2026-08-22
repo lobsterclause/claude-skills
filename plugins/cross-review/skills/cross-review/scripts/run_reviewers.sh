@@ -481,38 +481,6 @@ run_with_timeout() {
 # router that the direct lane did not involve. That is a fine trade for this
 # repo and possibly not for someone else's, so it is a visible decision made
 # where model ids already live.
-fallback_eligible() {
-  # $1 = reviewer name, $2 = final rc. Echoes a reason, or nothing.
-  local name="$1" rc="$2" blob=""
-  # A timeout is NEVER eligible: the budget was spent, and spending it again on
-  # another rail just doubles the bill for the same outcome. Same reasoning the
-  # retry path already applies to 124/137.
-  [[ "$rc" -eq 124 || "$rc" -eq 137 ]] && return 1
-  [[ "$rc" -eq 0 ]] && return 1
-  # agy quota is signalled structurally
-  if [[ "$rc" -eq 3 ]]; then echo "quota_exhausted"; return 0; fi
-  local f
-  for f in "$out/$name.stdout" "$out/$name.stderr"; do
-    [[ -f "$f" ]] && blob+="$(head -c 4000 "$f" 2>/dev/null)"
-  done
-  # Account-level walls a different rail genuinely fixes. Deliberately narrow:
-  # a generic non-zero rc is NOT eligible, because a reviewer that crashed on
-  # the diff will crash on the diff over OpenRouter too.
-  case "$blob" in
-    *"usage limit"*|*"insufficient balance"*|*"suspended"*|*"exceeded_current_quota"*)
-      echo "account_limit"; return 0 ;;
-    *"429"*)            echo "rate_limited"; return 0 ;;
-    *"401"*|*"403"*|*"authentication"*|*"Unauthorized"*)
-      echo "auth_failed"; return 0 ;;
-  esac
-  # agy's SIGSEGV panic: a client-side bug, so a different rail does fix it
-  if [[ -f "$out/$name.meta.json" ]] && command -v jq >/dev/null 2>&1; then
-    [[ "$(jq -r '.failure_kind // empty' "$out/$name.meta.json" 2>/dev/null)" == "agy_panic" ]] \
-      && { echo "agy_panic"; return 0; }
-  fi
-  return 1
-}
-
 maybe_or_fallback() {
   # $1 = reviewer name, $2 = final rc. Echoes the new rc on stdout.
   local name="$1" rc="$2"
@@ -520,7 +488,9 @@ maybe_or_fallback() {
   enabled="$(profile_path "$name" '.or_fallback.enabled')"
   fb_model="$(profile_path "$name" '.or_fallback.model')"
   [[ "$enabled" == "true" && -n "$fb_model" ]] || { echo "$rc"; return; }
-  reason="$(fallback_eligible "$name" "$rc")" || { echo "$rc"; return; }
+  reason="$(bash "$script_dir/fallback_eligible.sh" --name "$name" --rc "$rc" --out "$out")" \
+    || { echo "$rc"; return; }
+  [[ -n "$reason" ]] || { echo "$rc"; return; }
 
   local warn="$name: PRIMARY LANE FAILED ($reason) — falling back to OpenRouter ($fb_model). THE PRIMARY PROVIDER NEEDS ATTENTION; this is not a healthy round for $name."
   echo "WARN: $warn" >&2
@@ -528,9 +498,12 @@ maybe_or_fallback() {
 
   # Preserve the primary failure. Without this the fallback's own meta would
   # overwrite the evidence that the real lane is down.
-  local ext
+  local ext moved=()
   for ext in stdout stderr meta.json agy.log; do
-    [[ -f "$out/$name.$ext" ]] && mv -f "$out/$name.$ext" "$out/$name.primary-failed.$ext"
+    if [[ -f "$out/$name.$ext" ]]; then
+      mv -f "$out/$name.$ext" "$out/$name.primary-failed.$ext"
+      moved+=("$ext")
+    fi
   done
 
   local tvar="${name//-/_}_timeout"
@@ -538,13 +511,36 @@ maybe_or_fallback() {
   run_openrouter_reviewer "$name" "$fb_model" "$tmo"
   local frc=$?
 
+  # If the fallback bailed before writing anything (no OpenRouter key, no model),
+  # the primary's artifacts have already been moved aside -- so its failure_kind
+  # telemetry would be lost and a quota/panic lane would degrade to a generic
+  # "failed" with no reason. Put them back and report the ORIGINAL failure.
+  # (glm, PR #66.)
+  if [[ ! -f "$out/$name.meta.json" ]]; then
+    for ext in "${moved[@]}"; do
+      [[ -f "$out/$name.primary-failed.$ext" ]] && mv -f "$out/$name.primary-failed.$ext" "$out/$name.$ext"
+    done
+    echo "WARN: $name: fallback could not run (rc=$frc) — primary failure preserved, lane drops out" >&2
+    echo "$rc"
+    return
+  fi
+
   # Stamp the record. The provider is deliberately NOT touched.
   if [[ -f "$out/$name.meta.json" ]] && command -v jq >/dev/null 2>&1; then
     local pk="null"
     [[ -f "$out/$name.primary-failed.meta.json" ]] && \
       pk="$(jq -c '{exit_code, failure_kind, model, cli}' "$out/$name.primary-failed.meta.json" 2>/dev/null || echo null)"
+    # `succeeded` is NOT decorative. Stamping used:true unconditionally recorded
+    # a FAILED fallback as a successful one -- and append_runlog keys the
+    # "fallback" status off `used`, so a dead lane whose rescue also died was
+    # scored as a rescued round. Observed live in this very round: kimi's
+    # fallback returned rc=5 with 0 bytes and still wrote used:true.
+    # (codex, PR #66.)
+    local fsucc="false"
+    [[ "$frc" -eq 0 ]] && fsucc="true"
     jq --arg r "$reason" --arg m "$fb_model" --argjson p "${pk:-null}" --arg w "$warn" \
-      '. + {fallback: {used: true, reason: $r, via_model: $m, primary: $p, warning: $w}}' \
+      --argjson ok "$fsucc" \
+      '. + {fallback: {used: true, succeeded: $ok, reason: $r, via_model: $m, primary: $p, warning: $w}}' \
       "$out/$name.meta.json" >"$out/$name.meta.json.tmp" 2>/dev/null \
       && mv -f "$out/$name.meta.json.tmp" "$out/$name.meta.json" \
       || rm -f "$out/$name.meta.json.tmp"
@@ -580,7 +576,9 @@ retry_reviewer() {
   local rc=$?
   # rc=3 (agy quota exhausted) is also not retried: the shared Individual
   # quota resets on a ~2-day cadence, so attempt 2 is guaranteed to hit the
-  # same wall. No fallback by policy — the lap just drops out of this round.
+  # same wall. Since 2026-08-22 the lap is instead offered the OpenRouter
+  # fallback below (same Gemini model, recorded as status "fallback"); it drops
+  # out of the round only when that seat has no or_fallback configured.
   if [[ $rc -eq 3 ]]; then
     echo "$name: agy quota exhausted — not retrying (the shared quota resets on a ~2-day cadence)" >&2
     rc="$(maybe_or_fallback "$name" "$rc")"
@@ -820,9 +818,20 @@ run_codex() {
   if [[ -f project.godot ]]; then
     codex_cfg+=(-c "sandbox_workspace_write.writable_roots=[\"$HOME/Library/Application Support/Godot\"]")
   fi
+  # codex's model was, like kimi's before cli_model_alias, pinned nowhere in
+  # this repo -- it came from ~/.codex/config.toml. That made SKILL.md's
+  # "the fallback re-runs the SAME model" guarantee an unverified guess that
+  # would break silently the moment the CLI default moved. `cli_model` pins it
+  # here, and a test asserts it agrees with or_fallback.model. (glm, PR #66.)
+  local codex_model codex_model_args=()
+  codex_model="$(profile_get codex cli_model)"
+  if [[ -n "$codex_model" ]]; then
+    codex_model_args=(-m "$codex_model")
+  fi
   run_with_timeout "$codex_timeout" codex exec review \
     --base "$base" \
     --full-auto \
+    ${codex_model_args[@]+"${codex_model_args[@]}"} \
     ${codex_cfg[@]+"${codex_cfg[@]}"} \
     >"$out/codex.stdout" 2>&1
   rc=$?

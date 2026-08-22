@@ -2310,33 +2310,81 @@ FB_BAD="$(jq -r 'to_entries[]
   | .key' "$FB_PROF")"
 assert_eq "every enabled fallback pins a concrete model (no alias, no empty)" "$FB_BAD" ""
 
-# 3. The dispatcher must actually consult it, from BOTH paths. codex is the one
-#    lane outside retry_reviewer, so it needs its own hook -- that asymmetry is
-#    exactly how the first implementation silently skipped codex entirely.
-if grep -q 'maybe_or_fallback "$name" "$rc"' "$S/run_reviewers.sh"; then
-  ok "retry_reviewer offers the fallback"
-else bad "retry_reviewer no longer calls maybe_or_fallback"; fi
-if grep -q 'fallback_only run_codex codex' "$S/run_reviewers.sh"; then
-  ok "codex is dispatched through the fallback wrapper"
-else bad "codex bypasses the fallback again (it does not go through retry_reviewer)"; fi
+# 3. Same-model invariant, machine-checked. SKILL.md promises the fallback
+#    re-runs THE SAME model. codex's model used to live only in
+#    ~/.codex/config.toml, making that promise an unverified guess that would
+#    break silently when the CLI default moved. (glm, PR #66.)
+CODEX_CLI_M="$(jq -r '.codex.cli_model // ""' "$FB_PROF")"
+CODEX_FB_M="$(jq -r '.codex.or_fallback.model // ""' "$FB_PROF")"
+if [[ -n "$CODEX_CLI_M" && "$CODEX_FB_M" == *"$CODEX_CLI_M" ]]; then
+  ok "codex's fallback model is the same model as its pinned CLI model"
+else
+  bad "codex same-model invariant broken (cli=$CODEX_CLI_M fallback=$CODEX_FB_M)"
+fi
 
-# 4. A timeout must never trigger a fallback: the budget was already spent, and
-#    re-spending it on another rail buys the same outcome twice.
-if grep -q 'rc" -eq 124 || "\$rc" -eq 137 \]\] && return 1' "$S/run_reviewers.sh"; then
-  ok "timeouts are excluded from fallback eligibility"
-else bad "the 124/137 exclusion is gone -- timeouts would now re-spend on OpenRouter"; fi
+# 4. ELIGIBILITY, TESTED AS BEHAVIOUR. The first version of these checks only
+#    grepped run_reviewers.sh for source text -- which still matches if the
+#    guard is negated or the call is unreachable, so an inverted implementation
+#    passed all of them. (glm, PR #66.) fallback_eligible.sh is a standalone
+#    entrypoint precisely so this can be driven with fixtures instead.
+FBE="$S/fallback_eligible.sh"
+FBT="$T/fbe"; mkdir -p "$FBT"
+fbe() { bash "$FBE" --name "$1" --rc "$2" --out "$FBT" 2>/dev/null; }
 
-# 5. THE ONE THAT MATTERS MOST: a rescued round must not score as healthy.
-#    The fallback writes the OR run's meta (exit_code 0, real output), so
-#    without a distinct status the dead primary reads as "ok" forever -- the
-#    precise blindness the old policy prevented. Fixture-driven, real script.
+: >"$FBT/kimi.stdout"
+printf 'Error code: 429 - account is suspended due to insufficient balance\n' >"$FBT/kimi.stdout"
+assert_eq "an account wall is eligible"        "$(fbe kimi 75)"  "account_limit"
+assert_eq "a success is never eligible"        "$(fbe kimi 0)"   ""
+# A timeout must never fall back: the budget was already spent.
+assert_eq "a timeout (124) is never eligible"  "$(fbe kimi 124)" ""
+assert_eq "a SIGKILLed timeout (137) is never eligible" "$(fbe kimi 137)" ""
+
+# rc=3 is agy's quota signal and ONLY agy's -- it used to be honoured for every
+# seat, buying a paid re-run mislabelled quota_exhausted. (codex+glm convergent.)
+: >"$FBT/antigravity.stdout"
+: >"$FBT/codex.stdout"
+assert_eq "rc=3 is a quota signal for an agy lap"      "$(fbe antigravity 3)" "quota_exhausted"
+assert_eq "rc=3 is NOT a quota signal for codex"       "$(fbe codex 3)"       ""
+assert_eq "rc=3 is NOT a quota signal for kimi"        "$(fbe kimi 3)"        ""
+
+# THE FALSE POSITIVE THAT MOTIVATED THE REWRITE: reviewers emit prose ABOUT
+# code, so bare 401/403/429 and the word "authentication" appear innocently --
+# in a diff about auth handling, or a timing like 4290ms. Matching those bought
+# a paid re-run and wrote a bogus "sick provider" row into the record.
+printf 'The handler returns 401 when the token is stale; authentication is checked first. Latency was 4290ms and 403 paths are untested.\n' >"$FBT/glm.stdout"
+assert_eq "review prose containing 401/403/429/authentication is NOT eligible" "$(fbe glm 1)" ""
+
+# but a genuine HTTP error still is
+printf 'openrouter API error: HTTP 429 Too Many Requests\n' >"$FBT/grok.stdout"
+assert_eq "a real HTTP 429 is eligible" "$(fbe grok 1)" "rate_limited"
+
+# A misconfigured kimi alias must fail LOUDLY, not become a silent recurring
+# paid OpenRouter run. (glm, PR #66.)
+printf 'LLM not set\n' >"$FBT/kimi2.stdout"
+assert_eq "a kimi model-alias misconfiguration is NOT an account wall" "$(fbe kimi2 1)" ""
+
+# agy's SIGSEGV panic is structural, read from meta rather than text
+printf '{"failure_kind": "agy_panic"}\n' >"$FBT/gemini-pro.meta.json"
+: >"$FBT/gemini-pro.stdout"
+assert_eq "an agy panic is eligible (a different rail does fix it)" "$(fbe gemini-pro 2)" "agy_panic"
+
+# 5. A rescued round must not score as healthy -- AND a fallback that itself
+#    failed must not score as rescued. The second half was a real bug: `used`
+#    was stamped true regardless of the fallback's own rc, and the classifier
+#    keyed on `used` alone, so a dead lane whose rescue also died read as a
+#    successful fallback. Seen live on PR #66 (kimi, rc=5, 0 bytes). (codex.)
 FBDIR="$T/fbrun"; mkdir -p "$FBDIR/raw"
 cat >"$FBDIR/raw/codex.meta.json" <<'JSON'
 {"exit_code": 0, "duration_s": 9, "timed_out": false, "output_bytes": 276,
  "attempt": 1, "timeout_budget_s": 900, "model": "openai/gpt-5.6-sol",
  "cli": "openrouter",
- "fallback": {"used": true, "reason": "account_limit",
-              "via_model": "openai/gpt-5.6-sol"}}
+ "fallback": {"used": true, "succeeded": true, "reason": "account_limit"}}
+JSON
+cat >"$FBDIR/raw/kimi.meta.json" <<'JSON'
+{"exit_code": 5, "duration_s": 2, "timed_out": false, "output_bytes": 0,
+ "attempt": 1, "timeout_budget_s": 600, "model": "moonshotai/kimi-k2.7-code",
+ "cli": "openrouter",
+ "fallback": {"used": true, "succeeded": false, "reason": "account_limit"}}
 JSON
 cat >"$FBDIR/raw/kat.meta.json" <<'JSON'
 {"exit_code": 0, "duration_s": 9, "timed_out": false, "output_bytes": 276,
@@ -2347,13 +2395,27 @@ FBLOG="$T/fb-runlog.jsonl"
 CROSS_REVIEW_RUNLOG="$FBLOG" bash "$S/append_runlog.sh" --run-dir "$FBDIR" \
   --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 \
   --top "-" --notes "fixture" >/dev/null 2>&1
-assert_eq "a rescued lane is recorded as 'fallback', never 'ok'" \
+assert_eq "a successful rescue records as 'fallback', never 'ok'" \
   "$(jq -r '.reviewers.codex.status' "$FBLOG" 2>/dev/null)" "fallback"
+assert_eq "a rescue that ITSELF failed records as 'failed', not 'fallback'" \
+  "$(jq -r '.reviewers.kimi.status' "$FBLOG" 2>/dev/null)" "failed"
 assert_eq "an ordinary clean lane is still 'ok'" \
   "$(jq -r '.reviewers.kat.status' "$FBLOG" 2>/dev/null)" "ok"
-# and leaderboard reliability counts only "ok", so the sick lane stays visible
-assert_eq "leaderboard does not count a fallback round as ok" \
-  "$(jq -r '[.reviewers.codex] | map(select(.status == "ok")) | length' "$FBLOG" 2>/dev/null)" "0"
+
+# 6. and leaderboard.sh must actually SEE it. The previous version of this
+#    assertion re-queried the runlog for .status=="ok" -- re-testing the
+#    append_runlog branch asserted above and never running leaderboard at all,
+#    leaving the documented claim (reliability drops) untested. (glm, PR #66.)
+FBLB="$(CROSS_REVIEW_RUNLOG="$FBLOG" bash "$S/leaderboard.sh" --mode json 2>/dev/null)"
+FB_CODEX_REL="$(jq -r '[.[] | select(.reviewer=="codex")] | .[0].reliability_pct // "ABSENT"' <<<"$FBLB" 2>/dev/null)"
+FB_KAT_REL="$(jq -r '[.[] | select(.reviewer=="kat")] | .[0].reliability_pct // "ABSENT"' <<<"$FBLB" 2>/dev/null)"
+if [[ "$FB_CODEX_REL" == "ABSENT" || "$FB_KAT_REL" == "ABSENT" ]]; then
+  bad "leaderboard.sh did not report codex/kat at all (codex=$FB_CODEX_REL kat=$FB_KAT_REL)"
+elif awk -v a="$FB_CODEX_REL" -v b="$FB_KAT_REL" 'BEGIN{exit !(a+0 < b+0)}'; then
+  ok "leaderboard reliability is lower for the rescued lane than the clean one ($FB_CODEX_REL < $FB_KAT_REL)"
+else
+  bad "leaderboard scores a fallback round as reliably as a clean one (codex=$FB_CODEX_REL kat=$FB_KAT_REL)"
+fi
 
 echo "── seat wiring: every profile seat reaches every dispatch site ──"
 
