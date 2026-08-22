@@ -2231,6 +2231,78 @@ else
   bad "run_reviewers.sh no longer reads supports_json_object -- seed goes dead again"
 fi
 
+echo "── first-party OpenRouter fallback (policy revised 2026-08-22) ──"
+
+# Forced by a round that lost BOTH baselines at once: codex to an OpenAI usage
+# cap, kimi to a suspended Moonshot balance that also killed kimi27 and kimi3.
+# The old no-fallback policy protected honesty of the record, not a technical
+# constraint -- so these pin the properties that keep it honest.
+
+FB_PROF="$SKILL_DIR/references/reviewer_profiles.json"
+
+# 1. The provider must NOT change. codex-over-OpenRouter is still OpenAI, and
+#    counting it as a second independent vote would corrupt every convergence
+#    judgement downstream.
+assert_eq "codex keeps provider openai despite an OR fallback" \
+  "$(jq -r '.codex.provider' "$FB_PROF")" "openai"
+assert_eq "kimi keeps provider moonshot despite an OR fallback" \
+  "$(jq -r '.kimi.provider' "$FB_PROF")" "moonshot"
+
+# 2. Every fallback must name a concrete pinned model -- never an alias, never
+#    empty (MODEL IDS LIVE IN EXACTLY ONE PLACE applies here too).
+FB_BAD="$(jq -r 'to_entries[]
+  | select(.value | type == "object")
+  | select(.value.or_fallback.enabled == true)
+  | select((.value.or_fallback.model // "") == ""
+           or (.value.or_fallback.model | startswith("~")))
+  | .key' "$FB_PROF")"
+assert_eq "every enabled fallback pins a concrete model (no alias, no empty)" "$FB_BAD" ""
+
+# 3. The dispatcher must actually consult it, from BOTH paths. codex is the one
+#    lane outside retry_reviewer, so it needs its own hook -- that asymmetry is
+#    exactly how the first implementation silently skipped codex entirely.
+if grep -q 'maybe_or_fallback "$name" "$rc"' "$S/run_reviewers.sh"; then
+  ok "retry_reviewer offers the fallback"
+else bad "retry_reviewer no longer calls maybe_or_fallback"; fi
+if grep -q 'fallback_only run_codex codex' "$S/run_reviewers.sh"; then
+  ok "codex is dispatched through the fallback wrapper"
+else bad "codex bypasses the fallback again (it does not go through retry_reviewer)"; fi
+
+# 4. A timeout must never trigger a fallback: the budget was already spent, and
+#    re-spending it on another rail buys the same outcome twice.
+if grep -q 'rc" -eq 124 || "\$rc" -eq 137 \]\] && return 1' "$S/run_reviewers.sh"; then
+  ok "timeouts are excluded from fallback eligibility"
+else bad "the 124/137 exclusion is gone -- timeouts would now re-spend on OpenRouter"; fi
+
+# 5. THE ONE THAT MATTERS MOST: a rescued round must not score as healthy.
+#    The fallback writes the OR run's meta (exit_code 0, real output), so
+#    without a distinct status the dead primary reads as "ok" forever -- the
+#    precise blindness the old policy prevented. Fixture-driven, real script.
+FBDIR="$T/fbrun"; mkdir -p "$FBDIR/raw"
+cat >"$FBDIR/raw/codex.meta.json" <<'JSON'
+{"exit_code": 0, "duration_s": 9, "timed_out": false, "output_bytes": 276,
+ "attempt": 1, "timeout_budget_s": 900, "model": "openai/gpt-5.6-sol",
+ "cli": "openrouter",
+ "fallback": {"used": true, "reason": "account_limit",
+              "via_model": "openai/gpt-5.6-sol"}}
+JSON
+cat >"$FBDIR/raw/kat.meta.json" <<'JSON'
+{"exit_code": 0, "duration_s": 9, "timed_out": false, "output_bytes": 276,
+ "attempt": 1, "timeout_budget_s": 600, "model": "kwaipilot/kat-coder-pro-v2.5",
+ "cli": "openrouter"}
+JSON
+FBLOG="$T/fb-runlog.jsonl"
+CROSS_REVIEW_RUNLOG="$FBLOG" bash "$S/append_runlog.sh" --run-dir "$FBDIR" \
+  --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 \
+  --top "-" --notes "fixture" >/dev/null 2>&1
+assert_eq "a rescued lane is recorded as 'fallback', never 'ok'" \
+  "$(jq -r '.reviewers.codex.status' "$FBLOG" 2>/dev/null)" "fallback"
+assert_eq "an ordinary clean lane is still 'ok'" \
+  "$(jq -r '.reviewers.kat.status' "$FBLOG" 2>/dev/null)" "ok"
+# and leaderboard reliability counts only "ok", so the sick lane stays visible
+assert_eq "leaderboard does not count a fallback round as ok" \
+  "$(jq -r '[.reviewers.codex] | map(select(.status == "ok")) | length' "$FBLOG" 2>/dev/null)" "0"
+
 echo "── seat wiring: every profile seat reaches every dispatch site ──"
 
 # Adding a reviewer means editing eight files that share no schema, and until

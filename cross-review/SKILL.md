@@ -11,7 +11,19 @@ Orchestrates a rotating fleet of external AI reviewers to review the current bra
 
 **On the Gemini fleet:** `antigravity` and `gemini-pro` are both Google-Gemini reviewers running through the **same** `agy` (Antigravity) CLI, differing only by `--model` (Flash High vs. Pro High). The `agy` CLI replaced the standalone `gemini` CLI, which stopped serving consumer requests on **2026-06-18**. Because they share a provider, treat Flash↔Pro agreement as **one** provider's vote, not two independent ones. They also **share one Google "Individual quota"** (resets on a ~2-day cadence) — when it's exhausted, agy exits 0 with empty stdout in seconds and only the `.agy.log` says why; the wrapper detects this (`failure_kind: "quota_exhausted"` + an `agy.quota_exhausted` sentinel). The sentinel spares **retries and the fact-check pass** — the concurrently-launched sibling lap usually completes its own doomed ~5s call first, since laps start only 2s apart.
 
-**No first-party fallbacks (policy, 2026-07-01):** codex, the Gemini laps, and any Claude reviewer are **never** routed through OpenRouter. A failed agy lap drops out of the round honestly; rotation covers the gap next round and the leaderboard down-weights it until it recovers. The OpenRouter pool reviewers require an OpenRouter key: `$OPENROUTER_API_KEY` env var or `~/.config/openrouter/key`.
+**First-party OpenRouter fallback (policy REVISED 2026-08-22, per Gabriel — supersedes the 2026-07-01 no-fallback rule):** a first-party lane that fails on an **account-level wall** may be re-run over OpenRouter against the **same model**, and it warns every time.
+
+What forced the revision: on 2026-08-22 a round lost both baselines at once — `codex` to an OpenAI usage cap (5 days to reset) and `kimi` to a suspended Moonshot balance, which simultaneously killed `kimi27` and `kimi3` since all three bill against one account. Four seats, two accounts, and nothing to be done for days.
+
+What the old policy was protecting, by its own note, was **honesty of the record** and the leaderboard's ability to notice a sick lane — not a technical constraint. Both survive here because the fallback is recorded rather than silent:
+
+- **Opt-in per seat**, in `reviewer_profiles.json`: `"or_fallback": {"enabled": true, "model": "openai/gpt-5.6-sol"}`. Per-seat and not global on purpose — a fallback moves the diff onto a US router the direct lane never involved, which is a fine trade for some repos and not others, so it is a visible decision made where model ids already live.
+- **The provider does not change.** `codex`-via-OpenRouter is still OpenAI and must never count as a second independent vote beside anything OpenAI. Nothing in the fallback touches `.provider`.
+- **The primary's failure is preserved**, at `<slug>.primary-failed.*`. Otherwise a permanently-broken lane looks healthy forever because the fallback keeps answering.
+- **The round is not scored as healthy.** `append_runlog.sh` classifies a fallback run as `status: "fallback"`, not `"ok"`, so `leaderboard.sh` reliability still drops and the seat is still visibly sick. Its findings keep their normal value credit.
+- **Timeouts are never eligible.** A lane that burned its budget will burn it again; only account walls (usage cap, suspension, 401/403/429, agy quota, agy SIGSEGV panic) trigger it.
+
+Every fallback prints a `WARN:` line and drops a `<slug>.fallback.warning` file — surface it to the user, because it means **the primary provider needs attention**. The OpenRouter pool reviewers require an OpenRouter key: `$OPENROUTER_API_KEY` env var or `~/.config/openrouter/key`.
 
 ## When to use this
 

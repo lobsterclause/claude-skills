@@ -252,6 +252,15 @@ profile_get() {
 }
 profile_timeout() { profile_get "$1" timeout_s; }
 
+profile_path() {
+  # Usage: profile_path <reviewer> <jq-path-after-the-reviewer>
+  # e.g. profile_path codex '.or_fallback.model'
+  local r="$1" path="$2"
+  [[ -f "$profile_file" ]] || { echo ""; return; }
+  command -v jq >/dev/null 2>&1 || { echo ""; return; }
+  jq -r --arg r "$r" "(.[\$r]${path} // empty)" "$profile_file" 2>/dev/null
+}
+
 profile_flag() {
   # Usage: profile_flag <reviewer> <key> <default-true|false>
   # Booleans CANNOT go through profile_get: it uses jq's `//`, and `false //
@@ -436,6 +445,133 @@ run_with_timeout() {
 # survives callees that declare their own `local attempt`, which is a
 # reasonable future refactor that would otherwise silently break the
 # retry telemetry.
+# --- first-party OpenRouter fallback (policy revised 2026-08-22, per Gabriel) --
+#
+# The 2026-07-01 policy was: first-party lanes (codex, the agy laps, kimi) NEVER
+# fall back to OpenRouter; a failed lap drops out and rotation covers the gap.
+# What that policy was protecting, per its own note, was HONESTY OF THE RECORD
+# and the leaderboard's ability to notice a lane was sick -- not a technical
+# constraint. Both survive here, because the fallback is recorded rather than
+# silent.
+#
+# What forced the revision: on 2026-08-22 a review round lost BOTH baselines at
+# once -- codex to an OpenAI usage cap (5 days to reset) and kimi to a suspended
+# Moonshot balance, which simultaneously killed kimi27 and kimi3 since all three
+# bill against the same account. Four seats, two accounts, no reviewers. The
+# round produced no baseline coverage at all and there was nothing to be done
+# about it for days.
+#
+# Three properties this MUST preserve, or it recreates the problem the old
+# policy prevented:
+#   1. The provider does NOT change. codex-via-OpenRouter is still OpenAI, and
+#      must never count as a second independent vote next to anything OpenAI.
+#      Nothing here touches `.provider`.
+#   2. The record says it happened. meta.json carries a `fallback` object, a
+#      warning file lands next to it, and stderr says so every single time.
+#      "Warn each time" is only a guarantee if it outlives the terminal.
+#   3. The PRIMARY lane's failure is preserved, not overwritten. Its artifacts
+#      move to <slug>.primary-failed.* so the next round can still see that the
+#      real lane is sick. Otherwise a permanently-broken lane looks healthy
+#      forever because the fallback keeps answering -- exactly the blindness the
+#      2026-07-01 policy existed to prevent.
+#
+# Opt-in per seat, in reviewer_profiles.json:
+#     "or_fallback": { "enabled": true, "model": "openai/gpt-5.6-sol" }
+# Per-seat and not global on purpose: a fallback moves the diff onto a US
+# router that the direct lane did not involve. That is a fine trade for this
+# repo and possibly not for someone else's, so it is a visible decision made
+# where model ids already live.
+fallback_eligible() {
+  # $1 = reviewer name, $2 = final rc. Echoes a reason, or nothing.
+  local name="$1" rc="$2" blob=""
+  # A timeout is NEVER eligible: the budget was spent, and spending it again on
+  # another rail just doubles the bill for the same outcome. Same reasoning the
+  # retry path already applies to 124/137.
+  [[ "$rc" -eq 124 || "$rc" -eq 137 ]] && return 1
+  [[ "$rc" -eq 0 ]] && return 1
+  # agy quota is signalled structurally
+  if [[ "$rc" -eq 3 ]]; then echo "quota_exhausted"; return 0; fi
+  local f
+  for f in "$out/$name.stdout" "$out/$name.stderr"; do
+    [[ -f "$f" ]] && blob+="$(head -c 4000 "$f" 2>/dev/null)"
+  done
+  # Account-level walls a different rail genuinely fixes. Deliberately narrow:
+  # a generic non-zero rc is NOT eligible, because a reviewer that crashed on
+  # the diff will crash on the diff over OpenRouter too.
+  case "$blob" in
+    *"usage limit"*|*"insufficient balance"*|*"suspended"*|*"exceeded_current_quota"*)
+      echo "account_limit"; return 0 ;;
+    *"429"*)            echo "rate_limited"; return 0 ;;
+    *"401"*|*"403"*|*"authentication"*|*"Unauthorized"*)
+      echo "auth_failed"; return 0 ;;
+  esac
+  # agy's SIGSEGV panic: a client-side bug, so a different rail does fix it
+  if [[ -f "$out/$name.meta.json" ]] && command -v jq >/dev/null 2>&1; then
+    [[ "$(jq -r '.failure_kind // empty' "$out/$name.meta.json" 2>/dev/null)" == "agy_panic" ]] \
+      && { echo "agy_panic"; return 0; }
+  fi
+  return 1
+}
+
+maybe_or_fallback() {
+  # $1 = reviewer name, $2 = final rc. Echoes the new rc on stdout.
+  local name="$1" rc="$2"
+  local enabled fb_model reason
+  enabled="$(profile_path "$name" '.or_fallback.enabled')"
+  fb_model="$(profile_path "$name" '.or_fallback.model')"
+  [[ "$enabled" == "true" && -n "$fb_model" ]] || { echo "$rc"; return; }
+  reason="$(fallback_eligible "$name" "$rc")" || { echo "$rc"; return; }
+
+  local warn="$name: PRIMARY LANE FAILED ($reason) — falling back to OpenRouter ($fb_model). THE PRIMARY PROVIDER NEEDS ATTENTION; this is not a healthy round for $name."
+  echo "WARN: $warn" >&2
+  printf '%s\n' "$warn" >"$out/$name.fallback.warning"
+
+  # Preserve the primary failure. Without this the fallback's own meta would
+  # overwrite the evidence that the real lane is down.
+  local ext
+  for ext in stdout stderr meta.json agy.log; do
+    [[ -f "$out/$name.$ext" ]] && mv -f "$out/$name.$ext" "$out/$name.primary-failed.$ext"
+  done
+
+  local tvar="${name//-/_}_timeout"
+  local tmo="${!tvar:-$timeout_s_default}"
+  run_openrouter_reviewer "$name" "$fb_model" "$tmo"
+  local frc=$?
+
+  # Stamp the record. The provider is deliberately NOT touched.
+  if [[ -f "$out/$name.meta.json" ]] && command -v jq >/dev/null 2>&1; then
+    local pk="null"
+    [[ -f "$out/$name.primary-failed.meta.json" ]] && \
+      pk="$(jq -c '{exit_code, failure_kind, model, cli}' "$out/$name.primary-failed.meta.json" 2>/dev/null || echo null)"
+    jq --arg r "$reason" --arg m "$fb_model" --argjson p "${pk:-null}" --arg w "$warn" \
+      '. + {fallback: {used: true, reason: $r, via_model: $m, primary: $p, warning: $w}}' \
+      "$out/$name.meta.json" >"$out/$name.meta.json.tmp" 2>/dev/null \
+      && mv -f "$out/$name.meta.json.tmp" "$out/$name.meta.json" \
+      || rm -f "$out/$name.meta.json.tmp"
+  fi
+  echo "$frc"
+}
+
+fallback_only() {
+  # Run a reviewer ONCE, then offer it the OpenRouter fallback -- no retry.
+  #
+  # codex is the only lane dispatched outside retry_reviewer (`run_codex &`
+  # directly). There is no recorded reason; it reads as an artefact of codex
+  # predating retry_reviewer and never being migrated. Left that way on
+  # purpose here rather than "fixed" as a side effect of adding fallback: a
+  # codex retry would re-spend a budget that defaults to 900s, and changing
+  # that is a separate decision from letting a dead account reach a live rail.
+  local fn="$1" name="$2"
+  export CROSS_REVIEW_ATTEMPT=1
+  "$fn"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    rc="$(maybe_or_fallback "$name" "$rc")"
+  fi
+  unset CROSS_REVIEW_ATTEMPT
+  return "$rc"
+}
+
 retry_reviewer() {
   local fn="$1"
   local name="$2"
@@ -446,7 +582,8 @@ retry_reviewer() {
   # quota resets on a ~2-day cadence, so attempt 2 is guaranteed to hit the
   # same wall. No fallback by policy — the lap just drops out of this round.
   if [[ $rc -eq 3 ]]; then
-    echo "$name: agy quota exhausted — not retrying, lap drops out of this round (reset ETA: see $out/agy.quota_exhausted)" >&2
+    echo "$name: agy quota exhausted — not retrying (the shared quota resets on a ~2-day cadence)" >&2
+    rc="$(maybe_or_fallback "$name" "$rc")"
     unset CROSS_REVIEW_ATTEMPT
     return "$rc"
   fi
@@ -469,6 +606,9 @@ retry_reviewer() {
     # pass 3) — same retry semantics as 124: the budget was consumed and a
     # retry would just consume it again.
     echo "$name: attempt 1 timed out (rc=$rc), not retrying — bump the timeout if this recurs" >&2
+  fi
+  if [[ $rc -ne 0 ]]; then
+    rc="$(maybe_or_fallback "$name" "$rc")"
   fi
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
@@ -1825,7 +1965,7 @@ for r in "${requested[@]}"; do
     codex)
       if command -v codex >/dev/null 2>&1; then
         [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
-        run_codex &
+        fallback_only run_codex codex &
         pids+=($!)
         ran+=("codex")
       else
