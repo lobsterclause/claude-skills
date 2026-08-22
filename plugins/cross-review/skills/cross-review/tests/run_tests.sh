@@ -2283,6 +2283,43 @@ assert_eq "kimi/kimi27/kimi3 all remain one provider" \
   "$(jq -r '[.kimi.provider, .kimi27.provider, .kimi3.provider] | unique | join(",")' \
       "$SKILL_DIR/references/reviewer_profiles.json")" "moonshot"
 
+echo "── review-record roster excludes forensic artifacts ──"
+
+# post_comment.sh builds the "Automated review by ..." line from *.meta.json
+# filenames in the raw dir. Three separate artifact suffixes have now been
+# miscounted as reviewers: <slug>.attempt<N> (PR #41/#50), <slug>.agy-failed,
+# and <slug>.primary-failed -- the last one introduced by the OpenRouter
+# fallback on 2026-08-22, which credited a PR #66 review to
+# "codex + codex.primary-failed + kimi + mimo + north": five names, three
+# reviewers. Enumerating suffixes clearly does not converge, so the roster is
+# now derived from reviewer_profiles.json and this pins it.
+PCR="$T/pcroster"; mkdir -p "$PCR/raw"
+for n in codex codex.primary-failed codex.attempt1 kimi kimi.agy-failed not-a-reviewer; do
+  printf '{"exit_code":0,"output_bytes":10}\n' >"$PCR/raw/$n.meta.json"
+done
+printf '# findings\n\nnothing to report\n' >"$PCR/findings.md"
+: >"$CR_TEST_CAPTURE"
+CR_TEST_PR_JSON='{"headRefOid":"abc1234567","state":"OPEN"}' \
+  bash "$SKILL_DIR/scripts/post_comment.sh" --pr 4242 --mode summary \
+  --findings "$PCR/findings.md" --head-sha "abc1234567890123456789012345678901234567" \
+  >/dev/null 2>&1
+PC_ROSTER="$(grep -o 'Automated review by [^.]*' "$CR_TEST_CAPTURE" 2>/dev/null | head -1)"
+if [[ "$PC_ROSTER" == *"primary-failed"* ]]; then
+  bad "the review record counts <slug>.primary-failed as a reviewer: $PC_ROSTER"
+else
+  ok "the review record excludes .primary-failed artifacts"
+fi
+if [[ "$PC_ROSTER" == *"attempt1"* || "$PC_ROSTER" == *"agy-failed"* ]]; then
+  bad "the review record counts a retry/failure artifact as a reviewer: $PC_ROSTER"
+else
+  ok "the review record excludes .attempt/.agy-failed artifacts"
+fi
+if [[ "$PC_ROSTER" == *"not-a-reviewer"* ]]; then
+  bad "the review record counts an unknown name as a reviewer: $PC_ROSTER"
+else
+  ok "the review record counts only names present in reviewer_profiles.json"
+fi
+
 echo "── first-party OpenRouter fallback (policy revised 2026-08-22) ──"
 
 # Forced by a round that lost BOTH baselines at once: codex to an OpenAI usage

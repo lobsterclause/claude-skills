@@ -187,6 +187,13 @@ case "$mode" in
     # the wrapper writes $run_dir/raw/<reviewer>.meta.json per reviewer ran.
     roster_line=""
     raw_dir="$(dirname "$findings")/raw"
+    # The set of real reviewer names, from the profile. Empty when jq or the
+    # profile is unavailable, in which case the suffix skips above still apply.
+    known_reviewers=""
+    _kr_profile="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/references/reviewer_profiles.json"
+    if command -v jq >/dev/null 2>&1 && [[ -f "$_kr_profile" ]]; then
+      known_reviewers="$(jq -r 'to_entries[] | select(.value | type == "object") | select(.key | startswith("_") | not) | .key' "$_kr_profile" 2>/dev/null | tr '\n' ' ')"
+    fi
     if [[ -d "$raw_dir" ]]; then
       for m in "$raw_dir"/*.meta.json; do
         [[ -f "$m" ]] || continue
@@ -200,6 +207,19 @@ case "$mode" in
         # "antigravity.attempt1 + antigravity + codex + glm + kimi" — five
         # names for four reviewers.
         [[ "$n" == *.attempt[0-9]* ]] && continue
+        # ...and <slug>.primary-failed.meta.json, left by a first-party lane
+        # that fell back to OpenRouter (2026-08-22). THIRD suffix to hit this
+        # exact bug, so stop enumerating suffixes: a reviewer is a name that
+        # appears in reviewer_profiles.json, and anything else in this
+        # directory is an artifact. That covers whatever the next forensic
+        # suffix turns out to be, without another round of this.
+        [[ "$n" == *.primary-failed ]] && continue
+        if [[ -n "$known_reviewers" ]]; then
+          case " $known_reviewers " in
+            *" $n "*) ;;
+            *) continue ;;
+          esac
+        fi
         roster_line="${roster_line:+$roster_line + }$n"
       done
     fi
