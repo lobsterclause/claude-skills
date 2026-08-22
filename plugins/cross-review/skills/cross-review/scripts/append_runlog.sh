@@ -187,7 +187,12 @@ reviewer_obj() {
   # `succeeded` -- a fallback that itself failed must fall through to the
   # ordinary failure branches, not be recorded as a rescued round. Keying only
   # on `used` scored a lane whose rescue also died as "fallback"; seen live on
-  # PR #66, where kimi's fallback returned rc=5 with 0 bytes. (codex, PR #66.) A first-party
+  # PR #66, where kimi's fallback returned rc=5 with 0 bytes. (codex, PR #66.)
+  # `succeeded` falls back to (exit_code == 0) rather than to false: meta written
+  # by the version before that field existed carries `used` alone, and defaulting
+  # those to false would reclassify an old SUCCESSFUL rescue as a healthy "ok" --
+  # the very misreading this branch exists to prevent, inflicted on the archive.
+  # (codex, PR #66 delta.) A first-party
   # lane that failed and was rescued over OpenRouter writes the FALLBACK run's
   # meta -- exit_code 0, real output -- so it would otherwise classify as "ok"
   # and the dead primary would look perfectly healthy forever, which is exactly
@@ -196,7 +201,7 @@ reviewer_obj() {
   # while the findings still earn their normal value credit.
   jq -c '. + {status: (if .timed_out == true then "timed_out"
                        elif (.fallback.used // false) == true
-                            and (.fallback.succeeded // false) == true then "fallback"
+                            and (.fallback.succeeded // (.exit_code == 0)) == true then "fallback"
                        elif .failure_kind == "quota_exhausted" then "quota"
                        elif .failure_kind == "headless_permission_denied" then "permission_denied"
                        elif .failure_kind == "degenerate_output" then "degenerate"

@@ -2358,6 +2358,28 @@ assert_eq "review prose containing 401/403/429/authentication is NOT eligible" "
 printf 'openrouter API error: HTTP 429 Too Many Requests\n' >"$FBT/grok.stdout"
 assert_eq "a real HTTP 429 is eligible" "$(fbe grok 1)" "rate_limited"
 
+# TOKEN ANCHORING -- second defect of this class on this matcher. The first
+# rewrite required only that an HTTP-ish prefix and the digits appear on the
+# same line with optional separators, so a status code could be lifted out of a
+# LONGER number. All four of these were demonstrated eligible before the fix.
+# (kimi High, PR #66 delta round.)
+fbe_no() {  # $1=label $2=text -- must NOT be eligible
+  printf '%s\n' "$2" >"$FBT/anch.stdout"
+  local r; r="$(bash "$FBE" --name anch --rc 1 --out "$FBT" 2>/dev/null)"
+  if [[ -z "$r" ]]; then ok "not an account wall: $1"; else bad "false positive ($r) on: $1"; fi
+}
+fbe_no "a 429 lifted out of 4290ms"      'request status: 4290ms elapsed'
+fbe_no "a 403 lifted out of 4031 bytes"  'wrote http 4031 bytes to disk'
+fbe_no "a 429 lifted out of 4295 items"  'error code: 4295 items processed'
+fbe_no "'accountability suspended'"      'the accountability suspended clause'
+# and the anchored forms still match
+printf 'state=account.suspended\n' >"$FBT/anch2.stdout"
+assert_eq "a dot-separated account.suspended still matches" \
+  "$(bash "$FBE" --name anch2 --rc 1 --out "$FBT" 2>/dev/null)" "account_limit"
+printf 'HTTP 401 Unauthorized\n' >"$FBT/anch3.stdout"
+assert_eq "a real 401 still matches" \
+  "$(bash "$FBE" --name anch3 --rc 1 --out "$FBT" 2>/dev/null)" "auth_failed"
+
 # A misconfigured kimi alias must fail LOUDLY, not become a silent recurring
 # paid OpenRouter run. (glm, PR #66.)
 printf 'LLM not set\n' >"$FBT/kimi2.stdout"
@@ -2401,6 +2423,29 @@ assert_eq "a rescue that ITSELF failed records as 'failed', not 'fallback'" \
   "$(jq -r '.reviewers.kimi.status' "$FBLOG" 2>/dev/null)" "failed"
 assert_eq "an ordinary clean lane is still 'ok'" \
   "$(jq -r '.reviewers.kat.status' "$FBLOG" 2>/dev/null)" "ok"
+# LEGACY metadata: meta written before `succeeded` existed carries `used` alone.
+# Defaulting those to false would reclassify an old SUCCESSFUL rescue as a
+# healthy "ok" -- the exact misreading this branch prevents, inflicted on the
+# archive instead. So `succeeded` falls back to (exit_code == 0).
+# (codex Medium, PR #66 delta round.)
+cat >"$FBDIR/raw/glm.meta.json" <<'JSON'
+{"exit_code": 0, "duration_s": 9, "timed_out": false, "output_bytes": 276,
+ "attempt": 1, "timeout_budget_s": 600, "model": "openai/gpt-5.6-sol",
+ "cli": "openrouter", "fallback": {"used": true, "reason": "account_limit"}}
+JSON
+cat >"$FBDIR/raw/qwen.meta.json" <<'JSON'
+{"exit_code": 5, "duration_s": 2, "timed_out": false, "output_bytes": 0,
+ "attempt": 1, "timeout_budget_s": 600, "model": "openai/gpt-5.6-sol",
+ "cli": "openrouter", "fallback": {"used": true, "reason": "account_limit"}}
+JSON
+FBLOG2="$T/fb-runlog-legacy.jsonl"
+CROSS_REVIEW_RUNLOG="$FBLOG2" bash "$S/append_runlog.sh" --run-dir "$FBDIR" \
+  --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 \
+  --top "-" --notes "fixture" >/dev/null 2>&1
+assert_eq "legacy fallback meta with no 'succeeded' but rc=0 stays 'fallback'" \
+  "$(jq -r '.reviewers.glm.status' "$FBLOG2" 2>/dev/null)" "fallback"
+assert_eq "legacy fallback meta with no 'succeeded' and rc!=0 is 'failed'" \
+  "$(jq -r '.reviewers.qwen.status' "$FBLOG2" 2>/dev/null)" "failed"
 
 # 6. and leaderboard.sh must actually SEE it. The previous version of this
 #    assertion re-queried the runlog for .status=="ok" -- re-testing the

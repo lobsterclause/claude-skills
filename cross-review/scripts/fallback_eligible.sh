@@ -57,13 +57,21 @@ done
 # repo's own files match them. So every numeric code now requires an HTTP-error
 # context, and bare "authentication"/"unauthorized" are gone.
 # (glm High + codex Medium, convergent, PR #66.)
-if grep -Eqi 'usage limit|insufficient balance|account[^.]{0,40}suspended|exceeded_current_quota|quota exceeded' <<<"$blob"; then
+# TOKEN-ANCHORED. The first rewrite required only that an HTTP-ish prefix and
+# the digits appear on the same line with optional separators -- which still
+# matched "request status: 4290ms elapsed" (429 taken from inside 4290),
+# "wrote http 4031 bytes", and "error code: 4295 items". All four were
+# demonstrated live. So: at least one separator, and the code must not be
+# followed by another digit. Likewise "account" needs a boundary on BOTH sides
+# or "the accountability suspended clause" reads as a suspended account.
+# (kimi High, PR #66 delta -- second defect of this class on this matcher.)
+if grep -Eqi 'usage limit|insufficient balance|(^|[^[:alnum:]])account([^[:alnum:]].{0,40})?suspend|exceeded_current_quota|quota exceeded' <<<"$blob"; then
   echo "account_limit"; exit 0
 fi
-if grep -Eqi '(error code|http|status( code)?)[[:space:]:]*429|429 too many requests' <<<"$blob"; then
+if grep -Eqi '(error code|http|status( code)?)[[:space:]:]+429([^0-9]|$)|429 too many requests' <<<"$blob"; then
   echo "rate_limited"; exit 0
 fi
-if grep -Eqi '(error code|http|status( code)?)[[:space:]:]*40[13]|401 unauthorized|403 forbidden|authentication failed|invalid[[:space:]_-]*api[[:space:]_-]*key' <<<"$blob"; then
+if grep -Eqi '(error code|http|status( code)?)[[:space:]:]+40[13]([^0-9]|$)|401 unauthorized|403 forbidden|authentication failed|invalid[[:space:]_-]*api[[:space:]_-]*key' <<<"$blob"; then
   echo "auth_failed"; exit 0
 fi
 
