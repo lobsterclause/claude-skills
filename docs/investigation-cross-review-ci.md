@@ -229,3 +229,21 @@ Refuted with evidence (see the PR comment): gemini-pro's `test(…; "m")` claim 
 Oniguruma MULTI_LINE (`.` matches newline) and does **not** line-anchor `^`, so `^` is
 string-anchored and the "comment starts with the marker" contract is intact; kimi's two Mediums;
 deepseek's null-`contains` Medium (GitHub `&&` short-circuits).
+
+### Resolution (head 56ae9ff)
+
+All three P1s fixed, plus gemini-pro's base-resolution gap:
+
+- privileged job moved to `pull_request_target` (base-branch workflow definition), with the
+  never-run-PR-code property asserted in the harness so it cannot silently invert
+- `fetch_comments` resolves real repository permission per distinct author; `currency_verdict`
+  requires admin/write/maintain via one shared jq `trusted()` definition. OWNER short-circuits.
+- unreadable permission → waved through with `(standing unverified)` in the status, overridable
+  with `CR_PERMISSION_UNREADABLE=refuse`. Both behaviours tested.
+- base commit resolved by API on `issue_comment` instead of guessing the default branch, with a
+  40-hex guard so an unresolved base fails closed
+
+ci harness 143 → 174 cases, all mutation-checked. Full suite 321/321.
+
+**The posted review record is stamped `7a80204` and the head is now `56ae9ff`** — by the gate's own
+rule this PR is not currently reviewed. A pass 3 is required before merge.
