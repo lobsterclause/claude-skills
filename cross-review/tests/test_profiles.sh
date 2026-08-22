@@ -69,8 +69,20 @@ echo "── kimi3.draw_boost RETIRED 2026-08-22 (bring-up complete, per Gabriel
 # inverted rather than deleted -- the retirement itself is the thing worth
 # pinning, exactly as kimi27's was on 2026-07-12. Both Moonshot rotation
 # seats are back to 1.0.
-assert_eq "kimi3.draw_boost == 1.0 (retired after bring-up)" "$(jq -r '.kimi3.draw_boost' "$PROFILES")" "1.0"
-assert_eq "kimi27.draw_boost == 1.0 (retired 2026-07-12)" "$(jq -r '.kimi27.draw_boost' "$PROFILES")" "1.0"
+# Compared NUMERICALLY, not as a string. antigravity called this a High on the
+# grounds that `jq -r` renders 1.0 as "1" -- falsified here (jq 1.7 preserves
+# the literal, and the suite is green), but it WAS true of jq 1.6, so a string
+# compare is a real cross-version trap even though the reported bug is not.
+if jq -e '.kimi3.draw_boost == 1.0' "$PROFILES" >/dev/null 2>&1; then
+  ok "kimi3.draw_boost == 1.0 (retired after bring-up)"
+else
+  bad "kimi3.draw_boost is $(jq -r '.kimi3.draw_boost' "$PROFILES"), want 1.0"
+fi
+if jq -e '.kimi27.draw_boost == 1.0' "$PROFILES" >/dev/null 2>&1; then
+  ok "kimi27.draw_boost == 1.0 (retired 2026-07-12)"
+else
+  bad "kimi27.draw_boost is $(jq -r '.kimi27.draw_boost' "$PROFILES"), want 1.0"
+fi
 
 echo "── the five disproven-heavy tail seats each carry a bench_note ──"
 for seat in north laguna devstral qwen mimo; do

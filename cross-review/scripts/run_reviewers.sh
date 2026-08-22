@@ -1041,9 +1041,15 @@ $json_findings_suffix"
   local rf_args=()
   if [[ "$want_json" == "true" ]]; then
     rf_args=(--argjson rf '{"type":"json_object"}')
-  else
+  elif [[ "$want_json" == "false" ]]; then
     rf_args=(--argjson rf 'null')
     echo "$slug: response_format omitted (profile says this model rejects json_object)" >&2
+  else
+    # Anything that is neither true nor false is a typo, not an opt-out. Silently
+    # treating it as one would drop the JSON contract for a seat whose author
+    # thought they had enabled it. (kimi, PR #64 delta round.)
+    rf_args=(--argjson rf '{"type":"json_object"}')
+    echo "WARN: $slug: supports_json_object is '$want_json' (expected true/false) — treating as true" >&2
   fi
   if [[ "$cli" == "openrouter" ]]; then
     jq -n --rawfile p "$prompt_tmp" --arg m "$model" "${rf_args[@]}" \
