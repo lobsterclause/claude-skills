@@ -240,7 +240,7 @@ if [[ "$N_R1" -ge 3 ]]; then ok "roster ≥3 ($N_R1)"; else bad "roster <3 ($R1)
 # must redraw unfiltered and keep the floor]
 SLOWLOG="$T/slow-runlog.jsonl"
 jq -nc '{ts:"2026-07-01T05:00:00Z", reviewers: (
-  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","qwen","devstral","laguna","kat","north","nemotron","spark","kimi27","kimi3"]
+  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","qwen","devstral","laguna","kat","north","nemotron","spark","seed","grok","kimi27","kimi3"]
   | map({key: ., value: {status:"ok", exit_code:0, duration_s:5000, output_bytes:10, timeout_budget_s:600}}) | from_entries)}' >"$SLOWLOG"
 FAST_ERR="$T/fast.err"
 RF="$(CROSS_REVIEW_RUNLOG="$SLOWLOG" bash "$S/select_roster.sh" --seed 7 --fast 2>"$FAST_ERR")"
@@ -391,25 +391,28 @@ assert_eq "second attempt recorded" "$(jq -r '.attempt' "$T/o7/glm.meta.json")" 
 rm -f "$T/bin/curl" "$T/curl_calls"
 
 # leaderboard: avg_cost_usd aggregates; roster draw halves a $0.50 reviewer
+# NOTE: both seats here MUST have no draw_boost in reviewer_profiles.json, or
+# the boost multiplier swamps the cost divisor this asserts. deepseek was the
+# control until it took a 2.5 boost on 2026-08-14; minimax replaced it.
 COSTLOG="$T/cost-runlog.jsonl"
 cat >"$COSTLOG" <<'EOF'
-{"ts":"2026-07-03T01:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0.5},"deepseek":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0}}}
-{"ts":"2026-07-03T02:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0.5},"deepseek":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0}}}
+{"ts":"2026-07-03T01:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0.5},"minimax":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0}}}
+{"ts":"2026-07-03T02:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0.5},"minimax":{"status":"ok","exit_code":0,"duration_s":50,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0}}}
 EOF
 CLB="$(CROSS_REVIEW_RUNLOG="$COSTLOG" bash "$S/leaderboard.sh" --mode json)"
 assert_eq "leaderboard aggregates avg_cost_usd" \
   "$(jq -r '.[] | select(.reviewer=="glm") | .avg_cost_usd' <<<"$CLB")" "0.5"
 assert_eq "zero-cost reviewer stays 0" \
-  "$(jq -r '.[] | select(.reviewer=="deepseek") | .avg_cost_usd' <<<"$CLB")" "0"
+  "$(jq -r '.[] | select(.reviewer=="minimax") | .avg_cost_usd' <<<"$CLB")" "0"
 # identical twins except cost: expensive one draws at half weight
 CAND="$(CROSS_REVIEW_RUNLOG="$COSTLOG" bash "$S/select_roster.sh" --seed 5 2>&1 >/dev/null | grep '^  candidate')"
 W_GLM="$(printf '%s\n' "$CAND" | awk '$2=="glm" {sub(/weight=/,"",$NF); print $NF}')"
-W_DS="$(printf '%s\n' "$CAND" | awk '$2=="deepseek" {sub(/weight=/,"",$NF); print $NF}')"
+W_MM="$(printf '%s\n' "$CAND" | awk '$2=="minimax" {sub(/weight=/,"",$NF); print $NF}')"
 assert_contains "candidate line surfaces cost" "$CAND" 'cost=$'
-if [ -n "$W_GLM" ] && [ -n "$W_DS" ] && awk -v g="$W_GLM" -v d="$W_DS" 'BEGIN{exit !(g*1.9 < d*1.1 && g*2.1 > d*0.9)}'; then
-  ok "\$0.50/run reviewer draws at ~half weight ($W_GLM vs $W_DS)"
+if [ -n "$W_GLM" ] && [ -n "$W_MM" ] && awk -v g="$W_GLM" -v d="$W_MM" 'BEGIN{exit !(g*1.9 < d*1.1 && g*2.1 > d*0.9)}'; then
+  ok "\$0.50/run reviewer draws at ~half weight ($W_GLM vs $W_MM)"
 else
-  bad "cost divisor not applied in draw weight (glm=$W_GLM deepseek=$W_DS)"
+  bad "cost divisor not applied in draw weight (glm=$W_GLM minimax=$W_MM)"
 fi
 # [pin: PR #28 pass 2 (codex) — a zero/garbage COST_PIVOT_USD must not
 # divide-by-zero the draw or shrink the roster below the floor]
@@ -906,11 +909,13 @@ BOOST_ERR="$T/boost.err"
 CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR"
 assert_contains "selector draws kimi27 as a candidate" "$(cat "$BOOST_ERR")" "kimi27"
 # rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0;
-# draw_boost retired to 1.0 → 75.0, identical to an unboosted rookie (nemotron).
+# draw_boost retired to 1.0 → 75.0, identical to an unboosted rookie (spark).
+# The control seat must carry NO draw_boost; nemotron held this role until it
+# took a 2.5 boost on 2026-08-14.
 assert_contains "kimi27 weight reflects the retired (1.0) draw_boost" \
   "$(grep 'kimi27' "$BOOST_ERR")" "weight=75.0"
 assert_contains "unboosted rookie weight unchanged" \
-  "$(grep 'nemotron' "$BOOST_ERR")" "weight=75.0"
+  "$(grep 'spark' "$BOOST_ERR")" "weight=75.0"
 # no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
 MOONSHOT_API_KEY= bash "$S/run_reviewers.sh" --base main --out "$T/o11" --reviewers kimi27 >/dev/null 2>"$T/k27skip.err"
 assert_eq "kimi27 without a key exits 1 (all requested reviewers failed)" "$?" "1"
@@ -1454,6 +1459,68 @@ pc_run '{"headRefOid":"399df23d4d5945162d0c5ed623484d608337165d","state":"MERGED
   --head-sha 399df23d4d5945162d0c5ed623484d608337165d
 assert_contains "merged-before-review is flagged" "$(cat "$CR_TEST_CAPTURE")" "already merged before the review finished"
 
+# ── post_comment derives the pass number from the PR ──
+# `pass` defaulted to 1 with nothing computing it, so a caller that omitted
+# --pass stamped pass=1 on every round. kindred-mama-ai#3399's second round
+# posted a comment headed "pass 1" carrying `pass=1`, while its own body said
+# "pass 2" — the model-written prose was right and both machine-readable
+# fields were wrong, which is the wrong way round for a field a gate reads.
+#
+# This stub runs the --jq filter for real rather than returning a canned
+# answer. The filter is the part that can be wrong, and a stub that returns
+# the number directly would pass against any filter at all.
+cat >"$T/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "pr view")
+      jqf=""
+      while [ $# -gt 0 ]; do [ "$1" = "--jq" ] && jqf="$2"; shift; done
+      if [ -n "$jqf" ]; then printf '%s\n' "${CR_TEST_PR_JSON:-}" | jq -r "$jqf"; else
+        printf '%s\n' "${CR_TEST_PR_JSON:-}"; fi
+      exit 0 ;;
+  "pr comment")
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--body-file" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
+        shift
+      done
+      exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/gh"
+
+PC_SHA=27ea01d42096c729c4afcc2d65f3e67503c0234f
+pc_json() {  # $@ = prior pass numbers already stamped on the PR
+  local c=""
+  for n in "$@"; do
+    c="${c:+$c,}{\"body\":\"<!-- cross-review: sha=$PC_SHA pass=$n -->\"}"
+  done
+  printf '{"headRefOid":"%s","state":"OPEN","comments":[%s]}' "$PC_SHA" "$c"
+}
+
+# 3. No prior record → this is pass 1.
+pc_run "$(pc_json)" --head-sha "$PC_SHA"
+assert_contains "first pass heads 1"  "$(cat "$CR_TEST_CAPTURE")" "## Cross-review — pass 1"
+assert_contains "first pass marks 1"  "$(cat "$CR_TEST_CAPTURE")" "sha=$PC_SHA pass=1 -->"
+
+# 4. Two rounds already posted → this is pass 3, in BOTH the heading and the
+#    marker. Asserting only the heading would pass while the gate-read field
+#    stayed wrong, which is exactly the bug.
+pc_run "$(pc_json 1 2)" --head-sha "$PC_SHA"
+assert_contains "third pass heads 3" "$(cat "$CR_TEST_CAPTURE")" "## Cross-review — pass 3"
+assert_contains "third pass marks 3" "$(cat "$CR_TEST_CAPTURE")" "sha=$PC_SHA pass=3 -->"
+
+# 5. An explicit --pass still wins. Reconciliation re-posts a past round and
+#    must be able to say which one it was.
+pc_run "$(pc_json 1 2)" --head-sha "$PC_SHA" --pass 7
+assert_contains "explicit --pass overrides" "$(cat "$CR_TEST_CAPTURE")" "sha=$PC_SHA pass=7 -->"
+
+# 6. Unreadable PR → fall back to 1 rather than refusing to post. A wrong pass
+#    number must never cost the user a posted review.
+pc_run 'not json at all' --head-sha "$PC_SHA"
+assert_contains "unreadable pr still posts" "$(cat "$CR_TEST_CAPTURE")" "sha=$PC_SHA pass=1 -->"
+
 # ── post_comment records the posting outcome ──
 # Six real reviews (kindred-mama-ai #3214/#3252/#3264/#3269/#3276/#3280) left
 # 68-676KB of reviewer output and nothing on GitHub. Nothing on disk said whether
@@ -1556,9 +1623,26 @@ fi
 pc_run '' --head-sha 399df23d4d5945162d0c5ed623484d608337165d
 assert_contains "posts anyway when PR metadata is unavailable" "$(cat "$CR_TEST_CAPTURE")" "nothing to report"
 
-# 5. Backwards compatible: no --head-sha at all still posts.
-pc_run '{"headRefOid":"abc","state":"OPEN"}'
-assert_contains "still posts without --head-sha" "$(cat "$CR_TEST_CAPTURE")" "nothing to report"
+# 5. No --head-sha REFUSES to post (dc68990). This test used to assert the
+#    opposite -- "backwards compatible: no --head-sha at all still posts" --
+#    which is precisely the behaviour that commit removed on purpose: an
+#    unstamped comment is a review record that cannot say which commit it
+#    covered, and half the sampled comments on 2026-08-14 were exactly that.
+#    Inverted rather than deleted, so the refusal itself stays pinned.
+: >"$CR_TEST_CAPTURE"; rm -f "$T/posted.json"
+CR_TEST_PR_JSON='{"headRefOid":"abc","state":"OPEN"}' \
+  bash "$SKILL_DIR/scripts/post_comment.sh" \
+  --pr 3207 --mode summary --findings "$PC_FIND" >/dev/null 2>&1
+PC_RC=$?
+assert_eq "no --head-sha exits 2 rather than posting" "$PC_RC" "2"
+if [[ -s "$CR_TEST_CAPTURE" ]]; then
+  bad "no --head-sha still reached gh pr comment"
+else
+  ok "no --head-sha posts nothing to the PR"
+fi
+assert_eq "and the refusal is recorded as its own reason" \
+  "$(jq -r '.reason' "$T/posted.json" 2>/dev/null)" "no-head-sha"
+assert_eq "and posted=false" "$(jq -r '.posted' "$T/posted.json" 2>/dev/null)" "false"
 
 # 6. The roster line is derived from raw/*.meta.json, and a retried agy lap
 #    leaves BOTH <slug>.meta.json and <slug>.attempt<N>.meta.json behind.
@@ -1570,7 +1654,10 @@ mkdir -p "$(dirname "$PC_FIND")/raw"
 : >"$(dirname "$PC_FIND")/raw/antigravity.attempt1.meta.json"
 : >"$(dirname "$PC_FIND")/raw/codex.meta.json"
 : >"$(dirname "$PC_FIND")/raw/gemini-pro.agy-failed.meta.json"
-pc_run '{"headRefOid":"abc","state":"OPEN"}'
+# --head-sha is mandatory since dc68990; without it this run exits 2 and
+# captures nothing, and the two controls below fail on an empty roster line.
+pc_run '{"headRefOid":"abc","state":"OPEN"}' \
+  --head-sha 399df23d4d5945162d0c5ed623484d608337165d
 # Grab the whole line. A `[^.]*` capture stops at the dot INSIDE
 # "antigravity.attempt1", so it can never contain the string the assertion
 # below looks for — it passed with the exclusion removed.
