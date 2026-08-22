@@ -4,10 +4,9 @@
 # CLIs, no tokens.
 #
 # Mirrors run_tests.sh's fixture/assertion conventions (assert_eq/assert_contains,
-# mktemp -d + trap cleanup, real git repos under $T) but is intentionally NOT
-# wired into run_tests.sh — the parent orchestrating session wires it in later
-# (collision avoidance; see tests/test_digest.sh / tests/test_profiles.sh for
-# the same pattern).
+# mktemp -d + trap cleanup, real git repos under $T) and is wired into
+# run_tests.sh's standalone-suite loop (see tests/test_digest.sh /
+# tests/test_profiles.sh for the same pattern).
 #
 # Why this exists: worktree.sh's secret_pattern only matched CHANGED FILE
 # PATHS (.env, .pem, credentials, id_rsa, ...). A hardcoded API key literal
@@ -109,6 +108,80 @@ assert_eq "warn_secrets=false for an ordinary diff" \
   "$(jq -r '.warn_secrets' <<<"$OUT3")" "false"
 CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end \
   --worktree "$(jq -r '.worktree' <<<"$OUT3")" >/dev/null 2>&1 || true
+
+# ── regression: a secret being REMOVED (rotated out) lives only on the `-`
+# side of the diff. The scan used to only awk-extract `+` lines, so deleting
+# a hardcoded key shipped the plaintext key to third-party reviewers
+# unredacted with zero warning. (cross-review PR #57 finding.)
+REPO4="$T/repo4"; mkdir -p "$REPO4"
+( cd "$REPO4"
+  git init -q -b main 2>/dev/null || git init -q
+  printf 'const token = "sk-ant-abcdefghijklmnopqrstuvwxyz1234";\n' >secrets.ts
+  git add .
+  git -c user.email=t@t -c user.name=t commit -qm init
+  git checkout -qb feat
+  printf '// key rotated out, see vault\n' >secrets.ts
+  git add .
+  git -c user.email=t@t -c user.name=t commit -qm 'remove old key' )
+
+echo "── content scan flags a secret-shaped literal that only exists on the removed (-) side ──"
+OUT4="$( cd "$REPO4" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$RUNROOT" \
+  bash "$S/worktree.sh" start --ref HEAD --id content-removed --base main 2>/dev/null )"
+assert_eq "warn_secrets=true for a sk-... literal only on the deleted side" \
+  "$(jq -r '.warn_secrets' <<<"$OUT4")" "true"
+assert_contains "risky_files names secrets.ts even though the key line was only removed" \
+  "$(jq -r '.risky_files' <<<"$OUT4")" "secrets.ts"
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end \
+  --worktree "$(jq -r '.worktree' <<<"$OUT4")" >/dev/null 2>&1 || true
+
+# ── regression: an all-caps API_KEY marker, and a hyphenated sk-proj-style
+# key, both used to slip past the case-sensitive/no-hyphen pattern.
+# (cross-review PR #57 finding.)
+REPO5="$T/repo5"; mkdir -p "$REPO5"
+( cd "$REPO5"
+  git init -q -b main 2>/dev/null || git init -q
+  printf 'export const APP_NAME = "demo";\n' >env.ts
+  git add .
+  git -c user.email=t@t -c user.name=t commit -qm init
+  git checkout -qb feat
+  printf 'export const APP_NAME = "demo";\nconst API_KEY = "somesecretvalue1234567890";\nconst other = "sk-proj-abcdefghijklmnopqrstuvwxyz";\n' >env.ts
+  git add .
+  git -c user.email=t@t -c user.name=t commit -qm 'add caps API_KEY and hyphenated sk- key' )
+
+echo "── content scan flags all-caps API_KEY and hyphenated sk-proj-... keys ──"
+OUT5="$( cd "$REPO5" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$RUNROOT" \
+  bash "$S/worktree.sh" start --ref HEAD --id content-caps --base main 2>/dev/null )"
+assert_eq "warn_secrets=true for all-caps API_KEY / hyphenated sk-proj- literal" \
+  "$(jq -r '.warn_secrets' <<<"$OUT5")" "true"
+assert_contains "risky_files names env.ts" \
+  "$(jq -r '.risky_files' <<<"$OUT5")" "env.ts"
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end \
+  --worktree "$(jq -r '.worktree' <<<"$OUT5")" >/dev/null 2>&1 || true
+
+# ── regression: a rename (git mv) with an edit that adds a secret used to be
+# excluded entirely by --diff-filter=ACM (no R), skipping the content scan
+# for the whole file. (cross-review PR #57 finding.)
+REPO6="$T/repo6"; mkdir -p "$REPO6"
+( cd "$REPO6"
+  git init -q -b main 2>/dev/null || git init -q
+  printf 'export const APP_NAME = "demo";\n' >old-name.ts
+  git add .
+  git -c user.email=t@t -c user.name=t commit -qm init
+  git checkout -qb feat
+  git mv old-name.ts new-name.ts
+  printf 'export const APP_NAME = "demo";\nconst apiKey = "sk-abcdEFGH12345678901234";\n' >new-name.ts
+  git add .
+  git -c user.email=t@t -c user.name=t commit -qm 'rename and add key' )
+
+echo "── content scan still flags a secret added in a rename+edit (diff-filter includes R) ──"
+OUT6="$( cd "$REPO6" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$RUNROOT" \
+  bash "$S/worktree.sh" start --ref HEAD --id content-rename --base main 2>/dev/null )"
+assert_eq "warn_secrets=true for a key added alongside a git mv rename" \
+  "$(jq -r '.warn_secrets' <<<"$OUT6")" "true"
+assert_contains "risky_files names the renamed file" \
+  "$(jq -r '.risky_files' <<<"$OUT6")" "new-name.ts"
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end \
+  --worktree "$(jq -r '.worktree' <<<"$OUT6")" >/dev/null 2>&1 || true
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

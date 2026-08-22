@@ -197,18 +197,27 @@ case "$cmd" in
     # skip the content scan entirely on diffs so large the size warning has
     # already fired, so a pathological diff can't make this scan slow.
     if [[ "$size_lines" -le 20000 ]]; then
-      content_secret_pattern='AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}|[Aa]pi[_-]?[Kk]ey[[:space:]]*[:=][[:space:]]*['"'"'"][A-Za-z0-9/+=_-]{16,}['"'"'"]'
-      # -z/--diff-filter=ACM excludes deletions and renames-only so we scan
-      # what's actually landing, not what's leaving. --no-color and -U0 keep
-      # the grep below cheap and free of ANSI noise. Binary files are skipped
-      # by git diff itself (it emits "Binary files ... differ", not content).
-      content_hits=$(git -C "$worktree" diff --no-color -U0 --diff-filter=ACM "$base"...HEAD 2>/dev/null \
+      content_secret_pattern='AKIA[0-9A-Z]{16}|[Ss][Kk]-[A-Za-z0-9_-]{20,}|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]]*[:=][[:space:]]*['"'"'"][A-Za-z0-9/+=_-]{16,}['"'"'"]'
+      # --diff-filter=ACMR includes renames (a `git mv` + edit can still add a
+      # secret in the same change; excluding R let it skip the file's content
+      # scan entirely). --no-color and -U0 keep the grep below cheap and free
+      # of ANSI noise. Binary files are skipped by git diff itself (it emits
+      # "Binary files ... differ", not content).
+      #
+      # Both added (`+`) AND removed (`-`) line content are scanned: a secret
+      # being *rotated out* (e.g. deleting a hardcoded key) exists only on the
+      # `-` side of the diff and would otherwise ship unredacted to third-party
+      # reviewer APIs. The `---`/`+++` file-header lines are excluded so they
+      # aren't mistaken for content.
+      content_hits=$(git -C "$worktree" diff --no-color -U0 --diff-filter=ACMR "$base"...HEAD 2>/dev/null \
         | awk '
             /^diff --git / { file=""; next }
             /^\+\+\+ / {
               f=$0; sub(/^\+\+\+ [ab]\//, "", f); if (f != "/dev/null") file=f; next
             }
+            /^--- / { next }
             /^\+/ && !/^\+\+\+/ { print file "\t" $0 }
+            /^-/ && !/^--- / { print file "\t" $0 }
           ' \
         | grep -E "$content_secret_pattern" \
         | cut -f1 \
