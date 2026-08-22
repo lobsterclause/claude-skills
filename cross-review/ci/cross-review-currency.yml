@@ -69,12 +69,44 @@
 name: Cross-Review Currency
 
 on:
-  pull_request:
+  # WHY THE PRIVILEGED HALF RUNS ON pull_request_target.
+  #
+  # On `pull_request`, GitHub runs THE PR'S VERSION OF THIS FILE. Pinning
+  # `actions/checkout` to the base — which this workflow also does — stops a PR
+  # supplying the SCRIPT that grades it, and stops nothing else: the same PR can
+  # delete that pin, or drop the script entirely and POST
+  # `cross-review/current=success` straight to the API with the `statuses:
+  # write` token this job holds. A gate whose own definition the candidate
+  # supplies is not a gate. `pull_request_target` is the only PR trigger whose
+  # workflow definition is resolved from the BASE branch, so it is the only one
+  # under which a privileged job means anything.
+  #
+  # It also fixes forks. `pull_request` hands fork and Dependabot PRs a
+  # read-only token no matter what `permissions:` asks for, so the status POST
+  # 403s — and since a failed POST is now exit 2 rather than a warning, that is
+  # a red job on every fork PR. `pull_request_target` runs in the base context
+  # with a real token.
+  #
+  # pull_request_target IS A FOOTGUN, and the reason it is safe here is narrow
+  # and must stay true: THIS WORKFLOW NEVER CHECKS OUT OR EXECUTES PR CODE.
+  # The privileged job checks out the base and runs the base's script; the PR's
+  # own test suite runs in the `self-test` job below, under plain
+  # `pull_request`, with `contents: read` and nothing else. If you ever find
+  # yourself adding a PR-ref checkout, a `npm install`, or a build step to the
+  # `currency` job, you have re-opened everything this file argues about.
+  pull_request_target:
     # `labeled` / `unlabeled` are here for the escape hatch. Without them a
     # human could apply `cross-review-exempt` and watch the check stay red
     # forever, with an empty commit as the only way out — the label containment
     # would never fire.
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  # The UNPRIVILEGED half. `self-test` runs the PR's own harness against the
+  # PR's own code, which is the point of it, so it needs the PR-code trigger —
+  # and must never appear under pull_request_target. No `labeled`/`unlabeled`
+  # here: a label does not change the code the harness tests, and a run whose
+  # only job is skipped still costs a scheduling round trip.
+  pull_request:
+    types: [opened, synchronize, reopened]
   # `deleted` is here because the status this workflow writes outlives the
   # comment it was computed from. A PR goes green because a cross-review record
   # exists, or because an exemption justification exists; someone deletes that
@@ -198,7 +230,7 @@ jobs:
     # cross-review record, or an exemption justification. Everything else skips
     # here and costs nothing.
     if: >-
-      github.event_name == 'pull_request' ||
+      github.event_name == 'pull_request_target' ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        (github.event.action != 'deleted' ||
         contains(github.event.comment.body, '## Cross-review') ||
@@ -240,17 +272,47 @@ jobs:
       # exists because the honour system does not bind, and a gate whose own
       # source the candidate supplies is back on the honour system.
       #
-      # So check out the BASE — code that is already merged and reviewed. On
-      # `pull_request` that is the merge base in the payload; on
-      # `issue_comment` the payload carries no base ref, so fall back to the
-      # default branch. The script needs nothing from the PR: it reads PR
-      # state through the API and is passed the head sha explicitly.
+      # So check out the BASE — code that is already merged and reviewed. The
+      # script needs nothing from the PR: it reads PR state through the API and
+      # is passed the head sha explicitly.
       #
+      # RESOLVED, NOT GUESSED. `pull_request_target` carries the base sha in the
+      # payload; `issue_comment` does not, and the first cut of this fell back
+      # to the repository's DEFAULT branch. That is wrong for any PR targeting
+      # something else — a release line, a long-lived integration branch — and
+      # it fails outright if the gate is installed on that branch and not on the
+      # default one. One API call resolves it exactly. Flagged by gemini-pro in
+      # cross-review of PR #63.
+      #
+      # This step runs BEFORE the checkout, so it executes no repository code at
+      # all — which is what makes it safe to run first in a privileged job.
+      - name: Resolve the base commit to grade from
+        id: base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          sha="${PR_BASE_SHA:-}"
+          if [[ -z "$sha" ]]; then
+            sha="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
+          fi
+          # Fail closed on anything that is not a commit id. An unresolved base
+          # must never degrade into checking out whatever ref happens to be
+          # named by a malformed API response.
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "cross-review currency: could not resolve the base commit for PR $PR" >&2
+            echo "  got: '${sha}'" >&2
+            exit 2
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       # `persist-credentials: false` because nothing here pushes, and the
       # token this job holds is the one worth not leaving in .git/config.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          ref: ${{ steps.base.outputs.sha }}
           persist-credentials: false
 
       # BOOTSTRAP: on the PR that installs this gate, the base has no script

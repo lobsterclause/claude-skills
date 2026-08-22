@@ -201,3 +201,31 @@ Should `crv` live in this repo (skill-adjacent, versioned with
 and keeps the profile JSON as the one roster source of truth; standalone is
 what you need if a third caller (another repo's workflow) ever appears. Default
 to skill-adjacent until a third caller exists.
+
+---
+
+## Pass 2 of cross-review on PR #63 (2026-08-22, head 7a80204)
+
+Roster codex / kimi / deepseek / gemini-pro (four providers; kimi27 drawn but failed twice).
+Full write-up posted to the PR: https://github.com/lobsterclause/claude-skills/pull/63#issuecomment-5382066275
+Run artifacts: `/Users/gabrielphoenix/.cross-review/runs/claude-skills-pr-63-pass2-20260822T134221-16245`
+
+Three P1s from codex, one of them convergent with gemini-pro. They share a root:
+
+1. **The workflow YAML itself comes from the PR on `pull_request`.** Pinning `actions/checkout`
+   to the base — pass 1's fix — stops a PR editing the *script*, not a PR editing the *workflow*
+   to drop the pin or POST the status directly. Only `pull_request_target` resolves its
+   definition from the base branch.
+2. **`author_association` is not repository permission.** `MEMBER` = org membership, not repo
+   write; `COLLABORATOR` includes read/triage. The Critical fix that opened pass 1 is therefore
+   weaker than its own comment claims on any org repo.
+3. **Fork PRs get a read-only token**, so the status POST 403s and — since pass 1 made a failed
+   POST exit 2 — the job now goes red on every fork PR. A regression pass 1 introduced.
+
+Blocked on a maintainer decision: (1) and (3) both want `pull_request_target`, which is a
+trust-model change with its own footguns, and (2) changes what "trusted" means.
+
+Refuted with evidence (see the PR comment): gemini-pro's `test(…; "m")` claim — jq's `"m"` sets
+Oniguruma MULTI_LINE (`.` matches newline) and does **not** line-anchor `^`, so `^` is
+string-anchored and the "comment starts with the marker" contract is intact; kimi's two Mediums;
+deepseek's null-`contains` Medium (GitHub `&&` short-circuits).

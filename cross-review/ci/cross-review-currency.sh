@@ -180,6 +180,39 @@ CR_STAMP_RE='Reviewed (at )?`[0-9a-f]{7,40}`'
 # standing, is not an outage — it is an unsigned record.
 CR_TRUSTED_ASSOC="${CR_TRUSTED_ASSOC:-OWNER MEMBER COLLABORATOR}"
 
+# ...AND ASSOCIATION IS NOT PERMISSION.
+#
+# The set above is what GitHub calls author_association, and on an organisation
+# repository it does not mean what it looks like. `MEMBER` means "member of the
+# org that owns this repo" — which on a public repo can be someone with no
+# access to this repo at all. `COLLABORATOR` means "was invited", which includes
+# read-only and triage-only invitations. So on any org repo the association
+# filter still admits accounts that cannot push, and those accounts could post a
+# record and turn a required check green. On a personal repo `OWNER` is
+# unambiguous and the association is enough. The skill ships to other repos, so
+# that is not a defence. Flagged by codex in cross-review of PR #63.
+#
+# The authority is the repository permission itself:
+#   GET /repos/{owner}/{repo}/collaborators/{login}/permission
+# resolved once per distinct author in fetch_comments, and carried on each
+# comment as `perm`. OWNER short-circuits — the account that owns the repo needs
+# no lookup and the call would be one API round trip per run for nothing.
+CR_TRUSTED_PERMISSION="${CR_TRUSTED_PERMISSION:-admin write maintain}"
+
+# WHAT TO DO WHEN THE PERMISSION CANNOT BE READ, which is a real case and not a
+# rare one: that endpoint is itself gated on the caller having push access, and
+# a workflow token's exact scope for it varies by repository type — so `perm`
+# coming back empty may mean an outage, or may mean this token can never read
+# it here. Refusing on empty would turn the second case into a permanently red
+# gate for every repo whose token cannot make that call.
+#
+#   trust  — fall back to the association, and SAY SO in the status description
+#            so an unverified grant is visible rather than silent. The attack
+#            then needs a read-only collaborator AND an unreadable endpoint.
+#   refuse — an unverifiable grant is no grant. Correct where you know the token
+#            can read permissions; a red gate everywhere else.
+CR_PERMISSION_UNREADABLE="${CR_PERMISSION_UNREADABLE:-trust}"
+
 # The escape hatch. The label is only half of it; the justification comment
 # must start with this marker and carry >= 15 further characters of reason, so
 # that "exempt" alone does not clear a PR and the audit trail says why.
@@ -388,13 +421,25 @@ currency_verdict() {
     return
   fi
 
-  # The trusted set as a JSON array, so jq can test membership directly.
-  local trusted_json
+  # The trusted sets as JSON arrays, so jq can test membership directly.
+  local trusted_json perm_json lenient
   trusted_json="$(printf '%s' "$CR_TRUSTED_ASSOC" | jq -Rc 'split(" ") | map(select(length > 0))' 2>/dev/null || printf '[]')"
+  perm_json="$(printf '%s' "$CR_TRUSTED_PERMISSION" | jq -Rc 'split(" ") | map(select(length > 0))' 2>/dev/null || printf '[]')"
+  [[ "$CR_PERMISSION_UNREADABLE" == "trust" ]] && lenient=true || lenient=false
+
+  # ONE definition of "trusted", shared by all three queries below. They have to
+  # agree — a record the count calls trusted and the selector does not is a
+  # verdict computed from two different worlds. `perm` is resolved by
+  # fetch_comments; OWNER is stamped `admin` there and never looked up.
+  local TRUST_DEF
+  TRUST_DEF='def trusted($t; $p; $lenient):
+      (.assoc // "") as $a | (.perm // "") as $q
+      | ($t | index($a)) != null
+        and ($a == "OWNER" or ($p | index($q)) != null or ($lenient and $q == ""));'
 
   any_count="$(printf '%s' "$comments" \
-    | jq -r --arg h "$CR_HEADER" --argjson t "$trusted_json" \
-        '[.[]? | select((.assoc // "") as $a | ($t | index($a)) != null) | (.body // "") | select(startswith($h))] | length' 2>/dev/null || echo 0)"
+    | jq -r --arg h "$CR_HEADER" --argjson t "$trusted_json" --argjson p "$perm_json" --argjson l "$lenient" \
+        "$TRUST_DEF"'[.[]? | select(trusted($t; $p; $l)) | (.body // "") | select(startswith($h))] | length' 2>/dev/null || echo 0)"
 
   # Records that look like reviews but carry no repository standing. Counted
   # separately so the refusal can say WHICH thing is wrong: "nobody reviewed
@@ -402,8 +447,9 @@ currency_verdict() {
   # review" call for very different reactions from whoever reads the status.
   local untrusted_count
   untrusted_count="$(printf '%s' "$comments" \
-    | jq -r --arg h "$CR_HEADER" --arg m "$CR_MARKER_RE" --arg re "$CR_STAMP_RE" --argjson t "$trusted_json" \
-        '[.[]? | select((.assoc // "") as $a | ($t | index($a)) == null) | (.body // "")
+    | jq -r --arg h "$CR_HEADER" --arg m "$CR_MARKER_RE" --arg re "$CR_STAMP_RE" \
+        --argjson t "$trusted_json" --argjson p "$perm_json" --argjson l "$lenient" \
+        "$TRUST_DEF"'[.[]? | select(trusted($t; $p; $l) | not) | (.body // "")
           | select(startswith($h)) | select(test($m) or test($re))] | length' 2>/dev/null || echo 0)"
   # Pick the newest record carrying a stamp of EITHER kind, then read the
   # marker out of it if it has one. Selecting on both forms together is what
@@ -419,9 +465,24 @@ currency_verdict() {
   # one behind it is still the last element.
   local record
   record="$(printf '%s' "$comments" \
-    | jq -r --arg h "$CR_HEADER" --arg m "$CR_MARKER_RE" --arg re "$CR_STAMP_RE" --argjson t "$trusted_json" \
-        '[.[]? | select((.assoc // "") as $a | ($t | index($a)) != null) | (.body // "")
+    | jq -r --arg h "$CR_HEADER" --arg m "$CR_MARKER_RE" --arg re "$CR_STAMP_RE" \
+        --argjson t "$trusted_json" --argjson p "$perm_json" --argjson l "$lenient" \
+        "$TRUST_DEF"'[.[]? | select(trusted($t; $p; $l)) | (.body // "")
           | select(startswith($h)) | select(test($m) or test($re))] | last // ""' \
+        2>/dev/null || printf '')"
+
+  # Was the accepted record's standing actually VERIFIED, or waved through
+  # because the permission endpoint could not be read? An unverified grant is
+  # allowed (see CR_PERMISSION_UNREADABLE) but it is not allowed to be silent —
+  # it goes in the status description, where a human reading the merge button
+  # can see it.
+  local unverified
+  unverified="$(printf '%s' "$comments" \
+    | jq -r --arg h "$CR_HEADER" --arg m "$CR_MARKER_RE" --arg re "$CR_STAMP_RE" \
+        --argjson t "$trusted_json" --argjson p "$perm_json" --argjson l "$lenient" \
+        "$TRUST_DEF"'[.[]? | select(trusted($t; $p; $l)) | select((.body // "") | startswith($h))
+          | select((.body // "") | test($m) or test($re))] | last
+          | if . == null then "" elif ((.perm // "") == "") then " (standing unverified)" else "" end' \
         2>/dev/null || printf '')"
 
   # Marker first. Within one comment the two can disagree — a model may edit
@@ -441,7 +502,7 @@ currency_verdict() {
     # what actually happened is that something tried to sign off and could not.
     if [[ "${untrusted_count:-0}" -gt 0 ]]; then
       printf 'failure\t%s\n' \
-        "cross-review record is not from a repo member — only ${CR_TRUSTED_ASSOC// /\/} count"
+        "cross-review record is not from an account with write access to this repo"
     elif [[ "${any_count:-0}" -gt 0 ]]; then
       printf 'failure\t%s\n' \
         "cross-review record carries no SHA stamp — re-run /cross-review, or label ${CR_EXEMPT_LABEL}"
@@ -455,7 +516,7 @@ currency_verdict() {
   # Compare on the stamp's own width: the record abbreviates, the head does not.
   local n="${#reviewed}"
   if [[ "${head_sha:0:$n}" == "$reviewed" ]]; then
-    printf 'success\t%s\n' "reviewed at ${head_sha:0:9}"
+    printf 'success\t%s\n' "reviewed at ${head_sha:0:9}${unverified}"
     return 0
   fi
 
@@ -488,9 +549,33 @@ fetch_comments() {
   # selected on its body alone is a record anyone who can comment can forge.
   # See CR_TRUSTED_ASSOC above for why standing rather than authorship is the
   # thing being checked. Absent, like `user`, means untrusted, not unknown.
-  gh api --paginate --slurp "repos/$1/issues/$2/comments" 2>/dev/null \
+  #
+  # `perm` is the account's actual repository permission, resolved below.
+  local raw
+  raw="$(gh api --paginate --slurp "repos/$1/issues/$2/comments" 2>/dev/null \
     | jq -c '[.[][] | {body: (.body // ""), user: (.user.login // ""), assoc: (.author_association // "")}]' 2>/dev/null \
-    || printf 'null'
+    || printf 'null')"
+  [[ -n "$raw" && "$raw" != "null" ]] || { printf 'null'; return 0; }
+
+  # One lookup per DISTINCT author that the association filter would otherwise
+  # wave through, not one per comment — a PR with forty comments from the same
+  # reviewer is one API call. OWNER is skipped entirely: it is unambiguous, and
+  # on the overwhelmingly common single-maintainer repo that keeps this whole
+  # addition at zero extra calls.
+  local logins login perm perms='{}'
+  logins="$(printf '%s' "$raw" \
+    | jq -r --argjson t "$(printf '%s' "$CR_TRUSTED_ASSOC" | jq -Rc 'split(" ") | map(select(length > 0))')" \
+        '[.[] | select((.assoc // "") as $a | ($t | index($a)) != null and $a != "OWNER")
+              | .user // "" | select(length > 0)] | unique | .[]' 2>/dev/null || printf '')"
+  while IFS= read -r login; do
+    [[ -n "$login" ]] || continue
+    perm="$(gh api "repos/$1/collaborators/$login/permission" --jq '.permission' 2>/dev/null || printf '')"
+    perms="$(printf '%s' "$perms" | jq -c --arg l "$login" --arg p "$perm" '. + {($l): $p}')"
+  done <<< "$logins"
+
+  printf '%s' "$raw" | jq -c --argjson m "$perms" \
+    '[.[] | . + {perm: (if (.assoc // "") == "OWNER" then "admin" else ($m[.user // ""] // "") end)}]' \
+    2>/dev/null || printf '%s' "$raw"
 }
 
 # fetch_exemption <repo> <pr> — is the hatch open, and who opened it?

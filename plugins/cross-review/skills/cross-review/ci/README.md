@@ -54,7 +54,7 @@ SKILL=~/.claude/skills/cross-review          # or wherever the skill lives
 cp "$SKILL"/ci/cross-review-currency.sh       scripts/
 cp "$SKILL"/ci/test-cross-review-currency.sh  scripts/
 cp "$SKILL"/ci/cross-review-currency.yml      .github/workflows/
-bash scripts/test-cross-review-currency.sh    # expect 143 passed, 0 failed
+bash scripts/test-cross-review-currency.sh    # expect 174 passed, 0 failed
 ```
 
 The harness finds the workflow beside itself (this directory) or at
@@ -62,14 +62,63 @@ The harness finds the workflow beside itself (this directory) or at
 edits. It is offline — no network, no `gh`, no tokens; it sources the script and
 calls `currency_verdict()` with fixtures.
 
+## Who is allowed to sign off
+
+A record only counts from an account that can **push to this repository**.
+Without that, anyone who can comment can post `## Cross-review` with a stamp
+naming the head and turn a required check green — the record is the whole
+evidence, so its provenance is the whole gate.
+
+Two checks, because one is not enough:
+
+1. `author_association` must be in `CR_TRUSTED_ASSOC`. Cheap, already on the
+   comment, no extra call.
+2. and the account's **repository permission** must be in
+   `CR_TRUSTED_PERMISSION`. Association is not permission: on an org repo
+   `MEMBER` means "member of the owning org" — possibly with no access to this
+   repo at all — and `COLLABORATOR` includes read-only and triage-only
+   invitations. `OWNER` short-circuits, so the single-maintainer repo pays no
+   extra API call.
+
+When the permission cannot be read the record is **waved through and the status
+says `(standing unverified)`**. That endpoint is itself gated on the caller
+having push access and a workflow token's scope for it varies by repository
+type, so refusing on an empty answer would make the gate permanently red
+wherever the token cannot make that call — and a permanently red gate gets
+switched off. Set `CR_PERMISSION_UNREADABLE=refuse` where you know your token
+can read permissions.
+
+The trust filter runs **before** "newest wins". Selecting the newest record and
+then checking its author would let an untrusted comment posted after a real
+review suppress it — a denial of service that turns a green PR red by
+commenting on it.
+
 ### Install the workflow before you make the check required
 
-The `currency` job holds `statuses: write`, so it deliberately checks out the
-**base branch** and runs the base copy of `cross-review-currency.sh` — never
-the PR's. A bare `actions/checkout` gives a job the proposed code, and a gate
-whose own source the candidate supplies is not a gate: one edited line makes it
-print `success`. This is the agent case, not an attacker's — an agent with push
-access, told to get CI green, edits the file in front of it.
+The `currency` job holds `statuses: write`, so it runs on **`pull_request_target`
+and checks out the base branch** — never the PR's code, and never under a
+trigger whose workflow definition the PR supplies.
+
+Both halves are needed. Pinning `actions/checkout` to the base stops a PR
+supplying the *script* that grades it. It does not stop a PR editing *this
+workflow file*, because on `pull_request` GitHub runs the PR's version of it:
+the same PR can delete the pin, or skip the script and POST
+`cross-review/current=success` straight to the API with the token the job
+holds. `pull_request_target` is the only PR trigger resolved from the base
+branch. It also gives fork and Dependabot PRs a token that can write a status
+at all — `pull_request` downgrades theirs to read-only whatever `permissions:`
+asks for.
+
+This is the agent case, not an attacker's: an agent with push access, told to
+get CI green, edits the file in front of it.
+
+**`pull_request_target` is a footgun, and it is safe here for one narrow reason
+that must stay true: this workflow never checks out or executes PR code.** The
+PR's own tests run in the `self-test` job, under plain `pull_request`, with
+`contents: read` and nothing else. The harness asserts that split — the trigger
+of each job, the checkout ref, that there is exactly one checkout, and that the
+privileged job names no build step — so it cannot silently invert. If you add a
+PR-ref checkout or an install step to `currency`, you have re-opened all of it.
 
 The consequence at install time: on the PR that *adds* the gate, the base has
 no script yet, so the job exits 2 and goes red with a message saying so. Merge
@@ -92,6 +141,9 @@ rather than springing it, and use the escape hatch below instead of reverting.
 |---|---|---|
 | `CR_CURRENCY_CONTEXT` | `cross-review/current` | commit-status context name |
 | `CR_EXEMPT_LABEL` | `cross-review-exempt` | escape-hatch label |
+| `CR_TRUSTED_ASSOC` | `OWNER MEMBER COLLABORATOR` | associations eligible to post a record |
+| `CR_TRUSTED_PERMISSION` | `admin write maintain` | repository permissions that count as sign-off |
+| `CR_PERMISSION_UNREADABLE` | `trust` | `trust` or `refuse`, when the permission cannot be read |
 
 Nothing else is repo-specific. There are no hardcoded branch names, org names,
 or issue numbers.

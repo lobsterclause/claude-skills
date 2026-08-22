@@ -2122,7 +2122,7 @@ fi
 
 echo "── ci/ merge gate (delegated harness) ──"
 
-# ci/ ships a second, self-contained harness (143 offline cases) for the
+# ci/ ships a second, self-contained harness (174 offline cases) for the
 # currency gate. Invoked HERE rather than left to a workflow, for the reason
 # its own header gives: a harness nothing calls is advisory — it runs when
 # someone remembers. One of its cases asserts that post_comment.sh still emits

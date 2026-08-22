@@ -78,6 +78,18 @@ comments_as() {
   done
   printf '%s' "$out"
 }
+# comments_perm <author> <assoc> <perm> <body>... — the full shape
+# fetch_comments returns once it has resolved the author's REPOSITORY
+# PERMISSION, which is a different fact from the association.
+comments_perm() {
+  local author="$1" assoc="$2" perm="$3"; shift 3
+  local out="[]" b
+  for b in "$@"; do
+    out="$(printf '%s' "$out" | jq -c --arg b "$b" --arg u "$author" --arg a "$assoc" --arg p "$perm" \
+      '. + [{body: $b, user: $u, assoc: $a, perm: $p}]')"
+  done
+  printf '%s' "$out"
+}
 # comments_by <author> <body>... — a trusted author. MEMBER rather than OWNER
 # so the tests exercise the middle of the trusted set rather than only its
 # most privileged element.
@@ -380,7 +392,7 @@ done
 # "no cross-review record" reads as an oversight — someone forgot to review —
 # when what happened is that something tried to sign off and could not.
 assert_contains "and says the record lacked standing, not that none existed" \
-  "$(desc_of "$(comments_as 'drive-by' CONTRIBUTOR "$MARKER_CURRENT")" "$HEAD40")" "not from a repo member"
+  "$(desc_of "$(comments_as 'drive-by' CONTRIBUTOR "$MARKER_CURRENT")" "$HEAD40")" "not from an account with write access"
 
 # An unattributable record is refused, fail-CLOSED, and this is the one place
 # the gate deliberately does NOT fail open. The distinction it turns on:
@@ -421,6 +433,84 @@ assert_eq "control: and still admits what it does list" \
 assert_eq "an untrusted account cannot post a stamp to dodge the hatch either" \
   "$(state_of "$(comments_as 'drive-by' CONTRIBUTOR "$MARKER_CURRENT")" "$HEAD40" "$(exemption false '' '')")" \
   "failure"
+
+echo
+echo "── association is not permission ──"
+#
+# FINDING (codex, P1, cross-review of PR #63 pass 2). The association filter
+# shipped in pass 1 called OWNER/MEMBER/COLLABORATOR "repository standing", and
+# on an organisation repo that is not what those values mean. `MEMBER` is
+# membership of the owning ORG — on a public repo, possibly with no access to
+# this repo at all. `COLLABORATOR` covers read-only and triage-only invitations.
+# So the fix that opened pass 1 still admitted accounts that cannot push. The
+# authority is the repository permission, resolved per author by fetch_comments
+# and carried as `perm`.
+
+# THE ATTACK. An org member, or a read-only invited collaborator, posts a record
+# stamped to the current head. The association says MEMBER; the permission says
+# read; the gate must not go green.
+assert_eq "an org MEMBER without write access cannot sign off" \
+  "$(state_of "$(comments_perm someone MEMBER read "$MARKER_CURRENT")" "$HEAD40")" "failure"
+assert_contains "and the refusal names write access, not membership" \
+  "$(desc_of "$(comments_perm someone MEMBER read "$MARKER_CURRENT")" "$HEAD40")" "write access"
+assert_eq "nor can a triage-only collaborator" \
+  "$(state_of "$(comments_perm someone COLLABORATOR triage "$MARKER_CURRENT")" "$HEAD40")" "failure"
+
+# CONTROLS. The three permissions that DO mean "can push" must all still pass,
+# or this has simply broken the gate for everyone.
+for perm in admin write maintain; do
+  assert_eq "control: a COLLABORATOR with $perm access still signs off" \
+    "$(state_of "$(comments_perm someone COLLABORATOR "$perm" "$MARKER_CURRENT")" "$HEAD40")" "success"
+done
+# OWNER short-circuits: it is unambiguous, and looking it up would cost an API
+# call per run on the single-maintainer repo that is the common case.
+assert_eq "control: OWNER needs no permission lookup" \
+  "$(state_of "$(comments_perm boss OWNER "" "$MARKER_CURRENT")" "$HEAD40")" "success"
+
+# ORDERING, again. The permission filter runs before "newest wins" for the same
+# reason the association filter does: a read-only account commenting after a
+# real review must not be able to turn a green PR red.
+NOWRITE_THEN_REAL="$(jq -c --arg m "$MARKER_CURRENT" \
+  '[{body: $m, user: "boss", assoc: "OWNER", perm: "admin"},
+    {body: $m, user: "drive-by", assoc: "MEMBER", perm: "read"}]' <<< 'null')"
+assert_eq "a read-only comment posted AFTER a real review does not suppress it" \
+  "$(state_of "$NOWRITE_THEN_REAL" "$HEAD40")" "success"
+
+echo
+echo "── an unverifiable permission is allowed, but never silently ──"
+#
+# That endpoint is itself gated on the caller having push access, and a workflow
+# token's scope for it varies by repository type — so an empty `perm` may be an
+# outage OR may be permanent for this repo. Refusing on empty would make the
+# gate permanently red wherever the token cannot read it, which is how a gate
+# gets switched off for good. It is waved through, and it SAYS so.
+assert_eq "an unreadable permission falls back to the association" \
+  "$(state_of "$(comments_perm someone MEMBER "" "$MARKER_CURRENT")" "$HEAD40")" "success"
+assert_contains "and the status admits the standing was never verified" \
+  "$(desc_of "$(comments_perm someone MEMBER "" "$MARKER_CURRENT")" "$HEAD40")" "standing unverified"
+# CONTROL: a VERIFIED record must not carry that caveat, or it is noise on every
+# status and stops meaning anything.
+[[ "$(desc_of "$(comments_perm someone MEMBER write "$MARKER_CURRENT")" "$HEAD40")" != *"unverified"* ]] \
+  && ok "control: a verified record is not labelled unverified" \
+  || bad "every success is labelled unverified — the caveat is noise"
+
+# The strict policy, for repos that know their token can read permissions.
+# NOT in a subshell: ok/bad increment PASS/FAIL, and a subshell's copies are
+# discarded on exit — these three would print their results and then fail to
+# fail the suite, which is the advisory-test shape this whole harness exists to
+# avoid. Set, assert, restore.
+CR_PERMISSION_UNREADABLE=refuse
+assert_eq "CR_PERMISSION_UNREADABLE=refuse turns the same record down" \
+  "$(state_of "$(comments_perm someone MEMBER "" "$MARKER_CURRENT")" "$HEAD40")" "failure"
+assert_eq "control: and still admits one whose permission WAS read" \
+  "$(state_of "$(comments_perm someone MEMBER write "$MARKER_CURRENT")" "$HEAD40")" "success"
+assert_eq "control: and OWNER survives it, having needed no lookup" \
+  "$(state_of "$(comments_perm boss OWNER "" "$MARKER_CURRENT")" "$HEAD40")" "success"
+CR_PERMISSION_UNREADABLE=trust
+# CONTROL: the restore actually took, or every case after this one is running
+# under the strict policy by accident.
+assert_eq "control: the default policy is restored for the rest of the run" \
+  "$(state_of "$(comments_perm someone MEMBER "" "$MARKER_CURRENT")" "$HEAD40")" "success"
 
 echo
 echo "── the skill emits what the gate reads ──"
@@ -983,7 +1073,10 @@ ic_new() {
   jq -nc --arg b "$1" \
     '{github:{event_name:"issue_comment", event:{action:"created", issue:{number:3406, pull_request:{}}, comment:{body:$b}}}}'
 }
-PR_SYNC='{"github":{"event_name":"pull_request","event":{"action":"synchronize","pull_request":{"number":3406}}}}'
+# A push run is a pull_request_target run now — the privileged job moved there,
+# and the property this section pins (a comment run never cancels a push run)
+# is only worth anything for the job that writes the status.
+PR_SYNC='{"github":{"event_name":"pull_request_target","event":{"action":"synchronize","pull_request":{"number":3406}}}}'
 
 DEL_RECORD="$(ev "$group" "$(ic_del "## Cross-review — pass 1
 
@@ -1038,7 +1131,7 @@ fi
 # run still land in different groups, so a re-review comment cannot cancel the
 # synchronize run it is chasing (#3290, #3291, #3292).
 if [[ "$SYNC" != "$NEW_CHATTER" && "$SYNC" != "$DEL_RECORD" ]]; then
-  ok "control: pull_request and issue_comment still occupy separate groups"
+  ok "control: pull_request_target and issue_comment still occupy separate groups"
 else
   bad "control: a comment run shares a group with a push run ('$SYNC')"
 fi
@@ -1059,7 +1152,7 @@ fi
 # The workflow only fired on opened/synchronize/reopened, so a human could
 # label a PR and watch the check stay red forever, with the only way out being
 # an empty commit. Flagged in docs/investigation-pipeline-throughput-levers.
-prtypes="$(awk '/^  pull_request:/{p=1; next} p && /types:/{print; exit}' "$CWF")"
+prtypes="$(awk '/^  pull_request_target:/{p=1; next} p && /types:/{print; exit}' "$CWF")"
 assert_contains "labeling a PR re-runs the check"   "$prtypes" "labeled"
 assert_contains "unlabeling a PR re-runs it too"    "$prtypes" "unlabeled"
 # CONTROL: the pre-existing triggers must survive, or this assertion is
@@ -1149,9 +1242,18 @@ assert_contains "workflow re-raises a could-not-run exit instead of swallowing i
 # access told to get CI green edits the file in front of it.
 currency_job="$(printf '%s' "$wf" | awk '/^  currency:/{f=1} f{print} f&&/^  [a-z]/&&!/^  currency:/{exit}')"
 assert_contains "the privileged job checks out the base, not the PR" \
-  "$currency_job" "ref: \${{ github.event.pull_request.base.sha"
-assert_contains "and has a trusted fallback where the payload carries no base" \
-  "$currency_job" "github.event.repository.default_branch"
+  "$currency_job" "ref: \${{ steps.base.outputs.sha }}"
+# The base is RESOLVED, never guessed. An earlier cut fell back to the
+# repository default branch on issue_comment, which is the wrong branch for any
+# PR targeting a release line — and fatal if the gate is installed there and not
+# on the default. (gemini-pro, PR #63.)
+assert_contains "and resolves the base commit rather than guessing a branch" \
+  "$currency_job" "gh api \"repos/\$GITHUB_REPOSITORY/pulls/\$PR\" --jq .base.sha"
+[[ "$currency_job" != *"github.event.repository.default_branch"* ]] \
+  && ok "and no longer falls back to the default branch" \
+  || bad "the default-branch guess is still there"
+assert_contains "and fails closed when the base does not resolve to a commit" \
+  "$currency_job" 'if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then'
 assert_contains "and refuses to run when the gate is absent from the base" \
   "$currency_job" "scripts/cross-review-currency.sh is not on the base branch"
 # CONTROL — the sibling self-test job must KEEP checking out the PR: its whole
@@ -1162,6 +1264,59 @@ selftest_job="$(printf '%s' "$wf" | awk '/^  self-test:/{f=1} f{print} f&&/^  cu
 [[ "$selftest_job" != *"ref:"* ]] \
   && ok "control: the unprivileged self-test still runs the PR's own code" \
   || bad "control: self-test was pinned to the base, so it tests nothing"
+
+# ── The privileged/unprivileged split must not silently invert ─────────────
+# FINDING (codex, P1, cross-review of PR #63 pass 2). Pinning `checkout` to the
+# base was not enough: on `pull_request`, GitHub runs THE PR'S VERSION OF THE
+# WORKFLOW FILE, so the same PR could delete the pin, or skip the script and
+# POST `cross-review/current=success` directly with the `statuses: write` token.
+# `pull_request_target` is the only PR trigger whose definition is resolved from
+# the base branch. It is also what gives fork PRs a token that can write a
+# status at all — `pull_request` downgrades theirs to read-only regardless of
+# the `permissions:` block, so with a failed POST now exiting 2, forks went red
+# on every push (codex and gemini-pro, convergently).
+#
+# pull_request_target is safe here for one narrow reason: THIS WORKFLOW NEVER
+# CHECKS OUT OR EXECUTES PR CODE. These assertions are that reason, written
+# down where CI enforces it — the split is worth nothing if a later edit can
+# quietly put PR code inside the privileged job.
+assert_contains "the privileged job runs from base-branch workflow code" \
+  "$currency_job" "github.event_name == 'pull_request_target'"
+[[ "$currency_job" != *"github.event_name == 'pull_request'"* ]] \
+  && ok "and never under plain pull_request, where the PR supplies the YAML" \
+  || bad "the privileged job still runs under pull_request"
+assert_contains "control: the unprivileged self-test DOES run the PR's code" \
+  "$selftest_job" "github.event_name == 'pull_request'"
+[[ "$selftest_job" != *"pull_request_target"* ]] \
+  && ok "and must never be reached under pull_request_target" \
+  || bad "self-test can run under pull_request_target — PR code with a base-context token"
+# These two look at DIRECTIVES, not prose. Both jobs argue about `statuses` and
+# about PR code in their comments — a substring test over the raw YAML matches
+# the argument rather than the configuration.
+selftest_code="$(printf '%s' "$selftest_job" | sed 's/[[:space:]]*#.*$//')"
+currency_code="$(printf '%s' "$currency_job" | sed 's/[[:space:]]*#.*$//')"
+
+assert_contains "control: and it narrows its own permissions" \
+  "$selftest_code" "permissions:"
+[[ "$selftest_code" != *"statuses:"* ]] \
+  && ok "control: self-test cannot write statuses" \
+  || bad "self-test was granted statuses — it runs PR code"
+
+# THE LOAD-BEARING ONE. Every way PR code could enter the privileged job. Note
+# what is NOT forbidden: `HEAD_SHA: ${{ github.event.pull_request.head.sha }}`
+# is the commit the status is BOUND to, passed as data to a script that only
+# ever compares it. Checking that same sha OUT is the thing that would execute
+# the PR.
+for forbidden in "ref: \${{ github.event.pull_request.head" "head.ref" "npm " "yarn " "pip install" "make -" "docker "; do
+  case "$currency_code" in
+    *"$forbidden"*) bad "the privileged job references '$forbidden' — that is PR code in a base-context job" ;;
+    *)              ok  "the privileged job does not reach for '$forbidden'" ;;
+  esac
+done
+# ...and exactly one checkout, so a second unpinned one cannot slip in beside
+# the pinned one.
+assert_eq "the privileged job checks out exactly once" \
+  "$(printf '%s' "$currency_code" | grep -c 'uses: actions/checkout')" "1"
 
 # ── A status that was never published is not a verdict ──────────────────────
 # FINDING (codex, P1, cross-review of PR #63). A failed POST only warned, then
