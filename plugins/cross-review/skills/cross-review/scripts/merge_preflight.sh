@@ -58,7 +58,7 @@ fi
 # `gh pr view` accepts a number, URL, or branch. Anything is fine here except
 # an empty string, which it would interpret as "the current branch's PR" and
 # silently answer a question nobody asked.
-gh_args=("$pr" --json comments,headRefOid,state,number,url)
+gh_args=("$pr" --json comments,headRefOid,baseRefName,state,number,url)
 [[ -n "$repo" ]] && gh_args+=(--repo "$repo")
 
 emit() {
@@ -167,6 +167,60 @@ reviewed_sha="$(printf '%s' "$review_body" \
 n="${#reviewed_sha}"
 if [[ "${cur_sha:0:$n}" == "$reviewed_sha" ]]; then
   emit clear 0 "PR #$pr was reviewed at its current head ${cur_sha:0:9}."
+fi
+
+# ---------------------------------------------------------------------------
+# The head moved. That is NOT the same as "unreviewed", and treating it as such
+# is what made this gate a treadmill: every fix answering a finding moves the
+# head, so the record containing the finding stops covering the code, and the
+# only exits are another full round or an override. Three rounds on PR #66 hit
+# this in one session.
+#
+# So before declaring staleness, ask the question that actually matters -- is
+# every commit in this PR covered by SOME record? Round 1 covers base..A,
+# round 2 covers A..B, round 3 covers B..head: no single record covers the PR,
+# together they cover all of it.
+#
+# Strictly additive. Point equality above still clears exactly what it always
+# cleared; this runs only where the gate previously said `stale` outright, and
+# falls through to that same verdict when coverage is genuinely incomplete.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -x "$here/read_stamp.sh" && -x "$here/range_coverage.sh" ]] && command -v git >/dev/null 2>&1; then
+  # EVERY stamped record, not just the newest -- the union is the whole point.
+  records="[]"
+  while IFS= read -r b64; do
+    [[ -z "$b64" ]] && continue
+    body="$(printf '%s' "$b64" | base64 --decode 2>/dev/null || true)"
+    [[ -z "$body" ]] && continue
+    st="$(printf '%s' "$body" | bash "$here/read_stamp.sh" --body-stdin 2>/dev/null || true)"
+    [[ -z "$st" ]] && continue
+    if [[ "$(jq -r '.stamped' <<<"$st" 2>/dev/null)" == "true" ]]; then
+      records="$(jq -c --argjson r "$st" '. + [{sha:$r.sha, base:$r.base, digest:$r.digest}]' <<<"$records")"
+    fi
+  done < <(printf '%s' "$comments_json" \
+             | jq -r '.[] | .body | select(startswith("## Cross-review")) | @base64' 2>/dev/null || true)
+
+  base_ref="$(printf '%s' "$pr_json" | jq -r '.baseRefName // ""' 2>/dev/null || true)"
+  pr_base=""
+  for cand in "origin/$base_ref" "$base_ref"; do
+    [[ -n "$base_ref" ]] || break
+    if git rev-parse --verify -q "$cand^{commit}" >/dev/null 2>&1; then
+      pr_base="$(git merge-base "$cand" "$cur_sha" 2>/dev/null || true)"
+      [[ -n "$pr_base" ]] && break
+    fi
+  done
+
+  if [[ -n "$pr_base" ]] && [[ "$(jq 'length' <<<"$records")" -gt 0 ]]; then
+    cov="$(bash "$here/range_coverage.sh" --base "$pr_base" --head "$cur_sha" --records "$records" 2>/dev/null || true)"
+    if [[ "$(jq -r '.covered // false' <<<"$cov" 2>/dev/null)" == "true" ]]; then
+      emit clear 0 "PR #$pr: head moved to ${cur_sha:0:9}, but $(jq -r '.reason' <<<"$cov") — the union of review records covers every commit being merged."
+    fi
+    ncov="$(jq -r '.uncovered | length' <<<"$cov" 2>/dev/null || echo 0)"
+    if [[ "${ncov:-0}" -gt 0 ]]; then
+      first_un="$(jq -r '.uncovered[0]' <<<"$cov" 2>/dev/null)"
+      emit stale 1 "PR #$pr: $(jq -r '.reason' <<<"$cov"). Unreviewed, starting at: ${first_un}. Re-run cross-review on the uncovered range, or merge deliberately knowing it is unreviewed."
+    fi
+  fi
 fi
 
 emit stale 1 "PR #$pr was reviewed at $reviewed_sha but its head is now ${cur_sha:0:9}. The review record does not cover the code you are about to merge. Re-run cross-review, or merge deliberately knowing the delta is unreviewed."

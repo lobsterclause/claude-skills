@@ -521,8 +521,21 @@ currency_verdict() {
   # Marker first. Within one comment the two can disagree — a model may edit
   # the human-readable line, or paste an old one — and the machine-written
   # value is the one with a provenance worth trusting.
-  reviewed="$(printf '%s' "$record" \
-    | sed -nE 's/.*<!-- cross-review: sha=([0-9a-f]{40}) .*/\1/p' | head -1)"
+  # Delegates to scripts/read_stamp.sh when it is reachable, so this consumer
+  # and merge_preflight.sh cannot drift apart again. They already had: this
+  # file read the MARKER while the merge hook read the PROSE, and a record
+  # corrected in one half left the hook clearing on the other. The inline
+  # sed below stays as a fallback for the CI checkout layouts where scripts/
+  # is not shipped alongside ci/ -- same regex, one source of truth when both
+  # are present.
+  _rs="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" 2>/dev/null && pwd)/read_stamp.sh"
+  reviewed=""
+  if [[ -x "$_rs" ]]; then
+    reviewed="$(printf '%s' "$record" | bash "$_rs" --body-stdin 2>/dev/null \
+                 | jq -r 'select(.source == "marker") | .sha' 2>/dev/null || true)"
+  fi
+  [[ -n "$reviewed" ]] || reviewed="$(printf '%s' "$record" \
+    | sed -nE 's/.*<!-- cross-review: sha=([0-9a-f]{40})[^>]*-->.*/\1/p' | head -1)"
   # Fall back to prose. `(at )?` is the whole of the widening: the abbreviation
   # is captured in group 2 because group 1 is the optional word.
   [[ -n "$reviewed" ]] || reviewed="$(printf '%s' "$record" \
