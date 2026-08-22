@@ -65,23 +65,29 @@ OTHER40='37f0839938e45517b4e7007298f916ca412219c3'
 # asserting the refusal path by accident.
 GRANTER='gjalmaraz'
 
-# comments_by <author> <body>... → the JSON array shape fetch_comments returns.
-# fetch_comments carries the comment AUTHOR now; it is the second half of the
-# exemption binding, so the fixture has to carry it too.
-comments_by() {
-  local author="$1"; shift
+# comments_as <author> <assoc> <body>... → the JSON array shape fetch_comments
+# returns. fetch_comments carries the comment AUTHOR (the second half of the
+# exemption binding) and the author's repository STANDING (what the stamp path
+# requires), so the fixture has to carry both.
+comments_as() {
+  local author="$1" assoc="$2"; shift 2
   local out="[]" b
   for b in "$@"; do
-    out="$(printf '%s' "$out" | jq -c --arg b "$b" --arg u "$author" '. + [{body: $b, user: $u}]')"
+    out="$(printf '%s' "$out" | jq -c --arg b "$b" --arg u "$author" --arg a "$assoc" \
+      '. + [{body: $b, user: $u, assoc: $a}]')"
   done
   printf '%s' "$out"
 }
-# comments <body>... — authored by the granting human. Convenience for the
-# stamp tests, which do not care who posted, and for the hatch tests where the
-# granter is the one posting.
+# comments_by <author> <body>... — a trusted author. MEMBER rather than OWNER
+# so the tests exercise the middle of the trusted set rather than only its
+# most privileged element.
+comments_by() { local a="$1"; shift; comments_as "$a" MEMBER "$@"; }
+# comments <body>... — authored by the granting human, who has write access.
+# Convenience for the hatch tests, and for stamp tests whose subject is the
+# stamp rather than the poster.
 comments() { comments_by "$GRANTER" "$@"; }
-# The pre-author shape: a body with no author attached at all, which is what a
-# comment record we could not attribute looks like.
+# The pre-author shape: a body with no author and no standing attached at all,
+# which is what a comment record we could not attribute looks like.
 comments_anon() {
   local out="[]" b
   for b in "$@"; do
@@ -341,6 +347,82 @@ assert_eq "control: #3407's real comment still reads as stale" \
 _Automated review by codex + kimi. Reviewed \`1e3013326\`._")" "$LIVE_3407_HEAD")" "failure"
 
 echo
+echo "── a record only counts from an account with repository standing ──"
+# THE FINDING (cross-review of PR #63, gemini-pro, Critical). The stamp path
+# selected the newest record on its BODY alone and never asked who wrote it,
+# so anyone who could comment on a pull request could turn a REQUIRED check
+# green by pasting the header and a marker naming the head sha. On a fork PR
+# that is the contributor themselves — precisely the person the gate exists to
+# bind. The data was already being fetched; the stamp path just never looked.
+#
+# The rule is repository STANDING, not authorship. See CR_TRUSTED_ASSOC.
+
+# The attack, in one line: a correct, current, perfectly-formatted stamp, from
+# somebody with no write access.
+assert_eq "an outside contributor cannot self-certify with a forged marker" \
+  "$(state_of "$(comments_as 'drive-by' CONTRIBUTOR "$MARKER_CURRENT")" "$HEAD40")" "failure"
+assert_eq "nor with the prose form" \
+  "$(state_of "$(comments_as 'drive-by' CONTRIBUTOR "$STAMPED_CURRENT")" "$HEAD40")" "failure"
+assert_eq "nor can a first-time contributor" \
+  "$(state_of "$(comments_as 'newcomer' FIRST_TIME_CONTRIBUTOR "$MARKER_CURRENT")" "$HEAD40")" "failure"
+assert_eq "nor a passer-by with no association at all" \
+  "$(state_of "$(comments_as 'nobody' NONE "$MARKER_CURRENT")" "$HEAD40")" "failure"
+
+# CONTROLS — every account that SHOULD be able to post a record still can.
+# Without these the trust filter could be "reject everything" and the four
+# assertions above would all still pass.
+for assoc in OWNER MEMBER COLLABORATOR; do
+  assert_eq "control: a record from $assoc is honoured" \
+    "$(state_of "$(comments_as 'maintainer' "$assoc" "$MARKER_CURRENT")" "$HEAD40")" "success"
+done
+
+# The refusal has to name the actual problem. Reporting an untrusted record as
+# "no cross-review record" reads as an oversight — someone forgot to review —
+# when what happened is that something tried to sign off and could not.
+assert_contains "and says the record lacked standing, not that none existed" \
+  "$(desc_of "$(comments_as 'drive-by' CONTRIBUTOR "$MARKER_CURRENT")" "$HEAD40")" "not from a repo member"
+
+# An unattributable record is refused, fail-CLOSED, and this is the one place
+# the gate deliberately does NOT fail open. The distinction it turns on:
+# fetch_comments returning `null` is "we could not read" and stays green (the
+# case just below); a comment we DID read that carries no standing is not an
+# outage, it is an unsigned record.
+assert_eq "a record we cannot attribute is refused" \
+  "$(state_of "$(comments_anon "$MARKER_CURRENT")" "$HEAD40")" "failure"
+assert_eq "control: an unreadable comment FETCH is still green" \
+  "$(state_of "null" "$HEAD40")" "success"
+
+# ORDERING. The author filter has to run before "newest wins", not after.
+# Filtering afterwards would let anyone red-flag a properly reviewed PR just by
+# commenting on it — the forged record would be selected as newest and then
+# rejected, suppressing the genuine one behind it. That is a denial of service
+# on the gate, and it is the failure mode a naive fix walks straight into.
+assert_eq "a forged record posted AFTER a real one does not suppress it" \
+  "$(state_of "$(printf '%s' "$(comments_by 'maintainer' "$MARKER_CURRENT")$(comments_as 'drive-by' CONTRIBUTOR "$MARKER_CURRENT")" | jq -sc 'add')" "$HEAD40")" \
+  "success"
+
+# ...and the mirror image: standing does not excuse staleness. A trusted
+# account's stale record is still stale, so the filter cannot have been
+# implemented as "trusted author ⇒ pass".
+assert_eq "control: a trusted account's stale record is still stale" \
+  "$(state_of "$(comments_by 'maintainer' "$STAMPED_OLD")" "$HEAD40")" "failure"
+
+# The trusted set is configurable, because a repo that posts every review from
+# one bot account wants to gate on that account's standing and nothing else.
+assert_eq "CR_TRUSTED_ASSOC narrows the set" \
+  "$(CR_TRUSTED_ASSOC=OWNER state_of "$(comments_as 'maintainer' MEMBER "$MARKER_CURRENT")" "$HEAD40")" \
+  "failure"
+assert_eq "control: and still admits what it does list" \
+  "$(CR_TRUSTED_ASSOC=OWNER state_of "$(comments_as 'maintainer' OWNER "$MARKER_CURRENT")" "$HEAD40")" \
+  "success"
+
+# The hatch was already bound to a human; it must not become reachable through
+# the weaker of the two paths now that both exist.
+assert_eq "an untrusted account cannot post a stamp to dodge the hatch either" \
+  "$(state_of "$(comments_as 'drive-by' CONTRIBUTOR "$MARKER_CURRENT")" "$HEAD40" "$(exemption false '' '')")" \
+  "failure"
+
+echo
 echo "── the skill emits what the gate reads ──"
 # Half 1 and Half 2 have to agree on one marker format, and nothing else checks
 # that they do. This asserts against post_comment.sh itself when it is present
@@ -423,6 +505,47 @@ assert_eq "the literal false is not treated as truthy" \
 # failure applies to READING the record, never to granting an exemption.
 assert_eq "unparseable exemption data does not open the hatch" \
   "$(state_of "$(comments "$JUSTIFIED")" "$HEAD40" "garbage not json")" "failure"
+
+echo
+echo "── the commit reference is not a reason ──"
+#
+# FINDING (codex, P2, cross-review of PR #63). CR_EXEMPT_RE counts every
+# character after the marker, and the exemption is separately required to name
+# the head commit — so the sha satisfied the 15-character minimum by itself.
+# `Cross-review exemption:` plus a bare 40-character sha opened the hatch with
+# the reason field empty, which is the exact state the minimum exists to
+# refuse. The label says a human waved it through; the comment says nothing
+# about why; the audit trail is a commit id that was already in the status.
+SHA_ONLY="Cross-review exemption: ${HEAD40}"
+# Long enough to clear CR_EXEMPT_RE on raw length, so this case can only be
+# refused by the substance check itself.
+SHA_ONLY_SHORT="Cross-review exemption: ${HEAD40} ok"
+
+assert_eq "a bare sha is not 15 characters of reason" \
+  "$(state_of "$(comments "$SHA_ONLY")" "$HEAD40" "$EXEMPT_HUMAN")" "failure"
+assert_contains "and the refusal says a reason is what is missing" \
+  "$(desc_of "$(comments "$SHA_ONLY")" "$HEAD40" "$EXEMPT_HUMAN")" "no reason"
+assert_eq "nor does a token of prose alongside it" \
+  "$(state_of "$(comments "$SHA_ONLY_SHORT")" "$HEAD40" "$EXEMPT_HUMAN")" "failure"
+
+# CONTROL — the two above must not be passing because the SHA stopped binding.
+# A real reason plus the same sha still opens the hatch, or the fix has simply
+# broken the escape hatch instead of tightening it.
+assert_eq "control: a real reason with the same sha still opens the hatch" \
+  "$(state_of "$(comments "$JUSTIFIED")" "$HEAD40" "$EXEMPT_HUMAN")" "success"
+
+# CONTROL — the stripping must remove the commit reference and NOTHING else.
+# A greedy strip of every hex-looking run would eat words like `deadbeef`,
+# `facade`, `decade` out of ordinary prose and start refusing real reasons.
+assert_eq "control: prose that happens to be hex-ish is still a reason" \
+  "$(state_of "$(comments "Cross-review exemption: decade-old facade, dead code ${HEAD40:0:9}")" \
+      "$HEAD40" "$EXEMPT_HUMAN")" "success"
+
+# The refusal must not be reachable when nothing was justified at all — that
+# path has its own, different remedy ("needs a justification from @x"), and
+# collapsing the two would tell a human to lengthen a comment they never wrote.
+assert_contains "control: an unjustified PR still gets the unjustified remedy" \
+  "$(desc_of "$(comments)" "$HEAD40" "$EXEMPT_HUMAN")" "needs a justification"
 
 echo
 echo "── an exemption is bound to the commit it was granted for ──"
@@ -1014,6 +1137,61 @@ assert_contains "workflow re-raises a could-not-run exit instead of swallowing i
 [[ "$wf" != *'cross-review-currency.sh "${args[@]}" || true'* ]] \
   && ok "and does not swallow every exit code with a bare || true" \
   || bad "and does not swallow every exit code with a bare || true"
+
+
+# ── The gate must not be graded by the code it is grading ───────────────────
+# FINDING (codex, P0, cross-review of PR #63). The currency job held
+# `statuses: write` and ran scripts/cross-review-currency.sh out of a bare
+# `actions/checkout@v4` — which, with no `ref:`, is the PR's merge commit. The
+# PR under review therefore supplied the program deciding whether the PR was
+# reviewed: edit one line to print `success` and the required check goes green.
+# That is the agent case, not a hypothetical attacker — an agent with push
+# access told to get CI green edits the file in front of it.
+currency_job="$(printf '%s' "$wf" | awk '/^  currency:/{f=1} f{print} f&&/^  [a-z]/&&!/^  currency:/{exit}')"
+assert_contains "the privileged job checks out the base, not the PR" \
+  "$currency_job" "ref: \${{ github.event.pull_request.base.sha"
+assert_contains "and has a trusted fallback where the payload carries no base" \
+  "$currency_job" "github.event.repository.default_branch"
+assert_contains "and refuses to run when the gate is absent from the base" \
+  "$currency_job" "scripts/cross-review-currency.sh is not on the base branch"
+# CONTROL — the sibling self-test job must KEEP checking out the PR: its whole
+# job is to run the PR's tests. Pinning it to the base would make it assert
+# that the base still passes its own suite, which is not a check on anything.
+# It is safe there precisely because it carries `permissions: contents: read`.
+selftest_job="$(printf '%s' "$wf" | awk '/^  self-test:/{f=1} f{print} f&&/^  currency:/{exit}')"
+[[ "$selftest_job" != *"ref:"* ]] \
+  && ok "control: the unprivileged self-test still runs the PR's own code" \
+  || bad "control: self-test was pinned to the base, so it tests nothing"
+
+# ── A status that was never published is not a verdict ──────────────────────
+# FINDING (codex, P1, cross-review of PR #63). A failed POST only warned, then
+# fell through to `[[ "$state" == "success" ]]`. So a run that computed
+# `failure` and could not publish it exited 0: green job, and whatever an
+# earlier run left on the commit stays authoritative at the merge button. On a
+# re-review that turned red, the obsolete `success` survives and nothing
+# anywhere is red. Exit 2 ("could not run, posted nothing"), not 1 ("ran, and
+# the answer is no") — the workflow swallows 1 and re-raises 2.
+post_bin="$(mktemp -d)"
+for t in env cat sed awk grep printf jq; do
+  src="$(command -v "$t" 2>/dev/null)" && ln -sf "$src" "$post_bin/$t"
+done
+# `gh` that reads fine and cannot write. The read failing is harmless here: an
+# unreadable comment list is the documented fail-OPEN case, so the verdict is
+# `success` and the POST is still attempted — which is what this exercises.
+printf '#!/bin/sh\nexit 1\n' > "$post_bin/gh"; chmod +x "$post_bin/gh"
+post_out="$(PATH="$post_bin" "$(command -v bash)" "$HERE/cross-review-currency.sh" \
+  --pr 1 --repo o/r --sha "$HEAD40" --post 2>&1)"; post_rc=$?
+assert_eq "a failed status POST exits 2, not 0" "$post_rc" "2"
+assert_contains "and says the verdict was never published" \
+  "$post_out" "NOT published"
+
+# CONTROL — the same invocation with a `gh` that CAN write must exit 0, or the
+# assertion above is satisfied by a script that fails on every run.
+printf '#!/bin/sh\nexit 0\n' > "$post_bin/gh"
+PATH="$post_bin" "$(command -v bash)" "$HERE/cross-review-currency.sh" \
+  --pr 1 --repo o/r --sha "$HEAD40" --post >/dev/null 2>&1
+assert_eq "control: a successful POST still exits 0" "$?" "0"
+rm -rf "$post_bin"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

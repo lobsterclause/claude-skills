@@ -34,6 +34,12 @@ stamp, and compares that SHA to the head.
 - **could not read** (gh/jq missing, API failure) → `success`, with a
   description saying so
 
+"Could not read" is fail-open; **"could not run" and "could not publish" are
+not.** A runner without `gh`/`jq`, and a status POST that fails, both exit 2 and
+fail the job — because in those two cases nothing was written, so whatever
+status a previous run left on the commit is still what the merge button sees.
+A warning in a log is not a check.
+
 That last one is deliberate and is the line to keep straight: *"we read the
 comments and there were none"* and *"we could not read the comments"* are
 different facts. Conflating them lets one GitHub hiccup red-flag every open PR,
@@ -48,13 +54,27 @@ SKILL=~/.claude/skills/cross-review          # or wherever the skill lives
 cp "$SKILL"/ci/cross-review-currency.sh       scripts/
 cp "$SKILL"/ci/test-cross-review-currency.sh  scripts/
 cp "$SKILL"/ci/cross-review-currency.yml      .github/workflows/
-bash scripts/test-cross-review-currency.sh    # expect 115 passed, 0 failed
+bash scripts/test-cross-review-currency.sh    # expect 143 passed, 0 failed
 ```
 
 The harness finds the workflow beside itself (this directory) or at
 `../.github/workflows/` (a consuming repo), so it works in both layouts with no
 edits. It is offline — no network, no `gh`, no tokens; it sources the script and
 calls `currency_verdict()` with fixtures.
+
+### Install the workflow before you make the check required
+
+The `currency` job holds `statuses: write`, so it deliberately checks out the
+**base branch** and runs the base copy of `cross-review-currency.sh` — never
+the PR's. A bare `actions/checkout` gives a job the proposed code, and a gate
+whose own source the candidate supplies is not a gate: one edited line makes it
+print `success`. This is the agent case, not an attacker's — an agent with push
+access, told to get CI green, edits the file in front of it.
+
+The consequence at install time: on the PR that *adds* the gate, the base has
+no script yet, so the job exits 2 and goes red with a message saying so. Merge
+that PR first (the context is not required yet), then turn on branch
+protection. Reversing the order needs an admin merge.
 
 Then make it required, or it is decoration:
 
@@ -85,7 +105,9 @@ dependency bumps, rename-only. A PR is exempt when **all four** hold:
 2. applied by a **human account** (the `labeled` event's actor is not a bot or
    an app),
 3. a comment starts `Cross-review exemption:` followed by ≥15 characters of
-   actual reason, and that reason **names the head commit**,
+   actual reason, and that reason **names the head commit** — the commit
+   reference itself does not count toward the 15, or the sha would satisfy the
+   minimum on its own and the hatch would open with no reason at all,
 4. written **by that same human**.
 
 (3) and (4) exist because GitHub preserves both the label and the comment

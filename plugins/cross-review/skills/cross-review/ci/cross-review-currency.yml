@@ -215,8 +215,59 @@ jobs:
     # (exit 2) if it ever lands somewhere without them, so the regression
     # cannot repeat silently — but do not re-create the conditions for it.
     runs-on: ubuntu-latest
+    # Spelled out rather than inherited, so that the one job holding
+    # `statuses: write` says on its own face what it can write.
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: read
+      issues: read
     steps:
+      # THE GATE MUST NOT BE GRADED BY THE CODE IT IS GRADING.
+      #
+      # A bare `actions/checkout@v4` with no `ref:` checks out the PR's MERGE
+      # COMMIT — the proposed code. This job then ran
+      # scripts/cross-review-currency.sh out of that checkout while holding
+      # `statuses: write`, so the PR under review supplied the program that
+      # decides whether the PR is reviewed. Any same-repo PR could edit one
+      # line of the script to print `success` and its own required check went
+      # green. The sibling self-test job has exactly the same problem in
+      # reverse and is why it carries `permissions: contents: read` — running
+      # PR-authored code is fine, running it with a privileged token is not.
+      #
+      # This is the agent case, not a hypothetical attacker: an agent with push
+      # access, told to get CI green, edits the file in front of it. The gate
+      # exists because the honour system does not bind, and a gate whose own
+      # source the candidate supplies is back on the honour system.
+      #
+      # So check out the BASE — code that is already merged and reviewed. On
+      # `pull_request` that is the merge base in the payload; on
+      # `issue_comment` the payload carries no base ref, so fall back to the
+      # default branch. The script needs nothing from the PR: it reads PR
+      # state through the API and is passed the head sha explicitly.
+      #
+      # `persist-credentials: false` because nothing here pushes, and the
+      # token this job holds is the one worth not leaving in .git/config.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # BOOTSTRAP: on the PR that installs this gate, the base has no script
+      # yet, so this exits 2 and the job goes red with a readable reason. That
+      # is the right shape — a missing gate is "could not run", never "passed"
+      # — and it is why ci/README.md says to merge the workflow BEFORE making
+      # `cross-review/current` a required check. Once installed on the base
+      # branch it cannot recur.
+      - name: The gate must exist on the base branch
+        run: |
+          [[ -f scripts/cross-review-currency.sh ]] || {
+            echo "cross-review currency: scripts/cross-review-currency.sh is not on the base branch." >&2
+            echo "  This job deliberately runs the BASE copy, never the PR's, so that a PR" >&2
+            echo "  cannot supply the program that grades it. Merge the gate first, then" >&2
+            echo "  make cross-review/current a required check." >&2
+            exit 2
+          }
 
       - name: Report cross-review currency
         env:

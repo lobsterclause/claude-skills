@@ -50,7 +50,8 @@
 #   1. it carries the `cross-review-exempt` label, applied by a human account
 #      (the `labeled` timeline event's actor must not be a bot or an app),
 #   2. a justification comment beginning `Cross-review exemption:` followed by
-#      at least 15 characters of actual reason,
+#      at least 15 characters of actual reason (the commit reference does not
+#      count toward the 15),
 #   3. that justification NAMES THE HEAD COMMIT it is exempting, and
 #   4. it was WRITTEN BY THAT SAME HUMAN — the account the label came from.
 #
@@ -138,11 +139,73 @@ CR_HEADER='## Cross-review'
 CR_MARKER_RE='<!-- cross-review: sha=[0-9a-f]{40} '
 CR_STAMP_RE='Reviewed (at )?`[0-9a-f]{7,40}`'
 
+# A STAMP IS ONLY WORTH READING IF A TRUSTED ACCOUNT WROTE IT.
+#
+# Everything above describes how to read the stamp and nothing described who
+# is allowed to write one. The record was selected on its BODY alone, so
+# anyone who can comment on a pull request could turn a required check green
+# by pasting the header and a marker naming the head sha. On a fork PR that is
+# the contributor themselves. The gate's whole claim is that it binds the
+# people the hook cannot, and it bound them to a string anyone could type.
+#
+# The data was already here: fetch_comments has carried the author since the
+# exemption hatch needed it, and exemption_verdict has always refused a
+# justification it cannot attribute. The stamp path simply never looked, and a
+# comment in fetch_comments recorded that asymmetry as intentional. It was not
+# defensible: the hatch, which only ever clears TRIVIAL prs, was hardened
+# against exactly the attack the main path left open.
+#
+# WHY author_association AND NOT "reject the pr author". Rejecting the author
+# is the obvious reading of the bypass and it breaks every real use of this
+# gate. The cross-review record is posted by whoever ran the skill, which on a
+# solo repo is the author of the pull request every single time. That fix
+# would red-flag every correctly reviewed PR, and a gate that fails on the
+# happy path is a gate somebody switches off within the day. The property that
+# actually separates the attack from the ordinary case is REPOSITORY
+# STANDING, not authorship: an outside contributor cannot forge MEMBER.
+#
+# OWNER/MEMBER/COLLABORATOR is the write-access set. CONTRIBUTOR, FIRST_TIMER,
+# FIRST_TIME_CONTRIBUTOR, MENTIONEE, NONE are all people who can comment on a
+# PR without being trusted to approve one, which is the whole distinction.
+# Override with CR_TRUSTED_ASSOC (space-separated) for a repo that gates on
+# something narrower, e.g. a single bot account that posts every review.
+#
+# An UNATTRIBUTABLE record — no author_association at all — does not count,
+# and that is the fail-CLOSED direction on purpose. It is the same line
+# exemption_verdict already draws by refusing a justification whose `.user` is
+# absent: the fail-open-on-operational-failure rule covers READING a record,
+# never GRANTING one. Note where the two halves sit: if the comments FETCH
+# fails, fetch_comments returns `null` and the verdict is still green, because
+# that genuinely is "we could not read". A comment we did read, that carries no
+# standing, is not an outage — it is an unsigned record.
+CR_TRUSTED_ASSOC="${CR_TRUSTED_ASSOC:-OWNER MEMBER COLLABORATOR}"
+
 # The escape hatch. The label is only half of it; the justification comment
 # must start with this marker and carry >= 15 further characters of reason, so
 # that "exempt" alone does not clear a PR and the audit trail says why.
 CR_EXEMPT_LABEL="${CR_EXEMPT_LABEL:-cross-review-exempt}"
 CR_EXEMPT_RE='^Cross-review exemption:[[:space:]]*[^[:space:]].{14,}'
+
+# THE COMMIT REFERENCE IS NOT A REASON.
+#
+# CR_EXEMPT_RE counts every character after the marker, and the exemption is
+# also required to name the head commit — so `Cross-review exemption:` plus a
+# bare 40-character sha satisfied the 15-character minimum on its own. The
+# hatch opened with the reason field empty, which is precisely the state the
+# minimum exists to refuse: the label says a human waved it through, the
+# comment says nothing about why, and the audit trail is a commit id that was
+# already in the status. Strip the commit token before measuring.
+#
+# Done in jq rather than sed because \b is Oniguruma-portable and the BSD/GNU
+# sed word-boundary syntaxes are not, and this harness runs on both. Flagged by
+# codex in cross-review of PR #63.
+#
+# reason_substance <text> → the reason with any commit reference removed
+reason_substance() {
+  printf '%s' "${1:-}" \
+    | jq -Rr 'gsub("\\b[0-9a-f]{7,40}\\b"; "") | gsub("^\\s+|\\s+$"; "")' 2>/dev/null \
+    || printf '%s' "${1:-}"
+}
 
 # exemption_verdict <exemption-json> <comments-json-array> <head-sha>
 # Prints "<state>\t<description>" when the hatch applies or is being claimed
@@ -223,16 +286,33 @@ exemption_verdict() {
   # A comment we cannot attribute (`.user` absent) is not a re-affirmation. The
   # fail-open-on-operational-failure rule covers READING a record, never
   # GRANTING one — same line fetch_exemption draws with `null`.
+  #
+  # THE SHA IS LOOKED FOR ON THE EXEMPTION LINE, NOT ANYWHERE IN THE BODY.
+  # Matching the whole body meant an exemption written for an EARLIER head was
+  # honoured whenever some unrelated hex run elsewhere in the same comment —
+  # a pasted log, a stack trace, a diff — happened to prefix the new head. The
+  # binding to a commit is the entire reason (3) exists, and a coincidence
+  # somewhere else in the comment could satisfy it. Flagged convergently by
+  # gemini-pro and kimi in cross-review of PR #63.
   reason="$(printf '%s' "$comments" \
     | jq -r --arg re "$CR_EXEMPT_RE" --arg h "$head_sha" --arg a "$actor" \
         '[ .[]? | select((.user // "") == $a) | (.body // "")
            | select(test($re))
-           | select([match("[0-9a-f]{7,40}"; "g").string]
+           | (split("\n") | map(sub("\r$"; "")) | map(select(test($re))) | first // "") as $line
+           | select([$line | match("[0-9a-f]{7,40}"; "g").string]
                     | map(. as $t | $h | startswith($t)) | any)
          ] | last // ""' 2>/dev/null \
     | sed -nE 's/^Cross-review exemption:[[:space:]]*//p' | head -1)"
 
   if [[ -n "$reason" ]]; then
+    # Bound to the head and to the granting human, but is there a reason in it?
+    local substance
+    substance="$(reason_substance "$reason")"
+    if [[ "${#substance}" -lt 15 ]]; then
+      printf 'failure\t%s\n' \
+        "@${actor} named ${head_sha:0:9} but gave no reason — say why in 15+ characters"
+      return 0
+    fi
     printf 'success\t%s\n' "exempt by @${actor}: ${reason:0:80}"
     return 0
   fi
@@ -242,11 +322,14 @@ exemption_verdict() {
   # themselves. Or the granter bound one to an older commit, so the fix is one
   # more comment. Or nobody justified anything at all.
   local bound_by_other
+  # Same line-scoped match as above; the two have to agree on what "bound to
+  # this head" means or the refusal names the wrong remedy.
   bound_by_other="$(printf '%s' "$comments" \
     | jq -r --arg re "$CR_EXEMPT_RE" --arg h "$head_sha" \
         '[ .[]? | (.body // "")
            | select(test($re))
-           | select([match("[0-9a-f]{7,40}"; "g").string]
+           | (split("\n") | map(sub("\r$"; "")) | map(select(test($re))) | first // "") as $line
+           | select([$line | match("[0-9a-f]{7,40}"; "g").string]
                     | map(. as $t | $h | startswith($t)) | any)
          ] | length' 2>/dev/null || echo 0)"
 
@@ -305,18 +388,40 @@ currency_verdict() {
     return
   fi
 
+  # The trusted set as a JSON array, so jq can test membership directly.
+  local trusted_json
+  trusted_json="$(printf '%s' "$CR_TRUSTED_ASSOC" | jq -Rc 'split(" ") | map(select(length > 0))' 2>/dev/null || printf '[]')"
+
   any_count="$(printf '%s' "$comments" \
-    | jq -r --arg h "$CR_HEADER" \
-        '[.[]? | (.body // "") | select(startswith($h))] | length' 2>/dev/null || echo 0)"
+    | jq -r --arg h "$CR_HEADER" --argjson t "$trusted_json" \
+        '[.[]? | select((.assoc // "") as $a | ($t | index($a)) != null) | (.body // "") | select(startswith($h))] | length' 2>/dev/null || echo 0)"
+
+  # Records that look like reviews but carry no repository standing. Counted
+  # separately so the refusal can say WHICH thing is wrong: "nobody reviewed
+  # this" and "somebody without write access posted something shaped like a
+  # review" call for very different reactions from whoever reads the status.
+  local untrusted_count
+  untrusted_count="$(printf '%s' "$comments" \
+    | jq -r --arg h "$CR_HEADER" --arg m "$CR_MARKER_RE" --arg re "$CR_STAMP_RE" --argjson t "$trusted_json" \
+        '[.[]? | select((.assoc // "") as $a | ($t | index($a)) == null) | (.body // "")
+          | select(startswith($h)) | select(test($m) or test($re))] | length' 2>/dev/null || echo 0)"
   # Pick the newest record carrying a stamp of EITHER kind, then read the
   # marker out of it if it has one. Selecting on both forms together is what
   # keeps "newest wins" meaningful across the transition: a fresh prose
   # re-review must still be able to clear an older stale marker, and an older
   # prose record must not outrank a newer marker.
+  #
+  # The author filter runs BEFORE "newest wins", not after. Selecting the
+  # newest record and then checking its standing would let an untrusted
+  # comment posted after a real review suppress that review — a denial of
+  # service on the gate, turning a green PR red by commenting on it. Filtering
+  # first means an untrusted comment is not a record at all, so the genuine
+  # one behind it is still the last element.
   local record
   record="$(printf '%s' "$comments" \
-    | jq -r --arg h "$CR_HEADER" --arg m "$CR_MARKER_RE" --arg re "$CR_STAMP_RE" \
-        '[.[]? | (.body // "") | select(startswith($h)) | select(test($m) or test($re))] | last // ""' \
+    | jq -r --arg h "$CR_HEADER" --arg m "$CR_MARKER_RE" --arg re "$CR_STAMP_RE" --argjson t "$trusted_json" \
+        '[.[]? | select((.assoc // "") as $a | ($t | index($a)) != null) | (.body // "")
+          | select(startswith($h)) | select(test($m) or test($re))] | last // ""' \
         2>/dev/null || printf '')"
 
   # Marker first. Within one comment the two can disagree — a model may edit
@@ -330,7 +435,14 @@ currency_verdict() {
     | sed -nE 's/.*Reviewed (at )?`([0-9a-f]{7,40})`.*/\2/p' | head -1)"
 
   if [[ -z "$reviewed" ]]; then
-    if [[ "${any_count:-0}" -gt 0 ]]; then
+    # Ordered most-specific first. A stamped record from an account without
+    # write access is the interesting case and must not be reported as
+    # "no cross-review record" — that phrasing reads as an oversight, when
+    # what actually happened is that something tried to sign off and could not.
+    if [[ "${untrusted_count:-0}" -gt 0 ]]; then
+      printf 'failure\t%s\n' \
+        "cross-review record is not from a repo member — only ${CR_TRUSTED_ASSOC// /\/} count"
+    elif [[ "${any_count:-0}" -gt 0 ]]; then
       printf 'failure\t%s\n' \
         "cross-review record carries no SHA stamp — re-run /cross-review, or label ${CR_EXEMPT_LABEL}"
     else
@@ -366,12 +478,18 @@ fetch_comments() {
   # `[]` here would turn a rate-limit into 40 simultaneous red PRs.
   # `user` is carried because an exemption is bound to the human who granted
   # it, not only to a commit: exemption_verdict has to know who wrote the
-  # justification. currency_verdict's stamp path reads `.body` only and is
-  # unaffected. A comment whose author cannot be read comes back with `user`
+  # justification. A comment whose author cannot be read comes back with `user`
   # absent, which exemption_verdict treats as "not the granter" — unattributed
   # is never a re-affirmation.
+  #
+  # `assoc` is the author's standing in this repository, and currency_verdict
+  # requires it on the stamp path. This used to say the stamp path "reads
+  # `.body` only and is unaffected", which was true and was the bug: a record
+  # selected on its body alone is a record anyone who can comment can forge.
+  # See CR_TRUSTED_ASSOC above for why standing rather than authorship is the
+  # thing being checked. Absent, like `user`, means untrusted, not unknown.
   gh api --paginate --slurp "repos/$1/issues/$2/comments" 2>/dev/null \
-    | jq -c '[.[][] | {body: (.body // ""), user: (.user.login // "")}]' 2>/dev/null \
+    | jq -c '[.[][] | {body: (.body // ""), user: (.user.login // ""), assoc: (.author_association // "")}]' 2>/dev/null \
     || printf 'null'
 }
 
@@ -478,7 +596,25 @@ main() {
       -f description="${description:0:140}" \
       -f target_url="https://github.com/$repo/pull/$pr" \
       >/dev/null 2>&1 \
-      || echo "warning: could not post the commit status" >&2
+      || {
+        # A FAILED POST IS AN OUTAGE, NOT A VERDICT — exit 2, same as a runner
+        # with no gh/jq. This used to warn and fall through to the `success`
+        # test below, so a run that computed `failure` and could not publish it
+        # exited 0 and the job went green. The status on this commit is then
+        # whatever an earlier run left there: on a re-review that turned red,
+        # an obsolete `success` stays authoritative at the merge button and
+        # nothing anywhere is red. The one visible symptom was a line in the
+        # log nobody reads.
+        #
+        # Exit 2 rather than 1 for the same reason the tool guard uses it: the
+        # workflow swallows 1 ("ran, and the answer is no") and re-raises 2
+        # ("could not run, and posted nothing"). This is the second kind.
+        # Flagged by codex in cross-review of PR #63.
+        echo "cross-review currency: could not post the commit status to ${sha:0:9}" >&2
+        echo "  Computed: ${state} — ${description}" >&2
+        echo "  NOT published. Any status already on this commit is now stale." >&2
+        exit 2
+      }
   fi
 
   [[ "$state" == "success" ]]
