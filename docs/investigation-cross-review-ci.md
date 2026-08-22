@@ -247,3 +247,28 @@ ci harness 143 → 174 cases, all mutation-checked. Full suite 321/321.
 
 **The posted review record is stamped `7a80204` and the head is now `56ae9ff`** — by the gate's own
 rule this PR is not currently reviewed. A pass 3 is required before merge.
+
+## Pass 3 (2026-08-22, head 7358845 → fixes at a016b9f)
+
+Roster drew codex/kimi/laguna/qwen. **Both fixed baselines failed on billing** — codex over its
+OpenAI usage limit until 2026-08-27, kimi `429 … account suspended, insufficient balance` (the same
+Moonshot key kimi27 and kimi3 use, so all three seats are down). Topped up with gemini-pro and
+deepseek to keep four providers.
+
+- **Critical (gemini-pro):** pass 2's permission check does not fire on the stock `GITHUB_TOKEN` —
+  the collaborators-permission endpoint is gated on the caller having push access, which
+  `contents: read` is not. It 403s, `perm` is empty, and the gate silently falls back to the
+  `author_association` the check was written to replace. Fixed by documenting it loudly (stderr
+  warning + `(standing unverified)` + a README section) rather than pretending, with the remedy
+  being a PAT/App token plus `CR_PERMISSION_UNREADABLE=refuse`.
+- **Low (gemini-pro), real:** `reason_substance` stripped every hex-looking run, which eats
+  `defaced`/`effaced`/`acceded`. Now strips only the token the binding check accepts.
+- **Medium (deepseek):** permission lookups were unbounded; now record-authors only, capped at 10,
+  with overflow logged.
+
+Refuted with evidence: deepseek's `\b`-is-a-backspace (tested: it is a word boundary),
+`CR_STAMP_RE`, `CR_TRUSTED_ASSOC`, sha-prefix, mid-prose-sha and issue_comment-token claims; qwen's
+`contains()` Critical. laguna returned no findings.
+
+Record posted and stamped `a016b9f`, which **is** the current head — the first pass where the PR's
+review record is current. The pass-3 fixes themselves were not put through a further round.
