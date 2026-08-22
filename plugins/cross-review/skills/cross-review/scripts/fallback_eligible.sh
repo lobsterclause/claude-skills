@@ -65,13 +65,23 @@ done
 # followed by another digit. Likewise "account" needs a boundary on BOTH sides
 # or "the accountability suspended clause" reads as a suspended account.
 # (kimi High, PR #66 delta -- second defect of this class on this matcher.)
-if grep -Eqi 'usage limit|insufficient balance|(^|[^[:alnum:]])account([^[:alnum:]].{0,40})?suspend|exceeded_current_quota|quota exceeded' <<<"$blob"; then
+# THIRD defect of this class, same matcher (codex Medium + kimi3 Low, PR #66
+# delta-2). Anchoring on [[:space:]:] was too tight in one direction and the
+# optional post-"account" boundary too loose in the other. Verified live:
+#   HTTP/2 429, HTTP/1.1 429, status=429, HTTP/2 401, status=403  -> all MISSED
+#   accountsuspended                                              -> matched
+#   accounts suspended / accounts were suspended                  -> MISSED
+# So the separator is now any run of non-alphanumerics plus an optional HTTP
+# version token (/2, /1.1), the plural is allowed, and the delimiter after
+# "account" is MANDATORY. The trailing ([^0-9]|$) guard is what still rejects
+# "4290ms elapsed" and "http 4031 bytes" -- keep it when touching this.
+if grep -Eqi 'usage limit|insufficient balance|(^|[^[:alnum:]])accounts?[^[:alnum:]].{0,40}suspend|exceeded_current_quota|quota exceeded' <<<"$blob"; then
   echo "account_limit"; exit 0
 fi
-if grep -Eqi '(error code|http|status( code)?)[[:space:]:]+429([^0-9]|$)|429 too many requests' <<<"$blob"; then
+if grep -Eqi '(error code|http(/[0-9.]+)?|status( code)?)[^[:alnum:]]+429([^0-9]|$)|429 too many requests' <<<"$blob"; then
   echo "rate_limited"; exit 0
 fi
-if grep -Eqi '(error code|http|status( code)?)[[:space:]:]+40[13]([^0-9]|$)|401 unauthorized|403 forbidden|authentication failed|invalid[[:space:]_-]*api[[:space:]_-]*key' <<<"$blob"; then
+if grep -Eqi '(error code|http(/[0-9.]+)?|status( code)?)[^[:alnum:]]+40[13]([^0-9]|$)|401 unauthorized|403 forbidden|authentication failed|invalid[[:space:]_-]*api[[:space:]_-]*key' <<<"$blob"; then
   echo "auth_failed"; exit 0
 fi
 

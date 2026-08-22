@@ -199,9 +199,31 @@ reviewer_obj() {
   # the blindness the 2026-07-01 no-fallback policy existed to prevent. A
   # distinct status keeps reliability honest (leaderboard.sh counts only "ok"),
   # while the findings still earn their normal value credit.
+  #
+  # The `succeeded` read uses has(), NOT `//`. jq treats an explicit `false` as
+  # absent, so `.fallback.succeeded // (.exit_code == 0)` would read a rescue
+  # recorded as succeeded:false with exit_code 0 as a SUCCESSFUL rescue --
+  # crediting a dead lane with a served review. Latent rather than live today
+  # (run_reviewers.sh writes succeeded:false only when the fallback rc is
+  # non-zero, and stamps that same rc as exit_code), but it is one change away
+  # from being live and it is the third `//` false-collapse in this skill --
+  # cf. profile_flag() in run_reviewers.sh, same root cause, fixed the same way.
+  # (codex Medium + kimi3 Medium, convergent across two providers, PR #66
+  # delta-2.) The legacy default stays `.exit_code == 0` alone: adding an
+  # output_bytes clause here would silently RE-classify old rows, which is the
+  # regression this branch was already fixed for once.
   jq -c '. + {status: (if .timed_out == true then "timed_out"
                        elif (.fallback.used // false) == true
-                            and (.fallback.succeeded // (.exit_code == 0)) == true then "fallback"
+                            and (if (.fallback | has("succeeded"))
+                                 then .fallback.succeeded
+                                 else (.exit_code == 0) end) == true then "fallback"
+                       # used-but-not-succeeded is a FAILED lane, full stop. It
+                       # must not fall through to the exit-code heuristics
+                       # below, where a rescue that exited 0 with bytes on
+                       # stdout would score "ok" -- crediting a dead lane with
+                       # a healthy round, the exact blindness this status
+                       # exists to remove.
+                       elif (.fallback.used // false) == true then "failed"
                        elif .failure_kind == "quota_exhausted" then "quota"
                        elif .failure_kind == "headless_permission_denied" then "permission_denied"
                        elif .failure_kind == "degenerate_output" then "degenerate"

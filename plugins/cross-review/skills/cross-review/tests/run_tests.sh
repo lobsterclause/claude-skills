@@ -664,6 +664,51 @@ WARN_OUT="$(CROSS_REVIEW_RUNLOG="$WARNLOG" bash "$S/analyze_runlog.sh" --mode wa
 assert_contains "pool reviewer at 66% timeout rate warns" "$WARN_OUT" "north timed out"
 assert_contains "flag reviewer warning suggests --timeout-codex" "$WARN_OUT" "--timeout-codex"
 
+echo "── append_runlog.sh: an explicitly-failed rescue is not a rescue ──"
+# [pin: 2026-08-22, PR #66 delta-2 — codex Medium + kimi3 Medium, convergent
+# across two providers. The classifier read `.fallback.succeeded //
+# (.exit_code == 0)`, and jq treats an explicit `false` as ABSENT, so a rescue
+# recorded succeeded:false would take the legacy default and score as a
+# SUCCESSFUL fallback. Third `//` false-collapse in this skill (cf.
+# profile_flag() in run_reviewers.sh) — the class is what is being closed here,
+# not the instance.
+#
+# Honest note on reachability: today run_reviewers.sh writes succeeded:false
+# only when the fallback rc is non-zero, and stamps that same rc as exit_code,
+# so the pair below is not produced by the current writer. It is pinned anyway
+# because it is one line-change away from being produced, and because the
+# correct answer is not obvious — falling through to the exit-code heuristics
+# would have scored it "ok", crediting a dead lane with a healthy round.]
+FBC="$T/fbclass"; mkdir -p "$FBC/raw"
+fbclass() {  # $1=label $2=meta-json $3=expected status
+  rm -f "$FBC/raw/codex.meta.json"
+  printf '%s\n' "$2" >"$FBC/raw/codex.meta.json"
+  local lg="$FBC/log.jsonl"; : >"$lg"
+  CROSS_REVIEW_RUNLOG="$lg" bash "$S/append_runlog.sh" \
+    --run-dir "$FBC" --project test --base main --pr - --pass 1 \
+    --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+  assert_eq "$1" "$(jq -r '.reviewers.codex.status' <"$lg" | tail -1)" "$3"
+}
+fbclass "a rescue marked succeeded:false is NOT scored as a fallback" \
+  '{"exit_code":0,"duration_s":80,"timed_out":false,"output_bytes":1863,"fallback":{"used":true,"succeeded":false,"reason":"account_limit"}}' \
+  "failed"
+fbclass "a rescue marked succeeded:true is scored as a fallback" \
+  '{"exit_code":0,"duration_s":80,"timed_out":false,"output_bytes":1863,"fallback":{"used":true,"succeeded":true,"reason":"account_limit"}}' \
+  "fallback"
+# Legacy metadata predates `succeeded` entirely and must keep working, or the
+# fix re-classifies historical rows — a regression this branch already shipped once.
+fbclass "legacy fallback meta with no succeeded field still scores fallback" \
+  '{"exit_code":0,"duration_s":80,"timed_out":false,"output_bytes":1863,"fallback":{"used":true,"reason":"account_limit"}}' \
+  "fallback"
+fbclass "legacy fallback meta with a failing rc still scores failed" \
+  '{"exit_code":5,"duration_s":1,"timed_out":false,"output_bytes":0,"fallback":{"used":true,"reason":"account_limit"}}' \
+  "failed"
+# Controls: the ordinary no-fallback path must be untouched by all of the above.
+fbclass "control: no fallback object, rc=0 with output → ok" \
+  '{"exit_code":0,"duration_s":10,"timed_out":false,"output_bytes":500}' "ok"
+fbclass "control: no fallback object, rc=1 → failed" \
+  '{"exit_code":1,"duration_s":2,"timed_out":false,"output_bytes":0}' "failed"
+
 echo "── analyze_runlog.sh knows the `fallback` status it is fed ──"
 # [pin: 2026-08-22 — PR #66 taught append_runlog.sh to emit status "fallback"
 # for a first-party lane rescued over OpenRouter, but analyze_runlog.sh bucketed
@@ -2338,6 +2383,26 @@ echo "── review-record roster excludes forensic artifacts ──"
 # "codex + codex.primary-failed + kimi + mimo + north": five names, three
 # reviewers. Enumerating suffixes clearly does not converge, so the roster is
 # now derived from reviewer_profiles.json and this pins it.
+# This block installs its OWN gh stub. The `$T/bin/gh` stub is rewritten by
+# roughly seven later blocks and deleted outright by one, so a test down here
+# that relies on the capture stub created ~800 lines earlier is depending on
+# ambient global state -- which is precisely how this test came to pass while
+# capturing nothing at all. Install what you assert against.
+cat >"$T/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "pr view") printf '%s\n' "${CR_TEST_PR_JSON:-}" ; exit 0 ;;
+  "pr comment")
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--body-file" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
+        shift
+      done
+      exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/gh"
 PCR="$T/pcroster"; mkdir -p "$PCR/raw"
 for n in codex codex.primary-failed codex.attempt1 kimi kimi.agy-failed not-a-reviewer; do
   printf '{"exit_code":0,"output_bytes":10}\n' >"$PCR/raw/$n.meta.json"
@@ -2348,7 +2413,26 @@ CR_TEST_PR_JSON='{"headRefOid":"abc1234567","state":"OPEN"}' \
   bash "$SKILL_DIR/scripts/post_comment.sh" --pr 4242 --mode summary \
   --findings "$PCR/findings.md" --head-sha "abc1234567890123456789012345678901234567" \
   >/dev/null 2>&1
-PC_ROSTER="$(grep -o 'Automated review by [^.]*' "$CR_TEST_CAPTURE" 2>/dev/null | head -1)"
+# Capture to END OF LINE, not `[^.]*`. The first version of this test stopped
+# the capture at the first dot -- and every artifact name it checks for
+# contains one, so with the fix fully reverted the capture collapsed to
+# "Automated review by codex, codex" and all three `bad` checks passed.
+# Demonstrated by reverting the fix; the test detected nothing.
+PC_ROSTER="$(grep -o 'Automated review by .*' "$CR_TEST_CAPTURE" 2>/dev/null | head -1)"
+# NON-VACUITY: the three exclusion checks below are all satisfied by an EMPTY
+# capture, which is reachable for reasons that have nothing to do with the
+# thing under test (post_comment.sh failing early, the capture shim not
+# engaging, reviewer_profiles.json changing shape so the whitelist matches
+# nothing). Reproduced live. So assert the positive first: real reviewers must
+# actually be named, or the exclusions prove nothing.
+# (kimi3 Medium, PR #66 delta-2.)
+if [[ -z "$PC_ROSTER" ]]; then
+  bad "the review record roster line is missing entirely — the exclusion checks below would pass vacuously"
+else
+  ok "the review record emits a roster line to assert against"
+fi
+assert_contains "roster names the codex reviewer" "$PC_ROSTER" "codex"
+assert_contains "roster names the kimi reviewer" "$PC_ROSTER" "kimi"
 if [[ "$PC_ROSTER" == *"primary-failed"* ]]; then
   bad "the review record counts <slug>.primary-failed as a reviewer: $PC_ROSTER"
 else
@@ -2461,6 +2545,41 @@ assert_eq "a dot-separated account.suspended still matches" \
 printf 'HTTP 401 Unauthorized\n' >"$FBT/anch3.stdout"
 assert_eq "a real 401 still matches" \
   "$(bash "$FBE" --name anch3 --rc 1 --out "$FBT" 2>/dev/null)" "auth_failed"
+
+# THIRD defect of this class, same matcher, found by the delta round that
+# reviewed the second fix. Anchoring on [[:space:]:] was too tight in one
+# direction while the optional post-"account" boundary stayed too loose in the
+# other. Every line below was verified against the live script before the fix:
+# the MUST-match ones all returned nothing, and "accountsuspended" matched.
+# (codex Medium + kimi3 Low, PR #66 delta-2.)
+fbe_yes() {  # $1=label $2=text $3=expected reason -- must BE eligible
+  printf '%s\n' "$2" >"$FBT/anch4.stdout"
+  local r; r="$(bash "$FBE" --name anch4 --rc 1 --out "$FBT" 2>/dev/null)"
+  assert_eq "$1" "$r" "$3"
+}
+# Real-world status-line shapes. `HTTP/2 429` is what curl and most proxies
+# actually emit, and the previous pattern could not match it at all -- so the
+# single most common form of the error this feature exists to catch was the
+# one form it missed.
+fbe_yes "HTTP/2 429 is eligible"        'HTTP/2 429'                  "rate_limited"
+fbe_yes "HTTP/1.1 429 is eligible"      'HTTP/1.1 429 Too Many Requests' "rate_limited"
+fbe_yes "status=429 is eligible"        'openrouter: status=429'      "rate_limited"
+fbe_yes "HTTP/2 401 is eligible"        'HTTP/2 401'                  "auth_failed"
+fbe_yes "status=403 is eligible"        'gateway: status=403'         "auth_failed"
+# The plural was collateral damage of the previous anchoring pass.
+fbe_yes "'accounts suspended' is eligible"      'accounts suspended'          "account_limit"
+fbe_yes "'accounts were suspended' is eligible" 'your accounts were suspended' "account_limit"
+# ...while the delimiter after "account" is now MANDATORY, so a run-on word is
+# no longer a paid re-run.
+fbe_no "run-on 'accountsuspended'"      'accountsuspended'
+# The trailing ([^0-9]|$) guard is what keeps the looser separator honest --
+# these are the four false positives demonstrated live in the previous round
+# and they must STAY rejected. Re-asserted here because widening the separator
+# class is exactly the change that would resurrect them.
+fbe_no "widened separator still rejects 4290ms"   'request status: 4290ms elapsed'
+fbe_no "widened separator still rejects 4031"     'wrote http 4031 bytes to disk'
+fbe_no "widened separator still rejects 4011"     'status: 4011 rows returned'
+fbe_no "widened separator still rejects http 200" 'discussing http 200 handling'
 
 # A misconfigured kimi alias must fail LOUDLY, not become a silent recurring
 # paid OpenRouter run. (glm, PR #66.)
