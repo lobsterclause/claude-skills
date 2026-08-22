@@ -5,20 +5,21 @@
 #    "glm": bool, "deepseek": bool, "mimo": bool, "minimax": bool, "qwen": bool,
 #    "devstral": bool, "laguna": bool, "kat": bool,
 #    "north": bool, "nemotron": bool, "spark": bool,
-#    "seed": bool, "grok": bool, "kimi27": bool,
+#    "seed": bool, "grok": bool, "longcat": bool, "inkling": bool,
+#    "kimi27": bool,
 #    "kimi3": bool, "openrouter": bool}
 #
 # As of the 2026-06-18 Gemini-CLI consumer sunset, BOTH Gemini-family reviewers
 # run on Google's `agy` (Antigravity) CLI:
-#   - antigravity → agy --model "Gemini 3.5 Flash (High)"   (fast lap)
+#   - antigravity → agy --model "Gemini 3.7 Flash (High)"   (fast lap)
 #   - gemini-pro  → agy --model "Gemini 3.1 Pro (High)"     (deep lap)
 # So their availability both track the single `agy` binary. The standalone
 # `gemini` CLI is no longer used (it stopped serving consumer requests on
 # 2026-06-18). codex and kimi are unchanged.
 #
 # The OpenRouter pool (glm, deepseek, mimo, minimax, qwen, devstral, laguna,
-# kat, north, nemotron, spark, seed, grok)
-# runs via the OpenRouter API — no CLI; all thirteen track the same condition:
+# kat, north, nemotron, spark, seed, grok, longcat, inkling)
+# runs via the OpenRouter API — no CLI; all fifteen track the same condition:
 # an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key) + curl.
 # `openrouter` reports that shared condition. NOTE: there is NO OpenRouter
 # fallback for the first-party reviewers (policy, 2026-07-01) — a failed agy
@@ -140,10 +141,10 @@ fi
 # WARNING: the format-string keys and the positional args below are coupled
 # by POSITION ONLY — inserting a reviewer in one without the other silently
 # shifts every later value (kimi+kat convergent nit, PR #29 pass 1). Keep the
-# order: 4 named CLIs, 13x $openrouter for the OR pool, $kimi27, $kimi3, $openrouter.
-printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "spark": %s, "seed": %s, "grok": %s, "kimi27": %s, "kimi3": %s, "openrouter": %s}\n' \
+# order: 4 named CLIs, 15x $openrouter for the OR pool, $kimi27, $kimi3, $openrouter.
+printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "spark": %s, "seed": %s, "grok": %s, "longcat": %s, "inkling": %s, "kimi27": %s, "kimi3": %s, "openrouter": %s}\n' \
   "$codex" "$antigravity" "$gemini_pro" "$kimi" \
-  "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" \
+  "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" \
   "$kimi27" "$kimi3" "$openrouter"
 
 # --- baseline enforcement ---------------------------------------------------

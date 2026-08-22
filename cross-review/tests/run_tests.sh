@@ -240,7 +240,7 @@ if [[ "$N_R1" -ge 3 ]]; then ok "roster ≥3 ($N_R1)"; else bad "roster <3 ($R1)
 # must redraw unfiltered and keep the floor]
 SLOWLOG="$T/slow-runlog.jsonl"
 jq -nc '{ts:"2026-07-01T05:00:00Z", reviewers: (
-  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","qwen","devstral","laguna","kat","north","nemotron","spark","seed","grok","kimi27","kimi3"]
+  ["antigravity","gemini-pro","glm","deepseek","mimo","minimax","qwen","devstral","laguna","kat","north","nemotron","spark","seed","grok","longcat","inkling","kimi27","kimi3"]
   | map({key: ., value: {status:"ok", exit_code:0, duration_s:5000, output_bytes:10, timeout_budget_s:600}}) | from_entries)}' >"$SLOWLOG"
 FAST_ERR="$T/fast.err"
 RF="$(CROSS_REVIEW_RUNLOG="$SLOWLOG" bash "$S/select_roster.sh" --seed 7 --fast 2>"$FAST_ERR")"
@@ -969,10 +969,21 @@ assert_eq "detect still reports kimi27 available (positional coupling check)" \
 BOOST_ERR3="$T/boost3.err"
 CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR3"
 assert_contains "selector draws kimi3 as a candidate" "$(cat "$BOOST_ERR3")" "kimi3"
+# What this pins is that draw_boost actually MULTIPLIES the drawn weight --
+# kimi3 was only ever the vehicle, and its boost was retired to 1.0 on
+# 2026-08-22 (per Gabriel: enough data gathered), which broke this assertion.
+# Repointed to `inkling`, a seat that genuinely still carries 2.5. THE SEAT
+# NAMED HERE MUST BE ONE WITH draw_boost 2.5 AND NO RUNLOG HISTORY -- when
+# inkling's boost is retired in turn, repoint again rather than editing the
+# expected number, or this stops testing the multiplier at all. Same failure
+# the deepseek/nemotron swap caused on 2026-08-14.
 # rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0;
-# draw_boost 2.5 (fresh seat, not yet retired) → 75.0 * 2.5 = 187.5.
-assert_contains "kimi3 weight reflects its draw_boost (2.5, not yet retired)" \
-  "$(grep 'kimi3 ' "$BOOST_ERR3")" "weight=187.5"
+# draw_boost 2.5 → 75.0 * 2.5 = 187.5.
+assert_contains "a boosted rookie seat's weight reflects its draw_boost (inkling, 2.5)" \
+  "$(grep 'inkling ' "$BOOST_ERR3")" "weight=187.5"
+# and the retired seat is now drawn at the unboosted rookie weight
+assert_contains "kimi3 draws unboosted after its 2026-08-22 boost retirement" \
+  "$(grep 'kimi3 ' "$BOOST_ERR3")" "weight=75.0"
 # no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
 MOONSHOT_API_KEY= bash "$S/run_reviewers.sh" --base main --out "$T/o13" --reviewers kimi3 >/dev/null 2>"$T/k3skip.err"
 assert_eq "kimi3 without a key exits 1 (all requested reviewers failed)" "$?" "1"
@@ -2187,6 +2198,160 @@ if grep -q -- '--repo other/proj' "$CR_RECON_MARKER"; then
   ok "--post targets the repo recorded by the attempt"
 else bad "--post invoked gh with no --repo — it can hit a same-numbered PR elsewhere"; fi
 unset CR_RECON_MARKER
+
+echo "── response_format opt-out (the seat that was dead for 8 days) ──"
+
+# bytedance-seed/seed-2.0-code hard-400s on response_format.type=json_object.
+# The `seed` seat failed rc=1 with 0 bytes on all 6 dispatches it ever got
+# between 2026-08-14 and 2026-08-22 -- while carrying draw_boost 2.5, so the
+# selector PREFERRED it for rounds it could not contribute to. It read as
+# flakiness; it was an unsupported request field. (PR #64 cross-review round.)
+#
+# The subtle part is the accessor, not the flag. jq's `//` treats false as
+# absent, so `.[$r][$k] // empty` -- what profile_get uses -- collapses an
+# explicit `false` into "" and makes an opt-OUT unexpressible. These pin the
+# has()-based semantics against the real profile.
+PF_JQ='if (.[$r] | type) == "object" and (.[$r] | has($k)) then (.[$r][$k] | tostring) else $d end'
+pflag() { jq -r --arg r "$1" --arg k "supports_json_object" --arg d "true" "$PF_JQ" \
+            "$SKILL_DIR/references/reviewer_profiles.json"; }
+assert_eq "seed opts out of response_format" "$(pflag seed)" "false"
+assert_eq "a seat with no flag defaults to true (glm)" "$(pflag glm)" "true"
+assert_eq "an unknown seat defaults to true" "$(pflag not-a-seat)" "true"
+
+# and prove the naive accessor really would have broken -- if this ever starts
+# returning "false", profile_get became safe and the helper could be retired
+assert_eq "profile_get's // accessor collapses false to empty (why profile_flag exists)" \
+  "$(jq -r --arg r seed --arg k supports_json_object '.[$r][$k] // empty' \
+      "$SKILL_DIR/references/reviewer_profiles.json")" ""
+
+# the wrapper must actually consult the flag, not just carry it in the profile
+if grep -q 'profile_flag "$slug" supports_json_object' "$S/run_reviewers.sh"; then
+  ok "run_reviewers.sh gates response_format on the profile flag"
+else
+  bad "run_reviewers.sh no longer reads supports_json_object -- seed goes dead again"
+fi
+
+echo "── seat wiring: every profile seat reaches every dispatch site ──"
+
+# Adding a reviewer means editing eight files that share no schema, and until
+# now nothing checked that you finished. The 2026-08-22 refresh (longcat,
+# inkling) had to touch: reviewer_profiles.json, detect_reviewers.sh (a printf
+# whose format keys and positional args are coupled BY POSITION ONLY -- the
+# PR #29 nit), select_roster.sh's POOL, leaderboard.sh's REVIEWERS + provider
+# map, analyze_runlog.sh's REVIEWERS, append_runlog.sh's provider map and its
+# three jq wiring sites, and run_reviewers.sh's model_backed_reviewers +
+# run_<seat> + three dispatch case arms.
+#
+# Miss one and nothing fails loudly: a seat absent from POOL is simply never
+# drawn, a seat absent from the provider map silently reports provider
+# "unknown" and stops counting as an independent vote at synthesis, and a
+# printf arg missed shifts every LATER reviewer's availability by one. All
+# three read as reviewer flakiness rather than as config.
+#
+# The profile is the source of truth; this asserts the rest agrees with it.
+# Deliberately derived -- seats are enumerated from the JSON rather than
+# hardcoded, so a seat added tomorrow is covered without editing this test.
+#
+# Membership is tested on a NORMALISED token list, not a regex against the
+# raw line. The first draft used "[( ]$seat[ )]" and false-positived on `glm`
+# forever, because the first element of `POOL+=(glm deepseek ...)` has the
+# opening paren consumed by the literal prefix and so is never preceded by a
+# delimiter. Normalising ()|,+= to spaces and matching " $seat " has no
+# first-element or last-element special case.
+wire_has() {  # $1=extracted text  $2=seat -> 0 if seat is a member
+  local toks
+  toks=" $(printf '%s' "$1" | tr '()|,+=' '      ' | tr -s ' \n' '  ') "
+  [[ "$toks" == *" $2 "* ]]
+}
+
+WIRE_SEATS="$(jq -r 'to_entries[]
+  | select(.value|type=="object")
+  | select(.value.cli=="openrouter")
+  | .key' "$SKILL_DIR/references/reviewer_profiles.json")"
+
+WIRE_DETECT="$(PATH="$T/bin:$PATH" bash "$S/detect_reviewers.sh" 2>/dev/null || true)"
+WIRE_POOL="$(grep 'POOL+=' "$S/select_roster.sh")"
+WIRE_LB="$(grep 'REVIEWERS=(' "$S/leaderboard.sh")"
+WIRE_AN="$(grep 'REVIEWERS=(' "$S/analyze_runlog.sh")"
+WIRE_MB="$(sed -n '/^model_backed_reviewers=(/,/)/p' "$S/run_reviewers.sh")"
+# every OR-pool case arm in the dispatcher; a seat must be in ALL of them.
+# Routed through wire_has like the rest -- an arm is a `|`-delimited list and
+# has the identical first-element trap a raw regex falls into.
+WIRE_ARM_LINES="$(grep 'glm|deepseek' "$S/run_reviewers.sh")"
+WIRE_ARMS="$(printf '%s\n' "$WIRE_ARM_LINES" | grep -c .)"
+wire_in_every_arm() {  # $1=seat
+  local n=0 line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    wire_has "$line" "$1" && n=$((n + 1))
+  done <<<"$WIRE_ARM_LINES"
+  # never report success against zero arms -- see the non-vacuity block below
+  [[ "$WIRE_ARMS" -gt 0 && "$n" == "$WIRE_ARMS" ]]
+}
+
+# NON-VACUITY, first. A check that silently enumerates nothing reports "ok"
+# and is worse than no check, because it looks like coverage. Both paths were
+# confirmed live: WIRE_ARMS=0 makes wire_in_every_arm true for every seat
+# (0 == 0), and an empty WIRE_SEATS skips the loop entirely. Either can happen
+# from a jq path change, a renamed `cli` field, an unset SKILL_DIR, or a
+# reworded case arm -- none of which are exotic. (glm 5.3, PR #64.)
+WIRE_SEAT_COUNT="$(printf '%s\n' "$WIRE_SEATS" | grep -c .)"
+if [[ "$WIRE_SEAT_COUNT" -ge 10 ]]; then
+  ok "seat-wiring enumerated $WIRE_SEAT_COUNT openrouter seats from the profile"
+else
+  bad "seat-wiring enumerated only $WIRE_SEAT_COUNT seats -- the check would pass vacuously"
+fi
+if [[ "$WIRE_ARMS" -ge 3 ]]; then
+  ok "seat-wiring found $WIRE_ARMS dispatcher case arms to check against"
+else
+  bad "seat-wiring found $WIRE_ARMS case arms -- wire_in_every_arm would pass vacuously"
+fi
+
+WIRE_MISSING=""
+for _seat in $WIRE_SEATS; do
+  # detection must name it AND the value must parse as a real boolean --
+  # that is what catches a positional shift, as opposed to a missing key
+  [[ "$(jq -r --arg s "$_seat" '.[$s] // "ABSENT"' <<<"$WIRE_DETECT" 2>/dev/null)" =~ ^(true|false)$ ]] \
+    || WIRE_MISSING="$WIRE_MISSING detect:$_seat"
+  wire_has "$WIRE_POOL" "$_seat" || WIRE_MISSING="$WIRE_MISSING pool:$_seat"
+  wire_has "$WIRE_LB"   "$_seat" || WIRE_MISSING="$WIRE_MISSING leaderboard:$_seat"
+  wire_has "$WIRE_AN"   "$_seat" || WIRE_MISSING="$WIRE_MISSING analyze:$_seat"
+  wire_has "$WIRE_MB"   "$_seat" || WIRE_MISSING="$WIRE_MISSING model-backed:$_seat"
+  # the dispatcher's OR-pool case arms: present in every one of them
+  wire_in_every_arm "$_seat" || WIRE_MISSING="$WIRE_MISSING case-arm:$_seat"
+  grep -q "^run_${_seat}()" "$S/run_reviewers.sh"       || WIRE_MISSING="$WIRE_MISSING dispatch:$_seat"
+  grep -q "\"$_seat\":\"" "$S/append_runlog.sh"         || WIRE_MISSING="$WIRE_MISSING provmap:$_seat"
+  grep -q "^${_seat}_json=" "$S/append_runlog.sh"       || WIRE_MISSING="$WIRE_MISSING runlog-var:$_seat"
+  grep -q -- "--argjson $_seat " "$S/append_runlog.sh"  || WIRE_MISSING="$WIRE_MISSING runlog-arg:$_seat"
+  grep -q "$_seat: \$$_seat" "$S/append_runlog.sh"      || WIRE_MISSING="$WIRE_MISSING runlog-entry:$_seat"
+done
+WIRE_MISSING="${WIRE_MISSING# }"
+if [[ -z "$WIRE_MISSING" ]]; then
+  ok "every openrouter seat in the profile is wired into all dispatch sites"
+else
+  bad "seat wiring incomplete: $WIRE_MISSING"
+fi
+
+# Guard the guard: the check above is only worth having if it can fail, and
+# its first draft could not fail for the first seat in a list. Prove the
+# matcher rejects a seat that is genuinely absent.
+if wire_has "$WIRE_POOL" "definitely-not-a-seat"; then
+  bad "seat-wiring matcher accepts a seat that is not there"
+else
+  ok "seat-wiring matcher rejects an absent seat"
+fi
+
+# The provider map is what makes a seat count as an INDEPENDENT vote. A seat
+# whose provider resolves to "unknown" still runs and still reports findings --
+# it just silently stops contributing to convergence, which is the whole point
+# of having it. [pin: the #59 finding that the leaderboard keys on seat name]
+WIRE_NOPROV=""
+for _seat in $WIRE_SEATS; do
+  _prov="$(jq -r --arg s "$_seat" '.[$s].provider // ""' "$SKILL_DIR/references/reviewer_profiles.json")"
+  [[ -z "$_prov" ]] && WIRE_NOPROV="$WIRE_NOPROV $_seat"
+done
+assert_eq "every openrouter seat declares a provider (else it is not an independent vote)" \
+  "${WIRE_NOPROV# }" ""
 
 echo "── dual-copy identity (repo context only) ──"
 

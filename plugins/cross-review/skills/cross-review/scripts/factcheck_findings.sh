@@ -40,7 +40,22 @@
 set -uo pipefail
 
 findings="" ; out="" ; base="" ; repo="." ; diff_file="" ; emit_events_run_id=""
-reviewer="agy" ; model="Gemini 3.5 Flash (High)" ; timeout_s=300
+# The agy display-name default is READ FROM THE PROFILE, not declared here.
+# Deduping it within this file was not enough: reviewer_profiles.json is the
+# single source of model ids (run_reviewers.sh resolves every model from it),
+# so a literal here was still a second copy -- and the next antigravity bump
+# would have left this pass pinned to a stale model while the openrouter
+# lane's equality test below silently stopped matching. That is precisely the
+# two-copies rot the old comment here claimed to have fixed. (glm 5.3, PR #64.)
+# Falls back to the literal only when jq or the profile is unavailable, since
+# this script must stay runnable standalone.
+_fc_profile="$(cd "$(dirname "$0")/.." && pwd)/references/reviewer_profiles.json"
+agy_default_model=""
+if command -v jq >/dev/null 2>&1 && [[ -f "$_fc_profile" ]]; then
+  agy_default_model="$(jq -r '.antigravity.model // empty' "$_fc_profile" 2>/dev/null)"
+fi
+: "${agy_default_model:=Gemini 3.7 Flash (High)}"
+reviewer="agy" ; model="$agy_default_model" ; timeout_s=300
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
@@ -223,7 +238,7 @@ case "$reviewer" in
   openrouter)
     # Direct OpenRouter lane (no agy involved). --model here means an
     # OpenRouter model id; the agy default display-name is not valid — swap it.
-    [[ "$model" == "Gemini 3.5 Flash (High)" ]] && model="$or_fallback_model"
+    [[ "$model" == "$agy_default_model" ]] && model="$or_fallback_model"
     openrouter_factcheck "$model" || keep_all "openrouter factcheck failed (fail-safe)"
     ;;
   *) echo "factcheck: unknown --reviewer '$reviewer' (use agy|kimi|openrouter)" >&2; exit 2 ;;

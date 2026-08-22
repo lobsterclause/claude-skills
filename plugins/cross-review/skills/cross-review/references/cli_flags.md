@@ -40,7 +40,7 @@ Binary: `agy` (Google Antigravity CLI). Verify with `agy --version`. Install: `c
 >
 > | Reviewer | `--model` | Role | Default timeout |
 > |---|---|---|---|
-> | `antigravity` | `Gemini 3.5 Flash (High)` | fast lap | 600s |
+> | `antigravity` | `Gemini 3.7 Flash (High)` | fast lap | 600s |
 > | `gemini-pro`  | `Gemini 3.1 Pro (High)`   | deep lap | 900s |
 >
 > They are the **same provider (Google)** — count their agreement as a single provider's vote, not two independent ones (see `reviewer_profiles.json` `_synthesis_rules.provider_independence`).

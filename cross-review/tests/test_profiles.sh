@@ -63,8 +63,14 @@ assert_eq "no benched profile exceeds draw_boost 0.3" "$OVER_BOOSTED" ""
 echo "── kimi3.timeout_s bumped to 950 (p95 700s was sitting ON the old budget) ──"
 assert_eq "kimi3.timeout_s == 950" "$(jq -r '.kimi3.timeout_s' "$PROFILES")" "950"
 
-echo "── kimi3.draw_boost untouched (still bringing up leaderboard data) ──"
-assert_eq "kimi3.draw_boost == 2.5 (unchanged by this bench)" "$(jq -r '.kimi3.draw_boost' "$PROFILES")" "2.5"
+echo "── kimi3.draw_boost RETIRED 2026-08-22 (bring-up complete, per Gabriel) ──"
+# This asserted 2.5 "unchanged by this bench" while kimi3 was still earning
+# leaderboard data. That condition has now been met, so the assertion is
+# inverted rather than deleted -- the retirement itself is the thing worth
+# pinning, exactly as kimi27's was on 2026-07-12. Both Moonshot rotation
+# seats are back to 1.0.
+assert_eq "kimi3.draw_boost == 1.0 (retired after bring-up)" "$(jq -r '.kimi3.draw_boost' "$PROFILES")" "1.0"
+assert_eq "kimi27.draw_boost == 1.0 (retired 2026-07-12)" "$(jq -r '.kimi27.draw_boost' "$PROFILES")" "1.0"
 
 echo "── the five disproven-heavy tail seats each carry a bench_note ──"
 for seat in north laguna devstral qwen mimo; do

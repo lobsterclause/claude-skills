@@ -16,7 +16,8 @@
 #   glm (Zhipu), deepseek (DeepSeek), mimo (Xiaomi), minimax (MiniMax),
 #   qwen (Alibaba), devstral (Mistral), laguna (Poolside), kat (Kuaishou),
 #   north (Cohere, free), nemotron (NVIDIA, free), spark (Meta),
-#   seed (ByteDance), grok (xAI).
+#   seed (ByteDance), grok (xAI), longcat (Meituan),
+#   inkling (Thinking Machines Lab).
 #   Model IDs are DELIBERATELY not repeated here — see the note above
 #   `model_backed_reviewers` below: they live only in reviewer_profiles.json,
 #   because a slug list in a comment rots silently and misleads whoever comes
@@ -45,7 +46,7 @@
 #
 # Usage:
 #   run_reviewers.sh --base <branch> --out <dir>
-#                    [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok]
+#                    [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling]
 #                    [--timeout <sec>]
 #                    [--timeout-codex <sec>] [--timeout-antigravity <sec>]
 #                    [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>]
@@ -95,7 +96,7 @@
 #   <out>/<or>.stdout          — each OpenRouter reviewer (glm, deepseek, mimo,
 #   <out>/<or>.stderr            minimax, qwen, devstral, laguna, kat,
 #   <out>/<or>.meta.json         north, nemotron, spark, seed,
-#                              grok) writes
+#                              grok, longcat, inkling) writes
 #                                stdout/stderr/meta plus request.json and
 #                                response.json for audit
 #   <out>/kimi27.*, kimi3.*    — direct-Moonshot rotation seats (same
@@ -178,7 +179,7 @@ timeout_glm=""
 # Resolution happens after profile_get is defined, further down.
 model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
                         devstral laguna kat north nemotron spark seed grok
-                        kimi27 kimi3)
+                        longcat inkling kimi27 kimi3)
 
 # Antigravity installs `agy` to $HOME/.local/bin. That directory isn't always
 # on $PATH for non-interactive shells (notably bash invocations from other
@@ -214,7 +215,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--snapshot-dir <dir>]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--snapshot-dir <dir>]" >&2
   exit 2
 fi
 
@@ -251,6 +252,21 @@ profile_get() {
 }
 profile_timeout() { profile_get "$1" timeout_s; }
 
+profile_flag() {
+  # Usage: profile_flag <reviewer> <key> <default-true|false>
+  # Booleans CANNOT go through profile_get: it uses jq's `//`, and `false //
+  # empty` yields empty -- an explicit false would be indistinguishable from a
+  # missing key, which is the opposite of what a per-seat opt-OUT needs. Use
+  # has() so an explicitly-false flag survives.
+  local r="$1" k="$2" dflt="$3"
+  [[ -f "$profile_file" ]] || { echo "$dflt"; return; }
+  command -v jq >/dev/null 2>&1 || { echo "$dflt"; return; }
+  jq -r --arg r "$r" --arg k "$k" --arg d "$dflt" \
+    'if (.[$r] | type) == "object" and (.[$r] | has($k))
+       then (.[$r][$k] | tostring) else $d end' "$profile_file" 2>/dev/null \
+    || echo "$dflt"
+}
+
 # Resolve every model string from the profile — the single source of truth (see
 # the note at the top of this file). A reviewer whose profile has no `.model`
 # ends up with an empty variable; run_agy_reviewer/run_openrouter_reviewer then
@@ -276,6 +292,8 @@ nemotron_profile="$(profile_timeout nemotron)"
 spark_profile="$(profile_timeout spark)"
 seed_profile="$(profile_timeout seed)"
 grok_profile="$(profile_timeout grok)"
+longcat_profile="$(profile_timeout longcat)"
+inkling_profile="$(profile_timeout inkling)"
 kimi27_profile="$(profile_timeout kimi27)"
 kimi3_profile="$(profile_timeout kimi3)"
 codex_timeout="${timeout_codex:-${timeout_s:-${codex_profile:-$(( timeout_s_default > 900 ? timeout_s_default : 900 ))}}}"
@@ -300,6 +318,8 @@ nemotron_timeout="${timeout_s:-${nemotron_profile:-$timeout_s_default}}"
 spark_timeout="${timeout_s:-${spark_profile:-$timeout_s_default}}"
 seed_timeout="${timeout_s:-${seed_profile:-$timeout_s_default}}"
 grok_timeout="${timeout_s:-${grok_profile:-$timeout_s_default}}"
+longcat_timeout="${timeout_s:-${longcat_profile:-$timeout_s_default}}"
+inkling_timeout="${timeout_s:-${inkling_profile:-$timeout_s_default}}"
 kimi27_timeout="${timeout_s:-${kimi27_profile:-$timeout_s_default}}"
 kimi3_timeout="${timeout_s:-${kimi3_profile:-$timeout_s_default}}"
 
@@ -728,14 +748,16 @@ moonshot_key() {
 # and prompt shape as run_kimi, and the same stdin/argv reasoning: the prompt
 # body goes through a temp file + jq --rawfile, never argv). This is the shared
 # runner for the whole OpenRouter rotation pool (glm, deepseek, mimo, minimax,
-# qwen, devstral, laguna, kat, north, nemotron, spark, seed, grok) — each an
+# qwen, devstral, laguna, kat, north, nemotron, spark, seed, grok, longcat,
+# inkling) — each an
 # independent provider
 # vote. It is NOT a fallback lane for the
 # first-party reviewers (policy: no OR fallbacks for codex/gemini/kimi).
 # Args:
 #   $1 slug           (glm | deepseek | mimo | minimax | qwen | devstral |
-#                      laguna | kat | north | nemotron | spark | seed | grok | kimi27 | kimi3)
-#   $2 model          (model id, e.g. z-ai/glm-5.2 or kimi-k2.7-code)
+#                      laguna | kat | north | nemotron | spark | seed | grok |
+#                      longcat | inkling | kimi27 | kimi3)
+#   $2 model          (model id, e.g. z-ai/glm-5.3 or kimi-k2.7-code)
 #   $3 timeout_budget (seconds)
 #   $4 endpoint       (optional; default OpenRouter chat-completions. kimi27/
 #                      kimi3 pass the direct Moonshot endpoint — the API is
@@ -854,14 +876,35 @@ $json_findings_suffix"
   # answering in the findings.json shape rather than free prose. This does
   # NOT touch the CLI reviewers (codex/agy/kimi CLI), which have no
   # request-body concept at all.
-  if [[ "$cli" == "openrouter" ]]; then
-    jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
-      '{model: $m, messages: [{role: "user", content: $p}], stream: false,
-        usage: {include: true}, response_format: {type: "json_object"}}' >"$body_file"
+  #
+  # NOT EVERY MODEL ACCEPTS IT. bytedance-seed/seed-2.0-code hard-400s with
+  # `InvalidParameter: response_format.type ... json_object is not supported by
+  # this model`. The `seed` seat was added 2026-08-14 and failed rc=1 with zero
+  # bytes on all 6 dispatches it ever got -- for 8 days, while carrying
+  # draw_boost 2.5, so it was PREFERENTIALLY drawn into rounds it could not
+  # contribute to. It read as reviewer flakiness; it was an unsupported request
+  # field. Seats that reject it set `"supports_json_object": false` in the
+  # profile and get the field omitted; the JSON findings suffix is still in the
+  # prompt, so they usually answer in-shape anyway, and merge_raw_findings.sh
+  # already lists anything unparseable as `unparsed:` for manual extraction
+  # rather than losing it. (Found by the PR #64 cross-review round.)
+  local want_json; want_json="$(profile_flag "$slug" supports_json_object true)"
+  local rf_args=()
+  if [[ "$want_json" == "true" ]]; then
+    rf_args=(--argjson rf '{"type":"json_object"}')
   else
-    jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
+    rf_args=(--argjson rf 'null')
+    echo "$slug: response_format omitted (profile says this model rejects json_object)" >&2
+  fi
+  if [[ "$cli" == "openrouter" ]]; then
+    jq -n --rawfile p "$prompt_tmp" --arg m "$model" "${rf_args[@]}" \
       '{model: $m, messages: [{role: "user", content: $p}], stream: false,
-        response_format: {type: "json_object"}}' >"$body_file"
+        usage: {include: true}}
+       + (if $rf == null then {} else {response_format: $rf} end)' >"$body_file"
+  else
+    jq -n --rawfile p "$prompt_tmp" --arg m "$model" "${rf_args[@]}" \
+      '{model: $m, messages: [{role: "user", content: $p}], stream: false}
+       + (if $rf == null then {} else {response_format: $rf} end)' >"$body_file"
   fi
   rm -f "$prompt_tmp"
 
@@ -1319,6 +1362,8 @@ run_nemotron() { run_openrouter_reviewer nemotron "$nemotron_model" "$nemotron_t
 run_spark()    { run_openrouter_reviewer spark    "$spark_model"    "$spark_timeout"; }
 run_seed()     { run_openrouter_reviewer seed     "$seed_model"     "$seed_timeout"; }
 run_grok()     { run_openrouter_reviewer grok     "$grok_model"     "$grok_timeout"; }
+run_longcat()  { run_openrouter_reviewer longcat  "$longcat_model"  "$longcat_timeout"; }
+run_inkling()  { run_openrouter_reviewer inkling  "$inkling_model"  "$inkling_timeout"; }
 # kimi27: same OpenAI-compatible single-turn body, direct Moonshot endpoint +
 # key. cli label "moonshot" selects the key source and lands in meta.json.
 run_kimi27()   { run_openrouter_reviewer kimi27   "$kimi27_model"   "$kimi27_timeout" \
@@ -1760,7 +1805,7 @@ stagger_s=2
 # 1-second 404 that reads like reviewer flakiness rather than stale config.
 for r in "${requested[@]}"; do
   case "$r" in
-    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok)
+    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok|longcat|inkling)
       bash "$script_dir/validate_or_models.sh" --no-fetch 2>&1 >/dev/null | head -5 >&2 || true
       break ;;
   esac
@@ -1817,7 +1862,7 @@ for r in "${requested[@]}"; do
         echo "kimi not installed — skipping" >&2
       fi
       ;;
-    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok)
+    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok|longcat|inkling)
       if ! command -v curl >/dev/null 2>&1; then
         echo "$r: curl not available — skipping" >&2
       elif openrouter_key >/dev/null 2>&1; then
@@ -1884,7 +1929,7 @@ for i in "${!pids[@]}"; do
         # failure_kind and the .agy.log tail are where the answer lives.
         echo "$name: failed (check failure_kind in $out/$name.meta.json; agy's own log: $out/$name.agy.log)" >&2 ;;
       kimi)        echo "$name: failed (see $out/kimi.stderr and $out/kimi.meta.json)" >&2 ;;
-      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok|kimi27|kimi3)
+      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok|longcat|inkling|kimi27|kimi3)
         echo "$name: failed (see $out/$name.stderr, $out/$name.response.json, $out/$name.meta.json)" >&2 ;;
       *)           echo "$name: failed (see $out/$name.* )" >&2 ;;
     esac
