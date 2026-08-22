@@ -2207,6 +2207,26 @@ else
   echo "  skip dual-copy identity (not in the skills repo)"
 fi
 
+echo "── ci/ merge gate (delegated harness) ──"
+
+# ci/ ships a second, self-contained harness (176 offline cases) for the
+# currency gate. Invoked HERE rather than left to a workflow, for the reason
+# its own header gives: a harness nothing calls is advisory — it runs when
+# someone remembers. One of its cases asserts that post_comment.sh still emits
+# the marker the gate matches, so this is also the only check on the contract
+# between the skill half and the CI half. Folded in as a single result; run it
+# directly for per-case output.
+CI_HARNESS="$SKILL_DIR/ci/test-cross-review-currency.sh"
+if [[ -f "$CI_HARNESS" ]]; then
+  if ci_out="$(bash "$CI_HARNESS" 2>&1)"; then
+    ok "ci/test-cross-review-currency.sh ($(printf '%s' "$ci_out" | grep -o '[0-9]* passed' | tail -1))"
+  else
+    bad "ci/test-cross-review-currency.sh failed — $(printf '%s' "$ci_out" | grep -c '  FAIL') case(s); run it directly"
+  fi
+else
+  echo "  skip ci/ harness not present"
+fi
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

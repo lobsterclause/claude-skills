@@ -54,8 +54,14 @@ OVER_BOOSTED="$(jq -r '
 ' "$PROFILES")"
 assert_eq "no benched profile exceeds draw_boost 0.3" "$OVER_BOOSTED" ""
 
-echo "── kimi3.timeout_s bumped to 700 (p95 574s was within 10% of the old 600s budget) ──"
-assert_eq "kimi3.timeout_s == 700" "$(jq -r '.kimi3.timeout_s' "$PROFILES")" "700"
+# 600 -> 700 (2026-08-03) was sized off a p95 of 574s, which left under 10%
+# headroom; the seat then timed out in 33% of its last 3 runs with a p95 of
+# 700s — sitting exactly ON the budget, which is the shape of a ceiling being
+# hit rather than a slow run. 950 restores ~35% headroom over that p95. The pin
+# moves with the profile deliberately: it exists so a bump arrives with the
+# numbers that justify it, not so the number never changes.
+echo "── kimi3.timeout_s bumped to 950 (p95 700s was sitting ON the old budget) ──"
+assert_eq "kimi3.timeout_s == 950" "$(jq -r '.kimi3.timeout_s' "$PROFILES")" "950"
 
 echo "── kimi3.draw_boost untouched (still bringing up leaderboard data) ──"
 assert_eq "kimi3.draw_boost == 2.5 (unchanged by this bench)" "$(jq -r '.kimi3.draw_boost' "$PROFILES")" "2.5"

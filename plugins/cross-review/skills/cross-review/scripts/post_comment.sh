@@ -249,6 +249,27 @@ case "$mode" in
       fi
     fi
 
+    # THE MACHINE-READABLE STAMP. Keep this literal byte-for-byte: the merge
+    # gate (cross-review/ci/cross-review-currency.sh) matches
+    #   <!-- cross-review: sha=[0-9a-f]{40} ...
+    # and its harness greps THIS line out of THIS file and renders it, so the
+    # two cannot drift apart silently.
+    #
+    # Why a marker at all, when `provenance` below already says "Reviewed
+    # `<sha>`": prose drifts. A census of the 10 most recent review comments
+    # found four written by hand as "Reviewed at `<sha>`" instead of
+    # "Reviewed `<sha>`" — one English word, and a working gate read four
+    # correctly-reviewed PRs as unreviewed. The marker is the form nobody
+    # composes by hand, and it carries the FULL 40 characters, so it is also
+    # free of the prefix ambiguity a 9-char abbreviation has.
+    #
+    # Emitted only for a full-width sha. An abbreviation here would be worse
+    # than nothing: the gate's regex would reject it and the prose fallback
+    # would then be the only stamp, which is the state this marker exists to
+    # get out of.
+    marker=""
+    [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] && marker="<!-- cross-review: sha=${head_sha} pass=${pass} -->"
+
     {
       printf '## Cross-review — pass %s\n\n' "$pass"
       [[ -n "$marker" ]] && printf '%s\n\n' "$marker"

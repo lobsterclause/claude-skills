@@ -85,7 +85,7 @@
     "notes": "Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it would be drawn frequently while earning leaderboard data. Retired to draw_boost 1.0 on 2026-07-12 after reaching 10 sampled runs (score 72, 7/16 findings convergent) \u2014 now competes on the same footing as the rest of the pool. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) \u2014 surface for security-sensitive repos."
   },
   "kimi3": {
-    "timeout_s": 700,
+    "timeout_s": 950,
     "provider": "moonshot",
     "cli": "moonshot",
     "model": "kimi-k3",
