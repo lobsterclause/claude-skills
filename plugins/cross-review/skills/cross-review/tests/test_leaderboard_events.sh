@@ -46,7 +46,7 @@ trap 'rm -rf "$T"' EXIT
 # events path must win, which is what pins precedence.
 FIXLOG="$T/runlog.jsonl"
 cat > "$FIXLOG" <<'EOF'
-{"ts":"2026-08-04T01:00:00Z","run_id":"fix-r1","reviewers":{"codex":{"status":"ok","duration_s":90},"kimi":{"status":"ok","duration_s":90},"north":{"status":"ok","duration_s":100,"findings_total":4,"findings_convergent":4,"findings_dropped":0},"laguna":{"status":"ok","duration_s":100},"qwen":{"status":"ok","duration_s":100},"mimo":{"status":"ok","duration_s":100},"devstral":{"status":"ok","duration_s":100},"kimi3":{"status":"ok","duration_s":100},"nemotron":{"status":"ok","duration_s":100},"spark":{"status":"ok","duration_s":100,"findings_total":4,"findings_convergent":1,"findings_dropped":0}}}
+{"ts":"2026-08-04T01:00:00Z","run_id":"fix-r1","reviewers":{"codex":{"status":"ok","duration_s":90},"kimi":{"status":"ok","duration_s":90},"north":{"status":"ok","duration_s":100,"findings_total":4,"findings_convergent":4,"findings_dropped":0},"laguna":{"status":"ok","duration_s":100},"qwen":{"status":"ok","duration_s":100},"mimo":{"status":"ok","duration_s":100},"devstral":{"status":"ok","duration_s":100},"kimi3":{"status":"ok","duration_s":100},"nemotron":{"status":"ok","duration_s":100},"spark":{"status":"ok","duration_s":100,"findings_total":4,"findings_convergent":1,"findings_dropped":0},"glm":{"status":"ok","duration_s":100},"minimax":{"status":"ok","duration_s":100}}}
 EOF
 
 # Events ledger. Every scored event carries run_id fix-r1; the fix-r0 event at
@@ -75,6 +75,20 @@ cat > "$EVENTS" <<'EOF'
 {"event":"proposed","reviewer":"kimi3","all_sources":["kimi3","kimi"],"severity":"Medium","file":"f.ts","claim":"k3 med","finding_id":"f-k1","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
 {"event":"proposed","reviewer":"nemotron","all_sources":["nemotron",null,"glm"],"severity":"Medium","file":"g.ts","claim":"ne med","finding_id":"f-ne1","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
 {"event":"proposed","reviewer":"north","all_sources":["north"],"severity":"Critical","file":"z.ts","claim":"stale round","finding_id":"f-n9","run_id":"fix-r0","ts":"2026-08-01T01:10:00Z"}
+{"event":"proposed","reviewer":"glm","all_sources":["glm"],"severity":"Low","file":"h.ts","claim":"lo 1","finding_id":"f-lo1","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"glm","all_sources":["glm"],"severity":"Low","file":"h.ts","claim":"lo 2","finding_id":"f-lo2","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"glm","all_sources":["glm"],"severity":"Low","file":"h.ts","claim":"lo 3","finding_id":"f-lo3","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"glm","all_sources":["glm"],"severity":"Low","file":"h.ts","claim":"lo 4","finding_id":"f-lo4","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"glm","all_sources":["glm"],"severity":"Low","file":"h.ts","claim":"lo 5","finding_id":"f-lo5","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"minimax","all_sources":["minimax"],"severity":"Low","file":"i.ts","claim":"hi 1","finding_id":"f-hi1","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"minimax","all_sources":["minimax"],"severity":"Low","file":"i.ts","claim":"hi 2","finding_id":"f-hi2","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"minimax","all_sources":["minimax"],"severity":"Low","file":"i.ts","claim":"hi 3","finding_id":"f-hi3","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"minimax","all_sources":["minimax"],"severity":"Low","file":"i.ts","claim":"hi 4","finding_id":"f-hi4","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"minimax","all_sources":["minimax"],"severity":"Low","file":"i.ts","claim":"hi 5","finding_id":"f-hi5","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"minimax","all_sources":["minimax"],"severity":"Low","file":"i.ts","claim":"hi dropped 1","finding_id":"f-hi6","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"proposed","reviewer":"minimax","all_sources":["minimax"],"severity":"Low","file":"i.ts","claim":"hi dropped 2","finding_id":"f-hi7","run_id":"fix-r1","ts":"2026-08-04T01:10:00Z"}
+{"event":"factcheck_dropped","reason":"diff contradicts it","sources":["minimax"],"file":"i.ts","severity":"Low","finding_id":"f-hi6","run_id":"fix-r1","ts":"2026-08-04T01:12:00Z"}
+{"event":"factcheck_dropped","reason":"diff contradicts it","sources":["minimax"],"file":"i.ts","severity":"Low","finding_id":"f-hi7","run_id":"fix-r1","ts":"2026-08-04T01:12:00Z"}
 EOF
 
 LB="$(CROSS_REVIEW_RUNLOG="$FIXLOG" CROSS_REVIEW_FINDING_EVENTS="$EVENTS" \
@@ -123,6 +137,30 @@ echo "── baseline-incremental tier: multi-provider without a baseline ──
 # ($provmap[null] kills the whole jq scorer).
 assert_eq "nemotron: no-baseline corroboration earns 0.85 credit (95)" \
   "$(field nemotron score)" "95"
+
+echo "── precision discount: high own factcheck-drop rate discounts solo credit ──"
+# glm and minimax both propose 5 solo Low findings (equal raw solo-finding
+# count, all kept, same severity) so the ONLY thing that can separate their
+# scores is the discount. minimax additionally proposes 2 more solo Lows
+# that get factcheck_dropped, pushing its OWN drop rate to 2/7 ≈ 28.6% —
+# over solo_discount_drop_rate_threshold (15%) and over solo_discount_min_n
+# (5 samples) — so its 5 kept solo Lows get the 0.7 discount applied to
+# their credit. glm has 0 drops (0% rate, no discount).
+#   glm:     tw=5, cw=5*1*1.0=5.0            → value 1.0,    survival 1.0
+#            → 100*(0.45+0.35+0.20) = 100
+#   minimax: tw=7, cw=5*1*(1.0*0.7)+2*0=3.5  → value 0.5,    survival 1-2/7≈0.7143
+#            → 100*(0.45+0.35*0.5+0.20*0.7143) ≈ 76.79 → 77
+# Sanity check the discount (not the drop-driven survival hit) is what
+# separates them: without the discount minimax's value would be
+# (5*1.0+0)/7=0.7143, giving 100*(0.45+0.35*0.7143+0.20*0.7143)=84.29 → 84 —
+# still below glm's 100 (drops always cost something) but well above the
+# actual 77, and that 84→77 gap is the discount, isolated from survival.
+assert_eq "glm: equal solo count, 0% own drop rate, undiscounted (100)" \
+  "$(field glm score)" "100"
+assert_eq "minimax: equal solo count, drop rate over threshold, discounted (77)" \
+  "$(field minimax score)" "77"
+assert_eq "precision discount actually lowers the high-drop reviewer below the low-drop one" \
+  "$([[ "$(field minimax score)" -lt "$(field glm score)" ]] && echo yes)" "yes"
 
 echo "── v1 fallback: reviewers with no window events keep the old formula ──"
 # spark: counts only (4 findings, 1 convergent, 0 dropped) → 73.75 → 74.
