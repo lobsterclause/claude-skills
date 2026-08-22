@@ -186,6 +186,58 @@ case "$cmd" in
       warn_secrets=true
     fi
 
+    # Content-based secret scan. Filename matching alone misses a hardcoded
+    # API key or credential literal sitting inside an innocuously-named file
+    # (config.ts, constants.ts, ...) — the diff still ships unredacted to 15+
+    # third-party reviewer APIs. This scans added/changed line CONTENT for
+    # common secret-literal shapes, independent of filename.
+    #
+    # Reuse the same size bound `size_lines` already computed above (it's the
+    # same diff we'd otherwise re-walk) rather than inventing a second cap:
+    # skip the content scan entirely on diffs so large the size warning has
+    # already fired, so a pathological diff can't make this scan slow.
+    if [[ "$size_lines" -le 20000 ]]; then
+      content_secret_pattern='AKIA[0-9A-Z]{16}|[Ss][Kk]-[A-Za-z0-9_-]{20,}|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]]*[:=][[:space:]]*['"'"'"][A-Za-z0-9/+=_-]{16,}['"'"'"]'
+      # --diff-filter=ACMRD: A/C/M/R already covered added/copied/modified/
+      # renamed content; D (deleted) is needed too — a whole file removed via
+      # `git rm` (the common way to rotate a secret out) was previously
+      # invisible to this scan entirely, since ACMR omits D and `git diff`
+      # emits nothing for a deleted file under that filter. --no-color and
+      # -U0 keep the grep below cheap and free of ANSI noise. Binary files
+      # are skipped by git diff itself (it emits "Binary files ... differ",
+      # not content).
+      #
+      # Both added (`+`) AND removed (`-`) line content are scanned: a secret
+      # being *rotated out* (e.g. deleting a hardcoded key, whether inside a
+      # modified file or a wholly deleted one) exists only on the `-` side of
+      # the diff and would otherwise ship unredacted to third-party reviewer
+      # APIs. The `---`/`+++` file-header lines are excluded so they aren't
+      # mistaken for content; a deleted file's `+++ /dev/null` header falls
+      # back to the `---` line for the real filename instead of leaving the
+      # literal header text as the filename.
+      content_hits=$(git -C "$worktree" diff --no-color -U0 --diff-filter=ACMRD "$base"...HEAD 2>/dev/null \
+        | awk '
+            /^diff --git / { file=""; next }
+            /^--- / {
+              f=$0; sub(/^--- [ab]\//, "", f); if (f != "/dev/null") file=f; next
+            }
+            /^\+\+\+ / {
+              f=$0; sub(/^\+\+\+ [ab]\//, "", f); if (f != "/dev/null") file=f; next
+            }
+            /^\+/ && !/^\+\+\+/ { print file "\t" $0 }
+            /^-/ && !/^--- / { print file "\t" $0 }
+          ' \
+        | grep -E "$content_secret_pattern" \
+        | cut -f1 \
+        | sort -u | head -5 || true)
+      if [[ -n "$content_hits" ]]; then
+        warn_secrets=true
+        # Union with any filename-based hits already in risky_files, deduped.
+        risky_files="$(printf '%s\n%s\n' "$risky_files" "$content_hits" \
+          | tr ',' '\n' | sed '/^$/d' | sort -u | head -5 | tr '\n' ',' | sed 's/,$//')"
+      fi
+    fi
+
     # The exact commit the reviewers will read. Ask the worktree, not the ref:
     # `--ref origin/foo` resolves at `worktree add` time, and re-resolving it
     # afterwards can pick up a fetch that landed in between. This is the SHA the
