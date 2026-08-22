@@ -54,7 +54,8 @@
     "notes": "Same `agy` CLI as antigravity, just pinned to `--model \"Gemini 3.1 Pro (High)\"`. Previously routed through the standalone `gemini` CLI (-m gemini-3.1-pro-preview); migrated to agy in the 2026-06-18 sunset since agy now hosts Gemini 3.1 Pro and exposes --model. Pro is a preview tier \u2014 surface model-availability errors to the user, don't auto-retry. NOTE: antigravity + gemini-pro are the SAME provider (Google) \u2014 their agreement is NOT independent the way codex/kimi convergence is; treat Flash+Pro overlap as one provider's vote, not two. Pro triggers agy's SIGSEGV panic (RunCommandHandler nil-deref, agy \u22641.0.15) far more than Flash \u2014 it roams files/commands harder; exit 2 + ~20-45s + empty output = the panic, not your diff. Quota semantics: same as antigravity (check failure_kind). NO FALLBACK (policy 2026-07-01) \u2014 a failed lap drops out; rotation + leaderboard handle it."
   },
   "kimi": {
-    "or_fallback": { "enabled": true, "model": "moonshotai/kimi-k2.5" },
+    "or_fallback": { "enabled": true, "model": "moonshotai/kimi-k2.7-code" },
+    "cli_model_alias": "kimi-k27-code",
     "timeout_s": 600,
     "provider": "moonshot",
     "baseline": true,
@@ -86,7 +87,7 @@
     "synthesis_weight": 0.75,
     "draw_boost": 1.0,
     "specialization": "single-turn diff reasoning on Moonshot's code-specialized k2.7; rotation-pool member on the DIRECT Moonshot platform API (same billing rail as the kimi baseline, NOT OpenRouter).",
-    "notes": "Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it would be drawn frequently while earning leaderboard data. Retired to draw_boost 1.0 on 2026-07-12 after reaching 10 sampled runs (score 72, 7/16 findings convergent) \u2014 now competes on the same footing as the rest of the pool. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) \u2014 surface for security-sensitive repos."
+    "notes": "BENCHED 2026-08-22 (per Gabriel): removed from select_roster.sh's draw pool, seat definition and history retained. The kimi BASELINE now runs kimi-k2.7-code itself via cli_model_alias \u2014 with file-reading tools, which this diff-only curl seat does not have \u2014 so this became pure redundancy on a provider (Moonshot) that already votes once whether one seat answers or three. Not deleted: 122 references across 17 files, 65 of them test fixtures, on the fail-closed baseline path; benching is one line, reversible, and keeps this seat's leaderboard history readable. Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it would be drawn frequently while earning leaderboard data. Retired to draw_boost 1.0 on 2026-07-12 after reaching 10 sampled runs (score 72, 7/16 findings convergent) \u2014 now competes on the same footing as the rest of the pool. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) \u2014 surface for security-sensitive repos."
   },
   "kimi3": {
     "or_fallback": { "enabled": true, "model": "moonshotai/kimi-k3" },

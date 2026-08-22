@@ -1633,7 +1633,25 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     [[ "$kimi_budget" -gt 3000 ]] && kimi_budget=3000
     echo "kimi: ${total_lines}-line diff — budget scaled ${kimi_timeout}s → ${kimi_budget}s" >&2
   fi
+  # WHICH MODEL the kimi baseline runs was, until now, the ONE model id in the
+  # whole fleet that lived outside this repo: the CLI reads ~/.kimi/config.toml,
+  # so reviewer_profiles.json had no `.model` for kimi at all. The baseline's
+  # model was therefore invisible to the repo, unpinned by any test, and
+  # silently different on any other machine -- the same blind spot that left
+  # antigravity on Gemini 3.5 for weeks. `cli_model_alias` pins it here.
+  #
+  # The value is a config KEY from ~/.kimi/config.toml ([models.<alias>]), not
+  # a raw slug -- `kimi -m` resolves aliases, and an unknown one fails fast with
+  # "LLM not set" rather than silently running the default. PORTABILITY: the
+  # alias must exist in that user's config; when it does not, the lane fails and
+  # (with or_fallback enabled) drops to the OpenRouter route for the same model.
+  local kimi_alias kimi_model_args=()
+  kimi_alias="$(profile_get kimi cli_model_alias)"
+  if [[ -n "$kimi_alias" ]]; then
+    kimi_model_args=(-m "$kimi_alias")
+  fi
   run_with_timeout "$kimi_budget" kimi \
+    "${kimi_model_args[@]}" \
     --plan \
     --print \
     --quiet \

@@ -156,7 +156,16 @@ fi
 # kimi3 (K3 flagship, released 2026-07-16) is the same direct-Moonshot seat
 # pattern, added 2026-07-18 — shares has_moonshot's gate and billing rail.
 if has_moonshot; then
-  POOL+=(kimi27 kimi3)
+  # kimi27 BENCHED 2026-08-22 (per Gabriel: "drop to only 3 and the kimi code
+  # variant"). The kimi BASELINE now runs kimi-k2.7-code itself via
+  # cli_model_alias -- with tools, which the curl seats do not have -- so a
+  # separate diff-only k2.7-code seat is pure redundancy on a provider that
+  # already votes once. Benched rather than deleted: the seat is referenced 122
+  # times across 17 files (65 of them test fixtures) and sits on the fail-closed
+  # baseline path, so removing it is a refactor with real regression risk and no
+  # coverage gain. Benching is one line and reversible, and it keeps kimi27's
+  # leaderboard history readable. Re-add it here to bring the seat back.
+  POOL+=(kimi3)
 fi
 
 if [[ ${#BASELINES[@]} -eq 0 && ${#POOL[@]} -eq 0 ]]; then

@@ -907,13 +907,25 @@ assert_eq "detect reports kimi27 available with Moonshot key" \
   "$(jq -r '.kimi27' <<<"$DETECT_OUT")" "true"
 BOOST_ERR="$T/boost.err"
 CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR"
-assert_contains "selector draws kimi27 as a candidate" "$(cat "$BOOST_ERR")" "kimi27"
-# rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0;
-# draw_boost retired to 1.0 → 75.0, identical to an unboosted rookie (spark).
+# BENCHED 2026-08-22 (per Gabriel): kimi27 left the draw pool when the kimi
+# baseline took over kimi-k2.7-code via cli_model_alias -- with tools, which
+# this diff-only seat lacked -- making it redundant on a provider that votes
+# once regardless. So this assertion is INVERTED: it used to pin that the seat
+# is drawn, and now pins that it is not. The seat itself still exists and still
+# detects (asserted above); only the draw changed.
+if grep -q 'kimi27' "$BOOST_ERR"; then
+  bad "kimi27 is being offered as a candidate again -- it was benched 2026-08-22"
+else
+  ok "kimi27 is benched: detected but never drawn"
+fi
+# The "retired boost is a no-op at 1.0" mechanism this block was written to pin
+# has moved to seats that are still drawn: `spark` below is the unboosted
+# control, and kimi3 (retired to 1.0 the same day) is asserted at weight=75.0
+# in the kimi3 block further down. kimi27 can no longer carry it -- a benched
+# seat produces no candidate line to measure.
+# rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0.
 # The control seat must carry NO draw_boost; nemotron held this role until it
 # took a 2.5 boost on 2026-08-14.
-assert_contains "kimi27 weight reflects the retired (1.0) draw_boost" \
-  "$(grep 'kimi27' "$BOOST_ERR")" "weight=75.0"
 assert_contains "unboosted rookie weight unchanged" \
   "$(grep 'spark' "$BOOST_ERR")" "weight=75.0"
 # no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
@@ -2230,6 +2242,46 @@ if grep -q 'profile_flag "$slug" supports_json_object' "$S/run_reviewers.sh"; th
 else
   bad "run_reviewers.sh no longer reads supports_json_object -- seed goes dead again"
 fi
+
+echo "── Moonshot consolidation: K3 + the code variant (2026-08-22) ──"
+
+# The kimi baseline's model was the ONE model id in the fleet living outside
+# this repo -- the CLI reads ~/.kimi/config.toml, so reviewer_profiles.json had
+# no `.model` for it at all. Invisible to the repo, unpinned by any test, and
+# silently different on another machine: the same blind spot that left
+# antigravity on Gemini 3.5 for weeks. cli_model_alias pins it here.
+assert_eq "the kimi baseline's model is pinned in the repo, not just in ~/.kimi" \
+  "$(jq -r '.kimi.cli_model_alias // ""' "$SKILL_DIR/references/reviewer_profiles.json")" \
+  "kimi-k27-code"
+if grep -q 'profile_get kimi cli_model_alias' "$S/run_reviewers.sh"; then
+  ok "run_reviewers.sh passes the pinned alias to the kimi CLI"
+else
+  bad "the kimi CLI no longer reads cli_model_alias -- its model escapes the repo again"
+fi
+
+# kimi27 is benched, not deleted. Its seat, profile and history must all still
+# exist -- deleting it would be a 122-reference refactor across 17 files on the
+# fail-closed baseline path, for zero coverage gain.
+# NB: deliberately not using wire_has() here -- it is defined further down in
+# the seat-wiring section, and bash resolves functions at call time, so calling
+# it from above would silently mean "command not found" rather than a match.
+POOL_TOK=" $(grep 'POOL+=' "$S/select_roster.sh" | tr '()|,+=' '      ' | tr -s ' \n' '  ') "
+case "$POOL_TOK" in
+  *" kimi27 "*) bad "kimi27 is back in the draw pool -- it duplicates the baseline's model with no tools" ;;
+  *)            ok  "kimi27 is benched out of the draw pool" ;;
+esac
+case "$POOL_TOK" in
+  *" kimi3 "*)  ok  "kimi3 is still drawn (the K3 half of the consolidation)" ;;
+  *)            bad "kimi3 fell out of the draw pool" ;;
+esac
+assert_eq "kimi27's seat definition is retained, not deleted" \
+  "$(jq -r 'has("kimi27")' "$SKILL_DIR/references/reviewer_profiles.json")" "true"
+
+# All three Moonshot seats are ONE provider vote. If this ever stops being true
+# the synthesis step starts double-counting a single lab's opinion.
+assert_eq "kimi/kimi27/kimi3 all remain one provider" \
+  "$(jq -r '[.kimi.provider, .kimi27.provider, .kimi3.provider] | unique | join(",")' \
+      "$SKILL_DIR/references/reviewer_profiles.json")" "moonshot"
 
 echo "── first-party OpenRouter fallback (policy revised 2026-08-22) ──"
 
