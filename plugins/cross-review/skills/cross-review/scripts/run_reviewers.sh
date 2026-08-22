@@ -16,7 +16,8 @@
 #   glm (Zhipu), deepseek (DeepSeek), mimo (Xiaomi), minimax (MiniMax),
 #   qwen (Alibaba), devstral (Mistral), laguna (Poolside), kat (Kuaishou),
 #   north (Cohere, free), nemotron (NVIDIA, free), spark (Meta),
-#   seed (ByteDance), grok (xAI).
+#   seed (ByteDance), grok (xAI), longcat (Meituan),
+#   inkling (Thinking Machines Lab).
 #   Model IDs are DELIBERATELY not repeated here — see the note above
 #   `model_backed_reviewers` below: they live only in reviewer_profiles.json,
 #   because a slug list in a comment rots silently and misleads whoever comes
@@ -45,7 +46,7 @@
 #
 # Usage:
 #   run_reviewers.sh --base <branch> --out <dir>
-#                    [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok]
+#                    [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling]
 #                    [--timeout <sec>]
 #                    [--timeout-codex <sec>] [--timeout-antigravity <sec>]
 #                    [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>]
@@ -95,7 +96,7 @@
 #   <out>/<or>.stdout          — each OpenRouter reviewer (glm, deepseek, mimo,
 #   <out>/<or>.stderr            minimax, qwen, devstral, laguna, kat,
 #   <out>/<or>.meta.json         north, nemotron, spark, seed,
-#                              grok) writes
+#                              grok, longcat, inkling) writes
 #                                stdout/stderr/meta plus request.json and
 #                                response.json for audit
 #   <out>/kimi27.*, kimi3.*    — direct-Moonshot rotation seats (same
@@ -178,7 +179,7 @@ timeout_glm=""
 # Resolution happens after profile_get is defined, further down.
 model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
                         devstral laguna kat north nemotron spark seed grok
-                        kimi27 kimi3)
+                        longcat inkling kimi27 kimi3)
 
 # Antigravity installs `agy` to $HOME/.local/bin. That directory isn't always
 # on $PATH for non-interactive shells (notably bash invocations from other
@@ -214,7 +215,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--snapshot-dir <dir>]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--snapshot-dir <dir>]" >&2
   exit 2
 fi
 
@@ -276,6 +277,8 @@ nemotron_profile="$(profile_timeout nemotron)"
 spark_profile="$(profile_timeout spark)"
 seed_profile="$(profile_timeout seed)"
 grok_profile="$(profile_timeout grok)"
+longcat_profile="$(profile_timeout longcat)"
+inkling_profile="$(profile_timeout inkling)"
 kimi27_profile="$(profile_timeout kimi27)"
 kimi3_profile="$(profile_timeout kimi3)"
 codex_timeout="${timeout_codex:-${timeout_s:-${codex_profile:-$(( timeout_s_default > 900 ? timeout_s_default : 900 ))}}}"
@@ -300,6 +303,8 @@ nemotron_timeout="${timeout_s:-${nemotron_profile:-$timeout_s_default}}"
 spark_timeout="${timeout_s:-${spark_profile:-$timeout_s_default}}"
 seed_timeout="${timeout_s:-${seed_profile:-$timeout_s_default}}"
 grok_timeout="${timeout_s:-${grok_profile:-$timeout_s_default}}"
+longcat_timeout="${timeout_s:-${longcat_profile:-$timeout_s_default}}"
+inkling_timeout="${timeout_s:-${inkling_profile:-$timeout_s_default}}"
 kimi27_timeout="${timeout_s:-${kimi27_profile:-$timeout_s_default}}"
 kimi3_timeout="${timeout_s:-${kimi3_profile:-$timeout_s_default}}"
 
@@ -728,14 +733,16 @@ moonshot_key() {
 # and prompt shape as run_kimi, and the same stdin/argv reasoning: the prompt
 # body goes through a temp file + jq --rawfile, never argv). This is the shared
 # runner for the whole OpenRouter rotation pool (glm, deepseek, mimo, minimax,
-# qwen, devstral, laguna, kat, north, nemotron, spark, seed, grok) — each an
+# qwen, devstral, laguna, kat, north, nemotron, spark, seed, grok, longcat,
+# inkling) — each an
 # independent provider
 # vote. It is NOT a fallback lane for the
 # first-party reviewers (policy: no OR fallbacks for codex/gemini/kimi).
 # Args:
 #   $1 slug           (glm | deepseek | mimo | minimax | qwen | devstral |
-#                      laguna | kat | north | nemotron | spark | seed | grok | kimi27 | kimi3)
-#   $2 model          (model id, e.g. z-ai/glm-5.2 or kimi-k2.7-code)
+#                      laguna | kat | north | nemotron | spark | seed | grok |
+#                      longcat | inkling | kimi27 | kimi3)
+#   $2 model          (model id, e.g. z-ai/glm-5.3 or kimi-k2.7-code)
 #   $3 timeout_budget (seconds)
 #   $4 endpoint       (optional; default OpenRouter chat-completions. kimi27/
 #                      kimi3 pass the direct Moonshot endpoint — the API is
@@ -1319,6 +1326,8 @@ run_nemotron() { run_openrouter_reviewer nemotron "$nemotron_model" "$nemotron_t
 run_spark()    { run_openrouter_reviewer spark    "$spark_model"    "$spark_timeout"; }
 run_seed()     { run_openrouter_reviewer seed     "$seed_model"     "$seed_timeout"; }
 run_grok()     { run_openrouter_reviewer grok     "$grok_model"     "$grok_timeout"; }
+run_longcat()  { run_openrouter_reviewer longcat  "$longcat_model"  "$longcat_timeout"; }
+run_inkling()  { run_openrouter_reviewer inkling  "$inkling_model"  "$inkling_timeout"; }
 # kimi27: same OpenAI-compatible single-turn body, direct Moonshot endpoint +
 # key. cli label "moonshot" selects the key source and lands in meta.json.
 run_kimi27()   { run_openrouter_reviewer kimi27   "$kimi27_model"   "$kimi27_timeout" \
@@ -1760,7 +1769,7 @@ stagger_s=2
 # 1-second 404 that reads like reviewer flakiness rather than stale config.
 for r in "${requested[@]}"; do
   case "$r" in
-    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok)
+    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok|longcat|inkling)
       bash "$script_dir/validate_or_models.sh" --no-fetch 2>&1 >/dev/null | head -5 >&2 || true
       break ;;
   esac
@@ -1817,7 +1826,7 @@ for r in "${requested[@]}"; do
         echo "kimi not installed — skipping" >&2
       fi
       ;;
-    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok)
+    glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok|longcat|inkling)
       if ! command -v curl >/dev/null 2>&1; then
         echo "$r: curl not available — skipping" >&2
       elif openrouter_key >/dev/null 2>&1; then
@@ -1884,7 +1893,7 @@ for i in "${!pids[@]}"; do
         # failure_kind and the .agy.log tail are where the answer lives.
         echo "$name: failed (check failure_kind in $out/$name.meta.json; agy's own log: $out/$name.agy.log)" >&2 ;;
       kimi)        echo "$name: failed (see $out/kimi.stderr and $out/kimi.meta.json)" >&2 ;;
-      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok|kimi27|kimi3)
+      glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok|longcat|inkling|kimi27|kimi3)
         echo "$name: failed (see $out/$name.stderr, $out/$name.response.json, $out/$name.meta.json)" >&2 ;;
       *)           echo "$name: failed (see $out/$name.* )" >&2 ;;
     esac

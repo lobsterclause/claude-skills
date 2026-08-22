@@ -117,7 +117,7 @@ runlog="${CROSS_REVIEW_RUNLOG:-$skill_dir/runlog.jsonl}"
 profile_file="$skill_dir/references/reviewer_profiles.json"
 
 # Full fleet — keep in sync with run_reviewers.sh dispatch and analyze_runlog.sh.
-REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok kimi27 kimi3)
+REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok longcat inkling kimi27 kimi3)
 
 structured=""
 if [[ -f "$runlog" ]]; then
@@ -170,6 +170,8 @@ provider_of() {
       spark) p="meta" ;;
       seed) p="bytedance" ;;
       grok) p="xai" ;;
+      longcat) p="meituan" ;;
+      inkling) p="thinkingmachines" ;;
       kimi27) p="moonshot" ;;
       kimi3) p="moonshot" ;;
       *) p="unknown" ;;

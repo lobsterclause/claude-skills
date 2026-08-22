@@ -216,6 +216,7 @@ enrich_with_findings() {
       "minimax":"minimax","qwen":"alibaba","devstral":"mistral",
       "laguna":"poolside","kat":"kuaishou","north":"cohere","nemotron":"nvidia",
       "spark":"meta","seed":"bytedance","grok":"xai",
+      "longcat":"meituan","inkling":"thinkingmachines",
       "kimi27":"moonshot","kimi3":"moonshot"}) as $prov
     | [(.findings // [])[] | select((.sources // []) | index($r))] as $mine
     | { findings_total: ($mine | length),
@@ -247,6 +248,8 @@ nemotron_json=$(enrich_with_findings nemotron "$(reviewer_obj nemotron)")
 spark_json=$(enrich_with_findings spark "$(reviewer_obj spark)")
 seed_json=$(enrich_with_findings seed "$(reviewer_obj seed)")
 grok_json=$(enrich_with_findings grok "$(reviewer_obj grok)")
+longcat_json=$(enrich_with_findings longcat "$(reviewer_obj longcat)")
+inkling_json=$(enrich_with_findings inkling "$(reviewer_obj inkling)")
 kimi27_json=$(enrich_with_findings kimi27 "$(reviewer_obj kimi27)")
 kimi3_json=$(enrich_with_findings kimi3 "$(reviewer_obj kimi3)")
 
@@ -281,6 +284,8 @@ entry=$(jq -nc \
   --argjson spark "$spark_json" \
   --argjson seed "$seed_json" \
   --argjson grok "$grok_json" \
+  --argjson longcat "$longcat_json" \
+  --argjson inkling "$inkling_json" \
   --argjson kimi27 "$kimi27_json" \
   --argjson kimi3 "$kimi3_json" \
   --arg run_id "$run_id" \
@@ -298,6 +303,7 @@ entry=$(jq -nc \
                 deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
                 devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
                 spark: $spark, seed: $seed, grok: $grok,
+                longcat: $longcat, inkling: $inkling,
                 kimi27: $kimi27, kimi3: $kimi3},
     convergent_count: $convergent,
     verdict: $verdict,

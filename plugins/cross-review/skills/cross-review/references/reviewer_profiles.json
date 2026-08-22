@@ -20,7 +20,7 @@
     "timeout_s": 600,
     "provider": "google",
     "cli": "agy",
-    "model": "Gemini 3.5 Flash (High)",
+    "model": "Gemini 3.7 Flash (High)",
     "retry_policy": "retry_on_transient",
     "prompt_style": "custom_with_tools",
     "severity_priors": {
@@ -30,8 +30,8 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.85,
-    "specialization": "architecture, side-effects, cross-file reasoning; agentic file-reading via Google's `agy` CLI on Gemini 3.5 Flash. Fast lap of the Gemini fleet. Rotation-pool member (not a baseline).",
-    "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.5 Flash (High)\"` \u2014 must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones \u2014 weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing \u2014 quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. NO FALLBACK (policy 2026-07-01): on quota/panic the lap drops out of the round; roster rotation covers the gap and the leaderboard down-weights it until it recovers."
+    "specialization": "architecture, side-effects, cross-file reasoning; agentic file-reading via Google's `agy` CLI on Gemini 3.7 Flash. Fast lap of the Gemini fleet. Rotation-pool member (not a baseline).",
+    "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.7 Flash (High)\"` \u2014 must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones \u2014 weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing \u2014 quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. NO FALLBACK (policy 2026-07-01): on quota/panic the lap drops out of the round; roster rotation covers the gap and the leaderboard down-weights it until it recovers. MODEL BUMPED 2026-08-22: Gemini 3.5 Flash (High) \u2192 3.7 Flash (High). agy had been listing 3.6 and 3.7 Flash for weeks while this seat stayed pinned to 3.5 \u2014 detection never noticed because detect_reviewers.sh only greps the models list for a 3.1 Pro entry, and the 6h agy_models.txt cache hid the rest. No draw_boost: a Flash point-release is the same seat, not a new identity (contrast deepseek/nemotron in #59, which changed tier and model outright)."
   },
   "gemini-pro": {
     "timeout_s": 900,
@@ -106,7 +106,7 @@
     "timeout_s": 600,
     "provider": "zhipu",
     "cli": "openrouter",
-    "model": "z-ai/glm-5.2",
+    "model": "z-ai/glm-5.3",
     "retry_policy": "retry_on_transient",
     "prompt_style": "diff_only_no_tools",
     "severity_priors": {
@@ -117,7 +117,7 @@
     },
     "synthesis_weight": 0.8,
     "specialization": "single-turn diff reasoning; independent provider vote (Zhipu). Rotation-pool member.",
-    "notes": "GLM 5.2 via the OpenRouter chat-completions API \u2014 no CLI, no agentic tools; the diff is inlined (8000-line cap, same as kimi). Requires an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key); without one the wrapper skips it. Added 2026-07-01; verified live (caught a planted one-line bug as Critical on its first run). Priors start conservative (mirroring kimi); let leaderboard.sh data drive tuning. China-origin provider (Zhipu), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
+    "notes": "GLM 5.3 via the OpenRouter chat-completions API \u2014 no CLI, no agentic tools; the diff is inlined (8000-line cap, same as kimi). Requires an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key); without one the wrapper skips it. Added 2026-07-01; verified live (caught a planted one-line bug as Critical on its first run). Priors start conservative (mirroring kimi); let leaderboard.sh data drive tuning. China-origin provider (Zhipu), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos. MODEL BUMPED 2026-08-22: glm-5.2 \u2192 glm-5.3 (released 2026-08-18, billed for complex software engineering and long-horizon agent tasks). NOTE THE PRICE: $0.97/M in, $3.04/M out \u2192 $1.40/M in, $4.40/M out, a ~45% rise. select_roster.sh divides draw weight by observed avg cost, so the seat self-throttles if 5.3 does not earn the difference. No draw_boost \u2014 point release, same family."
   },
   "deepseek": {
     "timeout_s": 600,
@@ -288,7 +288,7 @@
     "timeout_s": 600,
     "provider": "meta",
     "cli": "openrouter",
-    "model": "meta/muse-spark-1.1",
+    "model": "meta/muse-spark-1.2",
     "retry_policy": "retry_on_transient",
     "prompt_style": "diff_only_no_tools",
     "severity_priors": {
@@ -299,7 +299,7 @@
     },
     "synthesis_weight": 0.75,
     "specialization": "single-turn diff reasoning; independent provider vote (Meta). Rotation-pool member.",
-    "notes": "Meta Muse Spark 1.1 via OpenRouter ($1.25/M in, $4.25/M out; Meta Superintelligence Labs' first paid model, multimodal/agentic-oriented natively but run here diff-only-no-tools like the rest of the OR pool). Added 2026-07-19, rookie \u2014 priors conservative until leaderboard data accumulates. US-origin provider (Meta), routed through OpenRouter (US)."
+    "notes": "Meta Muse Spark 1.2 via OpenRouter ($1.25/M in, $4.25/M out; Meta Superintelligence Labs' first paid model, multimodal/agentic-oriented natively but run here diff-only-no-tools like the rest of the OR pool). Added 2026-07-19 (as 1.1), rookie \u2014 priors conservative until leaderboard data accumulates. US-origin provider (Meta), routed through OpenRouter (US). MODEL BUMPED 2026-08-22: muse-spark-1.1 \u2192 1.2, identical price. DELIBERATELY NOT muse-spark-1.2-contributor: that tier is 12x cheaper ($0.10/$0.20) and a discount that size at an unchanged model is bought with something \u2014 read Meta\u0027s contributor terms before seating it, because this skill ships diffs of private repositories. No draw_boost \u2014 point release, same family."
   },
   "seed": {
     "timeout_s": 600,
@@ -337,6 +337,44 @@
     "specialization": "single-turn diff reasoning, frontier tier, 500k context; independent provider vote (xAI). Rotation-pool member.",
     "notes": "xAI Grok 4.6 via OpenRouter ($2.00/M in, $6.00/M out, 500k ctx; released 2026-08-12). Added 2026-08-14 — xAI held zero seats, so this closes the last major frontier-lab gap in the fleet. Priciest OR-pool seat after spark; select_roster.sh already divides weight by avg cost, so it will self-throttle if it proves expensive per finding. draw_boost 2.5 while it earns leaderboard data; retire after ~10 sampled runs. US-origin provider (xAI), routed through OpenRouter (US)."
   },
+  "longcat": {
+    "timeout_s": 600,
+    "provider": "meituan",
+    "cli": "openrouter",
+    "model": "meituan/longcat-2.0",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "draw_boost": 2.5,
+    "specialization": "single-turn diff reasoning; independent provider vote (Meituan). Rotation-pool member.",
+    "notes": "Meituan LongCat 2.0 via OpenRouter ($0.30/M in, $1.20/M out; sparse MoE, 48B active of 1.6T, 1M ctx). Added 2026-08-22, rookie \u2014 priors conservative until leaderboard data accumulates. Picked off the 2026-08 catalog sweep because its card names repository-level changes and long-horizon coding specifically, and Meituan held no seat, so it is a genuinely new provider vote rather than another draw from a lab already in the pool. draw_boost 2.5 while it earns leaderboard data; retire after ~10 sampled runs. China-origin provider (Meituan), routed through OpenRouter (US) \u2014 surface for security-sensitive repos, same caveat as glm/kimi."
+  },
+
+  "inkling": {
+    "timeout_s": 600,
+    "provider": "thinkingmachines",
+    "cli": "openrouter",
+    "model": "thinkingmachines/inkling",
+    "retry_policy": "retry_on_transient",
+    "prompt_style": "diff_only_no_tools",
+    "severity_priors": {
+      "Critical": "trust_if_convergent",
+      "High": "verify",
+      "Medium": "verify",
+      "Low": "skip_unless_convergent"
+    },
+    "synthesis_weight": 0.75,
+    "draw_boost": 2.5,
+    "specialization": "single-turn diff reasoning; independent provider vote (Thinking Machines Lab). Rotation-pool member.",
+    "notes": "Thinking Machines Inkling via OpenRouter ($0.95/M in, $4.05/M out; open-weight MoE, 41B active of 975B, 1M ctx). Added 2026-08-22, rookie \u2014 priors conservative until leaderboard data accumulates. Cost is in line with spark and below grok; the fugu precedent (cut 2026-07-02 at $5/$30) is the bar this clears. A `thinkingmachines/inkling:free` route also exists \u2014 NOT used here: it caps context at 262k against the paid route\u0027s 1M, and free OpenRouter routes carry different data-retention terms, which matters because this skill ships private diffs. BILLING CAVEAT, measured live 2026-08-22 on a trivial 20-token prompt: 24 of 32 completion tokens were REASONING tokens, billed as output. Sticker output price is $4.05/M but effective cost per useful token is several times that, and a max_tokens too low returns finish_reason=length with content:null and no findings at all \u2014 the seat looks broken when it is merely truncated mid-reasoning. This is the shape of the fugu problem (hidden orchestration tokens billed as output) at a survivable magnitude; watch avg cost per finding on the leaderboard and cut it if it drifts toward fugu territory. draw_boost 2.5 while it earns leaderboard data; retire after ~10 sampled runs. US-origin provider (Thinking Machines Lab), routed through OpenRouter (US)."
+  },
+
   "_synthesis_rules": {
     "skip_unless_convergent": "Drop a single-reviewer finding at this severity unless another reviewer flagged the same file/area.",
     "trust_if_convergent": "Promote/keep when 2+ reviewers agree; downgrade or verify when solo.",

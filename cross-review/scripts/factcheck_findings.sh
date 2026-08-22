@@ -40,7 +40,13 @@
 set -uo pipefail
 
 findings="" ; out="" ; base="" ; repo="." ; diff_file="" ; emit_events_run_id=""
-reviewer="agy" ; model="Gemini 3.5 Flash (High)" ; timeout_s=300
+# The agy display-name default lives here ONCE: the openrouter lane below
+# has to recognise "the caller never passed --model" to know it may swap in
+# an OpenRouter slug, and it used to do that by repeating this literal. Two
+# copies of a model string is the exact rot run_reviewers.sh warns about --
+# bumping one and not the other would have silently disabled the swap.
+agy_default_model="Gemini 3.7 Flash (High)"
+reviewer="agy" ; model="$agy_default_model" ; timeout_s=300
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
@@ -223,7 +229,7 @@ case "$reviewer" in
   openrouter)
     # Direct OpenRouter lane (no agy involved). --model here means an
     # OpenRouter model id; the agy default display-name is not valid — swap it.
-    [[ "$model" == "Gemini 3.5 Flash (High)" ]] && model="$or_fallback_model"
+    [[ "$model" == "$agy_default_model" ]] && model="$or_fallback_model"
     openrouter_factcheck "$model" || keep_all "openrouter factcheck failed (fail-safe)"
     ;;
   *) echo "factcheck: unknown --reviewer '$reviewer' (use agy|kimi|openrouter)" >&2; exit 2 ;;
