@@ -969,10 +969,21 @@ assert_eq "detect still reports kimi27 available (positional coupling check)" \
 BOOST_ERR3="$T/boost3.err"
 CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR3"
 assert_contains "selector draws kimi3 as a candidate" "$(cat "$BOOST_ERR3")" "kimi3"
+# What this pins is that draw_boost actually MULTIPLIES the drawn weight --
+# kimi3 was only ever the vehicle, and its boost was retired to 1.0 on
+# 2026-08-22 (per Gabriel: enough data gathered), which broke this assertion.
+# Repointed to `inkling`, a seat that genuinely still carries 2.5. THE SEAT
+# NAMED HERE MUST BE ONE WITH draw_boost 2.5 AND NO RUNLOG HISTORY -- when
+# inkling's boost is retired in turn, repoint again rather than editing the
+# expected number, or this stops testing the multiplier at all. Same failure
+# the deepseek/nemotron swap caused on 2026-08-14.
 # rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0;
-# draw_boost 2.5 (fresh seat, not yet retired) → 75.0 * 2.5 = 187.5.
-assert_contains "kimi3 weight reflects its draw_boost (2.5, not yet retired)" \
-  "$(grep 'kimi3 ' "$BOOST_ERR3")" "weight=187.5"
+# draw_boost 2.5 → 75.0 * 2.5 = 187.5.
+assert_contains "a boosted rookie seat's weight reflects its draw_boost (inkling, 2.5)" \
+  "$(grep 'inkling ' "$BOOST_ERR3")" "weight=187.5"
+# and the retired seat is now drawn at the unboosted rookie weight
+assert_contains "kimi3 draws unboosted after its 2026-08-22 boost retirement" \
+  "$(grep 'kimi3 ' "$BOOST_ERR3")" "weight=75.0"
 # no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
 MOONSHOT_API_KEY= bash "$S/run_reviewers.sh" --base main --out "$T/o13" --reviewers kimi3 >/dev/null 2>"$T/k3skip.err"
 assert_eq "kimi3 without a key exits 1 (all requested reviewers failed)" "$?" "1"
@@ -2242,8 +2253,27 @@ wire_in_every_arm() {  # $1=seat
     [[ -z "$line" ]] && continue
     wire_has "$line" "$1" && n=$((n + 1))
   done <<<"$WIRE_ARM_LINES"
-  [[ "$n" == "$WIRE_ARMS" ]]
+  # never report success against zero arms -- see the non-vacuity block below
+  [[ "$WIRE_ARMS" -gt 0 && "$n" == "$WIRE_ARMS" ]]
 }
+
+# NON-VACUITY, first. A check that silently enumerates nothing reports "ok"
+# and is worse than no check, because it looks like coverage. Both paths were
+# confirmed live: WIRE_ARMS=0 makes wire_in_every_arm true for every seat
+# (0 == 0), and an empty WIRE_SEATS skips the loop entirely. Either can happen
+# from a jq path change, a renamed `cli` field, an unset SKILL_DIR, or a
+# reworded case arm -- none of which are exotic. (glm 5.3, PR #64.)
+WIRE_SEAT_COUNT="$(printf '%s\n' "$WIRE_SEATS" | grep -c .)"
+if [[ "$WIRE_SEAT_COUNT" -ge 10 ]]; then
+  ok "seat-wiring enumerated $WIRE_SEAT_COUNT openrouter seats from the profile"
+else
+  bad "seat-wiring enumerated only $WIRE_SEAT_COUNT seats -- the check would pass vacuously"
+fi
+if [[ "$WIRE_ARMS" -ge 3 ]]; then
+  ok "seat-wiring found $WIRE_ARMS dispatcher case arms to check against"
+else
+  bad "seat-wiring found $WIRE_ARMS case arms -- wire_in_every_arm would pass vacuously"
+fi
 
 WIRE_MISSING=""
 for _seat in $WIRE_SEATS; do

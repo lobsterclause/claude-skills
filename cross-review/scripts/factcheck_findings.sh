@@ -40,12 +40,21 @@
 set -uo pipefail
 
 findings="" ; out="" ; base="" ; repo="." ; diff_file="" ; emit_events_run_id=""
-# The agy display-name default lives here ONCE: the openrouter lane below
-# has to recognise "the caller never passed --model" to know it may swap in
-# an OpenRouter slug, and it used to do that by repeating this literal. Two
-# copies of a model string is the exact rot run_reviewers.sh warns about --
-# bumping one and not the other would have silently disabled the swap.
-agy_default_model="Gemini 3.7 Flash (High)"
+# The agy display-name default is READ FROM THE PROFILE, not declared here.
+# Deduping it within this file was not enough: reviewer_profiles.json is the
+# single source of model ids (run_reviewers.sh resolves every model from it),
+# so a literal here was still a second copy -- and the next antigravity bump
+# would have left this pass pinned to a stale model while the openrouter
+# lane's equality test below silently stopped matching. That is precisely the
+# two-copies rot the old comment here claimed to have fixed. (glm 5.3, PR #64.)
+# Falls back to the literal only when jq or the profile is unavailable, since
+# this script must stay runnable standalone.
+_fc_profile="$(cd "$(dirname "$0")/.." && pwd)/references/reviewer_profiles.json"
+agy_default_model=""
+if command -v jq >/dev/null 2>&1 && [[ -f "$_fc_profile" ]]; then
+  agy_default_model="$(jq -r '.antigravity.model // empty' "$_fc_profile" 2>/dev/null)"
+fi
+: "${agy_default_model:=Gemini 3.7 Flash (High)}"
 reviewer="agy" ; model="$agy_default_model" ; timeout_s=300
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
