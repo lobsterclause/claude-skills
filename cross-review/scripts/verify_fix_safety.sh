@@ -91,12 +91,38 @@ awk '/^\+\+\+ / { next } /^\+/ { print substr($0, 2) }' "$diff_file" > "$added"
 
 [[ -s "$removed" || -s "$added" ]] || write_verdict false "no +/- diff lines found — not a unified diff (fail-safe)"
 
-# count_matches <regex> <file> — case-insensitive match count, 0 on no match
-# (grep -c exits 1 with no matches; -Ei keeps this portable to macOS grep).
+# A real unified diff carries at least one hunk header (@@ ... @@) or a
+# ---/+++ file-header pair. A hand-built artifact of bare -old/+new lines
+# with neither is not a diff this gate can trust the shape of — fail closed
+# rather than silently scoring it.
+if ! grep -Eq '^(@@|--- |\+\+\+ )' "$diff_file" 2>/dev/null; then
+  write_verdict false "input has no @@ hunk header or ---/+++ file header — not a real unified diff (fail-safe)"
+fi
+
+# count_matches <regex> <file> — case-insensitive match count. Fails closed
+# (exit 1) rather than silently returning 0 when the file argument is
+# missing/unreadable — a silent 0 here reads to callers as "no dangerous
+# pattern found", which is exactly the wrong default for a missing file.
 count_matches() {
   local n
+  if [[ ! -f "$2" ]]; then
+    echo "count_matches: file not found: $2" >&2
+    return 1
+  fi
   n="$(grep -Eic -- "$1" "$2" 2>/dev/null)" || n=0
   printf '%s' "${n:-0}"
+}
+
+# safe_count <regex> <file> — wraps count_matches and fails the whole gate
+# closed (safe:false) if the file argument is missing/unreadable, instead of
+# letting a swallowed non-zero status silently fall through as an empty
+# (== 0-ish) count.
+safe_count() {
+  local n
+  if ! n="$(count_matches "$1" "$2")"; then
+    write_verdict false "internal error: could not read '$2' for pattern matching (fail-safe)"
+  fi
+  printf '%s' "$n"
 }
 
 matched=()
@@ -107,12 +133,40 @@ reasons=()
 # negated-condition auth/permission check, or a thrown Unauthorized/Forbidden.
 # A guard that's merely reformatted (same shape re-added elsewhere in the
 # hunk) is not penalized — only a net decrease counts.
-auth_re='(if[^;{]*![^;{]*\bauth)|(if[^;{]*![^;{]*\bpermit)|(if[^;{]*![^;{]*\bauthoriz)|(throw[^;]*\bunauthoriz)|(throw[^;]*\bforbidden)'
-auth_removed="$(count_matches "$auth_re" "$removed")"
-auth_added="$(count_matches "$auth_re" "$added")"
+#
+# Word-boundary notes:
+#  - `\bauth\b` / `\bpermit\b` are exact-word matches (both boundaries) so
+#    they DON'T fire on `author`/`authority` (blocked by the trailing
+#    boundary: "auth" is immediately followed by a word char in both) or on
+#    `permitting`/`permitted`.
+#  - `authoriz`/`authentic`/`permission`/`isallowed`/`checkaccess`/
+#    `requireauth` are deliberately NOT `\b`-anchored on the left: these need
+#    to match inside camelCase compounds like `isAuthorized`/`hasPermission`/
+#    `checkAccess`, where the preceding character is a lowercase letter (a
+#    word char), so a leading `\b` would never fire there. Each alternative
+#    still requires enough trailing/internal specificity (`oriz`, `entic`,
+#    `ssion`, the full compound) that it doesn't misfire on unrelated words.
+auth_re='(if[^;{]*![^;{]*\bauth\b)|(if[^;{]*![^;{]*authoriz)|(if[^;{]*![^;{]*authentic)|(if[^;{]*![^;{]*\bpermit\b)|(if[^;{]*![^;{]*permission)|(if[^;{]*![^;{]*isallowed)|(if[^;{]*![^;{]*checkaccess)|(if[^;{]*![^;{]*requireauth)|(throw[^;]*unauthoriz)|(throw[^;]*forbidden)|(throw[^;]*accessdenied)'
+auth_removed="$(safe_count "$auth_re" "$removed")"
+auth_added="$(safe_count "$auth_re" "$added")"
 if [[ "$auth_removed" -gt "$auth_added" ]]; then
   matched+=("auth_guard_removed")
   reasons+=("an authorization/permission check or Unauthorized/Forbidden throw was removed without an equivalent replacement")
+fi
+
+# ── 1b. Authorization guard commented out (not net-removed) ─────────────────
+# A net-count comparison alone is blind to a fix that turns a live guard into
+# a comment: `if (!isAuthorized(user)) return 403;` -> `// if (!isAuthorized(user))
+# return 403;`. The guard-shaped text is identical on both sides (removed==added),
+# so check 1 sees no net decrease and would call it safe — even though the
+# guard is now dead code. Catch it directly: any ADDED line that matches the
+# auth-guard shape AND looks like a comment/no-op wrapper (//, #, /*, <!--) is
+# unsafe regardless of what the counts say.
+comment_prefix_re='^[[:space:]]*(//|#|/\*|<!--)'
+auth_commented="$(grep -Ei -- "$auth_re" "$added" 2>/dev/null | grep -Ec -- "$comment_prefix_re" 2>/dev/null)" || auth_commented=0
+if [[ "${auth_commented:-0}" -gt 0 ]]; then
+  matched+=("auth_guard_commented_out")
+  reasons+=("an authorization/permission guard was commented out rather than removed, leaving it as dead code while line counts stay balanced")
 fi
 
 # ── 2. Input validation weakened ─────────────────────────────────────────────
@@ -120,8 +174,8 @@ fi
 # check, validate/sanitize/isValid call) without a replacement of the same
 # shape landing elsewhere in the diff.
 valid_re='(\.test\()|(\.match\()|(new RegExp)|(length[[:space:]]*[<>]=?)|(typeof[[:space:]])|(instanceof[[:space:]])|(isValid)|(\bvalidate)|(\bsanitize)'
-valid_removed="$(count_matches "$valid_re" "$removed")"
-valid_added="$(count_matches "$valid_re" "$added")"
+valid_removed="$(safe_count "$valid_re" "$removed")"
+valid_added="$(safe_count "$valid_re" "$added")"
 if [[ "$valid_removed" -gt "$valid_added" ]]; then
   matched+=("validation_weakened")
   reasons+=("an input validation check (regex/length/type) was removed without an equivalent or stronger replacement")
@@ -130,7 +184,7 @@ fi
 # ── 3. Test disabled or deleted ─────────────────────────────────────────────
 # (a) a skip marker was newly introduced by the fix.
 skip_re='(\.skip\()|(\bxit\()|(\bxdescribe\()'
-skip_added="$(count_matches "$skip_re" "$added")"
+skip_added="$(safe_count "$skip_re" "$added")"
 if [[ "$skip_added" -gt 0 ]]; then
   matched+=("test_disabled")
   reasons+=("the fix introduces a .skip()/xit()/xdescribe() marker, disabling a test")
@@ -138,8 +192,8 @@ fi
 # (b) a net removal of it(/test(/describe( blocks — a test being deleted
 # outright rather than reworked in place.
 test_block_re='\b(it|test|describe)\('
-test_removed="$(count_matches "$test_block_re" "$removed")"
-test_added="$(count_matches "$test_block_re" "$added")"
+test_removed="$(safe_count "$test_block_re" "$removed")"
+test_added="$(safe_count "$test_block_re" "$added")"
 if [[ "$test_removed" -gt "$test_added" ]]; then
   matched+=("test_deleted")
   reasons+=("the fix has a net removal of it()/test()/describe() blocks — a test is being deleted, not reworked")
@@ -151,8 +205,8 @@ fi
 # Losing the anchors, or losing the regex line entirely, broadens what the
 # pattern will accept.
 anchored_regex_re='/\^[^/]*\$/'
-anchored_removed="$(count_matches "$anchored_regex_re" "$removed")"
-anchored_added="$(count_matches "$anchored_regex_re" "$added")"
+anchored_removed="$(safe_count "$anchored_regex_re" "$removed")"
+anchored_added="$(safe_count "$anchored_regex_re" "$added")"
 if [[ "$anchored_removed" -gt "$anchored_added" ]]; then
   matched+=("regex_weakened")
   reasons+=("an anchored allowlist/format regex (^...\$) was removed or had its anchors dropped, broadening what it accepts")

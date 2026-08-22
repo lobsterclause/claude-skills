@@ -30,7 +30,8 @@ assert_contains() {
 command -v jq >/dev/null 2>&1 || { echo "jq required to run these tests" >&2; exit 1; }
 
 if [[ ! -x "$S" ]]; then
-  echo "  (expected pre-implementation) verify_fix_safety.sh not found/executable at $S" >&2
+  echo "  FAIL verify_fix_safety.sh not found/executable at $S" >&2
+  exit 1
 fi
 
 # ── Case 1: a suggested "fix" removes an auth guard ─────────────────────────
@@ -140,6 +141,97 @@ EMPTY_DIFF="$T/empty.diff"
 EMPTY_OUT="$T/empty.out.json"
 bash "$S" --diff "$EMPTY_DIFF" --out "$EMPTY_OUT" >/dev/null 2>"$T/empty.stderr.txt"
 assert_eq "empty diff -> safe:false (fail-safe)" "$(jq -r '.safe' "$EMPTY_OUT")" "false"
+
+# ── Case 7: an auth guard is commented out, not removed ──────────────────────
+# The laundering shape a pure net-count check misses: the guard text is
+# identical on both sides of the diff (removed count == added count), so a
+# naive comparison says "no net decrease" -> safe. But the added copy is
+# wrapped in a comment, so the guard no longer executes. Must be safe:false.
+COMMENTED_DIFF="$T/commented.diff"
+cat >"$COMMENTED_DIFF" <<'EOF'
+diff --git a/src/handler.ts b/src/handler.ts
+index 1111111..2222222 100644
+--- a/src/handler.ts
++++ b/src/handler.ts
+@@ -10,7 +10,7 @@ export function handleRequest(req: Request, user: User) {
+   const payload = parseBody(req);
+
+-  if (!isAuthorized(user, payload.resourceId)) {
++  // if (!isAuthorized(user, payload.resourceId)) {
+     throw new Error('Unauthorized');
+   }
+
+   return process(payload);
+ }
+EOF
+
+COMMENTED_OUT="$T/commented.out.json"
+bash "$S" --diff "$COMMENTED_DIFF" --out "$COMMENTED_OUT" >/dev/null 2>"$T/commented.stderr.txt"
+assert_eq "auth guard commented out -> safe:false" "$(jq -r '.safe' "$COMMENTED_OUT")" "false"
+assert_contains "matched categories include auth_guard_commented_out" "$(jq -r '.matched | join(",")' "$COMMENTED_OUT")" "auth_guard_commented_out"
+
+# ── Case 8: broadened predicate names (hasPermission / isAllowed / etc.) ─────
+# Regression pin: the original auth_re only recognized a handful of tokens
+# and required a leading \b that never matches inside camelCase compounds
+# (isAuthorized, hasPermission, checkAccess). Confirm the broadened regex
+# catches a removed hasPermission-style guard.
+PERM_DIFF="$T/perm.diff"
+cat >"$PERM_DIFF" <<'EOF'
+diff --git a/src/handler.ts b/src/handler.ts
+index 1111111..2222222 100644
+--- a/src/handler.ts
++++ b/src/handler.ts
+@@ -10,7 +10,5 @@ export function handleRequest(req: Request, user: User) {
+   const payload = parseBody(req);
+
+-  if (!hasPermission(user, payload.resourceId)) {
+-    throw new Error('AccessDenied');
+-  }
+
+   return process(payload);
+ }
+EOF
+
+PERM_OUT="$T/perm.out.json"
+bash "$S" --diff "$PERM_DIFF" --out "$PERM_OUT" >/dev/null 2>"$T/perm.stderr.txt"
+assert_eq "hasPermission guard removal -> safe:false" "$(jq -r '.safe' "$PERM_OUT")" "false"
+assert_contains "matched categories include auth_guard_removed" "$(jq -r '.matched | join(",")' "$PERM_OUT")" "auth_guard_removed"
+
+# ── Case 9: word-boundary tightening — `author`/`authority` are not auth ────
+# Regression pin: a naive prefix match on \bauth would misfire on unrelated
+# English words. A diff that just deletes an `author` field must stay safe.
+AUTHOR_DIFF="$T/author.diff"
+cat >"$AUTHOR_DIFF" <<'EOF'
+diff --git a/src/post.ts b/src/post.ts
+index 1111111..2222222 100644
+--- a/src/post.ts
++++ b/src/post.ts
+@@ -1,7 +1,5 @@
+ export function describePost(post: Post): string {
+-  if (!post.author) {
+-    return 'unknown authority';
+-  }
+   return post.author.name;
+ }
+EOF
+
+AUTHOR_OUT="$T/author.out.json"
+bash "$S" --diff "$AUTHOR_DIFF" --out "$AUTHOR_OUT" >/dev/null 2>"$T/author.stderr.txt"
+assert_eq "unrelated author/authority text -> safe:true" "$(jq -r '.safe' "$AUTHOR_OUT")" "true"
+
+# ── Case 10: malformed hand-built artifact with no real diff headers ────────
+# No `@@` hunk header and no `---`/`+++` file header — just bare -old/+new
+# lines. This is not a real unified diff and must fail closed rather than
+# silently scoring whatever pattern happens to match.
+MALFORMED_DIFF="$T/malformed.diff"
+cat >"$MALFORMED_DIFF" <<'EOF'
+-const nm = rawName.trim();
++const trimmedName = rawName.trim();
+EOF
+
+MALFORMED_OUT="$T/malformed.out.json"
+bash "$S" --diff "$MALFORMED_DIFF" --out "$MALFORMED_OUT" >/dev/null 2>"$T/malformed.stderr.txt"
+assert_eq "malformed non-diff input -> safe:false (fail-safe)" "$(jq -r '.safe' "$MALFORMED_OUT")" "false"
 
 echo
 echo "$PASS passed, $FAIL failed"
