@@ -54,7 +54,7 @@ SKILL=~/.claude/skills/cross-review          # or wherever the skill lives
 cp "$SKILL"/ci/cross-review-currency.sh       scripts/
 cp "$SKILL"/ci/test-cross-review-currency.sh  scripts/
 cp "$SKILL"/ci/cross-review-currency.yml      .github/workflows/
-bash scripts/test-cross-review-currency.sh    # expect 174 passed, 0 failed
+bash scripts/test-cross-review-currency.sh    # expect 176 passed, 0 failed
 ```
 
 The harness finds the workflow beside itself (this directory) or at
@@ -64,10 +64,10 @@ calls `currency_verdict()` with fixtures.
 
 ## Who is allowed to sign off
 
-A record only counts from an account that can **push to this repository**.
-Without that, anyone who can comment can post `## Cross-review` with a stamp
-naming the head and turn a required check green — the record is the whole
-evidence, so its provenance is the whole gate.
+A record only counts from an account with standing in this repository. Without
+that, anyone who can comment can post `## Cross-review` with a stamp naming the
+head and turn a required check green — the record is the whole evidence, so its
+provenance is the whole gate.
 
 Two checks, because one is not enough:
 
@@ -80,13 +80,35 @@ Two checks, because one is not enough:
    invitations. `OWNER` short-circuits, so the single-maintainer repo pays no
    extra API call.
 
-When the permission cannot be read the record is **waved through and the status
-says `(standing unverified)`**. That endpoint is itself gated on the caller
-having push access and a workflow token's scope for it varies by repository
-type, so refusing on an empty answer would make the gate permanently red
-wherever the token cannot make that call — and a permanently red gate gets
-switched off. Set `CR_PERMISSION_UNREADABLE=refuse` where you know your token
-can read permissions.
+### Read this before believing step 2 is on
+
+**On the stock `GITHUB_TOKEN`, step 2 does not fire.** That endpoint is gated on
+the *caller* having push access; the workflow token here holds `contents: read`,
+so the call 403s, `perm` comes back empty for everyone, and the gate falls back
+to the association — the very thing step 2 exists to replace. A warning naming
+the reason goes to the job log, and the status carries `(standing unverified)`,
+so it degrades loudly rather than silently. But it degrades.
+
+To actually get step 2:
+
+```yaml
+env:
+  GH_TOKEN: ${{ secrets.CROSS_REVIEW_TOKEN }}   # PAT or App token, repo admin
+  CR_PERMISSION_UNREADABLE: refuse
+```
+
+`refuse` is not the default, and deliberately so: on the stock token it would
+turn every repo permanently red, and a permanently red gate gets switched off
+for good — which is the failure mode this whole design is written against.
+
+So on a personal repo, `OWNER` is doing the real work and is unambiguous. On an
+org repo without that token, narrow `CR_TRUSTED_ASSOC` to `OWNER` rather than
+trusting `MEMBER`/`COLLABORATOR` to mean write access, because they do not.
+
+The permission lookup is bounded: only the authors of comments that already look
+like a review record, distinct, `OWNER` never, and at most
+`CR_PERMISSION_LOOKUP_CAP` (10) per run, with anything beyond the cap named in
+the log. A PR with no record makes no lookups at all.
 
 The trust filter runs **before** "newest wins". Selecting the newest record and
 then checking its author would let an untrusted comment posted after a real
@@ -144,6 +166,7 @@ rather than springing it, and use the escape hatch below instead of reverting.
 | `CR_TRUSTED_ASSOC` | `OWNER MEMBER COLLABORATOR` | associations eligible to post a record |
 | `CR_TRUSTED_PERMISSION` | `admin write maintain` | repository permissions that count as sign-off |
 | `CR_PERMISSION_UNREADABLE` | `trust` | `trust` or `refuse`, when the permission cannot be read |
+| `CR_PERMISSION_LOOKUP_CAP` | `10` | max distinct record authors resolved per run |
 
 Nothing else is repo-specific. There are no hardcoded branch names, org names,
 or issue numbers.

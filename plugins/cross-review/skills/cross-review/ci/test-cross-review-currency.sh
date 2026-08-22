@@ -624,11 +624,24 @@ assert_eq "nor does a token of prose alongside it" \
 assert_eq "control: a real reason with the same sha still opens the hatch" \
   "$(state_of "$(comments "$JUSTIFIED")" "$HEAD40" "$EXEMPT_HUMAN")" "success"
 
-# CONTROL — the stripping must remove the commit reference and NOTHING else.
-# A greedy strip of every hex-looking run would eat words like `deadbeef`,
-# `facade`, `decade` out of ordinary prose and start refusing real reasons.
+# CONTROL — the stripping must remove THIS COMMIT'S reference and nothing else.
+# The first cut deleted every \b[0-9a-f]{7,40}\b run, which eats ordinary
+# English written entirely in hex letters: `defaced`, `effaced` and `acceded`
+# are each seven characters of [0-9a-f], and each one vanished. A real
+# justification then falls under the minimum and is refused with a message
+# about not having given a reason. (gemini-pro, pass 3.)
 assert_eq "control: prose that happens to be hex-ish is still a reason" \
   "$(state_of "$(comments "Cross-review exemption: decade-old facade, dead code ${HEAD40:0:9}")" \
+      "$HEAD40" "$EXEMPT_HUMAN")" "success"
+# Sized so it ONLY passes if `defaced` survives: 17 characters with it, 10
+# without, against a minimum of 15.
+assert_eq "control: a seven-letter hex word is prose, not a commit reference" \
+  "$(state_of "$(comments "Cross-review exemption: the notes defaced ${HEAD40:0:9}")" \
+      "$HEAD40" "$EXEMPT_HUMAN")" "success"
+# ...and the converse: a hex run that is NOT this commit is left in place, so it
+# cannot be used to pad a reason down to nothing either way.
+assert_eq "an unrelated hash is not mistaken for this commit's reference" \
+  "$(state_of "$(comments "Cross-review exemption: see ${OTHER40:0:12} nothing else ${HEAD40:0:9}")" \
       "$HEAD40" "$EXEMPT_HUMAN")" "success"
 
 # The refusal must not be reachable when nothing was justified at all — that

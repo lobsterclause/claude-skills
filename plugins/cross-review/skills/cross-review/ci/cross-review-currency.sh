@@ -199,12 +199,27 @@ CR_TRUSTED_ASSOC="${CR_TRUSTED_ASSOC:-OWNER MEMBER COLLABORATOR}"
 # no lookup and the call would be one API round trip per run for nothing.
 CR_TRUSTED_PERMISSION="${CR_TRUSTED_PERMISSION:-admin write maintain}"
 
-# WHAT TO DO WHEN THE PERMISSION CANNOT BE READ, which is a real case and not a
-# rare one: that endpoint is itself gated on the caller having push access, and
-# a workflow token's exact scope for it varies by repository type — so `perm`
-# coming back empty may mean an outage, or may mean this token can never read
-# it here. Refusing on empty would turn the second case into a permanently red
-# gate for every repo whose token cannot make that call.
+# WHAT TO DO WHEN THE PERMISSION CANNOT BE READ — AND EXPECT THAT TO BE THE
+# DEFAULT, NOT THE EXCEPTION.
+#
+# `GET /repos/{owner}/{repo}/collaborators/{login}/permission` is gated on the
+# CALLER having push access. The workflow token here holds `contents: read`, so
+# it does not, and the call is expected to 403. Which means: under the stock
+# GITHUB_TOKEN this check does not fire, `perm` is empty for everyone, and the
+# gate falls back to exactly the author_association it was written to replace.
+#
+# That is stated here rather than papered over, because the alternative — a
+# check whose README promises write-access verification while it silently
+# degrades — is worse than not having it. What the fallback buys is honesty and
+# a switch: the status says `(standing unverified)`, a warning names the reason
+# on stderr, and a repo that wants the real check supplies a token that can make
+# the call (a PAT or GitHub App token with repository admin, as GH_TOKEN) and
+# sets CR_PERMISSION_UNREADABLE=refuse. Flagged by gemini-pro in cross-review of
+# PR #63 pass 3.
+#
+# Refusing by DEFAULT is not the answer: it would turn every repo on the stock
+# token permanently red, and a permanently red gate gets switched off for good —
+# which is the failure mode this whole file is written against.
 #
 #   trust  — fall back to the association, and SAY SO in the status description
 #            so an unverified grant is visible rather than silent. The attack
@@ -233,10 +248,28 @@ CR_EXEMPT_RE='^Cross-review exemption:[[:space:]]*[^[:space:]].{14,}'
 # sed word-boundary syntaxes are not, and this harness runs on both. Flagged by
 # codex in cross-review of PR #63.
 #
-# reason_substance <text> → the reason with any commit reference removed
+# ONLY THIS COMMIT'S REFERENCE IS STRIPPED, not every hex-looking run. The first
+# cut deleted anything matching \b[0-9a-f]{7,40}\b, which eats ordinary English
+# written entirely in hex letters — `defaced`, `effaced`, `acceded` are all
+# seven characters of [0-9a-f]. Verified live: each one vanished. A reason
+# saying "the release notes were defaced" lost eight characters to the stripper
+# and could fall under the minimum, so a genuine justification would be refused
+# with a message about not giving a reason. Matching against the head sha
+# instead makes this exact: the only thing removed is the token the binding
+# check accepts as naming this commit, so the two halves cannot disagree about
+# what "the commit reference" means. (gemini-pro, PR #63 pass 3.)
+#
+# JQ SCOPING, for the third time in this file: inside `startswith(...)` the `.`
+# has rebound to the piped value, so `($h | startswith(.t))` looks for `.t` on
+# $h and dies. Bind the capture to a variable first.
+#
+# reason_substance <text> <head-sha> → the reason with THIS commit's reference removed
 reason_substance() {
   printf '%s' "${1:-}" \
-    | jq -Rr 'gsub("\\b[0-9a-f]{7,40}\\b"; "") | gsub("^\\s+|\\s+$"; "")' 2>/dev/null \
+    | jq -Rr --arg h "${2:-}" '
+        gsub("\\b(?<t>[0-9a-f]{7,40})\\b";
+             (.t) as $tok | if ($h | startswith($tok)) then "" else $tok end)
+        | gsub("^\\s+|\\s+$"; "")' 2>/dev/null \
     || printf '%s' "${1:-}"
 }
 
@@ -340,7 +373,7 @@ exemption_verdict() {
   if [[ -n "$reason" ]]; then
     # Bound to the head and to the granting human, but is there a reason in it?
     local substance
-    substance="$(reason_substance "$reason")"
+    substance="$(reason_substance "$reason" "$head_sha")"
     if [[ "${#substance}" -lt 15 ]]; then
       printf 'failure\t%s\n' \
         "@${actor} named ${head_sha:0:9} but gave no reason — say why in 15+ characters"
@@ -557,20 +590,46 @@ fetch_comments() {
     || printf 'null')"
   [[ -n "$raw" && "$raw" != "null" ]] || { printf 'null'; return 0; }
 
-  # One lookup per DISTINCT author that the association filter would otherwise
-  # wave through, not one per comment — a PR with forty comments from the same
-  # reviewer is one API call. OWNER is skipped entirely: it is unambiguous, and
-  # on the overwhelmingly common single-maintainer repo that keeps this whole
-  # addition at zero extra calls.
-  local logins login perm perms='{}'
+  # One lookup per DISTINCT author OF A RECORD-SHAPED COMMENT — not one per
+  # comment, and not one per commenter. Three narrowings, each of which is the
+  # difference between a bounded job and an unbounded one:
+  #
+  #   - only comments that actually look like a review record. Whether the
+  #     person who said "lgtm" can push is not a question this gate has to
+  #     answer, and on a PR with a long human thread it is dozens of calls to
+  #     answer it. A PR with no record makes ZERO calls.
+  #   - distinct authors, so forty comments from one reviewer is one call.
+  #   - OWNER never, since it is unambiguous. On the single-maintainer repo
+  #     that is the common case, this whole addition costs nothing.
+  #
+  # Sequential and rate-limited, so it is also capped, and the cap SAYS so
+  # rather than silently covering less than it appears to. Flagged as unbounded
+  # by deepseek in cross-review of PR #63 pass 3.
+  local logins login perm perms='{}' looked=0
   logins="$(printf '%s' "$raw" \
-    | jq -r --argjson t "$(printf '%s' "$CR_TRUSTED_ASSOC" | jq -Rc 'split(" ") | map(select(length > 0))')" \
-        '[.[] | select((.assoc // "") as $a | ($t | index($a)) != null and $a != "OWNER")
+    | jq -r --arg h "$CR_HEADER" --arg m "$CR_MARKER_RE" --arg re "$CR_STAMP_RE" \
+        --argjson t "$(printf '%s' "$CR_TRUSTED_ASSOC" | jq -Rc 'split(" ") | map(select(length > 0))')" \
+        '[.[] | select((.body // "") | startswith($h))
+              | select((.body // "") | test($m) or test($re))
+              | select((.assoc // "") as $a | ($t | index($a)) != null and $a != "OWNER")
               | .user // "" | select(length > 0)] | unique | .[]' 2>/dev/null || printf '')"
   while IFS= read -r login; do
     [[ -n "$login" ]] || continue
+    if [[ "$looked" -ge "${CR_PERMISSION_LOOKUP_CAP:-10}" ]]; then
+      echo "cross-review currency: more than ${CR_PERMISSION_LOOKUP_CAP:-10} distinct record authors;" \
+           "not resolving permission for '$login' — it will read as unverified" >&2
+      break
+    fi
     perm="$(gh api "repos/$1/collaborators/$login/permission" --jq '.permission' 2>/dev/null || printf '')"
+    if [[ -z "$perm" ]]; then
+      # The likeliest cause is not an outage. That endpoint is gated on the
+      # CALLER having push access, and the workflow token deliberately does not
+      # have it — see CR_PERMISSION_UNREADABLE.
+      echo "cross-review currency: could not read repository permission for '$login'" \
+           "(the default GITHUB_TOKEN usually cannot); falling back to author_association" >&2
+    fi
     perms="$(printf '%s' "$perms" | jq -c --arg l "$login" --arg p "$perm" '. + {($l): $p}')"
+    looked=$((looked + 1))
   done <<< "$logins"
 
   printf '%s' "$raw" | jq -c --argjson m "$perms" \
