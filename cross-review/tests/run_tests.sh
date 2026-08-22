@@ -1623,9 +1623,26 @@ fi
 pc_run '' --head-sha 399df23d4d5945162d0c5ed623484d608337165d
 assert_contains "posts anyway when PR metadata is unavailable" "$(cat "$CR_TEST_CAPTURE")" "nothing to report"
 
-# 5. Backwards compatible: no --head-sha at all still posts.
-pc_run '{"headRefOid":"abc","state":"OPEN"}'
-assert_contains "still posts without --head-sha" "$(cat "$CR_TEST_CAPTURE")" "nothing to report"
+# 5. No --head-sha REFUSES to post (dc68990). This test used to assert the
+#    opposite -- "backwards compatible: no --head-sha at all still posts" --
+#    which is precisely the behaviour that commit removed on purpose: an
+#    unstamped comment is a review record that cannot say which commit it
+#    covered, and half the sampled comments on 2026-08-14 were exactly that.
+#    Inverted rather than deleted, so the refusal itself stays pinned.
+: >"$CR_TEST_CAPTURE"; rm -f "$T/posted.json"
+CR_TEST_PR_JSON='{"headRefOid":"abc","state":"OPEN"}' \
+  bash "$SKILL_DIR/scripts/post_comment.sh" \
+  --pr 3207 --mode summary --findings "$PC_FIND" >/dev/null 2>&1
+PC_RC=$?
+assert_eq "no --head-sha exits 2 rather than posting" "$PC_RC" "2"
+if [[ -s "$CR_TEST_CAPTURE" ]]; then
+  bad "no --head-sha still reached gh pr comment"
+else
+  ok "no --head-sha posts nothing to the PR"
+fi
+assert_eq "and the refusal is recorded as its own reason" \
+  "$(jq -r '.reason' "$T/posted.json" 2>/dev/null)" "no-head-sha"
+assert_eq "and posted=false" "$(jq -r '.posted' "$T/posted.json" 2>/dev/null)" "false"
 
 # 6. The roster line is derived from raw/*.meta.json, and a retried agy lap
 #    leaves BOTH <slug>.meta.json and <slug>.attempt<N>.meta.json behind.
@@ -1637,7 +1654,10 @@ mkdir -p "$(dirname "$PC_FIND")/raw"
 : >"$(dirname "$PC_FIND")/raw/antigravity.attempt1.meta.json"
 : >"$(dirname "$PC_FIND")/raw/codex.meta.json"
 : >"$(dirname "$PC_FIND")/raw/gemini-pro.agy-failed.meta.json"
-pc_run '{"headRefOid":"abc","state":"OPEN"}'
+# --head-sha is mandatory since dc68990; without it this run exits 2 and
+# captures nothing, and the two controls below fail on an empty roster line.
+pc_run '{"headRefOid":"abc","state":"OPEN"}' \
+  --head-sha 399df23d4d5945162d0c5ed623484d608337165d
 # Grab the whole line. A `[^.]*` capture stops at the dot INSIDE
 # "antigravity.attempt1", so it can never contain the string the assertion
 # below looks for — it passed with the exclusion removed.
