@@ -25,7 +25,11 @@
 #   corroborated Lows, and a disproven Critical hurts 5x more than a
 #   disproven Low. Known trade-off: solo findings that fact-check can't
 #   actively disprove keep full solo credit — watch ev_dropped/ev_solo per
-#   reviewer before trusting a solo-heavy score.
+#   reviewer before trusting a solo-heavy score. Partial mitigation
+#   (2026-08-14): a reviewer whose OWN drop rate over this window exceeds
+#   solo_discount_drop_rate_threshold (15%, min sample solo_discount_min_n)
+#   has its 1.0 solo tier discounted to solo_discount_factor (0.7) for this
+#   pass — see the constants and comment above score_reviewer().
 #
 #   COUNTS FALLBACK (v1): reviewers with no window events keep the old
 #   aggregate-count formula:
@@ -146,6 +150,21 @@ if [[ -f "$profile_file" ]]; then
   [[ -n "$b" && "$b" != "[]" ]] && baselines="$b"
 fi
 
+# Precision discount (Goodhart's-law guard, 2026-08-14): factcheck_findings.sh
+# is deliberately recall-safe — it can only DROP a finding the diff actively
+# CONTRADICTS, and keeps anything it merely can't confirm. That lets a
+# reviewer that over-reports speculative/low-confidence findings keep full
+# 1.0 solo credit on most of them, while a careful reviewer reporting fewer,
+# higher-confidence findings earns no precision reward. To close that gap,
+# a reviewer whose OWN factcheck-drop rate over this same window exceeds the
+# threshold below has its solo-credit tier discounted for this scoring pass
+# (a low or zero drop rate leaves the discount at 1.0 — a no-op). Gated on a
+# minimum sample size so a single unlucky drop on a thin sample can't trip
+# the discount by chance; simple constants, not a curve, by design.
+solo_discount_min_n=5
+solo_discount_drop_rate_threshold=0.15
+solo_discount_factor=0.7
+
 # provider_of <reviewer> — profile `.provider` wins, else the built-in map.
 provider_of() {
   local r="$1" p=""
@@ -182,7 +201,10 @@ score_reviewer() {
   local r="$1" provider="$2"
   printf '%s\n' "$structured" | jq -s --arg r "$r" --arg provider "$provider" \
     --argjson events "$window_events" --argjson provmap "$provmap" \
-    --argjson baselines "$baselines" '
+    --argjson baselines "$baselines" \
+    --argjson solo_discount_min_n "$solo_discount_min_n" \
+    --argjson solo_discount_drop_rate_threshold "$solo_discount_drop_rate_threshold" \
+    --argjson solo_discount_factor "$solo_discount_factor" '
     map(.reviewers[$r] // {status:"skipped"}) as $rs
     # Sleep-killed timeouts (2026-07-03): a timed_out sample whose wall-clock
     # duration overran the ENFORCED budget by >60s means the machine slept
@@ -234,6 +256,19 @@ score_reviewer() {
     | ($events | map(select(.event == "anchored" and .resolved == false)
                      | {fid: .finding_id, rid: .run_id})) as $unanch_keys
     | ($provmap[$r] // "unknown") as $rprov
+    # Own factcheck-drop rate for this reviewer over this window (same
+    # $props / $drop_keys the events path already builds) — precision signal
+    # for the solo-credit discount below. Below the minimum sample size,
+    # treat as unproven (rate 0, no discount) rather than penalize a thin
+    # sample.
+    | ($props | length) as $own_n
+    | ($props | map(select(.finding_id as $fid | .run_id as $rid
+                            | ($drop_keys | any(.fid == $fid and .rid == $rid))))
+              | length) as $own_dropped
+    | (if $own_n < $solo_discount_min_n then 0
+       else ($own_dropped / $own_n) end) as $own_drop_rate
+    | (if $own_drop_rate > $solo_discount_drop_rate_threshold
+       then $solo_discount_factor else 1.0 end) as $solo_discount
     | ($props | map(
         (if .severity == "Critical" then 5
          elif .severity == "High" then 3
@@ -249,7 +284,8 @@ score_reviewer() {
         | ($srcs | map($provmap[.] // .) | unique) as $provs
         | (($provs - [$rprov]) | length == 0) as $is_solo
         | ($srcs | map(. as $s | $baselines | index($s) != null) | any) as $has_baseline
-        | (if $is_solo then 1.0 elif $has_baseline then 0.7 else 0.85 end) as $tier
+        | (if $is_solo then (1.0 * $solo_discount)
+           elif $has_baseline then 0.7 else 0.85 end) as $tier
         | (if $is_dropped then 0
            else ($tier * (if $is_unanch then 0.5 else 1 end)) end) as $credit
         | {w: $w, credit: $credit, dropped: $is_dropped,
