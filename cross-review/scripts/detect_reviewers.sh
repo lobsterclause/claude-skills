@@ -21,9 +21,12 @@
 # kat, north, nemotron, spark, seed, grok, longcat, inkling)
 # runs via the OpenRouter API — no CLI; all fifteen track the same condition:
 # an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key) + curl.
-# `openrouter` reports that shared condition. NOTE: there is NO OpenRouter
-# fallback for the first-party reviewers (policy, 2026-07-01) — a failed agy
-# lap drops out of the round and roster rotation covers the gap.
+# `openrouter` reports that shared condition. NOTE: as of 2026-08-22 the
+# first-party reviewers MAY fall back to OpenRouter on an account wall
+# (per-seat `or_fallback` in reviewer_profiles.json), superseding the
+# 2026-07-01 no-fallback rule. Detection is unaffected: this script reports
+# the PRIMARY lane's availability, which is what a fallback is a fallback
+# from. A lap with no or_fallback still just drops out of the round.
 
 set -euo pipefail
 

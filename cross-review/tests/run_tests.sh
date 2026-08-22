@@ -664,6 +664,96 @@ WARN_OUT="$(CROSS_REVIEW_RUNLOG="$WARNLOG" bash "$S/analyze_runlog.sh" --mode wa
 assert_contains "pool reviewer at 66% timeout rate warns" "$WARN_OUT" "north timed out"
 assert_contains "flag reviewer warning suggests --timeout-codex" "$WARN_OUT" "--timeout-codex"
 
+echo "── append_runlog.sh: an explicitly-failed rescue is not a rescue ──"
+# [pin: 2026-08-22, PR #66 delta-2 — codex Medium + kimi3 Medium, convergent
+# across two providers. The classifier read `.fallback.succeeded //
+# (.exit_code == 0)`, and jq treats an explicit `false` as ABSENT, so a rescue
+# recorded succeeded:false would take the legacy default and score as a
+# SUCCESSFUL fallback. Third `//` false-collapse in this skill (cf.
+# profile_flag() in run_reviewers.sh) — the class is what is being closed here,
+# not the instance.
+#
+# Honest note on reachability: today run_reviewers.sh writes succeeded:false
+# only when the fallback rc is non-zero, and stamps that same rc as exit_code,
+# so the pair below is not produced by the current writer. It is pinned anyway
+# because it is one line-change away from being produced, and because the
+# correct answer is not obvious — falling through to the exit-code heuristics
+# would have scored it "ok", crediting a dead lane with a healthy round.]
+FBC="$T/fbclass"; mkdir -p "$FBC/raw"
+fbclass() {  # $1=label $2=meta-json $3=expected status
+  rm -f "$FBC/raw/codex.meta.json"
+  printf '%s\n' "$2" >"$FBC/raw/codex.meta.json"
+  local lg="$FBC/log.jsonl"; : >"$lg"
+  CROSS_REVIEW_RUNLOG="$lg" bash "$S/append_runlog.sh" \
+    --run-dir "$FBC" --project test --base main --pr - --pass 1 \
+    --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+  assert_eq "$1" "$(jq -r '.reviewers.codex.status' <"$lg" | tail -1)" "$3"
+}
+fbclass "a rescue marked succeeded:false is NOT scored as a fallback" \
+  '{"exit_code":0,"duration_s":80,"timed_out":false,"output_bytes":1863,"fallback":{"used":true,"succeeded":false,"reason":"account_limit"}}' \
+  "failed"
+fbclass "a rescue marked succeeded:true is scored as a fallback" \
+  '{"exit_code":0,"duration_s":80,"timed_out":false,"output_bytes":1863,"fallback":{"used":true,"succeeded":true,"reason":"account_limit"}}' \
+  "fallback"
+# Legacy metadata predates `succeeded` entirely and must keep working, or the
+# fix re-classifies historical rows — a regression this branch already shipped once.
+fbclass "legacy fallback meta with no succeeded field still scores fallback" \
+  '{"exit_code":0,"duration_s":80,"timed_out":false,"output_bytes":1863,"fallback":{"used":true,"reason":"account_limit"}}' \
+  "fallback"
+fbclass "legacy fallback meta with a failing rc still scores failed" \
+  '{"exit_code":5,"duration_s":1,"timed_out":false,"output_bytes":0,"fallback":{"used":true,"reason":"account_limit"}}' \
+  "failed"
+# Controls: the ordinary no-fallback path must be untouched by all of the above.
+fbclass "control: no fallback object, rc=0 with output → ok" \
+  '{"exit_code":0,"duration_s":10,"timed_out":false,"output_bytes":500}' "ok"
+fbclass "control: no fallback object, rc=1 → failed" \
+  '{"exit_code":1,"duration_s":2,"timed_out":false,"output_bytes":0}' "failed"
+
+echo "── analyze_runlog.sh knows the `fallback` status it is fed ──"
+# [pin: 2026-08-22 — PR #66 taught append_runlog.sh to emit status "fallback"
+# for a first-party lane rescued over OpenRouter, but analyze_runlog.sh bucketed
+# only ok/timed_out/empty/failed/quota. A rescued attempt therefore landed in
+# $total and in NO outcome bucket: it inflated every rate denominator with no
+# numerator and rendered as "reliability 0% (ok=0, timeout=0, empty=0,
+# failed=0, quota=0)" — a warning that names no cause and no remedy, for a seat
+# whose provider account was 100% dead. Fourth instance of
+# producer-invents-a-value / consumer-enumerates-the-old-set (cf. .attempt<N>,
+# .agy-failed, .primary-failed in post_comment.sh).
+#
+# Two properties are pinned, and the SECOND is the one that matters:
+#   1. the bucket exists and is reported;
+#   2. the WARN fires with NO minimum sample size. The user asked to be warned
+#      *each time* a primary provider needs attention. Every other warning here
+#      is gated on `.total < 3` because it is a statistical claim; this one is a
+#      report of current fact, and sample-gating it would recreate the exact
+#      hole it closes — run_reviewers.sh writes "THE PRIMARY PROVIDER NEEDS
+#      ATTENTION" at dispatch, and the pre-run check would still say "nominal".]
+FBLOG="$T/fallback-runlog.jsonl"
+cat >"$FBLOG" <<'EOF'
+{"ts":"2026-08-22T01:00:00Z","reviewers":{"codex":{"status":"fallback","exit_code":0,"duration_s":80,"output_bytes":1863,"timeout_budget_s":900,"fallback":{"used":true,"succeeded":true,"reason":"account_limit","via_model":"openai/gpt-5.6-sol"}}}}
+EOF
+FB_OUT="$(CROSS_REVIEW_RUNLOG="$FBLOG" bash "$S/analyze_runlog.sh" --mode warn 2>&1)"
+assert_contains "single fallback run warns despite being below the 3-sample guard" "$FB_OUT" "OpenRouter FALLBACK"
+assert_contains "fallback warning names the actionable thing" "$FB_OUT" "PRIMARY PROVIDER NEEDS ATTENTION"
+FB_REP="$(CROSS_REVIEW_RUNLOG="$FBLOG" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
+assert_contains "report surfaces the fallback bucket next to ok" "$FB_REP" "fallback=1"
+# A rescue DID serve a usable review, so reliability must not collapse to 0% and
+# drag the leaderboard draw / timeout tuning down over a billing outage. The
+# degradation is carried by the WARN, which names something a human can fix.
+assert_contains "fallback counts as served for reliability" "$FB_REP" "reliability=100%"
+
+# Non-vacuity: the ordinary statuses must still bucket correctly, or the two
+# assertions above could pass against an analyzer that calls everything served.
+FBLOG2="$T/fallback-runlog-control.jsonl"
+cat >"$FBLOG2" <<'EOF'
+{"ts":"2026-08-22T01:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":50,"timeout_budget_s":600}}}
+{"ts":"2026-08-22T02:00:00Z","reviewers":{"glm":{"status":"failed","exit_code":1,"duration_s":2,"output_bytes":0,"timeout_budget_s":600}}}
+{"ts":"2026-08-22T03:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":11,"output_bytes":50,"timeout_budget_s":600}}}
+EOF
+FB_CTL="$(CROSS_REVIEW_RUNLOG="$FBLOG2" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
+assert_contains "control: ok/failed still bucket normally" "$FB_CTL" "ok=2/3"
+assert_contains "control: no fallback counted when none occurred" "$FB_CTL" "fallback=0"
+
 echo "── analyze_runlog.sh sleep-suspect samples (wall clock past enforced budget) ──"
 # [pin: 2026-07-03 — the Mac slept mid-round (pmset: Dark Wake Thermal
 # Emergency); gtimeout/curl timers freeze during system sleep while date +%s
@@ -907,13 +997,25 @@ assert_eq "detect reports kimi27 available with Moonshot key" \
   "$(jq -r '.kimi27' <<<"$DETECT_OUT")" "true"
 BOOST_ERR="$T/boost.err"
 CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR"
-assert_contains "selector draws kimi27 as a candidate" "$(cat "$BOOST_ERR")" "kimi27"
-# rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0;
-# draw_boost retired to 1.0 → 75.0, identical to an unboosted rookie (spark).
+# BENCHED 2026-08-22 (per Gabriel): kimi27 left the draw pool when the kimi
+# baseline took over kimi-k2.7-code via cli_model_alias -- with tools, which
+# this diff-only seat lacked -- making it redundant on a provider that votes
+# once regardless. So this assertion is INVERTED: it used to pin that the seat
+# is drawn, and now pins that it is not. The seat itself still exists and still
+# detects (asserted above); only the draw changed.
+if grep -q 'kimi27' "$BOOST_ERR"; then
+  bad "kimi27 is being offered as a candidate again -- it was benched 2026-08-22"
+else
+  ok "kimi27 is benched: detected but never drawn"
+fi
+# The "retired boost is a no-op at 1.0" mechanism this block was written to pin
+# has moved to seats that are still drawn: `spark` below is the unboosted
+# control, and kimi3 (retired to 1.0 the same day) is asserted at weight=75.0
+# in the kimi3 block further down. kimi27 can no longer carry it -- a benched
+# seat produces no candidate line to measure.
+# rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0.
 # The control seat must carry NO draw_boost; nemotron held this role until it
 # took a 2.5 boost on 2026-08-14.
-assert_contains "kimi27 weight reflects the retired (1.0) draw_boost" \
-  "$(grep 'kimi27' "$BOOST_ERR")" "weight=75.0"
 assert_contains "unboosted rookie weight unchanged" \
   "$(grep 'spark' "$BOOST_ERR")" "weight=75.0"
 # no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
@@ -2229,6 +2331,336 @@ if grep -q 'profile_flag "$slug" supports_json_object' "$S/run_reviewers.sh"; th
   ok "run_reviewers.sh gates response_format on the profile flag"
 else
   bad "run_reviewers.sh no longer reads supports_json_object -- seed goes dead again"
+fi
+
+echo "── Moonshot consolidation: K3 + the code variant (2026-08-22) ──"
+
+# The kimi baseline's model was the ONE model id in the fleet living outside
+# this repo -- the CLI reads ~/.kimi/config.toml, so reviewer_profiles.json had
+# no `.model` for it at all. Invisible to the repo, unpinned by any test, and
+# silently different on another machine: the same blind spot that left
+# antigravity on Gemini 3.5 for weeks. cli_model_alias pins it here.
+assert_eq "the kimi baseline's model is pinned in the repo, not just in ~/.kimi" \
+  "$(jq -r '.kimi.cli_model_alias // ""' "$SKILL_DIR/references/reviewer_profiles.json")" \
+  "kimi-k27-code"
+if grep -q 'profile_get kimi cli_model_alias' "$S/run_reviewers.sh"; then
+  ok "run_reviewers.sh passes the pinned alias to the kimi CLI"
+else
+  bad "the kimi CLI no longer reads cli_model_alias -- its model escapes the repo again"
+fi
+
+# kimi27 is benched, not deleted. Its seat, profile and history must all still
+# exist -- deleting it would be a 122-reference refactor across 17 files on the
+# fail-closed baseline path, for zero coverage gain.
+# NB: deliberately not using wire_has() here -- it is defined further down in
+# the seat-wiring section, and bash resolves functions at call time, so calling
+# it from above would silently mean "command not found" rather than a match.
+POOL_TOK=" $(grep 'POOL+=' "$S/select_roster.sh" | tr '()|,+=' '      ' | tr -s ' \n' '  ') "
+case "$POOL_TOK" in
+  *" kimi27 "*) bad "kimi27 is back in the draw pool -- it duplicates the baseline's model with no tools" ;;
+  *)            ok  "kimi27 is benched out of the draw pool" ;;
+esac
+case "$POOL_TOK" in
+  *" kimi3 "*)  ok  "kimi3 is still drawn (the K3 half of the consolidation)" ;;
+  *)            bad "kimi3 fell out of the draw pool" ;;
+esac
+assert_eq "kimi27's seat definition is retained, not deleted" \
+  "$(jq -r 'has("kimi27")' "$SKILL_DIR/references/reviewer_profiles.json")" "true"
+
+# All three Moonshot seats are ONE provider vote. If this ever stops being true
+# the synthesis step starts double-counting a single lab's opinion.
+assert_eq "kimi/kimi27/kimi3 all remain one provider" \
+  "$(jq -r '[.kimi.provider, .kimi27.provider, .kimi3.provider] | unique | join(",")' \
+      "$SKILL_DIR/references/reviewer_profiles.json")" "moonshot"
+
+echo "── review-record roster excludes forensic artifacts ──"
+
+# post_comment.sh builds the "Automated review by ..." line from *.meta.json
+# filenames in the raw dir. Three separate artifact suffixes have now been
+# miscounted as reviewers: <slug>.attempt<N> (PR #41/#50), <slug>.agy-failed,
+# and <slug>.primary-failed -- the last one introduced by the OpenRouter
+# fallback on 2026-08-22, which credited a PR #66 review to
+# "codex + codex.primary-failed + kimi + mimo + north": five names, three
+# reviewers. Enumerating suffixes clearly does not converge, so the roster is
+# now derived from reviewer_profiles.json and this pins it.
+# This block installs its OWN gh stub. The `$T/bin/gh` stub is rewritten by
+# roughly seven later blocks and deleted outright by one, so a test down here
+# that relies on the capture stub created ~800 lines earlier is depending on
+# ambient global state -- which is precisely how this test came to pass while
+# capturing nothing at all. Install what you assert against.
+cat >"$T/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "pr view") printf '%s\n' "${CR_TEST_PR_JSON:-}" ; exit 0 ;;
+  "pr comment")
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--body-file" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
+        shift
+      done
+      exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/gh"
+PCR="$T/pcroster"; mkdir -p "$PCR/raw"
+for n in codex codex.primary-failed codex.attempt1 kimi kimi.agy-failed not-a-reviewer; do
+  printf '{"exit_code":0,"output_bytes":10}\n' >"$PCR/raw/$n.meta.json"
+done
+printf '# findings\n\nnothing to report\n' >"$PCR/findings.md"
+: >"$CR_TEST_CAPTURE"
+CR_TEST_PR_JSON='{"headRefOid":"abc1234567","state":"OPEN"}' \
+  bash "$SKILL_DIR/scripts/post_comment.sh" --pr 4242 --mode summary \
+  --findings "$PCR/findings.md" --head-sha "abc1234567890123456789012345678901234567" \
+  >/dev/null 2>&1
+# Capture to END OF LINE, not `[^.]*`. The first version of this test stopped
+# the capture at the first dot -- and every artifact name it checks for
+# contains one, so with the fix fully reverted the capture collapsed to
+# "Automated review by codex, codex" and all three `bad` checks passed.
+# Demonstrated by reverting the fix; the test detected nothing.
+PC_ROSTER="$(grep -o 'Automated review by .*' "$CR_TEST_CAPTURE" 2>/dev/null | head -1)"
+# NON-VACUITY: the three exclusion checks below are all satisfied by an EMPTY
+# capture, which is reachable for reasons that have nothing to do with the
+# thing under test (post_comment.sh failing early, the capture shim not
+# engaging, reviewer_profiles.json changing shape so the whitelist matches
+# nothing). Reproduced live. So assert the positive first: real reviewers must
+# actually be named, or the exclusions prove nothing.
+# (kimi3 Medium, PR #66 delta-2.)
+if [[ -z "$PC_ROSTER" ]]; then
+  bad "the review record roster line is missing entirely — the exclusion checks below would pass vacuously"
+else
+  ok "the review record emits a roster line to assert against"
+fi
+assert_contains "roster names the codex reviewer" "$PC_ROSTER" "codex"
+assert_contains "roster names the kimi reviewer" "$PC_ROSTER" "kimi"
+if [[ "$PC_ROSTER" == *"primary-failed"* ]]; then
+  bad "the review record counts <slug>.primary-failed as a reviewer: $PC_ROSTER"
+else
+  ok "the review record excludes .primary-failed artifacts"
+fi
+if [[ "$PC_ROSTER" == *"attempt1"* || "$PC_ROSTER" == *"agy-failed"* ]]; then
+  bad "the review record counts a retry/failure artifact as a reviewer: $PC_ROSTER"
+else
+  ok "the review record excludes .attempt/.agy-failed artifacts"
+fi
+if [[ "$PC_ROSTER" == *"not-a-reviewer"* ]]; then
+  bad "the review record counts an unknown name as a reviewer: $PC_ROSTER"
+else
+  ok "the review record counts only names present in reviewer_profiles.json"
+fi
+
+echo "── first-party OpenRouter fallback (policy revised 2026-08-22) ──"
+
+# Forced by a round that lost BOTH baselines at once: codex to an OpenAI usage
+# cap, kimi to a suspended Moonshot balance that also killed kimi27 and kimi3.
+# The old no-fallback policy protected honesty of the record, not a technical
+# constraint -- so these pin the properties that keep it honest.
+
+FB_PROF="$SKILL_DIR/references/reviewer_profiles.json"
+
+# 1. The provider must NOT change. codex-over-OpenRouter is still OpenAI, and
+#    counting it as a second independent vote would corrupt every convergence
+#    judgement downstream.
+assert_eq "codex keeps provider openai despite an OR fallback" \
+  "$(jq -r '.codex.provider' "$FB_PROF")" "openai"
+assert_eq "kimi keeps provider moonshot despite an OR fallback" \
+  "$(jq -r '.kimi.provider' "$FB_PROF")" "moonshot"
+
+# 2. Every fallback must name a concrete pinned model -- never an alias, never
+#    empty (MODEL IDS LIVE IN EXACTLY ONE PLACE applies here too).
+FB_BAD="$(jq -r 'to_entries[]
+  | select(.value | type == "object")
+  | select(.value.or_fallback.enabled == true)
+  | select((.value.or_fallback.model // "") == ""
+           or (.value.or_fallback.model | startswith("~")))
+  | .key' "$FB_PROF")"
+assert_eq "every enabled fallback pins a concrete model (no alias, no empty)" "$FB_BAD" ""
+
+# 3. Same-model invariant, machine-checked. SKILL.md promises the fallback
+#    re-runs THE SAME model. codex's model used to live only in
+#    ~/.codex/config.toml, making that promise an unverified guess that would
+#    break silently when the CLI default moved. (glm, PR #66.)
+CODEX_CLI_M="$(jq -r '.codex.cli_model // ""' "$FB_PROF")"
+CODEX_FB_M="$(jq -r '.codex.or_fallback.model // ""' "$FB_PROF")"
+if [[ -n "$CODEX_CLI_M" && "$CODEX_FB_M" == *"$CODEX_CLI_M" ]]; then
+  ok "codex's fallback model is the same model as its pinned CLI model"
+else
+  bad "codex same-model invariant broken (cli=$CODEX_CLI_M fallback=$CODEX_FB_M)"
+fi
+
+# 4. ELIGIBILITY, TESTED AS BEHAVIOUR. The first version of these checks only
+#    grepped run_reviewers.sh for source text -- which still matches if the
+#    guard is negated or the call is unreachable, so an inverted implementation
+#    passed all of them. (glm, PR #66.) fallback_eligible.sh is a standalone
+#    entrypoint precisely so this can be driven with fixtures instead.
+FBE="$S/fallback_eligible.sh"
+FBT="$T/fbe"; mkdir -p "$FBT"
+fbe() { bash "$FBE" --name "$1" --rc "$2" --out "$FBT" 2>/dev/null; }
+
+: >"$FBT/kimi.stdout"
+printf 'Error code: 429 - account is suspended due to insufficient balance\n' >"$FBT/kimi.stdout"
+assert_eq "an account wall is eligible"        "$(fbe kimi 75)"  "account_limit"
+assert_eq "a success is never eligible"        "$(fbe kimi 0)"   ""
+# A timeout must never fall back: the budget was already spent.
+assert_eq "a timeout (124) is never eligible"  "$(fbe kimi 124)" ""
+assert_eq "a SIGKILLed timeout (137) is never eligible" "$(fbe kimi 137)" ""
+
+# rc=3 is agy's quota signal and ONLY agy's -- it used to be honoured for every
+# seat, buying a paid re-run mislabelled quota_exhausted. (codex+glm convergent.)
+: >"$FBT/antigravity.stdout"
+: >"$FBT/codex.stdout"
+assert_eq "rc=3 is a quota signal for an agy lap"      "$(fbe antigravity 3)" "quota_exhausted"
+assert_eq "rc=3 is NOT a quota signal for codex"       "$(fbe codex 3)"       ""
+assert_eq "rc=3 is NOT a quota signal for kimi"        "$(fbe kimi 3)"        ""
+
+# THE FALSE POSITIVE THAT MOTIVATED THE REWRITE: reviewers emit prose ABOUT
+# code, so bare 401/403/429 and the word "authentication" appear innocently --
+# in a diff about auth handling, or a timing like 4290ms. Matching those bought
+# a paid re-run and wrote a bogus "sick provider" row into the record.
+printf 'The handler returns 401 when the token is stale; authentication is checked first. Latency was 4290ms and 403 paths are untested.\n' >"$FBT/glm.stdout"
+assert_eq "review prose containing 401/403/429/authentication is NOT eligible" "$(fbe glm 1)" ""
+
+# but a genuine HTTP error still is
+printf 'openrouter API error: HTTP 429 Too Many Requests\n' >"$FBT/grok.stdout"
+assert_eq "a real HTTP 429 is eligible" "$(fbe grok 1)" "rate_limited"
+
+# TOKEN ANCHORING -- second defect of this class on this matcher. The first
+# rewrite required only that an HTTP-ish prefix and the digits appear on the
+# same line with optional separators, so a status code could be lifted out of a
+# LONGER number. All four of these were demonstrated eligible before the fix.
+# (kimi High, PR #66 delta round.)
+fbe_no() {  # $1=label $2=text -- must NOT be eligible
+  printf '%s\n' "$2" >"$FBT/anch.stdout"
+  local r; r="$(bash "$FBE" --name anch --rc 1 --out "$FBT" 2>/dev/null)"
+  if [[ -z "$r" ]]; then ok "not an account wall: $1"; else bad "false positive ($r) on: $1"; fi
+}
+fbe_no "a 429 lifted out of 4290ms"      'request status: 4290ms elapsed'
+fbe_no "a 403 lifted out of 4031 bytes"  'wrote http 4031 bytes to disk'
+fbe_no "a 429 lifted out of 4295 items"  'error code: 4295 items processed'
+fbe_no "'accountability suspended'"      'the accountability suspended clause'
+# and the anchored forms still match
+printf 'state=account.suspended\n' >"$FBT/anch2.stdout"
+assert_eq "a dot-separated account.suspended still matches" \
+  "$(bash "$FBE" --name anch2 --rc 1 --out "$FBT" 2>/dev/null)" "account_limit"
+printf 'HTTP 401 Unauthorized\n' >"$FBT/anch3.stdout"
+assert_eq "a real 401 still matches" \
+  "$(bash "$FBE" --name anch3 --rc 1 --out "$FBT" 2>/dev/null)" "auth_failed"
+
+# THIRD defect of this class, same matcher, found by the delta round that
+# reviewed the second fix. Anchoring on [[:space:]:] was too tight in one
+# direction while the optional post-"account" boundary stayed too loose in the
+# other. Every line below was verified against the live script before the fix:
+# the MUST-match ones all returned nothing, and "accountsuspended" matched.
+# (codex Medium + kimi3 Low, PR #66 delta-2.)
+fbe_yes() {  # $1=label $2=text $3=expected reason -- must BE eligible
+  printf '%s\n' "$2" >"$FBT/anch4.stdout"
+  local r; r="$(bash "$FBE" --name anch4 --rc 1 --out "$FBT" 2>/dev/null)"
+  assert_eq "$1" "$r" "$3"
+}
+# Real-world status-line shapes. `HTTP/2 429` is what curl and most proxies
+# actually emit, and the previous pattern could not match it at all -- so the
+# single most common form of the error this feature exists to catch was the
+# one form it missed.
+fbe_yes "HTTP/2 429 is eligible"        'HTTP/2 429'                  "rate_limited"
+fbe_yes "HTTP/1.1 429 is eligible"      'HTTP/1.1 429 Too Many Requests' "rate_limited"
+fbe_yes "status=429 is eligible"        'openrouter: status=429'      "rate_limited"
+fbe_yes "HTTP/2 401 is eligible"        'HTTP/2 401'                  "auth_failed"
+fbe_yes "status=403 is eligible"        'gateway: status=403'         "auth_failed"
+# The plural was collateral damage of the previous anchoring pass.
+fbe_yes "'accounts suspended' is eligible"      'accounts suspended'          "account_limit"
+fbe_yes "'accounts were suspended' is eligible" 'your accounts were suspended' "account_limit"
+# ...while the delimiter after "account" is now MANDATORY, so a run-on word is
+# no longer a paid re-run.
+fbe_no "run-on 'accountsuspended'"      'accountsuspended'
+# The trailing ([^0-9]|$) guard is what keeps the looser separator honest --
+# these are the four false positives demonstrated live in the previous round
+# and they must STAY rejected. Re-asserted here because widening the separator
+# class is exactly the change that would resurrect them.
+fbe_no "widened separator still rejects 4290ms"   'request status: 4290ms elapsed'
+fbe_no "widened separator still rejects 4031"     'wrote http 4031 bytes to disk'
+fbe_no "widened separator still rejects 4011"     'status: 4011 rows returned'
+fbe_no "widened separator still rejects http 200" 'discussing http 200 handling'
+
+# A misconfigured kimi alias must fail LOUDLY, not become a silent recurring
+# paid OpenRouter run. (glm, PR #66.)
+printf 'LLM not set\n' >"$FBT/kimi2.stdout"
+assert_eq "a kimi model-alias misconfiguration is NOT an account wall" "$(fbe kimi2 1)" ""
+
+# agy's SIGSEGV panic is structural, read from meta rather than text
+printf '{"failure_kind": "agy_panic"}\n' >"$FBT/gemini-pro.meta.json"
+: >"$FBT/gemini-pro.stdout"
+assert_eq "an agy panic is eligible (a different rail does fix it)" "$(fbe gemini-pro 2)" "agy_panic"
+
+# 5. A rescued round must not score as healthy -- AND a fallback that itself
+#    failed must not score as rescued. The second half was a real bug: `used`
+#    was stamped true regardless of the fallback's own rc, and the classifier
+#    keyed on `used` alone, so a dead lane whose rescue also died read as a
+#    successful fallback. Seen live on PR #66 (kimi, rc=5, 0 bytes). (codex.)
+FBDIR="$T/fbrun"; mkdir -p "$FBDIR/raw"
+cat >"$FBDIR/raw/codex.meta.json" <<'JSON'
+{"exit_code": 0, "duration_s": 9, "timed_out": false, "output_bytes": 276,
+ "attempt": 1, "timeout_budget_s": 900, "model": "openai/gpt-5.6-sol",
+ "cli": "openrouter",
+ "fallback": {"used": true, "succeeded": true, "reason": "account_limit"}}
+JSON
+cat >"$FBDIR/raw/kimi.meta.json" <<'JSON'
+{"exit_code": 5, "duration_s": 2, "timed_out": false, "output_bytes": 0,
+ "attempt": 1, "timeout_budget_s": 600, "model": "moonshotai/kimi-k2.7-code",
+ "cli": "openrouter",
+ "fallback": {"used": true, "succeeded": false, "reason": "account_limit"}}
+JSON
+cat >"$FBDIR/raw/kat.meta.json" <<'JSON'
+{"exit_code": 0, "duration_s": 9, "timed_out": false, "output_bytes": 276,
+ "attempt": 1, "timeout_budget_s": 600, "model": "kwaipilot/kat-coder-pro-v2.5",
+ "cli": "openrouter"}
+JSON
+FBLOG="$T/fb-runlog.jsonl"
+CROSS_REVIEW_RUNLOG="$FBLOG" bash "$S/append_runlog.sh" --run-dir "$FBDIR" \
+  --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 \
+  --top "-" --notes "fixture" >/dev/null 2>&1
+assert_eq "a successful rescue records as 'fallback', never 'ok'" \
+  "$(jq -r '.reviewers.codex.status' "$FBLOG" 2>/dev/null)" "fallback"
+assert_eq "a rescue that ITSELF failed records as 'failed', not 'fallback'" \
+  "$(jq -r '.reviewers.kimi.status' "$FBLOG" 2>/dev/null)" "failed"
+assert_eq "an ordinary clean lane is still 'ok'" \
+  "$(jq -r '.reviewers.kat.status' "$FBLOG" 2>/dev/null)" "ok"
+# LEGACY metadata: meta written before `succeeded` existed carries `used` alone.
+# Defaulting those to false would reclassify an old SUCCESSFUL rescue as a
+# healthy "ok" -- the exact misreading this branch prevents, inflicted on the
+# archive instead. So `succeeded` falls back to (exit_code == 0).
+# (codex Medium, PR #66 delta round.)
+cat >"$FBDIR/raw/glm.meta.json" <<'JSON'
+{"exit_code": 0, "duration_s": 9, "timed_out": false, "output_bytes": 276,
+ "attempt": 1, "timeout_budget_s": 600, "model": "openai/gpt-5.6-sol",
+ "cli": "openrouter", "fallback": {"used": true, "reason": "account_limit"}}
+JSON
+cat >"$FBDIR/raw/qwen.meta.json" <<'JSON'
+{"exit_code": 5, "duration_s": 2, "timed_out": false, "output_bytes": 0,
+ "attempt": 1, "timeout_budget_s": 600, "model": "openai/gpt-5.6-sol",
+ "cli": "openrouter", "fallback": {"used": true, "reason": "account_limit"}}
+JSON
+FBLOG2="$T/fb-runlog-legacy.jsonl"
+CROSS_REVIEW_RUNLOG="$FBLOG2" bash "$S/append_runlog.sh" --run-dir "$FBDIR" \
+  --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 \
+  --top "-" --notes "fixture" >/dev/null 2>&1
+assert_eq "legacy fallback meta with no 'succeeded' but rc=0 stays 'fallback'" \
+  "$(jq -r '.reviewers.glm.status' "$FBLOG2" 2>/dev/null)" "fallback"
+assert_eq "legacy fallback meta with no 'succeeded' and rc!=0 is 'failed'" \
+  "$(jq -r '.reviewers.qwen.status' "$FBLOG2" 2>/dev/null)" "failed"
+
+# 6. and leaderboard.sh must actually SEE it. The previous version of this
+#    assertion re-queried the runlog for .status=="ok" -- re-testing the
+#    append_runlog branch asserted above and never running leaderboard at all,
+#    leaving the documented claim (reliability drops) untested. (glm, PR #66.)
+FBLB="$(CROSS_REVIEW_RUNLOG="$FBLOG" bash "$S/leaderboard.sh" --mode json 2>/dev/null)"
+FB_CODEX_REL="$(jq -r '[.[] | select(.reviewer=="codex")] | .[0].reliability_pct // "ABSENT"' <<<"$FBLB" 2>/dev/null)"
+FB_KAT_REL="$(jq -r '[.[] | select(.reviewer=="kat")] | .[0].reliability_pct // "ABSENT"' <<<"$FBLB" 2>/dev/null)"
+if [[ "$FB_CODEX_REL" == "ABSENT" || "$FB_KAT_REL" == "ABSENT" ]]; then
+  bad "leaderboard.sh did not report codex/kat at all (codex=$FB_CODEX_REL kat=$FB_KAT_REL)"
+elif awk -v a="$FB_CODEX_REL" -v b="$FB_KAT_REL" 'BEGIN{exit !(a+0 < b+0)}'; then
+  ok "leaderboard reliability is lower for the rescued lane than the clean one ($FB_CODEX_REL < $FB_KAT_REL)"
+else
+  bad "leaderboard scores a fallback round as reliably as a clean one (codex=$FB_CODEX_REL kat=$FB_KAT_REL)"
 fi
 
 echo "── seat wiring: every profile seat reaches every dispatch site ──"

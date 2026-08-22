@@ -252,6 +252,15 @@ profile_get() {
 }
 profile_timeout() { profile_get "$1" timeout_s; }
 
+profile_path() {
+  # Usage: profile_path <reviewer> <jq-path-after-the-reviewer>
+  # e.g. profile_path codex '.or_fallback.model'
+  local r="$1" path="$2"
+  [[ -f "$profile_file" ]] || { echo ""; return; }
+  command -v jq >/dev/null 2>&1 || { echo ""; return; }
+  jq -r --arg r "$r" "(.[\$r]${path} // empty)" "$profile_file" 2>/dev/null
+}
+
 profile_flag() {
   # Usage: profile_flag <reviewer> <key> <default-true|false>
   # Booleans CANNOT go through profile_get: it uses jq's `//`, and `false //
@@ -436,6 +445,129 @@ run_with_timeout() {
 # survives callees that declare their own `local attempt`, which is a
 # reasonable future refactor that would otherwise silently break the
 # retry telemetry.
+# --- first-party OpenRouter fallback (policy revised 2026-08-22, per Gabriel) --
+#
+# The 2026-07-01 policy was: first-party lanes (codex, the agy laps, kimi) NEVER
+# fall back to OpenRouter; a failed lap drops out and rotation covers the gap.
+# What that policy was protecting, per its own note, was HONESTY OF THE RECORD
+# and the leaderboard's ability to notice a lane was sick -- not a technical
+# constraint. Both survive here, because the fallback is recorded rather than
+# silent.
+#
+# What forced the revision: on 2026-08-22 a review round lost BOTH baselines at
+# once -- codex to an OpenAI usage cap (5 days to reset) and kimi to a suspended
+# Moonshot balance, which simultaneously killed kimi27 and kimi3 since all three
+# bill against the same account. Four seats, two accounts, no reviewers. The
+# round produced no baseline coverage at all and there was nothing to be done
+# about it for days.
+#
+# Three properties this MUST preserve, or it recreates the problem the old
+# policy prevented:
+#   1. The provider does NOT change. codex-via-OpenRouter is still OpenAI, and
+#      must never count as a second independent vote next to anything OpenAI.
+#      Nothing here touches `.provider`.
+#   2. The record says it happened. meta.json carries a `fallback` object, a
+#      warning file lands next to it, and stderr says so every single time.
+#      "Warn each time" is only a guarantee if it outlives the terminal.
+#   3. The PRIMARY lane's failure is preserved, not overwritten. Its artifacts
+#      move to <slug>.primary-failed.* so the next round can still see that the
+#      real lane is sick. Otherwise a permanently-broken lane looks healthy
+#      forever because the fallback keeps answering -- exactly the blindness the
+#      2026-07-01 policy existed to prevent.
+#
+# Opt-in per seat, in reviewer_profiles.json:
+#     "or_fallback": { "enabled": true, "model": "openai/gpt-5.6-sol" }
+# Per-seat and not global on purpose: a fallback moves the diff onto a US
+# router that the direct lane did not involve. That is a fine trade for this
+# repo and possibly not for someone else's, so it is a visible decision made
+# where model ids already live.
+maybe_or_fallback() {
+  # $1 = reviewer name, $2 = final rc. Echoes the new rc on stdout.
+  local name="$1" rc="$2"
+  local enabled fb_model reason
+  enabled="$(profile_path "$name" '.or_fallback.enabled')"
+  fb_model="$(profile_path "$name" '.or_fallback.model')"
+  [[ "$enabled" == "true" && -n "$fb_model" ]] || { echo "$rc"; return; }
+  reason="$(bash "$script_dir/fallback_eligible.sh" --name "$name" --rc "$rc" --out "$out")" \
+    || { echo "$rc"; return; }
+  [[ -n "$reason" ]] || { echo "$rc"; return; }
+
+  local warn="$name: PRIMARY LANE FAILED ($reason) — falling back to OpenRouter ($fb_model). THE PRIMARY PROVIDER NEEDS ATTENTION; this is not a healthy round for $name."
+  echo "WARN: $warn" >&2
+  printf '%s\n' "$warn" >"$out/$name.fallback.warning"
+
+  # Preserve the primary failure. Without this the fallback's own meta would
+  # overwrite the evidence that the real lane is down.
+  local ext moved=()
+  for ext in stdout stderr meta.json agy.log; do
+    if [[ -f "$out/$name.$ext" ]]; then
+      mv -f "$out/$name.$ext" "$out/$name.primary-failed.$ext"
+      moved+=("$ext")
+    fi
+  done
+
+  local tvar="${name//-/_}_timeout"
+  local tmo="${!tvar:-$timeout_s_default}"
+  run_openrouter_reviewer "$name" "$fb_model" "$tmo"
+  local frc=$?
+
+  # If the fallback bailed before writing anything (no OpenRouter key, no model),
+  # the primary's artifacts have already been moved aside -- so its failure_kind
+  # telemetry would be lost and a quota/panic lane would degrade to a generic
+  # "failed" with no reason. Put them back and report the ORIGINAL failure.
+  # (glm, PR #66.)
+  if [[ ! -f "$out/$name.meta.json" ]]; then
+    for ext in "${moved[@]}"; do
+      [[ -f "$out/$name.primary-failed.$ext" ]] && mv -f "$out/$name.primary-failed.$ext" "$out/$name.$ext"
+    done
+    echo "WARN: $name: fallback could not run (rc=$frc) — primary failure preserved, lane drops out" >&2
+    echo "$rc"
+    return
+  fi
+
+  # Stamp the record. The provider is deliberately NOT touched.
+  if [[ -f "$out/$name.meta.json" ]] && command -v jq >/dev/null 2>&1; then
+    local pk="null"
+    [[ -f "$out/$name.primary-failed.meta.json" ]] && \
+      pk="$(jq -c '{exit_code, failure_kind, model, cli}' "$out/$name.primary-failed.meta.json" 2>/dev/null || echo null)"
+    # `succeeded` is NOT decorative. Stamping used:true unconditionally recorded
+    # a FAILED fallback as a successful one -- and append_runlog keys the
+    # "fallback" status off `used`, so a dead lane whose rescue also died was
+    # scored as a rescued round. Observed live in this very round: kimi's
+    # fallback returned rc=5 with 0 bytes and still wrote used:true.
+    # (codex, PR #66.)
+    local fsucc="false"
+    [[ "$frc" -eq 0 ]] && fsucc="true"
+    jq --arg r "$reason" --arg m "$fb_model" --argjson p "${pk:-null}" --arg w "$warn" \
+      --argjson ok "$fsucc" \
+      '. + {fallback: {used: true, succeeded: $ok, reason: $r, via_model: $m, primary: $p, warning: $w}}' \
+      "$out/$name.meta.json" >"$out/$name.meta.json.tmp" 2>/dev/null \
+      && mv -f "$out/$name.meta.json.tmp" "$out/$name.meta.json" \
+      || rm -f "$out/$name.meta.json.tmp"
+  fi
+  echo "$frc"
+}
+
+fallback_only() {
+  # Run a reviewer ONCE, then offer it the OpenRouter fallback -- no retry.
+  #
+  # codex is the only lane dispatched outside retry_reviewer (`run_codex &`
+  # directly). There is no recorded reason; it reads as an artefact of codex
+  # predating retry_reviewer and never being migrated. Left that way on
+  # purpose here rather than "fixed" as a side effect of adding fallback: a
+  # codex retry would re-spend a budget that defaults to 900s, and changing
+  # that is a separate decision from letting a dead account reach a live rail.
+  local fn="$1" name="$2"
+  export CROSS_REVIEW_ATTEMPT=1
+  "$fn"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    rc="$(maybe_or_fallback "$name" "$rc")"
+  fi
+  unset CROSS_REVIEW_ATTEMPT
+  return "$rc"
+}
+
 retry_reviewer() {
   local fn="$1"
   local name="$2"
@@ -444,9 +576,12 @@ retry_reviewer() {
   local rc=$?
   # rc=3 (agy quota exhausted) is also not retried: the shared Individual
   # quota resets on a ~2-day cadence, so attempt 2 is guaranteed to hit the
-  # same wall. No fallback by policy — the lap just drops out of this round.
+  # same wall. Since 2026-08-22 the lap is instead offered the OpenRouter
+  # fallback below (same Gemini model, recorded as status "fallback"); it drops
+  # out of the round only when that seat has no or_fallback configured.
   if [[ $rc -eq 3 ]]; then
-    echo "$name: agy quota exhausted — not retrying, lap drops out of this round (reset ETA: see $out/agy.quota_exhausted)" >&2
+    echo "$name: agy quota exhausted — not retrying (the shared quota resets on a ~2-day cadence)" >&2
+    rc="$(maybe_or_fallback "$name" "$rc")"
     unset CROSS_REVIEW_ATTEMPT
     return "$rc"
   fi
@@ -469,6 +604,9 @@ retry_reviewer() {
     # pass 3) — same retry semantics as 124: the budget was consumed and a
     # retry would just consume it again.
     echo "$name: attempt 1 timed out (rc=$rc), not retrying — bump the timeout if this recurs" >&2
+  fi
+  if [[ $rc -ne 0 ]]; then
+    rc="$(maybe_or_fallback "$name" "$rc")"
   fi
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
@@ -680,9 +818,20 @@ run_codex() {
   if [[ -f project.godot ]]; then
     codex_cfg+=(-c "sandbox_workspace_write.writable_roots=[\"$HOME/Library/Application Support/Godot\"]")
   fi
+  # codex's model was, like kimi's before cli_model_alias, pinned nowhere in
+  # this repo -- it came from ~/.codex/config.toml. That made SKILL.md's
+  # "the fallback re-runs the SAME model" guarantee an unverified guess that
+  # would break silently the moment the CLI default moved. `cli_model` pins it
+  # here, and a test asserts it agrees with or_fallback.model. (glm, PR #66.)
+  local codex_model codex_model_args=()
+  codex_model="$(profile_get codex cli_model)"
+  if [[ -n "$codex_model" ]]; then
+    codex_model_args=(-m "$codex_model")
+  fi
   run_with_timeout "$codex_timeout" codex exec review \
     --base "$base" \
     --full-auto \
+    ${codex_model_args[@]+"${codex_model_args[@]}"} \
     ${codex_cfg[@]+"${codex_cfg[@]}"} \
     >"$out/codex.stdout" 2>&1
   rc=$?
@@ -892,9 +1041,15 @@ $json_findings_suffix"
   local rf_args=()
   if [[ "$want_json" == "true" ]]; then
     rf_args=(--argjson rf '{"type":"json_object"}')
-  else
+  elif [[ "$want_json" == "false" ]]; then
     rf_args=(--argjson rf 'null')
     echo "$slug: response_format omitted (profile says this model rejects json_object)" >&2
+  else
+    # Anything that is neither true nor false is a typo, not an opt-out. Silently
+    # treating it as one would drop the JSON contract for a seat whose author
+    # thought they had enabled it. (kimi, PR #64 delta round.)
+    rf_args=(--argjson rf '{"type":"json_object"}')
+    echo "WARN: $slug: supports_json_object is '$want_json' (expected true/false) — treating as true" >&2
   fi
   if [[ "$cli" == "openrouter" ]]; then
     jq -n --rawfile p "$prompt_tmp" --arg m "$model" "${rf_args[@]}" \
@@ -1493,7 +1648,25 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     [[ "$kimi_budget" -gt 3000 ]] && kimi_budget=3000
     echo "kimi: ${total_lines}-line diff — budget scaled ${kimi_timeout}s → ${kimi_budget}s" >&2
   fi
+  # WHICH MODEL the kimi baseline runs was, until now, the ONE model id in the
+  # whole fleet that lived outside this repo: the CLI reads ~/.kimi/config.toml,
+  # so reviewer_profiles.json had no `.model` for kimi at all. The baseline's
+  # model was therefore invisible to the repo, unpinned by any test, and
+  # silently different on any other machine -- the same blind spot that left
+  # antigravity on Gemini 3.5 for weeks. `cli_model_alias` pins it here.
+  #
+  # The value is a config KEY from ~/.kimi/config.toml ([models.<alias>]), not
+  # a raw slug -- `kimi -m` resolves aliases, and an unknown one fails fast with
+  # "LLM not set" rather than silently running the default. PORTABILITY: the
+  # alias must exist in that user's config; when it does not, the lane fails and
+  # (with or_fallback enabled) drops to the OpenRouter route for the same model.
+  local kimi_alias kimi_model_args=()
+  kimi_alias="$(profile_get kimi cli_model_alias)"
+  if [[ -n "$kimi_alias" ]]; then
+    kimi_model_args=(-m "$kimi_alias")
+  fi
   run_with_timeout "$kimi_budget" kimi \
+    "${kimi_model_args[@]}" \
     --plan \
     --print \
     --quiet \
@@ -1825,7 +1998,7 @@ for r in "${requested[@]}"; do
     codex)
       if command -v codex >/dev/null 2>&1; then
         [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
-        run_codex &
+        fallback_only run_codex codex &
         pids+=($!)
         ran+=("codex")
       else
