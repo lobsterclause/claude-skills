@@ -198,24 +198,32 @@ case "$cmd" in
     # already fired, so a pathological diff can't make this scan slow.
     if [[ "$size_lines" -le 20000 ]]; then
       content_secret_pattern='AKIA[0-9A-Z]{16}|[Ss][Kk]-[A-Za-z0-9_-]{20,}|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]]*[:=][[:space:]]*['"'"'"][A-Za-z0-9/+=_-]{16,}['"'"'"]'
-      # --diff-filter=ACMR includes renames (a `git mv` + edit can still add a
-      # secret in the same change; excluding R let it skip the file's content
-      # scan entirely). --no-color and -U0 keep the grep below cheap and free
-      # of ANSI noise. Binary files are skipped by git diff itself (it emits
-      # "Binary files ... differ", not content).
+      # --diff-filter=ACMRD: A/C/M/R already covered added/copied/modified/
+      # renamed content; D (deleted) is needed too — a whole file removed via
+      # `git rm` (the common way to rotate a secret out) was previously
+      # invisible to this scan entirely, since ACMR omits D and `git diff`
+      # emits nothing for a deleted file under that filter. --no-color and
+      # -U0 keep the grep below cheap and free of ANSI noise. Binary files
+      # are skipped by git diff itself (it emits "Binary files ... differ",
+      # not content).
       #
       # Both added (`+`) AND removed (`-`) line content are scanned: a secret
-      # being *rotated out* (e.g. deleting a hardcoded key) exists only on the
-      # `-` side of the diff and would otherwise ship unredacted to third-party
-      # reviewer APIs. The `---`/`+++` file-header lines are excluded so they
-      # aren't mistaken for content.
-      content_hits=$(git -C "$worktree" diff --no-color -U0 --diff-filter=ACMR "$base"...HEAD 2>/dev/null \
+      # being *rotated out* (e.g. deleting a hardcoded key, whether inside a
+      # modified file or a wholly deleted one) exists only on the `-` side of
+      # the diff and would otherwise ship unredacted to third-party reviewer
+      # APIs. The `---`/`+++` file-header lines are excluded so they aren't
+      # mistaken for content; a deleted file's `+++ /dev/null` header falls
+      # back to the `---` line for the real filename instead of leaving the
+      # literal header text as the filename.
+      content_hits=$(git -C "$worktree" diff --no-color -U0 --diff-filter=ACMRD "$base"...HEAD 2>/dev/null \
         | awk '
             /^diff --git / { file=""; next }
+            /^--- / {
+              f=$0; sub(/^--- [ab]\//, "", f); if (f != "/dev/null") file=f; next
+            }
             /^\+\+\+ / {
               f=$0; sub(/^\+\+\+ [ab]\//, "", f); if (f != "/dev/null") file=f; next
             }
-            /^--- / { next }
             /^\+/ && !/^\+\+\+/ { print file "\t" $0 }
             /^-/ && !/^--- / { print file "\t" $0 }
           ' \

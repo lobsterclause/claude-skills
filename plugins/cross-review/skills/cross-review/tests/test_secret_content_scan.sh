@@ -134,6 +134,31 @@ assert_contains "risky_files names secrets.ts even though the key line was only 
 CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end \
   --worktree "$(jq -r '.worktree' <<<"$OUT4")" >/dev/null 2>&1 || true
 
+# ── regression: a secret-bearing file DELETED OUTRIGHT (e.g. `git rm` to
+# rotate a key out) used to be entirely invisible to the content scan: the
+# old --diff-filter=ACMR omits D (deleted), so `git diff` emits nothing for
+# a deleted file under that filter regardless of what it contained.
+# (cross-review PR #57 finding, round 2 — gemini-pro.)
+REPO4B="$T/repo4b"; mkdir -p "$REPO4B"
+( cd "$REPO4B"
+  git init -q -b main 2>/dev/null || git init -q
+  printf 'const token = "sk-ant-abcdefghijklmnopqrstuvwxyz1234";\n' >secrets.ts
+  git add .
+  git -c user.email=t@t -c user.name=t commit -qm init
+  git checkout -qb feat
+  git rm -q secrets.ts
+  git -c user.email=t@t -c user.name=t commit -qm 'delete secret file outright' )
+
+echo "── content scan flags a secret-shaped literal in a file deleted outright ──"
+OUT4B="$( cd "$REPO4B" && CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" CROSS_REVIEW_RUN_ROOT="$RUNROOT" \
+  bash "$S/worktree.sh" start --ref HEAD --id content-deleted --base main 2>/dev/null )"
+assert_eq "warn_secrets=true for a sk-... literal in a wholly deleted file" \
+  "$(jq -r '.warn_secrets' <<<"$OUT4B")" "true"
+assert_contains "risky_files names secrets.ts, not the raw '+++ /dev/null' diff header" \
+  "$(jq -r '.risky_files' <<<"$OUT4B")" "secrets.ts"
+CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end \
+  --worktree "$(jq -r '.worktree' <<<"$OUT4B")" >/dev/null 2>&1 || true
+
 # ── regression: an all-caps API_KEY marker, and a hyphenated sk-proj-style
 # key, both used to slip past the case-sensitive/no-hyphen pattern.
 # (cross-review PR #57 finding.)
