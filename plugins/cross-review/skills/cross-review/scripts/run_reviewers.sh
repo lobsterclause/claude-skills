@@ -252,6 +252,21 @@ profile_get() {
 }
 profile_timeout() { profile_get "$1" timeout_s; }
 
+profile_flag() {
+  # Usage: profile_flag <reviewer> <key> <default-true|false>
+  # Booleans CANNOT go through profile_get: it uses jq's `//`, and `false //
+  # empty` yields empty -- an explicit false would be indistinguishable from a
+  # missing key, which is the opposite of what a per-seat opt-OUT needs. Use
+  # has() so an explicitly-false flag survives.
+  local r="$1" k="$2" dflt="$3"
+  [[ -f "$profile_file" ]] || { echo "$dflt"; return; }
+  command -v jq >/dev/null 2>&1 || { echo "$dflt"; return; }
+  jq -r --arg r "$r" --arg k "$k" --arg d "$dflt" \
+    'if (.[$r] | type) == "object" and (.[$r] | has($k))
+       then (.[$r][$k] | tostring) else $d end' "$profile_file" 2>/dev/null \
+    || echo "$dflt"
+}
+
 # Resolve every model string from the profile — the single source of truth (see
 # the note at the top of this file). A reviewer whose profile has no `.model`
 # ends up with an empty variable; run_agy_reviewer/run_openrouter_reviewer then
@@ -861,14 +876,35 @@ $json_findings_suffix"
   # answering in the findings.json shape rather than free prose. This does
   # NOT touch the CLI reviewers (codex/agy/kimi CLI), which have no
   # request-body concept at all.
-  if [[ "$cli" == "openrouter" ]]; then
-    jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
-      '{model: $m, messages: [{role: "user", content: $p}], stream: false,
-        usage: {include: true}, response_format: {type: "json_object"}}' >"$body_file"
+  #
+  # NOT EVERY MODEL ACCEPTS IT. bytedance-seed/seed-2.0-code hard-400s with
+  # `InvalidParameter: response_format.type ... json_object is not supported by
+  # this model`. The `seed` seat was added 2026-08-14 and failed rc=1 with zero
+  # bytes on all 6 dispatches it ever got -- for 8 days, while carrying
+  # draw_boost 2.5, so it was PREFERENTIALLY drawn into rounds it could not
+  # contribute to. It read as reviewer flakiness; it was an unsupported request
+  # field. Seats that reject it set `"supports_json_object": false` in the
+  # profile and get the field omitted; the JSON findings suffix is still in the
+  # prompt, so they usually answer in-shape anyway, and merge_raw_findings.sh
+  # already lists anything unparseable as `unparsed:` for manual extraction
+  # rather than losing it. (Found by the PR #64 cross-review round.)
+  local want_json; want_json="$(profile_flag "$slug" supports_json_object true)"
+  local rf_args=()
+  if [[ "$want_json" == "true" ]]; then
+    rf_args=(--argjson rf '{"type":"json_object"}')
   else
-    jq -n --rawfile p "$prompt_tmp" --arg m "$model" \
+    rf_args=(--argjson rf 'null')
+    echo "$slug: response_format omitted (profile says this model rejects json_object)" >&2
+  fi
+  if [[ "$cli" == "openrouter" ]]; then
+    jq -n --rawfile p "$prompt_tmp" --arg m "$model" "${rf_args[@]}" \
       '{model: $m, messages: [{role: "user", content: $p}], stream: false,
-        response_format: {type: "json_object"}}' >"$body_file"
+        usage: {include: true}}
+       + (if $rf == null then {} else {response_format: $rf} end)' >"$body_file"
+  else
+    jq -n --rawfile p "$prompt_tmp" --arg m "$model" "${rf_args[@]}" \
+      '{model: $m, messages: [{role: "user", content: $p}], stream: false}
+       + (if $rf == null then {} else {response_format: $rf} end)' >"$body_file"
   fi
   rm -f "$prompt_tmp"
 

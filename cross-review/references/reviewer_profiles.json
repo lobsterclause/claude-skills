@@ -305,6 +305,7 @@
     "timeout_s": 600,
     "provider": "bytedance",
     "cli": "openrouter",
+    "supports_json_object": false,
     "model": "bytedance-seed/seed-2.0-code",
     "retry_policy": "retry_on_transient",
     "prompt_style": "diff_only_no_tools",
@@ -317,7 +318,7 @@
     "synthesis_weight": 0.75,
     "draw_boost": 2.5,
     "specialization": "single-turn diff reasoning, code-specialized tier; independent provider vote (ByteDance). Rotation-pool member.",
-    "notes": "ByteDance Seed 2.0 Code via OpenRouter ($0.50/M in, $3.00/M out, 262k ctx; released 2026-08-12). Added 2026-08-14 — ByteDance was unrepresented in the roster, so this is a genuinely new lab vote rather than another sample of an existing family. draw_boost 2.5 while it earns leaderboard data; retire the boost after ~10 sampled runs per the kimi27/kimi3 precedent. Rookie priors — conservative until data accumulates. China-origin provider (ByteDance), routed through OpenRouter (US) — surface both for security-sensitive repos."
+    "notes": "DEAD FROM DAY ONE UNTIL 2026-08-22: every one of its first 6 dispatches failed rc=1 with 0 bytes. Root cause found by the PR #64 cross-review round \u2014 ByteDance Seed rejects response_format.type=json_object with a 400 InvalidParameter, and the curl lane always sent it. Fixed via supports_json_object:false. Its pre-2026-08-22 leaderboard row is 6 failures that say nothing about the model. ByteDance Seed 2.0 Code via OpenRouter ($0.50/M in, $3.00/M out, 262k ctx; released 2026-08-12). Added 2026-08-14 — ByteDance was unrepresented in the roster, so this is a genuinely new lab vote rather than another sample of an existing family. draw_boost 2.5 while it earns leaderboard data; retire the boost after ~10 sampled runs per the kimi27/kimi3 precedent. Rookie priors — conservative until data accumulates. China-origin provider (ByteDance), routed through OpenRouter (US) — surface both for security-sensitive repos."
   },
   "grok": {
     "timeout_s": 600,

@@ -2199,6 +2199,38 @@ if grep -q -- '--repo other/proj' "$CR_RECON_MARKER"; then
 else bad "--post invoked gh with no --repo — it can hit a same-numbered PR elsewhere"; fi
 unset CR_RECON_MARKER
 
+echo "── response_format opt-out (the seat that was dead for 8 days) ──"
+
+# bytedance-seed/seed-2.0-code hard-400s on response_format.type=json_object.
+# The `seed` seat failed rc=1 with 0 bytes on all 6 dispatches it ever got
+# between 2026-08-14 and 2026-08-22 -- while carrying draw_boost 2.5, so the
+# selector PREFERRED it for rounds it could not contribute to. It read as
+# flakiness; it was an unsupported request field. (PR #64 cross-review round.)
+#
+# The subtle part is the accessor, not the flag. jq's `//` treats false as
+# absent, so `.[$r][$k] // empty` -- what profile_get uses -- collapses an
+# explicit `false` into "" and makes an opt-OUT unexpressible. These pin the
+# has()-based semantics against the real profile.
+PF_JQ='if (.[$r] | type) == "object" and (.[$r] | has($k)) then (.[$r][$k] | tostring) else $d end'
+pflag() { jq -r --arg r "$1" --arg k "supports_json_object" --arg d "true" "$PF_JQ" \
+            "$SKILL_DIR/references/reviewer_profiles.json"; }
+assert_eq "seed opts out of response_format" "$(pflag seed)" "false"
+assert_eq "a seat with no flag defaults to true (glm)" "$(pflag glm)" "true"
+assert_eq "an unknown seat defaults to true" "$(pflag not-a-seat)" "true"
+
+# and prove the naive accessor really would have broken -- if this ever starts
+# returning "false", profile_get became safe and the helper could be retired
+assert_eq "profile_get's // accessor collapses false to empty (why profile_flag exists)" \
+  "$(jq -r --arg r seed --arg k supports_json_object '.[$r][$k] // empty' \
+      "$SKILL_DIR/references/reviewer_profiles.json")" ""
+
+# the wrapper must actually consult the flag, not just carry it in the profile
+if grep -q 'profile_flag "$slug" supports_json_object' "$S/run_reviewers.sh"; then
+  ok "run_reviewers.sh gates response_format on the profile flag"
+else
+  bad "run_reviewers.sh no longer reads supports_json_object -- seed goes dead again"
+fi
+
 echo "── seat wiring: every profile seat reaches every dispatch site ──"
 
 # Adding a reviewer means editing eight files that share no schema, and until
