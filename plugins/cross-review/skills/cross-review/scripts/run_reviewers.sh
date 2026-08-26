@@ -245,13 +245,14 @@ model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
                         devstral laguna kat north nemotron spark seed grok
                         longcat inkling kimi27 kimi3)
 
-# Antigravity installs `agy` to $HOME/.local/bin. That directory isn't always
-# on $PATH for non-interactive shells (notably bash invocations from other
-# tools). Surface it ourselves so `command -v agy` and a bare `agy` both
-# resolve without requiring the user to edit their shell rc.
-if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-  PATH="$HOME/.local/bin:$PATH"
-fi
+# Shared with detect_reviewers.sh and select_roster.sh: ~/.local/bin for agy,
+# plus the nvm bin dir for the codex and kimi npm globals. This file used to
+# carry only the ~/.local/bin half, so a round dispatched to codex or kimi from
+# a non-interactive shell could not execute them at all -- the EXECUTION half of
+# the same drift that made select_roster.sh drop them from the draw. See
+# lib_path.sh.
+# shellcheck source=lib_path.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_path.sh"
 
 need_val() {
   local flag="$1"

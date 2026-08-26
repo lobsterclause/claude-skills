@@ -82,9 +82,12 @@ command -v jq >/dev/null 2>&1 || { echo "select_roster: jq required" >&2; exit 1
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 
-if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-  PATH="$HOME/.local/bin:$PATH"
-fi
+# Shared with detect_reviewers.sh and run_reviewers.sh. This file used to carry
+# only the ~/.local/bin half, so `command -v codex` below missed an nvm-installed
+# npm global and dropped the baseline from every draw while detect_reviewers.sh
+# reported it available. See lib_path.sh.
+# shellcheck source=lib_path.sh
+. "$script_dir/lib_path.sh"
 
 has_openrouter() {
   command -v curl >/dev/null 2>&1 || return 1
@@ -101,6 +104,29 @@ BASELINES=()
 missing_baselines=()
 if command -v codex >/dev/null 2>&1; then BASELINES+=(codex); else missing_baselines+=(codex); fi
 if command -v kimi  >/dev/null 2>&1; then BASELINES+=(kimi);  else missing_baselines+=(kimi);  fi
+
+# Fail closed, exactly as detect_reviewers.sh does. A missing baseline used to
+# be a stderr WARN plus a silently raised rotation count, which produces a
+# normal-looking four-seat roster with no codex in it -- a missing verifier and
+# a passing verification are indistinguishable from the outside, which is the
+# whole reason detect_reviewers.sh exits 1 here. This script is a second entry
+# point into the same decision and must answer the same way.
+#
+# Same escape hatch, same name: set it at the call site for a deliberate
+# degraded run, never as a wrapper default.
+if [[ ${#missing_baselines[@]} -gt 0 ]]; then
+  if [[ "${CROSS_REVIEW_ALLOW_MISSING_BASELINE:-0}" == "1" ]]; then
+    echo "select_roster: WARN baseline(s) not installed: ${missing_baselines[*]} (allowed via CROSS_REVIEW_ALLOW_MISSING_BASELINE)" >&2
+  else
+    echo "select_roster: baseline(s) not installed: ${missing_baselines[*]}" >&2
+    echo "  Do not run a round without them. Usually PATH, not a missing install:" >&2
+    echo "  codex and kimi are npm globals under the nvm bin dir, and nvm is a" >&2
+    echo "  shell function that never runs in a non-interactive shell." >&2
+    echo "  Check 'command -v codex'; set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1" >&2
+    echo "  only for a deliberate degraded spot check." >&2
+    exit 1
+  fi
+fi
 
 POOL=()
 if command -v agy >/dev/null 2>&1; then
