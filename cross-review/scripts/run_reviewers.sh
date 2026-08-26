@@ -1069,6 +1069,29 @@ else
   review_prompt="$default_prompt"
 fi
 
+# Review worktrees are `git worktree add` checkouts with no install step, so a
+# JS repo here has no node_modules. Agentic reviewers do not know that and will
+# try to run the suite -- reasonably, since "do the tests pass" is a good
+# question. It just cannot be answered here.
+#
+# Measured 2026-08-26 (kindred-mama-ai #3582, a two-file test diff): codex spent
+# its entire 600s budget chasing an unresolvable module, emitted 194KB of
+# transcript and ZERO verdict markers, and the round lost both baselines. The
+# retry at 1500s produced a verdict in 694s -- most of it still spent on the
+# same dead end.
+#
+# Appended after the prompt is resolved so a custom --prompt-file gets it too,
+# and gated on the condition actually holding: claiming deps are missing when
+# they are installed would be its own bad instruction.
+if [[ -f package.json && ! -d node_modules ]]; then
+  review_prompt="$review_prompt
+
+ENVIRONMENT: this is a bare git worktree — dependencies are NOT installed \
+(package.json is present, node_modules is not). Do not run tests, builds, \
+linters or typecheckers: they fail on missing modules, and that failure tells \
+you nothing about the diff. Review by reading the code."
+fi
+
 # json_findings_suffix: schema-mandate text appended ONLY in the curl lane
 # (run_openrouter_reviewer — the OpenRouter pool plus direct-Moonshot seats
 # like kimi27/kimi3). Those reviewers have no downstream tool loop of their
