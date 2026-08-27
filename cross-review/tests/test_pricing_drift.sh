@@ -129,13 +129,13 @@ assert_eq "--strict-pricing exits 1 when any seat drifted" "$?" "1"
 #    a live fetch never overwrites --catalog; flags need values ──────────────
 CAT2="$T/catalog2.json"
 jq 'map(if .id == "z-ai/glm-5.3" then .pricing.completion = "0.0000050" else . end)' "$CATALOG" >"$CAT2"
-OUT2="$(bash "$S/validate_or_models.sh" --profiles "$PROFILES" --catalog "$CAT2" --no-fetch 2>&1 >/dev/null)"
+OUT2="$(HOME="$CACHEHOME" OPENROUTER_API_KEY=test-key bash "$S/validate_or_models.sh" --profiles "$PROFILES" --catalog "$CAT2" --no-fetch 2>&1 >/dev/null)"
 assert_contains "two drifted components are joined with a comma and a space" "$OUT2" "/M (catalog), completion 4.40"
 DE_LOC="$(locale -a 2>/dev/null | grep -iE '^de_DE\.utf-?8$' | head -n1)"
 if [[ -n "$DE_LOC" ]]; then
   # use the exact spelling the system has, or bash would silently fall back
   # to C and the assertion would pass trivially (gemini-pro, pass 3)
-  OUT3="$(LC_ALL="$DE_LOC" bash "$S/validate_or_models.sh" --profiles "$PROFILES" --catalog "$CATALOG" --no-fetch 2>&1 >/dev/null)"
+  OUT3="$(HOME="$CACHEHOME" OPENROUTER_API_KEY=test-key LC_ALL="$DE_LOC" bash "$S/validate_or_models.sh" --profiles "$PROFILES" --catalog "$CATALOG" --no-fetch 2>&1 >/dev/null)"
   assert_contains "comma-decimal locale still formats prices with a period" "$OUT3" "prompt 1.40"
   assert_not_contains "comma-decimal locale never prints a comma price" "$OUT3" "0,00"
 else
