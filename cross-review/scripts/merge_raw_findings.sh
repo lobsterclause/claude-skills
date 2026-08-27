@@ -195,11 +195,14 @@ for f in ${sorted[@]+"${sorted[@]}"}; do
       # correct JSON string escaping of arbitrary reviewer-supplied text --
       # so this is 1 (whole reviewer) + 1-per-finding, down from 4-per-finding.
       while IFS= read -r -d $'\x1e' record; do
-        file="" claim="" local_id=""
-        { IFS= read -r -d $'\x1f' file
-          IFS= read -r -d $'\x1f' claim
-          IFS= read -r -d '' local_id
-        } < <(printf '%s' "$record")
+        # Split the record with parameter expansion, not a per-finding
+        # process substitution + three reads: zero forks, and no read that
+        # hits EOF with rc=1 (cross-review pass 2 of #137). \x1f cannot occur
+        # inside the fields, so the first/last-match splits are exact.
+        file="${record%%$'\x1f'*}"
+        rest="${record#*$'\x1f'}"
+        claim="${rest%%$'\x1f'*}"
+        local_id="${rest#*$'\x1f'}"
         claim_norm="$(printf '%s' "$claim" \
           | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' \
           | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
