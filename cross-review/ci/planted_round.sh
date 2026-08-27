@@ -100,12 +100,16 @@ run_dir="$out/run"
 # and `git commit` would die with "Please tell me who you are"; supply one
 # via the environment ONLY when the repo has no identity of its own, so a
 # developer's local config is untouched (cross-review of #143).
-if [[ -z "$(git -C "$repo_root" config user.email 2>/dev/null)" ]]; then
+if [[ -z "$(git -C "$repo_root" config user.email 2>/dev/null)" || -z "$(git -C "$repo_root" config user.name 2>/dev/null)" ]]; then
   export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-planted-round}"
   export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-planted-round@localhost}"
   export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-planted-round}"
   export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-planted-round@localhost}"
 fi
+# Throwaway commits are never signed: a global commit.gpgsign=true would hang
+# a headless run on a passphrase prompt. Exported so plant_mutation.sh's
+# commit inherits it as well (cross-review pass 2 of #143).
+export GIT_CONFIG_PARAMETERS="${GIT_CONFIG_PARAMETERS:+$GIT_CONFIG_PARAMETERS }'commit.gpgsign=false'"
 mkdir -p "$run_dir/raw"
 
 orig_ref="$(git -C "$repo_root" symbolic-ref --short -q HEAD || git -C "$repo_root" rev-parse HEAD)"
@@ -156,29 +160,52 @@ pick_fixture() {
       printf '%s' "$f"
       return 0
     fi
-  done < <(printf '%s\n' "$candidates" | while IFS= read -r c; do [[ -n "$c" ]] && printf '%s\t%s\n' "$(stat -f %m "$repo_root/$c" 2>/dev/null || stat -c %Y "$repo_root/$c" 2>/dev/null || echo 0)" "$c"; done | sort -rn | cut -f2-)
-  local fallback="cross-review/ci/fixtures/planted_target.ts"
-  if [[ -f "$repo_root/$fallback" ]] && fixture_line_for "$repo_root/$fallback" ts >/dev/null; then
-    printf '%s' "$fallback"
-    return 0
-  fi
+  done < <(printf '%s\n' "$candidates" | while IFS= read -r c; do [[ -n "$c" ]] && printf '%s\t%s\n' "$(stat -c %Y "$repo_root/$c" 2>/dev/null || stat -f %m "$repo_root/$c" 2>/dev/null || echo 0)" "$c"; done | sort -rn | cut -f2-)
+  # GNU stat (-c %Y) is tried first: on Linux `stat -f %m` succeeds with the
+  # filesystem MOUNT POINT, so the BSD form must not be first (cross-review
+  # pass 2 of #143).
+  local fallback
+  for fallback in "cross-review/ci/fixtures/planted_target.ts" \
+                  "plugins/cross-review/skills/cross-review/ci/fixtures/planted_target.ts"; do
+    if [[ -f "$repo_root/$fallback" ]] && fixture_line_for "$repo_root/$fallback" ts >/dev/null; then
+      printf '%s' "$fallback"
+      return 0
+    fi
+  done
   echo "planted_round: no tracked file under $repo_root has an applicable operator (and no $fallback)" >&2
   return 1
+}
+
+# operator_regexes_for <ext> — every operator `match` regex defined for
+# <ext>, one per line, from ONE jq call (the per-operator jq loop this
+# replaces cost 1 + 2*n_ops processes per candidate file).
+operator_regexes_for() {
+  jq -r --arg e "$1" 'map(select(.languages | index($e) != null)) | .[].match' "$operators_file"
 }
 
 # fixture_line_for <path> <ext> — prints the first line number in <path>
 # matching any operator defined for <ext>; returns 1 if none.
 fixture_line_for() {
-  local path="$1" fext="$2" n_ops oi langs match_re ln
-  n_ops="$(jq 'length' "$operators_file")"
-  for ((oi = 0; oi < n_ops; oi++)); do
-    langs="$(jq -r ".[$oi].languages | index(\"$fext\")" "$operators_file")"
-    [[ "$langs" == "null" ]] && continue
-    match_re="$(jq -r ".[$oi].match" "$operators_file")"
+  local path="$1" fext="$2" match_re ln
+  while IFS= read -r match_re; do
+    [[ -n "$match_re" ]] || continue
     ln="$(grep -nE -- "$match_re" "$path" 2>/dev/null | head -n 1 | cut -d: -f1)"
     if [[ -n "$ln" ]]; then printf '%s' "$ln"; return 0; fi
-  done
+  done < <(operator_regexes_for "$fext")
   return 1
+}
+
+# fixture_all_lines_for <path> <ext> — EVERY line number in <path> matching
+# any operator for <ext>, sorted, unique, one per line. The synthetic touch
+# re-adds all of them so plant_mutation.sh's seeded draw has the whole
+# candidate pool — touching only the first match pinned every weekly drill
+# to operator 0 (cross-review pass 2 of #143).
+fixture_all_lines_for() {
+  local path="$1" fext="$2" match_re
+  while IFS= read -r match_re; do
+    [[ -n "$match_re" ]] || continue
+    grep -nE -- "$match_re" "$path" 2>/dev/null | cut -d: -f1
+  done < <(operator_regexes_for "$fext") | sort -n | uniq
 }
 
 fixture_rel="$(pick_fixture)" || exit 2
@@ -188,8 +215,8 @@ fixture_path="$repo_root/$fixture_rel"
 # ── synthetic touch: re-affirm an operator-matching line as an ADDED line
 #    on a throwaway commit, so plant_mutation.sh has a diff to work with ──
 ext="${fixture_rel##*.}"
-touch_line_no="$(fixture_line_for "$fixture_path" "$ext")" || touch_line_no=""
-if [[ -z "$touch_line_no" ]]; then
+touch_lines="$(fixture_all_lines_for "$fixture_path" "$ext")"
+if [[ -z "$touch_lines" ]]; then
   echo "planted_round: fixture '$fixture_rel' has no line matching any operator for its extension" >&2
   exit 2
 fi
@@ -201,14 +228,19 @@ git -C "$repo_root" switch -c "$touch_branch" -q "$orig_ref" || { echo "planted_
 # awk -v rewrite of the line to itself was both a no-op for git and unsafe —
 # awk -v interprets backslash escapes inside the line text; cross-review of
 # #143.)
-sed -i.bak -e "${touch_line_no}s/\$/ /" "$fixture_path"
-rm -f "$fixture_path.bak"
+# Every operator-matching line is touched. awk (no -v of line text, so no
+# escape processing) keeps a CRLF ending intact: the space goes before the
+# \r, not between \r and \n.
+touch_list="$(printf '%s' "$touch_lines" | tr '\n' ',' | sed 's/,$//')"
+awk -v list="$touch_list" 'BEGIN { n = split(list, a, ","); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+  (NR in want) { if (sub(/\r$/, " \r") == 0) $0 = $0 " " } { print }' "$fixture_path" >"$fixture_path.tmp" \
+  && mv "$fixture_path.tmp" "$fixture_path"
 git -C "$repo_root" add -- "$fixture_rel" || { echo "planted_round: git add failed" >&2; exit 1; }
 if git -C "$repo_root" diff --cached --quiet -- "$fixture_rel"; then
   echo "planted_round: synthetic touch produced no diff on $fixture_rel" >&2
   exit 2
 fi
-git -C "$repo_root" commit -q --no-verify -m "chore(planted-round): synthetic touch for mutation drill (do not merge)" \
+git -C "$repo_root" commit -q --no-verify --no-gpg-sign -m "chore(planted-round): synthetic touch for mutation drill (do not merge)" \
   || { echo "planted_round: synthetic touch commit failed" >&2; exit 1; }
 touch_sha="$(git -C "$repo_root" rev-parse HEAD)"
 

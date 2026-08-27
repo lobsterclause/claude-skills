@@ -298,6 +298,44 @@ PATH="$T/bin:$PATH" OPENROUTER_API_KEY="sk-or-test-shim" \
 assert_eq "fallback drill exits 0" "$?" "0"
 assert_eq "fallback picked the committed drill target" "$(jq -r '.planted.file' "$T/out3/grade.json" 2>/dev/null)" "cross-review/ci/fixtures/planted_target.ts"
 assert_eq "fallback drill left the repo clean" "$(git -C "$REPO3" status --porcelain 2>/dev/null)" ""
+# The synthetic touch must expose EVERY operator-matching line, so the seeded
+# draw rotates across operators (a one-line touch pinned every drill to
+# operator 0). Four seeds on the same target must not all pick the same one.
+SEEN_OPS=""
+for sd in 1 2 3 4; do
+  : >"$T/planted-runlog-s$sd.jsonl"; : >"$T/planted-events-s$sd.jsonl"
+  PATH="$T/bin:$PATH" OPENROUTER_API_KEY="sk-or-test-shim" \
+    CROSS_REVIEW_RUNLOG="$T/planted-runlog-s$sd.jsonl" CROSS_REVIEW_FINDING_EVENTS="$T/planted-events-s$sd.jsonl" \
+    HOME="$T/home-empty" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    bash "$CI_DIR/planted_round.sh" --repo-root "$REPO3" \
+      --operators-file "$SKILL_DIR/references/mutation_operators.json" \
+      --fixture auto --roster glm --seed "$sd" --run-id "ci-test-seed-$sd" \
+      --out "$T/out-seed-$sd" >/dev/null 2>&1
+  SEEN_OPS="$SEEN_OPS $(jq -r '.planted.operator' "$T/out-seed-$sd/grade.json" 2>/dev/null)"
+done
+N_DISTINCT="$(tr ' ' '\n' <<<"$SEEN_OPS" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')"
+if [[ "$N_DISTINCT" -ge 2 ]]; then
+  ok "seeds 1-4 draw at least two distinct operators from the drill target ($SEEN_OPS )"
+else
+  bad "seeds 1-4 draw at least two distinct operators from the drill target (got:$SEEN_OPS )"
+fi
+
+# A CRLF fixture goes through the synthetic touch (the space lands before the
+# \r) and the whole drill without error, and the repo is restored.
+REPO4="$T/target-repo-crlf"; mkdir -p "$REPO4/src"
+printf 'export function check(a: boolean, b: boolean): boolean {\r\n  return a && b;\r\n}\r\n' >"$REPO4/src/win.ts"
+( cd "$REPO4" && git init -q -b main && git add -A \
+    && GIT_AUTHOR_NAME=seed GIT_AUTHOR_EMAIL=seed@x GIT_COMMITTER_NAME=seed GIT_COMMITTER_EMAIL=seed@x git commit -q -m init )
+: >"$T/planted-runlog4.jsonl"; : >"$T/planted-events4.jsonl"
+PATH="$T/bin:$PATH" OPENROUTER_API_KEY="sk-or-test-shim" \
+  CROSS_REVIEW_RUNLOG="$T/planted-runlog4.jsonl" CROSS_REVIEW_FINDING_EVENTS="$T/planted-events4.jsonl" \
+  HOME="$T/home-empty" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  bash "$CI_DIR/planted_round.sh" --repo-root "$REPO4" \
+    --operators-file "$SKILL_DIR/references/mutation_operators.json" \
+    --fixture auto --roster glm --seed 3 --run-id "ci-test-crlf" \
+    --out "$T/out4" >/dev/null 2>"$T/planted-round4.stderr"
+assert_eq "CRLF drill exits 0" "$?" "0"
+assert_eq "CRLF drill left the repo clean" "$(git -C "$REPO4" status --porcelain 2>/dev/null)" ""
 
 # The committed drill target must offer every operator a site, so the seeded
 # draw can land on any class.

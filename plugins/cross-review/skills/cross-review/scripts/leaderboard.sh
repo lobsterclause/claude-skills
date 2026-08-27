@@ -283,6 +283,10 @@ fi
 # detection, and the recall report below (#116).
 events_file="${CROSS_REVIEW_FINDING_EVENTS:-$skill_dir/finding_events.jsonl}"
 
+# run_id lists are handed to jq via --slurpfile (a file, read as $x[0]), not
+# --argjson: structured_raw is the WHOLE ledger now that the window is cut
+# after the exclusion, and an --argjson of every run_id would eventually hit
+# ARG_MAX (256 KB on macOS) — cross-review pass 2 of #143.
 # Synthetic-round detection (#116) — see header comment. Fail closed: a run
 # is synthetic when its row says so OR its run_id carries a `planted` event,
 # whichever fires first. WARN on stderr for every excluded run_id.
@@ -290,13 +294,13 @@ raw_run_ids="$(printf '%s\n' "$structured_raw" | jq -c -s '[.[] | .run_id // emp
 [[ -n "$raw_run_ids" ]] || raw_run_ids="[]"
 planted_run_ids="[]"
 if [[ -f "$events_file" && "$raw_run_ids" != "[]" ]]; then
-  planted_run_ids="$(jq -c -s --argjson rids "$raw_run_ids" \
-    '[.[] | select(.event == "planted" and (.run_id as $x | $rids | index($x) != null)) | .run_id] | unique' \
+  planted_run_ids="$(jq -c -s --slurpfile rids <(printf '%s' "$raw_run_ids") \
+    '$rids[0] as $rids | [.[] | select(.event == "planted" and (.run_id as $x | $rids | index($x) != null)) | .run_id] | unique' \
     "$events_file" 2>/dev/null)"
   [[ -n "$planted_run_ids" ]] || planted_run_ids="[]"
 fi
-synthetic_run_ids="$(printf '%s\n' "$structured_raw" | jq -c -s --argjson planted "$planted_run_ids" \
-  '[.[] | select((.synthetic == true) or (((.run_id // null) as $x | $x != null and ($planted | index($x) != null)))) | .run_id // empty] | unique' 2>/dev/null)"
+synthetic_run_ids="$(printf '%s\n' "$structured_raw" | jq -c -s --slurpfile planted <(printf '%s' "$planted_run_ids") \
+  '$planted[0] as $planted | [.[] | select((.synthetic == true) or (((.run_id // null) as $x | $x != null and ($planted | index($x) != null)))) | .run_id // empty] | unique' 2>/dev/null)"
 [[ -n "$synthetic_run_ids" ]] || synthetic_run_ids="[]"
 if [[ "$synthetic_run_ids" != "[]" ]]; then
   while IFS= read -r rid; do
@@ -307,10 +311,10 @@ fi
 # Production window: synthetic rows are excluded entirely (never contribute
 # to score, reliability, value, draw weight, or the epochs/context-mode
 # tables). Synthetic window: the complement, used only by the recall report.
-structured="$(printf '%s\n' "$structured_raw" | jq -c --argjson syn "$synthetic_run_ids" \
-  'select((.synthetic != true) and (((.run_id // null) as $x | $x == null or ($syn | index($x) == null))))' 2>/dev/null | tail -n "$recent")"
-structured_synthetic="$(printf '%s\n' "$structured_raw" | jq -c --argjson syn "$synthetic_run_ids" \
-  'select((.synthetic == true) or (((.run_id // null) as $x | $x != null and ($syn | index($x) != null))))' 2>/dev/null | tail -n "$recent")"
+structured="$(printf '%s\n' "$structured_raw" | jq -c --slurpfile syn <(printf '%s' "$synthetic_run_ids") \
+  '$syn[0] as $syn | select((.synthetic != true) and (((.run_id // null) as $x | $x == null or ($syn | index($x) == null))))' 2>/dev/null | tail -n "$recent")"
+structured_synthetic="$(printf '%s\n' "$structured_raw" | jq -c --slurpfile syn <(printf '%s' "$synthetic_run_ids") \
+  '$syn[0] as $syn | select((.synthetic == true) or (((.run_id // null) as $x | $x != null and ($syn | index($x) != null))))' 2>/dev/null | tail -n "$recent")"
 
 # Events ledger, joined to the PRODUCTION window by run_id. Entries older
 # than the run_id field (or rounds run without --emit-events) simply
@@ -318,8 +322,8 @@ structured_synthetic="$(printf '%s\n' "$structured_raw" | jq -c --argjson syn "$
 window_run_ids="$(printf '%s\n' "$structured" | jq -c -s '[.[] | .run_id // empty] | unique' 2>/dev/null)"
 window_events="[]"
 if [[ -f "$events_file" && -n "$window_run_ids" && "$window_run_ids" != "[]" ]]; then
-  window_events="$(jq -c -s --argjson rids "$window_run_ids" \
-    '[.[] | select(.run_id as $x | $rids | index($x) != null)]' \
+  window_events="$(jq -c -s --slurpfile rids <(printf '%s' "$window_run_ids") \
+    '$rids[0] as $rids | [.[] | select(.run_id as $x | $rids | index($x) != null)]' \
     "$events_file" 2>/dev/null)"
   [[ -n "$window_events" ]] || window_events="[]"
 fi
@@ -330,8 +334,8 @@ synthetic_run_id_list="$(printf '%s\n' "$structured_synthetic" | jq -c -s '[.[] 
 [[ -n "$synthetic_run_id_list" ]] || synthetic_run_id_list="[]"
 recall_events="[]"
 if [[ -f "$events_file" && "$synthetic_run_id_list" != "[]" ]]; then
-  recall_events="$(jq -c -s --argjson rids "$synthetic_run_id_list" \
-    '[.[] | select(.event as $e | (["planted","caught","missed"] | index($e)) != null) | select(.run_id as $x | $rids | index($x) != null)]' \
+  recall_events="$(jq -c -s --slurpfile rids <(printf '%s' "$synthetic_run_id_list") \
+    '$rids[0] as $rids | [.[] | select(.event as $e | (["planted","caught","missed"] | index($e)) != null) | select(.run_id as $x | $rids | index($x) != null)]' \
     "$events_file" 2>/dev/null)"
   [[ -n "$recall_events" ]] || recall_events="[]"
 fi
