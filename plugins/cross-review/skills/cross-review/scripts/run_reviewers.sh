@@ -492,8 +492,13 @@ if [[ "$context_mode" == "files" ]]; then
     # Defuse BOTH closing tags inside untrusted file content — </file> ends
     # one entry, </files> ends the whole block — same prompt-injection guard
     # as </diff> and </snapshot> (codex + kimi, PR #71 pass 1).
-    _ctx_blob="${_ctx_blob//<\/file>/< \/file>}"
-    _ctx_blob="${_ctx_blob//<\/files>/< \/files>}"
+    # The replacement side is NOT escaped: bash 3.2 (macOS /bin/bash) keeps
+    # a literal backslash from `< \/file>`, rendering `< \/file>` — still
+    # defused, but test_file_context's expectations then depend on which
+    # bash is first on PATH (2 fails on 3.2, green on brew bash 5). Same for
+    # the </diff> and </snapshot> sites below.
+    _ctx_blob="${_ctx_blob//<\/file>/< /file>}"
+    _ctx_blob="${_ctx_blob//<\/files>/< /files>}"
     # $(...) strips the trailing newline the format string adds; write it
     # back with exactly one — no blank line between entries (kimi, pass 2).
     _ctx_entry="$(printf '<file path="%s">\n%s\n</file>' "$_ctx_path_attr" "$_ctx_blob")"$'\n'
@@ -1198,7 +1203,7 @@ run_openrouter_reviewer() {
   if [[ "$using_snapshot" == true ]]; then
     # Defuse a literal closing tag inside untrusted snapshot content (same
     # prompt-injection guard as the raw-diff </diff> defuse below).
-    diff_full="${diff_full//<\/snapshot>/< \/snapshot>}"
+    diff_full="${diff_full//<\/snapshot>/< /snapshot>}"
     context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
     context_tag_open="<snapshot>"
     context_tag_close="</snapshot>"
@@ -1206,7 +1211,7 @@ run_openrouter_reviewer() {
   else
     # Defuse a literal </diff> inside untrusted patch content (same
     # prompt-injection guard as run_kimi).
-    diff_full="${diff_full//<\/diff>/< \/diff>}"
+    diff_full="${diff_full//<\/diff>/< /diff>}"
     context_label="Full diff:"
     context_tag_open="<diff>"
     context_tag_close="</diff>"
@@ -1528,7 +1533,7 @@ run_agy_reviewer() {
     diff_full="$(cat "$snapshot_path" 2>/dev/null || true)"
     # Defuse a literal closing tag inside untrusted snapshot content — same
     # guard as run_kimi/run_openrouter_reviewer.
-    diff_full="${diff_full//<\/snapshot>/< \/snapshot>}"
+    diff_full="${diff_full//<\/snapshot>/< /snapshot>}"
     context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
     context_tag_open="<snapshot>"
     context_tag_close="</snapshot>"
@@ -1550,7 +1555,7 @@ run_agy_reviewer() {
     diff_full="$(git diff --unified=50 "$base"...HEAD 2>/dev/null || true)"
     # Defuse a literal </diff> inside untrusted patch content — same guard as
     # run_kimi/run_openrouter_reviewer.
-    diff_full="${diff_full//<\/diff>/< \/diff>}"
+    diff_full="${diff_full//<\/diff>/< /diff>}"
     context_label="Full diff (unified context, against $base):"
     context_tag_open="<diff>"
     context_tag_close="</diff>"
@@ -1846,7 +1851,7 @@ run_kimi() {
     # Defuse a literal closing tag inside untrusted snapshot content so it
     # can't close the fence early and inject instructions — same guard as
     # the raw-diff </diff> defuse below (prompt-injection "inj").
-    diff_full="${diff_full//<\/snapshot>/< \/snapshot>}"
+    diff_full="${diff_full//<\/snapshot>/< /snapshot>}"
     context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
     context_tag_open="<snapshot>"
     context_tag_close="</snapshot>"
@@ -1854,7 +1859,7 @@ run_kimi() {
   else
     # Defuse a literal </diff> inside untrusted patch content so a malicious
     # diff can't close the fence early and inject instructions.
-    diff_full="${diff_full//<\/diff>/< \/diff>}"
+    diff_full="${diff_full//<\/diff>/< /diff>}"
     context_label="Full diff:"
     context_tag_open="<diff>"
     context_tag_close="</diff>"
