@@ -39,10 +39,18 @@
 # (per the proposal's own "reuse the hashing utility fingerprint_findings.sh
 # uses ... match it" instruction) takes precedence over that literal word.
 #
-# --judge agy|openrouter (a per-candidate factcheck-lane "does this describe
-# the planted defect?" call) is NOT wired in this pass -- exits 3 with a
-# clear message. Only --judge none (location match only, the default) works
-# today. See the PR / FOLLOW_UP_ISSUE for wiring judge lanes.
+# --judge agy|openrouter sends ONE factcheck-lane call per distinct candidate
+# (not per seat): a short question naming the planted operator/class/expected
+# severity, original_line -> mutated_line, and the candidate's own
+# claim/snippet/severity, asking "Does this finding describe the planted
+# defect? Answer exactly `yes` or `no`, then one sentence." The first word of
+# the reply is parsed case-insensitively: `no` DEMOTES that candidate -- seats
+# that only match through it are NOT credited by it (they may still be caught
+# via a different matching candidate); `yes` credits it; a timeout, non-zero
+# exit, empty output, or an unparseable first word all fail OPEN as `yes`
+# (same recall-safe philosophy as factcheck_findings.sh's keep-all) and are
+# recorded as judge verdict "unavailable". --judge none (the default) skips
+# all of this and matches by location alone, as before.
 #
 # Usage:
 #   grade_planted.sh --planted <planted.json> --findings <findings.anchored.json>
@@ -76,16 +84,23 @@
 # grade.json shape:
 #   { schema_version: 1, synthetic: true, run_id, planted_id,
 #     planted: {file, line_range, operator, class, expected_severity},
-#     caught: [{reviewer, matched_finding_id, severity_called, severity_accuracy}],
+#     caught: [{reviewer, matched_finding_id, severity_called, severity_accuracy,
+#               judged?: true|false}],  -- judged is present only when --judge
+#               is agy|openrouter: true when the matched candidate's judge
+#               verdict was "yes", false when it fell back to "unavailable"
+#               (fail-open; a "no" verdict is never on a caught entry -- that
+#               candidate was demoted before matching)
 #     missed: [reviewer, ...],
-#     candidates: [finding id, ...],
+#     candidates: [finding id, ...] when --judge none (unchanged); when
+#               --judge agy|openrouter, [{id, judge: {lane, verdict, note}}, ...]
+#               instead, one entry per distinct matched candidate,
 #     recall: caught_count / (caught_count + missed_count) as a 2-decimal
 #             STRING (same convention as severity_calibration.sh), plus
 #     recall_raw: the same ratio as a JSON number (4 decimals);
 #     severity_accuracy is a JSON number (1 exact, 0.5 otherwise) }
 #
-# Exit: 0 on a successful grade (always, even 0 caught); 2 on bad usage or
-# unreadable input files; 3 if --judge is agy/openrouter (not wired yet).
+# Exit: 0 on a successful grade (always, even 0 caught, even every judge call
+# failing open); 2 on bad usage or unreadable input files.
 
 set -uo pipefail
 
@@ -126,11 +141,7 @@ jq -e '.findings | type == "array" and all(.[]; type == "object")' "$findings" >
   || { echo "grade_planted: $findings must contain a .findings array of objects" >&2; exit 2; }
 
 case "$judge" in
-  none) ;;
-  agy|openrouter)
-    echo "grade_planted: --judge $judge is not wired yet (location-match-only for now; see FOLLOW_UP_ISSUE)" >&2
-    exit 3
-    ;;
+  none|agy|openrouter) ;;
   *) echo "grade_planted: --judge must be none|agy|openrouter (got '$judge')" >&2; exit 2 ;;
 esac
 
@@ -166,6 +177,8 @@ p_class="$(jq -r '.class // ""' "$planted")"
 p_expected_severity="$(jq -r '.expected_severity // ""' "$planted")"
 p_line0="$(jq -r '.line_range[0] // empty' "$planted")"
 p_line1="$(jq -r '.line_range[1] // empty' "$planted")"
+p_original_line="$(jq -r '.original_line // ""' "$planted")"
+p_mutated_line="$(jq -r '.mutated_line // ""' "$planted")"
 [[ -n "$p_file" && -n "$p_line0" && -n "$p_line1" ]] || { echo "grade_planted: planted.json missing file/line_range" >&2; exit 2; }
 jq -e '.line_range | type == "array" and length == 2 and all(.[]; type == "number" and floor == . and . > 0) and .[0] <= .[1]' "$planted" >/dev/null 2>&1 \
   || { echo "grade_planted: planted.json line_range must be exactly two positive integers, low <= high (got $(jq -c '.line_range' "$planted"))" >&2; exit 2; }
@@ -180,6 +193,108 @@ high=$(( p_line1 + window ))
 tmp_dir="$(mktemp -d)"; trap 'rm -rf "$tmp_dir"' EXIT
 cand_jsonl="$tmp_dir/candidates.jsonl"
 : > "$cand_jsonl"
+
+# ── judge lanes (agy | openrouter) ──────────────────────────────────────────
+# Wiring mirrors factcheck_findings.sh: same agy invocation shape (--sandbox,
+# --print-timeout, prompt via -p, </dev/null so a headless confirmation can't
+# hang) and the same OpenRouter request shape (bearer token via a 0600
+# --config file inside the trap-cleaned tmp_dir, never argv/disk after exit,
+# never printed). Unlike factcheck's whole-diff pass, a judge call's prompt is
+# a few lines, so it goes straight into -p / the chat body -- no ARG_MAX risk.
+if [[ "$judge" != "none" ]]; then
+  # Timeout shim (same fallback chain as factcheck_findings.sh).
+  TIMEOUT_BIN=""
+  command -v timeout  >/dev/null 2>&1 && TIMEOUT_BIN="timeout"
+  [[ -z "$TIMEOUT_BIN" ]] && command -v gtimeout >/dev/null 2>&1 && TIMEOUT_BIN="gtimeout"
+  run_to() { if [[ -n "$TIMEOUT_BIN" ]]; then "$TIMEOUT_BIN" "$1" "${@:2}"; else "${@:2}"; fi; }
+
+  # agy display model: read from the SAME profile factcheck_findings.sh reads,
+  # so a future antigravity model bump doesn't leave this pass pinned stale
+  # (glm 5.3, PR #64 rationale, reapplied here).
+  _judge_profile="$(cd "$(dirname "$0")/.." && pwd)/references/reviewer_profiles.json"
+  agy_judge_model=""
+  if [[ -f "$_judge_profile" ]]; then
+    agy_judge_model="$(jq -r '.antigravity.model // empty' "$_judge_profile" 2>/dev/null)"
+  fi
+  : "${agy_judge_model:=Gemini 3.7 Flash (High)}"
+  or_judge_model="deepseek/deepseek-v4-flash"
+  judge_timeout=60
+  judge_raw="$tmp_dir/judge_raw.txt"
+
+  openrouter_key() {
+    if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then printf '%s' "$OPENROUTER_API_KEY"; return 0; fi
+    [[ -s "$HOME/.config/openrouter/key" ]] && { tr -d '[:space:]' <"$HOME/.config/openrouter/key"; return 0; }
+    return 1
+  }
+
+  # judge_prompt_for <candidate-json-line> — the short falsify-only question.
+  judge_prompt_for() {
+    local cand="$1" claim snippet severity_called
+    claim="$(jq -r '.claim // ""' <<<"$cand")"
+    snippet="$(jq -r '.snippet // ""' <<<"$cand")"
+    severity_called="$(jq -r '.severity // ""' <<<"$cand")"
+    printf 'You are checking whether a code-review finding describes a specific planted (synthetic) defect.\n\nPlanted defect:\n- operator: %s\n- class: %s\n- expected severity: %s\n- original line: %s\n- mutated line: %s\n\nCandidate finding:\n- severity called: %s\n- claim: %s\n- snippet: %s\n\nDoes this finding describe the planted defect? Answer exactly `yes` or `no`, then one sentence.\n' \
+      "$p_operator" "$p_class" "$p_expected_severity" "$p_original_line" "$p_mutated_line" \
+      "$severity_called" "$claim" "$snippet"
+  }
+
+  # judge_via_agy <prompt> — writes the reply to $judge_raw. Returns nonzero on
+  # any transport failure (agy missing, nonzero exit, empty stdout).
+  judge_via_agy() {
+    command -v agy >/dev/null 2>&1 || return 1
+    # a crashed/timed-out agy that left partial stdout ("No route ...") must
+    # not read as a verdict: the exit code gates, not just non-empty output
+    # (antigravity + gemini-pro, PR #126 review)
+    run_to "$judge_timeout" agy --model "$agy_judge_model" --sandbox \
+      --print-timeout "${judge_timeout}s" -p "$1" \
+      >"$judge_raw" 2>"$tmp_dir/judge_err.txt" </dev/null || return 1
+    [[ -s "$judge_raw" ]]
+  }
+
+  # judge_via_openrouter <prompt> — writes the reply content to $judge_raw.
+  judge_via_openrouter() {
+    local key body resp auth
+    key="$(openrouter_key)" || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    body="$tmp_dir/judge_body.json"; resp="$tmp_dir/judge_resp.json"; auth="$tmp_dir/judge-curl-auth"
+    jq -n --arg p "$1" --arg m "$or_judge_model" \
+      '{model: $m, messages: [{role: "user", content: $p}], stream: false}' >"$body" || return 1
+    # Key via 0600 --config file, never argv (ps-visible) or a printed value.
+    ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$key" >"$auth" )
+    curl -sS --max-time "$judge_timeout" \
+      --config "$auth" \
+      -H "Content-Type: application/json" \
+      -H "X-Title: cross-review-grade-judge" \
+      -d @"$body" \
+      https://openrouter.ai/api/v1/chat/completions >"$resp" 2>"$tmp_dir/judge_err.txt" || return 1
+    [[ -n "$(jq -r '.error.message // empty' "$resp" 2>/dev/null)" ]] && return 1
+    jq -r '.choices[0].message.content // empty' "$resp" >"$judge_raw" 2>/dev/null || return 1
+    [[ -s "$judge_raw" ]]
+  }
+
+  # parse_judge_verdict — reads $judge_raw, echoes yes|no|unavailable based on
+  # the first word (case-insensitive, punctuation stripped).
+  parse_judge_verdict() {
+    local first_word
+    # first word of the first NON-EMPTY line only -- awk over every line turned
+    # "No.\nBecause ..." into "no\nbecause", which matched nothing and failed
+    # open as yes (antigravity + gemini-pro, PR #126 review)
+    first_word="$(head -c 200 "$judge_raw" | tr -d '\r' | awk 'NF { print tolower($1); exit }' | sed -E 's/[^a-z]//g')"
+    case "$first_word" in
+      yes) echo "yes" ;;
+      no)  echo "no" ;;
+      *)   echo "unavailable" ;;
+    esac
+  }
+
+  # judge_note — a terse note for the candidate record: the reply's first line
+  # (verdict + one sentence), trimmed, capped so grade.json stays small.
+  judge_note() {
+    # byte-truncate, then drop any half UTF-8 sequence so jq --arg cannot
+    # reject the note (gemini-pro, PR #126 review)
+    head -c 240 "$judge_raw" 2>/dev/null | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+$//'
+  }
+fi
 
 skipped_no_id=0
 while IFS= read -r f; do
@@ -207,6 +322,37 @@ done < <(jq -c '.findings[]' "$findings")
 candidates_json="$(jq -c -s '[.[].id] | reduce .[] as $id ([]; if index($id) then . else . + [$id] end)' "$cand_jsonl" 2>/dev/null || echo '[]')"
 [[ -z "$candidates_json" ]] && candidates_json='[]'
 
+# One judge call per DISTINCT candidate (not per seat) -- see the --judge
+# comment block above for the fail-open contract.
+judge_jsonl="$tmp_dir/judgments.jsonl"; : > "$judge_jsonl"
+if [[ "$judge" != "none" ]]; then
+  while IFS= read -r cid; do
+    [[ -z "$cid" ]] && continue
+    cand="$(jq -c --arg id "$cid" 'select(.id == $id)' "$cand_jsonl" | head -n 1)"
+    prompt="$(judge_prompt_for "$cand")"
+    : > "$judge_raw"
+    call_ok=1
+    if [[ "$judge" == "agy" ]]; then
+      judge_via_agy "$prompt" || call_ok=0
+    else
+      judge_via_openrouter "$prompt" || call_ok=0
+    fi
+    if [[ "$call_ok" -eq 1 ]]; then
+      verdict="$(parse_judge_verdict)"
+      if [[ "$verdict" == "unavailable" ]]; then
+        note="unparseable judge reply (fail-open: treated as yes) -- $(judge_note)"
+      else
+        note="$(judge_note)"
+      fi
+    else
+      verdict="unavailable"
+      note="judge call failed or timed out (fail-open: treated as yes)"
+    fi
+    jq -nc --arg id "$cid" --arg lane "$judge" --arg verdict "$verdict" --arg note "$note" \
+      '{id: $id, lane: $lane, verdict: $verdict, note: $note}' >> "$judge_jsonl"
+  done < <(jq -r '.[]' <<<"$candidates_json")
+fi
+
 caught_json="[]"
 missed_json="[]"
 # roster: trim whitespace and dedupe, so "codex, kimi" matches sources and
@@ -217,7 +363,22 @@ while IFS= read -r seat; do
 done < <(printf '%s' "$roster" | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | awk 'NF && !seen[$0]++')
 [[ "${#roster_arr[@]}" -gt 0 ]] || { echo "grade_planted: --roster has no seats" >&2; exit 2; }
 for seat in "${roster_arr[@]}"; do
-  match="$(jq -c --arg seat "$seat" 'select((.sources // []) | index($seat) != null)' "$cand_jsonl" 2>/dev/null | head -n 1)"
+  # Walk every candidate this seat's sources appear on (first-seen order), not
+  # just the first one -- with --judge active a "no" verdict demotes that
+  # candidate for THIS seat, but a later candidate may still credit it.
+  match=""
+  match_verdict=""
+  while IFS= read -r cand; do
+    [[ -z "$cand" ]] && continue
+    if [[ "$judge" == "none" ]]; then
+      match="$cand"; break
+    fi
+    cid="$(jq -r '.id' <<<"$cand")"
+    v="$(jq -r --arg id "$cid" 'select(.id == $id) | .verdict' "$judge_jsonl" 2>/dev/null | head -n 1)"
+    [[ -z "$v" ]] && v="unavailable"
+    [[ "$v" == "no" ]] && continue
+    match="$cand"; match_verdict="$v"; break
+  done < <(jq -c --arg seat "$seat" 'select((.sources // []) | index($seat) != null)' "$cand_jsonl" 2>/dev/null)
   if [[ -n "$match" ]]; then
     matched_id="$(jq -r '.id' <<<"$match")"
     severity_called="$(jq -r '.severity // ""' <<<"$match")"
@@ -228,14 +389,35 @@ for seat in "${roster_arr[@]}"; do
     else
       accuracy="0.5"
     fi
-    entry="$(jq -nc --arg reviewer "$seat" --arg matched_finding_id "$matched_id" \
-      --arg severity_called "$severity_called" --argjson severity_accuracy "$accuracy" \
-      '{reviewer: $reviewer, matched_finding_id: $matched_finding_id, severity_called: $severity_called, severity_accuracy: $severity_accuracy}')"
+    if [[ "$judge" == "none" ]]; then
+      entry="$(jq -nc --arg reviewer "$seat" --arg matched_finding_id "$matched_id" \
+        --arg severity_called "$severity_called" --argjson severity_accuracy "$accuracy" \
+        '{reviewer: $reviewer, matched_finding_id: $matched_finding_id, severity_called: $severity_called, severity_accuracy: $severity_accuracy}')"
+    else
+      # judged: true only for a verdict of "yes" -- "unavailable" is a
+      # fail-open credit, not an actual confirmation.
+      judged_bool="false"; [[ "$match_verdict" == "yes" ]] && judged_bool="true"
+      entry="$(jq -nc --arg reviewer "$seat" --arg matched_finding_id "$matched_id" \
+        --arg severity_called "$severity_called" --argjson severity_accuracy "$accuracy" \
+        --argjson judged "$judged_bool" \
+        '{reviewer: $reviewer, matched_finding_id: $matched_finding_id, severity_called: $severity_called, severity_accuracy: $severity_accuracy, judged: $judged}')"
+    fi
     caught_json="$(jq -c --argjson e "$entry" '. + [$e]' <<<"$caught_json")"
   else
     missed_json="$(jq -c --arg seat "$seat" '. + [$seat]' <<<"$missed_json")"
   fi
 done
+
+# Rebuild the "candidates" output: plain id strings for --judge none
+# (unchanged contract); {id, judge:{lane,verdict,note}} objects otherwise.
+if [[ "$judge" != "none" ]]; then
+  candidates_json="$(jq -c --slurpfile j "$judge_jsonl" '
+    . as $ids | $ids | map(. as $id
+      | (($j | map(select(.id == $id)) | first) // {lane: null, verdict: "unavailable", note: null}) as $jm
+      | {id: $id, judge: {lane: $jm.lane, verdict: $jm.verdict, note: $jm.note}})
+  ' <<<"$candidates_json" 2>/dev/null || echo '[]')"
+  [[ -z "$candidates_json" ]] && candidates_json='[]'
+fi
 
 caught_n="$(jq 'length' <<<"$caught_json")"
 missed_n="$(jq 'length' <<<"$missed_json")"
