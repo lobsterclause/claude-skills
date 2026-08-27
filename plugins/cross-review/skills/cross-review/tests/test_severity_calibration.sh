@@ -156,6 +156,12 @@ EOF
 J5="$(bash "$S/severity_calibration.sh" --events "$FIX5" --json)"
 assert_eq "distinct tuples that concatenate identically both survive dedupe" \
   "$(jq -r '.[] | select(.reviewer=="eta") | .proposed' <<<"$J5")" "2"
+# the terminal-status map keys the same way: a kept event for (a::b, c) must
+# not resolve (a, b::c)
+printf '{"finding_id":"a::b","run_id":"c","event":"factcheck_kept","ts":"2026-08-05T01:00:00Z"}\n' >>"$FIX5"
+J5b="$(bash "$S/severity_calibration.sh" --events "$FIX5" --json)"
+assert_eq "terminal map does not cross-resolve a '::' collision (1 kept, 1 unresolved)" \
+  "$(jq -r '.[] | select(.reviewer=="eta") | "\(.kept)/\(.unresolved)"' <<<"$J5b")" "1/1"
 
 echo "── argument validation ──"
 bash "$S/severity_calibration.sh" --events "$FIX1" --min-sample foo >/dev/null 2>"$T/err"; rc=$?

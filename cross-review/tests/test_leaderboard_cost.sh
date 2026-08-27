@@ -135,7 +135,14 @@ assert_eq "devstral kept but unpriced/unbilled: cost_per_kept is em dash" \
 assert_eq "devstral kept but unpriced/unbilled: cost_per_kept_ch is em dash" \
   "$(jq -r '.[] | select(.reviewer=="devstral") | .cost_per_kept_ch' <<<"$LB")" "—"
 REPORT_CWD="$(cd "$T" && RUN_LB --mode report 2>&1)"
-assert_contains "report mode finds severity_calibration.sh from another cwd" "$REPORT_CWD" "severity calibration"
+# the not-found fallback message also contains the words "severity calibration",
+# so assert on the section's own output line, not the heading (gemini-pro)
+if [[ "$REPORT_CWD" == *"not found next to"* ]]; then
+  bad "report mode finds severity_calibration.sh from another cwd (fallback message present)"
+else
+  ok "report mode finds severity_calibration.sh from another cwd"
+fi
+assert_contains "report mode prints severity_calibration.sh's per-seat table" "$REPORT_CWD" "inflation ="
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

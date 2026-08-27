@@ -165,10 +165,10 @@ report="$(jq -c -s --arg cutoff "$cutoff" --argjson min_sample "$min_sample" '
   # deepseek, PR #102 review). The ledger is append-only, so file order is
   # event order.
   | (reduce ($all[] | select(.event as $e | ($kept_names + $dropped_names | index($e)) != null)) as $e
-      ({}; .[$e.finding_id + "::" + $e.run_id] =
+      ({}; .[([$e.finding_id, $e.run_id] | tojson)] =
              (if ($kept_names | index($e.event)) != null then "kept" else "dropped" end))) as $tmap
   | ($proposed
-     | map(. + {status: ($tmap[.finding_id + "::" + .run_id] // "unresolved")})) as $rows
+     | map(. + {status: ($tmap[([.finding_id, .run_id] | tojson)] // "unresolved")})) as $rows
   | (["Critical","High","Medium","Low","Other"]) as $sevs
   | ($rows
      | group_by(.reviewer)
