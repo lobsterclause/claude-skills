@@ -459,9 +459,14 @@ score_reviewer() {
     | (["factcheck_kept","parent_verified_kept","fix_verified","human_accepted"]) as $kept_names
     | (["factcheck_dropped","parent_verified_dropped","human_rejected","duplicate_merged"]) as $term_dropped_names
     | ($events
-       | map(select(.event as $e | ($kept_names + $term_dropped_names | index($e)) != null))
+       # deferred takes part in ledger-order precedence: a deferred after a
+       # kept neutralises the finding instead of being ignored (gemini-pro,
+       # PR #133 review)
+       | map(select(.event as $e | ($kept_names + $term_dropped_names + ["deferred"] | index($e)) != null))
        | reduce .[] as $e ({}; .[([$e.finding_id, $e.run_id] | tojson)] =
-           (if ($kept_names | index($e.event)) != null then "kept" else "dropped" end))) as $term_map
+           (if ($kept_names | index($e.event)) != null then "kept"
+            elif ($term_dropped_names | index($e.event)) != null then "dropped"
+            else "deferred" end))) as $term_map
     | ($events | map(select(.event == "proposed" and .reviewer == $r
                              and (.run_id as $rid | $run_ids | index($rid)) != null))
                | unique_by([.finding_id, .run_id])
@@ -718,13 +723,16 @@ print_context_mode_report() {
           elif ($ca == "diff_only") then "diff"
           else "unknown" end
       end;
-    def kept_names: ["factcheck_kept","parent_verified_kept","fix_verified","human_accepted","duplicate_merged"];
-    def dropped_names: ["factcheck_dropped","parent_verified_dropped","human_rejected"];
+    # same vocabulary as score_reviewer: duplicate_merged is the dropped family
+    def kept_names: ["factcheck_kept","parent_verified_kept","fix_verified","human_accepted"];
+    def dropped_names: ["factcheck_dropped","parent_verified_dropped","human_rejected","duplicate_merged"];
     . as $rows
     | ($events
-       | map(select(.event as $e | ((kept_names + dropped_names) | index($e)) != null))
+       | map(select(.event as $e | ((kept_names + dropped_names + ["deferred"]) | index($e)) != null))
        | reduce .[] as $e ({}; .[([$e.finding_id, $e.run_id] | tojson)] =
-           (if (kept_names | index($e.event)) != null then "kept" else "dropped" end))
+           (if (kept_names | index($e.event)) != null then "kept"
+            elif (dropped_names | index($e.event)) != null then "dropped"
+            else "deferred" end))
       ) as $term_map
     | [ $revs[] as $r |
         ($rows | map({run_id: (.run_id // null), rv: (.reviewers[$r] // null)})
