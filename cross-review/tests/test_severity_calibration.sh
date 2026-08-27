@@ -129,6 +129,24 @@ assert_eq "delta is not a WARN on unresolved rows" \
 assert_eq "delta unresolved is 3" \
   "$(jq -r '.[] | select(.reviewer=="delta") | .unresolved' <<<"$J3")" "3"
 
+# ── Fixture 4 (pass 2): the sample gate counts resolved rows; duplicate
+#    proposed rows keep the LAST one in ledger order.
+FIX4="$T/events4.jsonl"
+{
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    printf '{"reviewer":"eps","severity":"Critical","finding_id":"k%s","run_id":"run4","event":"proposed","ts":"2026-08-04T00:00:00Z"}\n' "$i"
+  done
+  printf '{"finding_id":"k1","run_id":"run4","event":"factcheck_dropped","ts":"2026-08-04T01:00:00Z"}\n'
+  printf '{"reviewer":"zeta","severity":"Low","finding_id":"z1","run_id":"run4","event":"proposed","ts":"2026-08-04T00:00:00Z"}\n'
+  printf '{"reviewer":"zeta","severity":"Critical","finding_id":"z1","run_id":"run4","event":"proposed","ts":"2026-08-04T00:00:01Z"}\n'
+} >"$FIX4"
+J4="$(bash "$S/severity_calibration.sh" --events "$FIX4" --min-sample 2 --json)"
+assert_eq "12 proposed / 1 resolved does not WARN (sample gate counts resolved)" \
+  "$(jq -r '.[] | select(.reviewer=="eps") | .warn' <<<"$J4")" "false"
+assert_eq "eps resolved is 1" "$(jq -r '.[] | select(.reviewer=="eps") | .resolved' <<<"$J4")" "1"
+assert_eq "duplicate proposed keeps the last row in ledger order (zeta Critical)" \
+  "$(jq -r '.[] | select(.reviewer=="zeta") | .severity_share.Critical' <<<"$J4")" "1.00"
+
 echo "── argument validation ──"
 bash "$S/severity_calibration.sh" --events "$FIX1" --min-sample foo >/dev/null 2>"$T/err"; rc=$?
 assert_eq "--min-sample foo exits 2" "$rc" "2"

@@ -23,12 +23,17 @@
 #                     human_rejected/duplicate_merged count as dropped).
 #                     Findings with no terminal event are `unresolved` and
 #                     EXCLUDED from every survival denominator.
-#   inflation         (share of Critical+High among PROPOSED) minus (share
-#                     of Critical+High among KEPT) — a seat whose Critical/
+#   resolved          kept + dropped (proposed findings with a terminal event)
+#   inflation         (share of Critical+High among RESOLVED) minus (share
+#                     of Critical+High among KEPT); unresolved rows are
+#                     excluded from both terms — an unadjudicated Critical
+#                     is not evidence of inflation. A seat whose Critical/
 #                     High labels don't hold up scores high here.
-#   warn              true when inflation > 0.25 (strict) AND proposed >=
+#   warn              true when inflation > 0.25 (strict) AND resolved >=
 #                     --min-sample (default 10) — printed as a `WARN
-#                     inflation: ...` line in table mode.
+#                     inflation: ...` line in table mode. The sample gate
+#                     counts RESOLVED rows, so a pile of unresolved
+#                     proposals cannot turn one bad adjudication into a WARN.
 #
 # All decimal fields (severity_share, survival, inflation) are formatted as
 # fixed 2-decimal strings ("0.33", "1.00") rather than raw JSON numbers, so
@@ -44,15 +49,15 @@
 #                        N days (terminal events are still joined regardless
 #                        of their own ts, so recency filtering never turns a
 #                        real terminal outcome into `unresolved`)
-#     --min-sample N    minimum proposed count before inflation can WARN
-#                        (default 10)
+#     --min-sample N    minimum RESOLVED count (kept + dropped) before
+#                        inflation can WARN (default 10)
 #     --json            emit one JSON array (no WARN lines mixed in — see
 #                        each row's `warn` field instead); default is a
 #                        human-readable table with WARN lines
 #
-# Read-only: never writes to the events ledger. Exit 0 always (a malformed
-# --events path or an empty ledger just yields an empty report); exit 2 only
-# on bad usage; exit 1 if jq is missing.
+# Read-only: never writes to the events ledger. Exit 0 when the ledger is
+# missing or empty (empty report); exit 1 if jq is missing or the ledger is
+# unparseable; exit 2 on bad usage.
 
 set -uo pipefail
 
@@ -149,7 +154,9 @@ report="$(jq -c -s --arg cutoff "$cutoff" --argjson min_sample "$min_sample" '
   | ($all
      | map(select(.event == "proposed"))
      | (if $cutoff != "" then map(select((.ts // "") >= $cutoff)) else . end)
-     | unique_by([.finding_id, .run_id, .reviewer])
+     # keep the LAST duplicate in ledger order (unique_by sorts and keeps
+     # the first, which would pick by key order rather than recency)
+     | (reduce .[] as $e ({}; .[($e.finding_id + "::" + $e.run_id + "::" + $e.reviewer)] = $e) | [.[]])
      | map(. + {sev: norm_sev})) as $proposed
   # Terminal status: the LATEST terminal event in ledger order wins, so a
   # human_accepted appended after a factcheck_dropped reads as kept (codex +
@@ -190,7 +197,7 @@ report="$(jq -c -s --arg cutoff "$cutoff" --argjson min_sample "$min_sample" '
                    | length) as $ch_kept
         | (if $kept_total == 0 then 0 else ($ch_kept / $kept_total) end) as $ch_kept_share
         | (if $resolved_n == 0 then 0 else ($ch_proposed_share - $ch_kept_share) end) as $inflation
-        | (($resolved_n > 0) and ($inflation > 0.25) and ($proposed_n >= $min_sample)) as $warn
+        | (($resolved_n > 0) and ($inflation > 0.25) and ($resolved_n >= $min_sample)) as $warn
         | { reviewer: $reviewer,
             proposed: $proposed_n,
             severity_share: ($sevs | reduce .[] as $s ({};
@@ -224,7 +231,7 @@ printf '%s' "$report" | jq -r '
   "  survival: C=\(.survival.Critical) H=\(.survival.High) M=\(.survival.Medium) L=\(.survival.Low) O=\(.survival.Other)" +
   "  kept=\(.kept) dropped=\(.dropped) unresolved=\(.unresolved)  inflation=\(.inflation)" +
   (if .warn then
-    "\nWARN inflation: reviewer=\(.reviewer) inflation=\(.inflation) proposed=\(.proposed) (threshold 0.25, min-sample \($min_sample))"
+    "\nWARN inflation: reviewer=\(.reviewer) inflation=\(.inflation) resolved=\(.resolved) proposed=\(.proposed) (threshold 0.25, min-sample \($min_sample) resolved)"
    else "" end)
 ' --argjson min_sample "$min_sample"
 echo "──"
