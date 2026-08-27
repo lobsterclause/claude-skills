@@ -235,7 +235,7 @@ assert_contains "nemotron over-drawn WARN annotated with last recorded draw_boos
 NEM_WARN_LINE="$(printf '%s\n' "$SOUT" | grep 'nemotron')"
 GHOST_WARN_LINE="$(printf '%s\n' "$SOUT" | grep 'ghost starved')"
 if [[ "$GHOST_WARN_LINE" == *"check draw_boost"* ]]; then
-  bad "ghost (draw_boost 1) is not annotated with check draw_boost"
+  bad "ghost (draw_boost 1) should NOT be annotated with check draw_boost, but was"
 else
   ok "ghost (draw_boost 1) is not annotated with check draw_boost"
 fi

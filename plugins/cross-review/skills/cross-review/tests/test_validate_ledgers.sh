@@ -38,7 +38,7 @@ cat >"$RUNLOG" <<'EOF'
 {"ts":"2026-08-01T01:00:00Z","run_id":"r2","reviewers":{"codex":{"status":"ok"}}}
 {not json
 {"ts":"2026-08-01T02:00:00Z","run_id":"r3","reviewers":{"codex":{"status":"ok"}}}
-{"run_id":"r4","reviewers":{"codex":{"status":"ok"}}}
+{"schema_version":1,"run_id":"r4","reviewers":{"codex":{"status":"ok"}}}
 EOF
 
 # Fixture events: 2 events for r1, 1 event for orphan r9, 1 event with an
@@ -55,7 +55,7 @@ OUT="$(bash "$S/validate_ledgers.sh" --runlog "$RUNLOG" --events "$EVENTS" 2>&1)
 rc=$?
 assert_eq "exit code 1 on malformed/missing-ts errors" "$rc" "1"
 assert_contains "reports malformed runlog line" "$OUT" "runlog:3 malformed"
-assert_contains "reports missing ts" "$OUT" "missing ts"
+assert_contains "reports missing ts" "$OUT" "runlog:5 missing ts"
 assert_contains "reports orphan run_id" "$OUT" "r9"
 assert_contains "reports unknown event" "$OUT" "bogus"
 
@@ -146,6 +146,18 @@ assert_eq "future schema_version does not fail the run (exit 0)" "$futrc" "0"
 assert_contains "future schema_version WARN names it" "$FUTOUT" "above the writer's current"
 FUTJ="$(bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$EVENTS" --json 2>/dev/null)"
 assert_eq "--json runlog.future_version == 1" "$(printf '%s' "$FUTJ" | jq -r '.runlog.future_version')" "1"
+
+# events ledger: the same future-version rule; and the writer-fallback WARN
+# must survive (it is counted in this shell, not a subshell)
+FUTEV="$T/future-events.jsonl"
+printf '{"schema_version":7,"finding_id":"f1","run_id":"s1","event":"proposed","ts":"2026-08-01T00:00:00Z"}\n' >"$FUTEV"
+FUTEJ="$(bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null)"
+assert_eq "--json events.future_version == 1" "$(printf '%s' "$FUTEJ" | jq -r '.events.future_version')" "1"
+assert_contains "events future schema_version WARN names the line" "$(bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" 2>&1)" "events:1 schema_version 7 is above the writer's current"
+mkdir -p "$T/no-writers"
+FBOUT="$(CROSS_REVIEW_WRITERS_DIR="$T/no-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" 2>&1)"
+assert_contains "unreadable writers fall back to 1 with a WARN that is actually printed" "$FBOUT" "unable to read a writer's current schema_version"
+assert_eq "fallback still flags version 7 as future" "$(CROSS_REVIEW_WRITERS_DIR="$T/no-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null | jq -r '.runlog.current_schema_version')" "1"
 
 echo "── legacy no-ts rows (#111) ──"
 LEGLOG="$T/legacy-runlog.jsonl"

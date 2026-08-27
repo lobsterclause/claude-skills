@@ -112,21 +112,25 @@ events="${events:-${CROSS_REVIEW_FINDING_EVENTS:-$skill_dir/finding_events.jsonl
 # is picked up automatically. Falls back to 1 (the version both writers
 # stamp as of #109) with a WARN if the constant can't be read.
 current_ver_warns=0
+# Sets the named variable in THIS shell (printf -v): a $(...) call would run
+# in a subshell and lose the warning counter increment (antigravity +
+# gemini-pro, PR #127 review). Writers can be pointed elsewhere for tests via
+# $CROSS_REVIEW_WRITERS_DIR.
+writers_dir="${CROSS_REVIEW_WRITERS_DIR:-$skill_dir/scripts}"
 read_current_schema_version() {
-  local writer="$1"
-  local v
+  local writer="$1" target="$2" v
   if [[ -r "$writer" ]]; then
     v="$(grep -E '^SCHEMA_VERSION=' "$writer" 2>/dev/null | head -1 | cut -d= -f2)"
     if [[ "$v" =~ ^[0-9]+$ ]]; then
-      printf '%s' "$v"
-      return
+      printf -v "$target" '%s' "$v"
+      return 0
     fi
   fi
   current_ver_warns=$((current_ver_warns + 1))
-  printf '1'
+  printf -v "$target" '1'
 }
-runlog_current_sv="$(read_current_schema_version "$skill_dir/scripts/append_runlog.sh")"
-events_current_sv="$(read_current_schema_version "$skill_dir/scripts/append_finding_event.sh")"
+read_current_schema_version "$writers_dir/append_runlog.sh" runlog_current_sv
+read_current_schema_version "$writers_dir/append_finding_event.sh" events_current_sv
 
 errors=0
 warns=0
