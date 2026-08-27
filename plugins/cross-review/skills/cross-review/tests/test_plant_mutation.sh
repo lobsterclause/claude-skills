@@ -32,6 +32,9 @@ assert_eq() {
 assert_contains() {
   if [[ "$2" == *"$3"* ]]; then ok "$1"; else bad "$1 (no '$3' in output)"; fi
 }
+assert_not_contains() {
+  if [[ "$2" != *"$3"* ]]; then ok "$1"; else bad "$1 (found '$3' in output)"; fi
+}
 
 # ── build a fixture git repo under $T ───────────────────────────────────────
 # base commit: src/a.ts with a few unrelated lines, including one line with
@@ -133,8 +136,10 @@ OUT_B1="$T/planted-det-1.json"
 OUT_B2="$T/planted-det-2.json"
 bash "$S/plant_mutation.sh" --repo "$REPO_B1" --base "$B1_BASE" --head "$B1_HEAD" \
   --seed 42 --run-id mutation-det --out "$OUT_B1" >/dev/null 2>&1
+assert_eq "determinism run 1 exits 0" "$?" "0"
 bash "$S/plant_mutation.sh" --repo "$REPO_B2" --base "$B2_BASE" --head "$B2_HEAD" \
   --seed 42 --run-id mutation-det --out "$OUT_B2" >/dev/null 2>&1
+assert_eq "determinism run 2 exits 0" "$?" "0"
 
 if [[ -f "$OUT_B1" && -f "$OUT_B2" ]]; then
   # base/head SHAs differ across the two fixture repos (commit SHAs depend on
@@ -191,6 +196,64 @@ bash "$S/plant_mutation.sh" --repo "$NOOP_DIR" --base "$NOOP_BASE" --head "$NOOP
   --seed 1 --out "$T/planted-noop.json" >/dev/null 2>"$T/stderr-noop.log"
 NOOP_EXIT=$?
 assert_eq "no-candidate diff exits 2" "$NOOP_EXIT" "2"
+
+# (f) operator hygiene from the PR #107 review: block guards, generics and
+#     nested-paren calls are never candidates; single-line guards, spaced
+#     comparisons and flat calls are.
+mk_repo_with() {
+  local dir="$1"; shift
+  rm -rf "$dir"; mkdir -p "$dir/src"; git init -q "$dir"
+  git -C "$dir" config user.name "Test"; git -C "$dir" config user.email "test@example.com"
+  printf '// base\n' >"$dir/src/b.ts"; git -C "$dir" add src/b.ts; git -C "$dir" commit -q -m base
+  { printf '// base\n'; printf '%s\n' "$@"; } >"$dir/src/b.ts"
+  git -C "$dir" add src/b.ts; git -C "$dir" commit -q -m head
+}
+REPO_F="$T/repo-f"
+mk_repo_with "$REPO_F" \
+  'if (!x) {' \
+  'if (x == null) return null;' \
+  'const a: Array<T> = [];' \
+  'if (i < n) {' \
+  'app.auth(getUser());' \
+  'router.auth(token);' \
+  'const p = path.join(root, compute());' \
+  'const q = path.join(root, userPath);'
+F_BASE="$(git -C "$REPO_F" rev-parse HEAD~1)"; F_HEAD="$(git -C "$REPO_F" rev-parse HEAD)"
+FDRY="$(bash "$S/plant_mutation.sh" --repo "$REPO_F" --base "$F_BASE" --head "$F_HEAD" --seed 1 --dry-run 2>&1)"
+assert_not_contains "block guard 'if (!x) {' is not a guard_false candidate" "$FDRY" "src/b.ts:2  operator=guard_false"
+assert_contains "single-line guard is a guard_false candidate" "$FDRY" "src/b.ts:3  operator=guard_false"
+assert_not_contains "Array<T> is not a bounds candidate" "$FDRY" "src/b.ts:4  operator=bounds_lt_le"
+assert_contains "'i < n' is a bounds candidate" "$FDRY" "src/b.ts:5  operator=bounds_lt_le"
+assert_not_contains "nested-paren .auth(getUser()) is not a candidate" "$FDRY" "src/b.ts:6  operator=security_strip_auth_guard"
+assert_contains "flat .auth(token) is a candidate" "$FDRY" "src/b.ts:7  operator=security_strip_auth_guard"
+assert_not_contains "nested-paren path.join is not a candidate" "$FDRY" "src/b.ts:8  operator=security_widen_path_join"
+assert_contains "flat path.join is a candidate" "$FDRY" "src/b.ts:9  operator=security_widen_path_join"
+assert_contains "--dry-run header and candidates share one stream" "$FDRY" "candidate site(s)"
+
+OUT_F="$T/planted-f.json"
+bash "$S/plant_mutation.sh" --repo "$REPO_F" --base "$F_BASE" --head "$F_HEAD" --seed 1 --operator security_widen_path_join --run-id mutation-f --out "$OUT_F" >/dev/null 2>&1
+assert_eq "widen_path_join plants (exit 0)" "$?" "0"
+assert_eq "widen_path_join keeps the joined argument (\\1 is the argument group)" "$(jq -r '.mutated_line' "$OUT_F")" "const q = userPath;"
+
+# (g) guards: dirty tree, bad seed, tampered operator table
+REPO_G="$T/repo-g"; mk_fixture_repo "$REPO_G"
+G_BASE="$(git -C "$REPO_G" rev-parse HEAD~1)"; G_HEAD="$(git -C "$REPO_G" rev-parse HEAD)"
+printf '// dirty\n' >>"$REPO_G/src/a.ts"
+bash "$S/plant_mutation.sh" --repo "$REPO_G" --base "$G_BASE" --head "$G_HEAD" --seed 1 --out "$T/planted-g.json" >/dev/null 2>"$T/stderr-g.log"
+assert_eq "dirty tracked tree exits 1" "$?" "1"
+assert_contains "dirty tree names the cause" "$(cat "$T/stderr-g.log")" "uncommitted tracked changes"
+git -C "$REPO_G" checkout -q -- src/a.ts
+bash "$S/plant_mutation.sh" --repo "$REPO_G" --base "$G_BASE" --head "$G_HEAD" --seed abc --out "$T/planted-g.json" >/dev/null 2>&1
+assert_eq "non-integer --seed exits 1 before any mutation" "$?" "1"
+assert_eq "no mutation branch was created for the bad seed" "$(git -C "$REPO_G" branch --list 'mutation/*' | wc -l | tr -d ' ')" "0"
+BAD_OPS="$T/bad-ops.json"
+jq '.[0].replace = "s/x/y/e"' "$OPERATORS" >"$BAD_OPS"
+bash "$S/plant_mutation.sh" --repo "$REPO_G" --base "$G_BASE" --head "$G_HEAD" --seed 1 --operators "$BAD_OPS" --out "$T/planted-g.json" >/dev/null 2>"$T/stderr-ops.log"
+assert_eq "a replace with a sed command flag is rejected (exit 1)" "$?" "1"
+assert_contains "tampered replace is named" "$(cat "$T/stderr-ops.log")" "not a plain s/pat/repl"
+jq '. + [.[0]]' "$OPERATORS" >"$BAD_OPS"
+bash "$S/plant_mutation.sh" --repo "$REPO_G" --base "$G_BASE" --head "$G_HEAD" --seed 1 --operators "$BAD_OPS" --out "$T/planted-g.json" >/dev/null 2>&1
+assert_eq "duplicate operator ids are rejected (exit 1)" "$?" "1"
 
 echo
 echo "── summary ──"

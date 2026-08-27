@@ -6,25 +6,40 @@
     "match": "\\?\\?",
     "replace": "s/\\?\\?/||/",
     "expected_severity": "High",
-    "languages": ["ts", "tsx", "js", "jsx"]
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   },
   {
     "id": "bounds_lt_le",
     "class": "bounds",
-    "description": "Widen a strict less-than bound to less-than-or-equal, introducing an off-by-one that admits one extra element/index.",
-    "match": "<[^=]",
-    "replace": "s/<([^=])/<=\\1/",
+    "description": "Widen a strict less-than bound to less-than-or-equal, introducing an off-by-one that admits one extra element/index. Requires spaces around the operator so TypeScript generics (Array<T>) and JSX tags are never candidates.",
+    "match": " < [^=]",
+    "replace": "s/ < / <= /",
     "expected_severity": "Medium",
-    "languages": ["ts", "tsx", "js", "jsx"]
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   },
   {
     "id": "bounds_gt_ge",
     "class": "bounds",
-    "description": "Widen a strict greater-than bound to greater-than-or-equal, introducing an off-by-one on the upper edge of a range check.",
-    "match": ">[^=]",
-    "replace": "s/>([^=])/>=\\1/",
+    "description": "Widen a strict greater-than bound to greater-than-or-equal, introducing an off-by-one on the upper edge of a range check. Requires spaces around the operator so generics and JSX closing tags are never candidates.",
+    "match": " > [^=]",
+    "replace": "s/ > / >= /",
     "expected_severity": "Medium",
-    "languages": ["ts", "tsx", "js", "jsx"]
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   },
   {
     "id": "async_drop_await",
@@ -33,16 +48,26 @@
     "match": "^[[:space:]]*await ",
     "replace": "s/^([[:space:]]*)await /\\1/",
     "expected_severity": "High",
-    "languages": ["ts", "tsx", "js", "jsx"]
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   },
   {
     "id": "guard_false",
     "class": "guard",
-    "description": "Neuter a null/undefined guard (`if (x == null) return` / `if (!x) return`) by rewriting the condition to always-false, so the guard never fires.",
-    "match": "if \\((\\!|.*== null|.*=== null|.*== undefined|.*=== undefined)",
+    "description": "Neuter a single-line null/undefined guard (`if (x == null) return ...` / `if (!x) return ...`) by rewriting the condition to always-false, so the guard never fires. Block-form guards (`if (!x) {`) are not candidates: the replacement needs the return on the same line.",
+    "match": "if \\((\\!|.*== null|.*=== null|.*== undefined|.*=== undefined).*\\) *return",
     "replace": "s/if \\(.*\\) *return/if (false) return/",
     "expected_severity": "Critical",
-    "languages": ["ts", "tsx", "js", "jsx"]
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   },
   {
     "id": "logic_and_or",
@@ -51,7 +76,12 @@
     "match": "&&",
     "replace": "s/&&/||/",
     "expected_severity": "High",
-    "languages": ["ts", "tsx", "js", "jsx"]
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   },
   {
     "id": "logic_strict_eq_neq",
@@ -60,24 +90,39 @@
     "match": "===",
     "replace": "s/===/!==/",
     "expected_severity": "Critical",
-    "languages": ["ts", "tsx", "js", "jsx"]
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   },
   {
     "id": "security_strip_auth_guard",
     "class": "security",
-    "description": "Remove a leading auth-guard call (`.auth(...)`/`requireAuth(...)`) from the line, so the request proceeds unauthenticated.",
-    "match": "(\\.auth\\(|requireAuth\\()",
+    "description": "Remove an auth-guard call (`.auth(...)`/`requireAuth(...)`) from the line, so the request proceeds unauthenticated. Only calls without nested parentheses are candidates, so the rewrite never leaves a dangling `)`.",
+    "match": "(\\.auth\\([^()]*\\)|requireAuth\\([^()]*\\))",
     "replace": "s/(\\.auth\\([^)]*\\)|requireAuth\\([^)]*\\))//",
     "expected_severity": "Critical",
-    "languages": ["ts", "tsx", "js", "jsx"]
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   },
   {
     "id": "security_widen_path_join",
     "class": "security",
-    "description": "Strip a `path.join(root, ...)` wrapper down to the raw joined argument, dropping the root-confinement it provided and opening a path-traversal hole.",
-    "match": "path\\.join\\([A-Za-z0-9_.]+, *",
+    "description": "Strip a `path.join(root, ...)` wrapper down to the raw joined argument, dropping the root prefix it provided (a first step toward traversal; a post-resolution containment check, if any, is a separate guard). Only calls without nested parentheses are candidates.",
+    "match": "path\\.join\\([A-Za-z0-9_.]+, *[^()]*\\)",
     "replace": "s/path\\.join\\([A-Za-z0-9_.]+, *([^)]*)\\)/\\1/",
     "expected_severity": "Critical",
-    "languages": ["ts", "tsx", "js", "jsx"]
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   }
 ]

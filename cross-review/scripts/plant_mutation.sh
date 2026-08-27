@@ -88,6 +88,24 @@ command -v jq >/dev/null 2>&1 || { echo "plant_mutation: jq required" >&2; exit 
 [[ -n "$seed"     ]] || { echo "plant_mutation: --seed required" >&2; exit 1; }
 [[ -d "$repo"     ]] || { echo "plant_mutation: --repo '$repo' is not a directory" >&2; exit 1; }
 [[ -f "$operators_path" ]] || { echo "plant_mutation: operators table not found: $operators_path" >&2; exit 1; }
+# --seed feeds awk srand() and jq --argjson: anything but a non-negative
+# integer would be silently read as 0 by awk and then break the manifest
+# AFTER the mutation was committed (codex, PR #107 review).
+[[ "$seed" =~ ^[0-9]+$ ]] || { echo "plant_mutation: --seed must be a non-negative integer (got '$seed')" >&2; exit 1; }
+
+# The operators table is data, but its `replace` strings are executed by
+# sed. Accept only a plain single substitution -- `s/<pat>/<repl>/` with an
+# optional g flag -- so a tampered table cannot smuggle in a sed command
+# (GNU sed's `e` flag runs a shell; kimi, PR #107 review). Duplicate ids
+# would make the pick ambiguous (kimi).
+if ! jq -e '[.[].id] | length == (unique | length)' "$operators_path" >/dev/null; then
+  echo "plant_mutation: duplicate operator ids in $operators_path" >&2; exit 1
+fi
+while IFS= read -r r; do
+  if [[ ! "$r" =~ ^s/[^/]+/[^/]*/g?$ ]]; then
+    echo "plant_mutation: operator replace is not a plain s/pat/repl/[g] substitution: $r" >&2; exit 1
+  fi
+done < <(jq -r '.[].replace' "$operators_path")
 
 [[ -z "$run_id" ]] && run_id="mutation-$seed"
 [[ -z "$out"    ]] && out="./planted.json"
@@ -96,6 +114,14 @@ repo="$(cd "$repo" && pwd)"
 
 base_sha="$(git -C "$repo" rev-parse "$base" 2>/dev/null)" || { echo "plant_mutation: bad --base ref: $base" >&2; exit 1; }
 head_sha="$(git -C "$repo" rev-parse "$head" 2>/dev/null)" || { echo "plant_mutation: bad --head ref: $head" >&2; exit 1; }
+
+# A dirty tree could carry a pre-existing edit at the chosen site straight
+# into the "synthetic" commit (codex, PR #107 review). Untracked files are
+# fine; tracked modifications are not.
+if [[ "$dry_run" -eq 0 && -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  echo "plant_mutation: $repo has uncommitted tracked changes; commit or stash them first" >&2
+  exit 1
+fi
 
 # --- parse the diff into added (file, line_no, text) triples -----------------
 # `git diff --unified=0` gives one hunk header per contiguous run of changes
@@ -176,7 +202,7 @@ if [[ "$n_cand" -eq 0 ]]; then
 fi
 
 if [[ "$dry_run" -eq 1 ]]; then
-  echo "plant_mutation: $n_cand candidate site(s) for $base_sha..$head_sha:" >&2
+  echo "plant_mutation: $n_cand candidate site(s) for $base_sha..$head_sha:"
   i=0
   while IFS=$'\t' read -r file line_no op_id; do
     i=$((i + 1))
@@ -187,6 +213,10 @@ fi
 
 # --- deterministic pick via awk srand(seed)/rand() (same technique as
 #     select_roster.sh's draw_picks) -------------------------------------------
+# Same contract as the roster draw: deterministic for a given seed on a given
+# awk. Different awk implementations (gawk/mawk/BSD) seed differently, so a
+# seed reproduces on one machine, not across them -- acceptable for a drill,
+# recorded in planted.json via seed + operator + site.
 pick_idx="$(awk -v seed="$seed" -v n="$n_cand" 'BEGIN { srand(seed); print int(rand() * n) + 1 }')"
 picked_line="$(sed -n "${pick_idx}p" "$cand_tmp")"
 IFS=$'\t' read -r p_file p_line p_op <<<"$picked_line"
@@ -207,6 +237,16 @@ if git -C "$repo" rev-parse --verify --quiet "refs/heads/$mutation_branch" >/dev
 fi
 git -C "$repo" switch -c "$mutation_branch" "$head_sha" -q || { echo "plant_mutation: failed to create branch $mutation_branch" >&2; exit 1; }
 
+# Undo a half-planted mutation: restore the file first (a dirty tree would
+# block the switch), then drop the branch (kimi, PR #107 review).
+abort_plant() {
+  echo "plant_mutation: $1" >&2
+  git -C "$repo" checkout -q -- "$p_file" 2>/dev/null || true
+  git -C "$repo" switch - -q 2>/dev/null || true
+  git -C "$repo" branch -D "$mutation_branch" -q 2>/dev/null || true
+  exit 1
+}
+
 sed -E -i.bak "${p_line}${op_replace}" "$repo/$p_file"
 rm -f "$repo/${p_file}.bak"
 
@@ -216,16 +256,17 @@ diff_stat="$(git -C "$repo" diff HEAD --stat -- 2>/dev/null)"
 files_changed="$(git -C "$repo" diff HEAD --name-only -- 2>/dev/null | wc -l | tr -d ' ')"
 lines_changed="$(git -C "$repo" diff HEAD -U0 -- "$p_file" 2>/dev/null | grep -Ec '^[+-][^+-]')"
 if [[ "$files_changed" -ne 1 || "$lines_changed" -ne 2 ]]; then
-  echo "plant_mutation: mutation did not produce exactly one changed line in one file (files_changed=$files_changed, diff_lines=$lines_changed)" >&2
   echo "$diff_stat" >&2
-  git -C "$repo" switch - -q 2>/dev/null || true
-  git -C "$repo" branch -D "$mutation_branch" -q 2>/dev/null || true
-  exit 1
+  abort_plant "mutation did not produce exactly one changed line in one file (files_changed=$files_changed, diff_lines=$lines_changed)"
 fi
 
-git -C "$repo" add "$p_file"
-git -C "$repo" commit -q -m "chore(mutation): synthetic planted defect (do not merge)"
+# --no-verify: a pre-commit hook could reformat the file and break the
+# one-line invariant (kimi); commit failures roll back instead of reporting
+# the original head as the mutation (codex).
+git -C "$repo" add -- "$p_file" || abort_plant "git add failed"
+git -C "$repo" commit -q --no-verify -m "chore(mutation): synthetic planted defect (do not merge)" || abort_plant "git commit failed"
 mutation_sha="$(git -C "$repo" rev-parse HEAD)"
+[[ "$mutation_sha" != "$head_sha" ]] || abort_plant "commit did not advance HEAD"
 
 out_dir="$(dirname "$out")"
 mkdir -p "$out_dir"
