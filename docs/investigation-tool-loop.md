@@ -91,8 +91,28 @@ budget_exhausted, check_ran, check_rc}` and `tool_policy` `{mode, basis}`;
 ## Progress
 
 - [x] Live checks (above)
-- [ ] `lib_tool_loop.sh` + loop in `run_openrouter_reviewer`
-- [ ] `tool_policy.sh`
-- [ ] profiles + score_findings context kinds
-- [ ] tests (`test_tool_loop.sh`, `test_tool_policy.sh`) wired into `run_tests.sh`
-- [ ] SKILL.md + header docs
+- [x] `lib_tool_loop.sh` + loop in `run_openrouter_reviewer` (bash 3.2-clean; executor runs via redirect, not `$(…)`, so its counters survive)
+- [x] `tool_policy.sh` (ledgers go to jq as `--slurpfile` — the 3.3 MB runlog blew argv on the first live run)
+- [x] profiles `_synthesis_rules.tool_policy` + `tool_read`/`tool_check` context kinds in profiles and `score_findings.sh`
+- [x] tests: `test_tool_loop.sh` (80 asserts, provider shim answers tool_calls then final) and `test_tool_policy.sh` (39 asserts, fixture ledgers) wired into `run_tests.sh`; legacy single-shot suites pinned `CROSS_REVIEW_TOOL_MODE=off`
+- [x] SKILL.md step 2.5b + reviewer notes; `run_reviewers.sh` header
+
+## Live check against the real ledgers (2026-08-27)
+
+`tool_policy.sh --all --mode table` on the production runlog: every chat seat with
+history sits on the `off` arm at mean ≈ 0.62–0.70 (codex's fallback rows: 0.70 at
+$0.042/run); the untried `read` arm's optimistic prior (0.75 + exploration bonus)
+wins, so the first rounds explore `read` everywhere, as intended. `kimi3` (one
+perfect `off` run, mean 1.0) stays `off` until the bonus decays — also as intended.
+
+## Not done / follow-ups
+
+- `run_kimi` (the Kimi CLI baseline) and the agy laps are untouched. kimi could
+  ride the same loop via Moonshot's endpoint (the `kimi27` lane already does);
+  the CLI seat is left as the deliberate "deep single-turn reasoning" niche.
+- No live round has run with tools on yet; the first ones are the learner's
+  first `read` samples. Watch `tool_stats.steps`, `read_bytes`, `rf_dropped`
+  per provider in the runlog — a provider that 400s on `response_format`+tools
+  will show `rf_dropped: true` and should get `supports_json_object: false`.
+- Two pre-existing `test_file_context.sh` failures (`< /file>` defuse rendering)
+  reproduce on pristine HEAD `26f338e`; not introduced here.

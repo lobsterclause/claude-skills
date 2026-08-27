@@ -1239,7 +1239,7 @@ printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings
 echo "── standalone suites: json-output / score / report-block / digest ──"
 # Each standalone suite exits 0 all-green, 1 on any failure; fold into this
 # harness as one assertion per suite so CI stays a single entrypoint.
-for suite in test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan; do
+for suite in test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan test_tool_loop test_tool_policy; do
   if [[ -f "$SKILL_DIR/tests/$suite.sh" ]]; then
     if bash "$SKILL_DIR/tests/$suite.sh" >"$T/$suite.log" 2>&1; then
       ok "$suite suite green ($(grep -oE '[0-9]+ passed' "$T/$suite.log" | tail -1))"

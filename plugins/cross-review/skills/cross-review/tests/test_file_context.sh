@@ -41,6 +41,11 @@ command -v jq >/dev/null 2>&1 || { echo "jq required to run these tests" >&2; ex
 mkdir -p "$T/bin"
 export PATH="$T/bin:$PATH"
 export OPENROUTER_API_KEY="sk-or-test-shim"
+# This suite asserts the SINGLE-SHOT lane contract. The tool loop (default
+# --tool-mode auto, 2026-08-27) is covered by tests/test_tool_loop.sh; pin it
+# off here so a learned `read` arm cannot change the meta/prompt shape under
+# these assertions.
+export CROSS_REVIEW_TOOL_MODE=off
 export HOME="$T/home"
 mkdir -p "$HOME"
 
