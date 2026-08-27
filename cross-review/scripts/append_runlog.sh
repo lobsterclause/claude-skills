@@ -344,6 +344,10 @@ enrich_with_findings() {
 # profile_hash (#90). No-op for skipped reviewers, so a reviewer with no
 # meta this round gets no row change at all — status "skipped" stays the
 # entire object.
+# Every enrichment step is fail-open: if a jq step fails (e.g. tokens_prompt
+# arrives as a string and the cost multiplication errors), the pre-enrichment
+# row survives, so the entry still lands instead of --argjson crashing on an
+# empty string and dropping the whole pass (gemini-pro, PR #128 review).
 enrich_with_context_and_profile() {
   local name="$1" rjson="$2"
   if [[ -z "$rjson" || "$(jq -r '.status // empty' <<<"$rjson")" == "skipped" ]]; then
@@ -365,7 +369,7 @@ enrich_with_context_and_profile() {
         elif ($ca == "diff_only") then "diff"
         elif ($cli == "codex" or $cli == "agy") then "tools"
         else "diff" end
-      )}' <<<"$rjson" 2>/dev/null)"
+      )}' <<<"$rjson" 2>/dev/null || printf '%s' "$rjson")"
 
   # cost_usd_estimated / cost_estimated (#123): a billed row (cost_usd
   # present) is authoritative and gets cost_estimated:false, no estimate
@@ -389,7 +393,7 @@ enrich_with_context_and_profile() {
       | . + {cost_usd_estimated: $rounded, cost_estimated: true}
     else
       .
-    end' <<<"$rjson" 2>/dev/null)"
+    end' <<<"$rjson" 2>/dev/null || printf '%s' "$rjson")"
 
   # profile_hash (#90): first 12 hex of sha1(jq -cS of the seat's canonical
   # profile entry). Absent when the seat has no profile entry, or when no
@@ -400,7 +404,7 @@ enrich_with_context_and_profile() {
     if [[ -n "$profile_entry" ]]; then
       phash="$(printf '%s' "$profile_entry" | sha1_of | cut -c1-12)"
       if [[ "$phash" =~ ^[0-9a-f]{12}$ ]]; then
-        rjson="$(jq -c --arg h "$phash" '. + {profile_hash: $h}' <<<"$rjson" 2>/dev/null)"
+        rjson="$(jq -c --arg h "$phash" '. + {profile_hash: $h}' <<<"$rjson" 2>/dev/null || printf '%s' "$rjson")"
       fi
     fi
   fi

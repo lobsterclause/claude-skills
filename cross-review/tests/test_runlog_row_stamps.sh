@@ -176,6 +176,15 @@ PIN_WITH="$(tail -1 "$PINLOG")"
 assert_eq "pin: omitting run-id/roster-decision still byte-matches on everything else" \
   "$PIN_BASELINE" "$(jq -Sc 'del(.ts, .run_id, .roster_decision)' <<<"$PIN_WITH")"
 
+# ── PR #128 review: a malformed meta (tokens as strings) must not drop the
+#    whole entry; the row survives un-enriched ────────────────────────────────
+RUN_BAD="$T/run-bad"; mkdir -p "$RUN_BAD/raw"
+printf '{"exit_code":0,"duration_s":40,"timed_out":false,"output_bytes":500,"attempt":1,"timeout_budget_s":950,"cli":"moonshot","context_access":"file_context","tokens_prompt":"1000000","tokens_completion":"100000"}\n' >"$RUN_BAD/raw/kimi3.meta.json"
+LOG_BAD="$T/runlog-bad.jsonl"; : >"$LOG_BAD"
+CROSS_REVIEW_RUNLOG="$LOG_BAD" bash "$S/append_runlog.sh" --run-dir "$RUN_BAD" --project t --base main --pr - --pass 1 --verdict CLEAN --run-id r-bad --profiles "$T/profiles.json" >/dev/null 2>&1
+assert_eq "malformed meta: the entry still lands" "$(jq -r '.run_id' "$LOG_BAD" 2>/dev/null)" "r-bad"
+assert_eq "malformed meta: the reviewer row is present" "$(jq -r '.reviewers.kimi3.status' "$LOG_BAD" 2>/dev/null)" "ok"
+
 echo ""
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]] || exit 1
