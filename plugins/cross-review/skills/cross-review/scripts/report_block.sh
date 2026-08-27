@@ -32,11 +32,15 @@
 # Behavior:
 #   - Findings with factcheck.verdict=="drop" are EXCLUDED from all counts,
 #     convergence, and Top selection.
-#   - "convergent" = kept findings whose `sources` map to >= 2 DISTINCT
-#     providers (not raw reviewer count) — e.g. kimi+kimi27 (both moonshot)
-#     is NOT convergent; codex+kimi (openai+moonshot) IS.
+#   - "convergent" = a finding's own `convergent` field when the input is
+#     score_findings.sh output (that scorer also weighs what the agreeing
+#     seats could SEE — two hunk-only seats do not converge, issue #70);
+#     otherwise kept findings whose `sources` map to >= 2 DISTINCT providers
+#     (not raw reviewer count) — e.g. kimi+kimi27 (both moonshot) is NOT
+#     convergent; codex+kimi (openai+moonshot) IS.
 #   - "Top" selection: highest severity first (Critical > High > Medium >
-#     Low), then most distinct providers, then first occurrence in the
+#     Low), then the scorer's capability_votes when present (falling back
+#     to most distinct providers on unscored input), then first occurrence in the
 #     input array (stable, deterministic tie-break). Formatted exactly:
 #       <file>:<line> — <claim> [<severity>][<source1>+<source2>]
 #   - Empty/all-dropped findings -> C:0 H:0 M:0 L:0 and `Top:     —`.
@@ -122,10 +126,12 @@ n_c="$(jq '[.[] | select(.f.severity == "Critical")] | length' <<<"$kept")"
 n_h="$(jq '[.[] | select(.f.severity == "High")] | length' <<<"$kept")"
 n_m="$(jq '[.[] | select(.f.severity == "Medium")] | length' <<<"$kept")"
 n_l="$(jq '[.[] | select(.f.severity == "Low")] | length' <<<"$kept")"
-n_convergent="$(jq '[.[] | select(.f.provider_count >= 2)] | length' <<<"$kept")"
+# Prefer the scorer's verdict (it knows capability, not just provider count);
+# recompute from providers only for unscored input.
+n_convergent="$(jq '[.[] | select(if (.f.convergent | type) == "boolean" then .f.convergent else .f.provider_count >= 2 end)] | length' <<<"$kept")"
 
 top_line="$(jq -r '
-  sort_by([-(.f.sev_rank), -(.f.provider_count), .orig_index])
+  sort_by([-(.f.sev_rank), -(if (.f.capability_votes | type) == "number" then .f.capability_votes else .f.provider_count end), .orig_index])
   | .[0]
   | if . == null then "—"
     else "\(.f.file):\(.f.line) — \(.f.claim) [\(.f.severity)][\((.f.sources // []) | join("+"))]"
