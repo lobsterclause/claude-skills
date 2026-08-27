@@ -2785,6 +2785,33 @@ done
 assert_eq "every openrouter seat declares a provider (else it is not an independent vote)" \
   "${WIRE_NOPROV# }" ""
 
+echo "── standalone tests (tests/test_*.sh) ──"
+# Auto-discovers every tests/test_*.sh and runs it, so a new standalone test
+# file is wired into this suite automatically (#103) instead of relying on
+# someone remembering to add it to a static list. audit_roster, plant_mutation,
+# severity_calibration, validate_ledgers, and fingerprint_namespace previously
+# shipped with no caller at all. Suites already asserted individually above
+# (the "for suite in ..." loop, kept for its per-suite pass-count reporting)
+# are skipped here to avoid running them twice. Keyed on exit code, not on
+# each suite's own summary text — the four legacy files print that in
+# slightly different shapes (`PASS=n FAIL=m`, `PASS: n  FAIL: m`).
+ALREADY_RUN_SUITES=(test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan)
+for f in "$SKILL_DIR"/tests/test_*.sh; do
+  [[ -f "$f" ]] || continue
+  base="$(basename "$f" .sh)"
+  skip=0
+  for s in "${ALREADY_RUN_SUITES[@]}"; do
+    [[ "$base" == "$s" ]] && { skip=1; break; }
+  done
+  [[ "$skip" -eq 1 ]] && continue
+  STANDALONE_LOG="$T/standalone-$base.log"
+  if bash "$f" >"$STANDALONE_LOG" 2>&1; then
+    ok "$(basename "$f") ($(tail -1 "$STANDALONE_LOG"))"
+  else
+    bad "$(basename "$f") — tail: $(tail -3 "$STANDALONE_LOG" | tr '\n' ' ')"
+  fi
+done
+
 echo "── dual-copy identity (repo context only) ──"
 
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
