@@ -88,9 +88,11 @@ _emit_lifecycle_event() {
   local event="$1" fields="$2"
   local script_dir stderr_out
   script_dir="$(cd "$(dirname "$0")" && pwd)"
+  local rc=0
   stderr_out="$(bash "$script_dir/append_finding_event.sh" --event "$event" \
-    --finding-id "$finding_id" --run-id "$emit_events_run_id" --fields "$fields" 2>&1 >/dev/null)"
-  if [[ "$(printf '%s\n' "$stderr_out" | grep -c .)" -gt 1 ]]; then
+    --finding-id "$finding_id" --run-id "$emit_events_run_id" --fields "$fields" 2>&1 >/dev/null)" || rc=$?
+  # non-zero exit, or anything but the single success line, is a failure
+  if [[ "$rc" -ne 0 || "$stderr_out" != "appended finding event:"* || "$(printf '%s\n' "$stderr_out" | grep -c .)" -gt 1 ]]; then
     echo "WARN: verify_fix_safety: event append failed for event=$event finding_id=$finding_id: $stderr_out" >&2
   fi
 }

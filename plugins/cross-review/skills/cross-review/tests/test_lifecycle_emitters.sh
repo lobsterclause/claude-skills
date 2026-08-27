@@ -116,6 +116,37 @@ assert_eq "(d) first_reviewer is the first seat (alpha)" \
   "$(jq -r 'select(.event=="duplicate_merged") | .first_reviewer' "$T/ev_d.jsonl")" "alpha"
 assert_not_contains "(d) no duplicate_merged naming gamma" \
   "$(jq -c 'select(.event=="duplicate_merged")' "$T/ev_d.jsonl")" "gamma"
+assert_contains "(d) without a project the ids are f-dup-* and a WARN says they will not join" "$(cat "$T/d.err")" "will not join"
+
+# ── PR #131 review: ids must equal what fingerprint_findings.sh mints for the
+#    same (project, file, claim); a seat repeating itself is not a duplicate;
+#    an append failure is reported even when it is one line ──────────────────
+export CROSS_REVIEW_FINDING_EVENTS="$T/ev_d2.jsonl"
+bash "$S/merge_raw_findings.sh" --raw "$MRAW" --out "$T/merged2.json" --emit-events r5 --project test-project >/dev/null 2>&1
+unset CROSS_REVIEW_FINDING_EVENTS
+DUP_ID="$(jq -r 'select(.event=="duplicate_merged") | .finding_id' "$T/ev_d2.jsonl")"
+printf '{"findings":[{"id":"f1","file":"a.sh","line":3,"snippet":"rm -rf $x","claim":"unquoted var can expand to nothing and rm -rf /","sources":["alpha"]}]}\n' >"$T/fp-in.json"
+bash "$S/fingerprint_findings.sh" --findings "$T/fp-in.json" --project test-project --out "$T/fp-out.json" >/dev/null 2>&1
+FP_ID="$(jq -r '.findings[0].id' "$T/fp-out.json")"
+assert_eq "duplicate_merged id equals the fingerprinted id for the same project/file/claim" "$DUP_ID" "$FP_ID"
+MRAW2="$T/mraw2"; mkdir -p "$MRAW2"
+cat >"$MRAW2/alpha.stdout" <<'EOF'
+{"findings":[{"severity":"High","file":"a.sh","line":3,"snippet":"x","claim":"same claim twice"},{"severity":"High","file":"a.sh","line":9,"snippet":"y","claim":"same claim twice"}]}
+EOF
+export CROSS_REVIEW_FINDING_EVENTS="$T/ev_d3.jsonl"; : >"$T/ev_d3.jsonl"
+bash "$S/merge_raw_findings.sh" --raw "$MRAW2" --out "$T/merged3.json" --emit-events r6 --project test-project >/dev/null 2>&1
+unset CROSS_REVIEW_FINDING_EVENTS
+assert_eq "a seat repeating its own claim emits no duplicate_merged" "$(jq -r 'select(.event=="duplicate_merged")' "$T/ev_d3.jsonl" | jq -s 'length')" "0"
+if [[ "$(id -u)" -ne 0 ]]; then
+  mkdir -p "$T/ro-ev" && chmod 500 "$T/ro-ev"
+  ERR7="$(CROSS_REVIEW_FINDING_EVENTS="$T/ro-ev/ev.jsonl" bash "$S/merge_raw_findings.sh" --raw "$MRAW" --out "$T/merged4.json" --emit-events r7 --project test-project 2>&1 >/dev/null)"; rc7=$?
+  chmod 700 "$T/ro-ev"
+  assert_eq "merge still exits 0 when the events path is unwritable" "$rc7" "0"
+  assert_contains "merge reports the failed append" "$ERR7" "event append failed"
+else
+  ok "merge reports the failed append (skipped as root)"
+fi
+bash "$S/merge_raw_findings.sh" --raw >/dev/null 2>&1; assert_eq "--raw without a value exits 2" "$?" "2"
 
 echo "── (e) SKILL.md carries the lifecycle wiring literally (grep test) ──"
 SKILL_MD="$SKILL_DIR/SKILL.md"

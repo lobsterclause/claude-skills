@@ -54,15 +54,35 @@ set -uo pipefail
 raw=""
 out=""
 emit_events_run_id=""
+project=""
+repo_root=""
 
+need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --raw)         raw="${2:-}";                shift 2 ;;
-    --out)         out="${2:-}";                 shift 2 ;;
-    --emit-events) emit_events_run_id="${2:-}";  shift 2 ;;
+    --raw)         need_val "$1" "$#"; raw="$2";                shift 2 ;;
+    --out)         need_val "$1" "$#"; out="$2";                shift 2 ;;
+    --emit-events) need_val "$1" "$#"; emit_events_run_id="$2"; shift 2 ;;
+    --project)     need_val "$1" "$#"; project="$2";            shift 2 ;;
+    --repo-root)   need_val "$1" "$#"; repo_root="$2";          shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# duplicate_merged must join the ledger by the SAME id fingerprint_findings.sh
+# will mint later (sha1 of project\x1ffile\x1fclaim_norm), or leaderboard.sh /
+# severity_calibration.sh never resolve it (antigravity, PR #131 review). The
+# project namespace comes from --project or --repo-root exactly as in
+# fingerprint_findings.sh; without either, ids fall back to f-dup-<hash> and a
+# WARN says they will not join.
+if [[ -n "$project" && -n "$repo_root" ]]; then
+  echo "merge_raw_findings: --project and --repo-root are mutually exclusive" >&2; exit 2
+fi
+if [[ -n "$repo_root" ]]; then
+  # shellcheck source=lib_project_namespace.sh
+  source "$(cd "$(dirname "$0")" && pwd)/lib_project_namespace.sh"
+  project="$(derive_project "$repo_root")"
+fi
 
 if [[ -z "$raw" || -z "$out" ]]; then
   echo "usage: $0 --raw <dir> --out <findings.json>" >&2
@@ -157,7 +177,12 @@ for f in "${sorted[@]}"; do
           | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         # \x1f (unit separator) joins file/claim, same convention as
         # fingerprint_findings.sh, so a literal "|" in either can't collide.
-        hash="$(printf '%s\x1f%s' "$file" "$claim_norm" | sha1_of)"
+        # identical input to fingerprint_findings.sh when a project is known
+        if [[ -n "$project" ]]; then
+          hash="$(printf '%s\x1f%s\x1f%s' "$project" "$file" "$claim_norm" | sha1_of)"
+        else
+          hash="$(printf '%s\x1f%s' "$file" "$claim_norm" | sha1_of)"
+        fi
         jq -nc --arg hash "$hash" --arg reviewer "$reviewer" --arg file "$file" \
           --arg claim "$claim_norm" --arg local_id "$local_id" \
           '{hash: $hash, reviewer: $reviewer, file: $file, claim: $claim,
@@ -186,6 +211,8 @@ if [[ -n "$emit_events_run_id" ]]; then
         {seen: {}, events: []};
         if (.seen[$e.hash] // null) == null
         then .seen[$e.hash] = {first: $e.reviewer, sources: [$e.reviewer]}
+        elif (.seen[$e.hash].sources | index($e.reviewer)) != null
+        then .   # the same seat repeating itself is not an echo of another seat
         else (
           .seen[$e.hash].sources += [$e.reviewer]
           | .events += [{
@@ -200,13 +227,23 @@ if [[ -n "$emit_events_run_id" ]]; then
         end
       ) | .events[]
     ' "$dup_track")"
+    if [[ -z "$project" && -n "$dup_events" ]]; then
+      echo "WARN: merge_raw_findings: no --project/--repo-root, duplicate_merged ids are f-dup-* and will not join fingerprinted findings" >&2
+    fi
     while IFS= read -r ev; do
       [[ -z "$ev" ]] && continue
-      finding_id="f-dup-$(jq -r '.claim_hash' <<<"$ev")"
+      if [[ -n "$project" ]]; then
+        finding_id="f-$(jq -r '.claim_hash' <<<"$ev")"
+      else
+        finding_id="f-dup-$(jq -r '.claim_hash' <<<"$ev")"
+      fi
       fields="$(jq -c '{reviewer, first_reviewer, sources, local_id, file, claim_hash}' <<<"$ev")"
+      rc=0
       stderr_out="$(bash "$script_dir/append_finding_event.sh" --event duplicate_merged \
-        --finding-id "$finding_id" --run-id "$emit_events_run_id" --fields "$fields" 2>&1 >/dev/null)"
-      if [[ "$(printf '%s\n' "$stderr_out" | grep -c .)" -gt 1 ]]; then
+        --finding-id "$finding_id" --run-id "$emit_events_run_id" --fields "$fields" 2>&1 >/dev/null)" || rc=$?
+      # a failure is a non-zero exit OR anything but the single success line
+      # (a one-line bash redirect error used to slip past a line count)
+      if [[ "$rc" -ne 0 || "$stderr_out" != "appended finding event:"* || "$(printf '%s\n' "$stderr_out" | grep -c .)" -gt 1 ]]; then
         echo "WARN: merge_raw_findings: event append failed for duplicate_merged finding_id=$finding_id: $stderr_out" >&2
       fi
     done < <(printf '%s\n' "$dup_events")
