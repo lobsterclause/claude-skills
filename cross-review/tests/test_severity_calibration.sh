@@ -147,6 +147,16 @@ assert_eq "eps resolved is 1" "$(jq -r '.[] | select(.reviewer=="eps") | .resolv
 assert_eq "duplicate proposed keeps the last row in ledger order (zeta Critical)" \
   "$(jq -r '.[] | select(.reviewer=="zeta") | .severity_share.Critical' <<<"$J4")" "1.00"
 
+# ── Fixture 5 (pass 3): tuple keys cannot collide on a "::" inside a field
+FIX5="$T/events5.jsonl"
+cat >"$FIX5" <<'EOF'
+{"reviewer":"eta","severity":"Low","finding_id":"a::b","run_id":"c","event":"proposed","ts":"2026-08-05T00:00:00Z"}
+{"reviewer":"eta","severity":"Low","finding_id":"a","run_id":"b::c","event":"proposed","ts":"2026-08-05T00:00:00Z"}
+EOF
+J5="$(bash "$S/severity_calibration.sh" --events "$FIX5" --json)"
+assert_eq "distinct tuples that concatenate identically both survive dedupe" \
+  "$(jq -r '.[] | select(.reviewer=="eta") | .proposed' <<<"$J5")" "2"
+
 echo "── argument validation ──"
 bash "$S/severity_calibration.sh" --events "$FIX1" --min-sample foo >/dev/null 2>"$T/err"; rc=$?
 assert_eq "--min-sample foo exits 2" "$rc" "2"

@@ -156,7 +156,9 @@ report="$(jq -c -s --arg cutoff "$cutoff" --argjson min_sample "$min_sample" '
      | (if $cutoff != "" then map(select((.ts // "") >= $cutoff)) else . end)
      # keep the LAST duplicate in ledger order (unique_by sorts and keeps
      # the first, which would pick by key order rather than recency)
-     | (reduce .[] as $e ({}; .[($e.finding_id + "::" + $e.run_id + "::" + $e.reviewer)] = $e) | [.[]])
+     # key is the JSON-encoded tuple, so a "::" inside any field cannot
+     # collide two distinct tuples (codex, pass 3)
+     | (reduce .[] as $e ({}; .[([$e.finding_id, $e.run_id, $e.reviewer] | tojson)] = $e) | [.[]])
      | map(. + {sev: norm_sev})) as $proposed
   # Terminal status: the LATEST terminal event in ledger order wins, so a
   # human_accepted appended after a factcheck_dropped reads as kept (codex +
