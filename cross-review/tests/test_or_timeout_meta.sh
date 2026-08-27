@@ -2,8 +2,9 @@
 # test_or_timeout_meta.sh — an OpenRouter lane that times out after receiving
 # only whitespace keepalives must still write VALID meta.json (issue #74).
 #
-# Reproduces the observed shape: curl exits 28 after writing ~15KB of blank
-# lines to response.json. jq on whitespace-only input prints nothing with
+# Reproduces the observed shape: curl exits 28 after writing only blank
+# lines to response.json (the real lanes wrote ~15KB; ~480B is enough — jq
+# prints nothing on whitespace-only input whatever its size). jq on whitespace-only input prints nothing with
 # rc 0, so a naive `jq ... || echo null` leaves the usage fields empty and
 # the meta printf splices `"cost_usd": ,` — unparseable by every consumer.
 #
@@ -23,20 +24,28 @@ bad() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 assert_eq() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (got: '$2' want: '$3')"; fi; }
 
 command -v jq >/dev/null 2>&1 || { echo "jq required" >&2; exit 1; }
-mkdir -p "$T/bin"; export PATH="$T/bin:$PATH"
 export OPENROUTER_API_KEY="sk-or-test-shim"
 export HOME="$T/home"; mkdir -p "$HOME"
+# The shim lives in the SANDBOXED $HOME/.local/bin: run_reviewers.sh prepends
+# /usr/local/bin, /opt/homebrew/bin and $HOME/.local/bin (last one wins the
+# front), so a shim merely at the head of the inherited PATH would be
+# shadowed by a real curl in a homebrew prefix (codex, PR #79).
+mkdir -p "$HOME/.local/bin"; export PATH="$HOME/.local/bin:$PATH"
+# The lane's context mode is read from the environment; pin it so a caller's
+# CROSS_REVIEW_CONTEXT_MODE=diff cannot fail the context_access assertion
+# for an unrelated reason (kimi, PR #79).
+export CROSS_REVIEW_CONTEXT_MODE=files
 
 # curl shim: stream whitespace keepalives to stdout, then fail like a timeout.
-cat >"$T/bin/curl" <<'SHIM'
+cat >"$HOME/.local/bin/curl" <<'SHIM'
 #!/bin/sh
 i=0; while [ $i -lt 40 ]; do printf '         \n\n'; i=$((i+1)); done
 exit 28
 SHIM
-chmod +x "$T/bin/curl"
+chmod +x "$HOME/.local/bin/curl"
 
 REPO="$T/repo"; mkdir -p "$REPO"
-( cd "$REPO" && git init -q -b main 2>/dev/null || git init -q
+( cd "$REPO" && { git init -q -b main 2>/dev/null || { git init -q && git symbolic-ref HEAD refs/heads/main; }; }
   printf 'a\n' >f.txt && git add . && git -c user.email=t@t -c user.name=t commit -qm init
   git checkout -qb feat && printf 'a\nb\n' >f.txt && git add . && git -c user.email=t@t -c user.name=t commit -qm change )
 
