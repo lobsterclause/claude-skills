@@ -924,6 +924,19 @@ context_mode_json() {
   esac
 }
 
+# intended_context_mode_json <reviewer-slug> — the context_mode a text-only
+# lane WOULD have been given, for meta.json rows written before the prompt is
+# built (the no_model_configured early exit). Same table as context_mode_json,
+# resolved from the inputs instead of the outcome: a snapshot file for the
+# slug wins, then --context-mode files, else diff. Stamping a constant there
+# misreported --context-mode files rounds as "diff" (cross-review of #130).
+intended_context_mode_json() {
+  if snapshot_for "$1" >/dev/null; then printf '"files"'
+  elif [[ "$context_mode" == "files" ]]; then printf '"files"'
+  else printf '"diff"'
+  fi
+}
+
 # snapshot_for <reviewer-slug> — prints the path to that reviewer's
 # repomix-handoff snapshot under $snapshot_dir (checked in .md, .xml, .txt
 # order — first match wins) and returns 0, or returns 1 with nothing printed
@@ -1116,8 +1129,8 @@ run_openrouter_reviewer() {
   # reading a 404 as reviewer unreliability.
   if [[ -z "$model" ]]; then
     echo "$slug: no model configured — add \"model\" to references/reviewer_profiles.json (this script keeps no fallback copy)" >&2
-    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured", "context_mode": "diff"}\n' \
-      "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$cli" >"$out/${slug}.meta.json"
+    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured", "context_mode": %s}\n' \
+      "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$cli" "$(intended_context_mode_json "$slug")" >"$out/${slug}.meta.json"
     return 2
   fi
   local key

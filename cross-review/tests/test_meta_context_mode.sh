@@ -159,6 +159,31 @@ check_keys "glm.meta.json" "$T/o5/glm.meta.json" "$OR_KEYS_BEFORE"
 check_keys "kimi.meta.json" "$T/o5/kimi.meta.json" "$KIMI_KEYS_BEFORE"
 check_keys "antigravity.meta.json" "$T/o5/antigravity.meta.json" "$AGY_KEYS_BEFORE"
 
+echo "── (f) no_model_configured early exit stamps the INTENDED mode, not a constant ──"
+# The early exit fires before the prompt (and context_access) exists, so the
+# lane never received anything; the row must still say what the round asked
+# for. Same technique as run_tests.sh: drop .glm.model from the profile file
+# the script reads, restore on every exit path.
+PROFILES="$S/../references/reviewer_profiles.json"
+cp "$PROFILES" "$T/profiles.bak"
+trap 'cp "$T/profiles.bak" "$PROFILES"; rm -rf "$T"' EXIT
+jq 'del(.glm.model)' "$T/profiles.bak" >"$PROFILES"
+bash "$S/run_reviewers.sh" --base main --out "$T/o6" \
+  --reviewers glm --context-mode files >/dev/null 2>&1 || true
+assert_eq "no_model_configured row exists" \
+  "$(jq -r '.failure_kind' "$T/o6/glm.meta.json" 2>/dev/null)" "no_model_configured"
+assert_eq "no_model_configured + --context-mode files -> context_mode files" \
+  "$(jq -r '.context_mode' "$T/o6/glm.meta.json")" "files"
+bash "$S/run_reviewers.sh" --base main --out "$T/o7" \
+  --reviewers glm --context-mode diff >/dev/null 2>&1 || true
+assert_eq "no_model_configured + --context-mode diff -> context_mode diff" \
+  "$(jq -r '.context_mode' "$T/o7/glm.meta.json")" "diff"
+bash "$S/run_reviewers.sh" --base main --out "$T/o8" \
+  --reviewers glm --context-mode diff --snapshot-dir "$SNAP" >/dev/null 2>&1 || true
+assert_eq "no_model_configured + snapshot present -> context_mode files" \
+  "$(jq -r '.context_mode' "$T/o8/glm.meta.json")" "files"
+cp "$T/profiles.bak" "$PROFILES"
+
 echo ""
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]] || exit 1
