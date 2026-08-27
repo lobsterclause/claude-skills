@@ -160,6 +160,7 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
           reviewer: .reviewer,
           weight: (.weight // 0),
           selected: (.selected // false),
+          draw_boost: .draw_boost,
           ts: $e.ts,
           epoch: $ets,
           idx: $idx,
@@ -185,6 +186,7 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
         (map(select(.selected == true) | .idx)) as $di
         | if ($di | length) == 0 then null else ($di | max) end
       ),
+      last_draw_boost: (max_by(.idx) | .draw_boost),
       any_weight_positive_count: (map(select(.weight > 0)) | length)
     })) as $seats
 
@@ -218,7 +220,8 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
             rounds_since_drawn: $rounds_since,
             any_weight_positive_count: $s.any_weight_positive_count,
             eligible_for_ratio_warn: ($s.candidate_count >= 10),
-            starved: ($s.any_weight_positive_count >= 10 and $s.draws == 0)
+            starved: ($s.any_weight_positive_count >= 10 and $s.draws == 0),
+            last_draw_boost: $s.last_draw_boost
           }
       ) | sort_by(.reviewer))
     }
@@ -258,16 +261,27 @@ printf '%s' "$result" | jq -r '.seats[] |
   done
 
 echo ""
-warn_lines="$(printf '%s' "$result" | jq -r '.seats[] |
+# check_draw_boost (#104): annotate an over-drawn/under-drawn/starved WARN
+# with the seat's most recently RECORDED draw_boost (from
+# roster_decision.candidates -- the value actually used for the draw, not
+# the profile file) when that value is < 0.25, so a nemotron-style
+# draw_boost-stuck-at-0 bug is root-caused in one glance instead of
+# hand-counting draws across dozens of rounds.
+warn_lines="$(printf '%s' "$result" | jq -r '
+  def boost_suffix: if .last_draw_boost != null and .last_draw_boost < 0.25
+    then " — check draw_boost (last recorded \(.last_draw_boost))" else "" end;
+  .seats[] |
   if .eligible_for_ratio_warn and .ratio != null and .ratio > 2 then
-    "WARN \(.reviewer) over-drawn (ratio \(.ratio) > 2.0; drawn \(.draws)/\(.candidate_count) candidate rounds)"
+    "WARN \(.reviewer) over-drawn (ratio \(.ratio) > 2.0; drawn \(.draws)/\(.candidate_count) candidate rounds)\(boost_suffix)"
   elif .eligible_for_ratio_warn and .ratio != null and .ratio < 0.5 then
-    "WARN \(.reviewer) under-drawn (ratio \(.ratio) < 0.5; drawn \(.draws)/\(.candidate_count) candidate rounds)"
+    "WARN \(.reviewer) under-drawn (ratio \(.ratio) < 0.5; drawn \(.draws)/\(.candidate_count) candidate rounds)\(boost_suffix)"
   else empty end
 ')"
-starved_lines="$(printf '%s' "$result" | jq -r '.seats[] |
-  select(.starved == true) |
-  "WARN \(.reviewer) starved (weight > 0 in \(.any_weight_positive_count) of \(.candidate_count) candidate rounds, never drawn)"
+starved_lines="$(printf '%s' "$result" | jq -r '
+  def boost_suffix: if .last_draw_boost != null and .last_draw_boost < 0.25
+    then " — check draw_boost (last recorded \(.last_draw_boost))" else "" end;
+  .seats[] | select(.starved == true) |
+  "WARN \(.reviewer) starved (weight > 0 in \(.any_weight_positive_count) of \(.candidate_count) candidate rounds, never drawn)\(boost_suffix)"
 ')"
 
 all_warn="$(printf '%s\n%s\n' "$warn_lines" "$starved_lines" | sed '/^$/d')"

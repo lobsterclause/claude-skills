@@ -136,6 +136,36 @@ printf '{"ts":"2026-08-01T00:00:00Z","schema_version":"x\\ty"}\n' >"$TABLOG"
 TJ="$(bash "$S/validate_ledgers.sh" --runlog "$TABLOG" --events "$SHAPE_EVENTS" --json 2>/dev/null)"
 assert_eq "a schema_version with a tab still yields valid --json" "$(printf '%s' "$TJ" | jq -r '.runlog.schema_version | to_entries[0].value')" "1"
 
+echo "── future schema_version WARN (#122) ──"
+FUTLOG="$T/future-runlog.jsonl"
+cat >"$FUTLOG" <<'EOF'
+{"schema_version": 7, "ts": "2026-08-01T00:00:00Z", "run_id": "fut1"}
+EOF
+FUTOUT="$(bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$EVENTS" 2>&1)"; futrc=$?
+assert_eq "future schema_version does not fail the run (exit 0)" "$futrc" "0"
+assert_contains "future schema_version WARN names it" "$FUTOUT" "above the writer's current"
+FUTJ="$(bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$EVENTS" --json 2>/dev/null)"
+assert_eq "--json runlog.future_version == 1" "$(printf '%s' "$FUTJ" | jq -r '.runlog.future_version')" "1"
+
+echo "── legacy no-ts rows (#111) ──"
+LEGLOG="$T/legacy-runlog.jsonl"
+cat >"$LEGLOG" <<'EOF'
+{"run_id":"legacy1"}
+EOF
+LEGOUT="$(bash "$S/validate_ledgers.sh" --runlog "$LEGLOG" --events "$EVENTS" 2>&1)"; legrc=$?
+assert_eq "a legacy no-ts/no-schema_version row is a WARN, not an ERROR (exit 0)" "$legrc" "0"
+assert_contains "legacy no-ts row is reported as WARN legacy" "$LEGOUT" "WARN  legacy: runlog:1 has no ts (pre-schema entry)"
+LEGJ="$(bash "$S/validate_ledgers.sh" --runlog "$LEGLOG" --events "$EVENTS" --json 2>/dev/null)"
+assert_eq "--json runlog.legacy_no_ts == 1" "$(printf '%s' "$LEGJ" | jq -r '.runlog.legacy_no_ts')" "1"
+
+VERLOG="$T/versioned-noTS-runlog.jsonl"
+cat >"$VERLOG" <<'EOF'
+{"schema_version":1,"run_id":"x"}
+EOF
+VEROUT="$(bash "$S/validate_ledgers.sh" --runlog "$VERLOG" --events "$EVENTS" 2>&1)"; verrc=$?
+assert_eq "a versioned row with no ts is still an ERROR (exit 1)" "$verrc" "1"
+assert_contains "versioned no-ts row reports missing ts" "$VEROUT" "missing ts"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1
