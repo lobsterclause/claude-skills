@@ -184,6 +184,13 @@ LOG_BAD="$T/runlog-bad.jsonl"; : >"$LOG_BAD"
 CROSS_REVIEW_RUNLOG="$LOG_BAD" bash "$S/append_runlog.sh" --run-dir "$RUN_BAD" --project t --base main --pr - --pass 1 --verdict CLEAN --run-id r-bad --profiles "$T/profiles.json" >/dev/null 2>&1
 assert_eq "malformed meta: the entry still lands" "$(jq -r '.run_id' "$LOG_BAD" 2>/dev/null)" "r-bad"
 assert_eq "malformed meta: the reviewer row is present" "$(jq -r '.reviewers.kimi3.status' "$LOG_BAD" 2>/dev/null)" "ok"
+assert_eq "string tokens are coerced to numbers in the row" "$(jq -c '[.reviewers.kimi3.tokens_prompt, .reviewers.kimi3.tokens_completion]' "$LOG_BAD")" "[1000000,100000]"
+assert_eq "string tokens still yield the cost estimate" "$(jq -r '.reviewers.kimi3.cost_usd_estimated' "$LOG_BAD")" "1.3"
+RUN_BAD2="$T/run-bad2"; mkdir -p "$RUN_BAD2/raw"
+printf '{"exit_code":0,"duration_s":40,"timed_out":false,"output_bytes":500,"attempt":1,"timeout_budget_s":950,"cli":"moonshot","context_access":"file_context","tokens_prompt":"lots","tokens_completion":100000}\n' >"$RUN_BAD2/raw/kimi3.meta.json"
+LOG_BAD2="$T/runlog-bad2.jsonl"; : >"$LOG_BAD2"
+CROSS_REVIEW_RUNLOG="$LOG_BAD2" bash "$S/append_runlog.sh" --run-dir "$RUN_BAD2" --project t --base main --pr - --pass 1 --verdict CLEAN --run-id r-bad2 --profiles "$T/profiles.json" >/dev/null 2>&1
+assert_eq "an uncoercible token value is dropped from the row, never stamped as a string" "$(jq -c '[.reviewers.kimi3 | has("tokens_prompt"), has("cost_estimated")]' "$LOG_BAD2")" "[false,false]"
 
 echo ""
 echo "══ $PASS passed, $FAIL failed ══"

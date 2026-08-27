@@ -380,15 +380,23 @@ enrich_with_context_and_profile() {
   local pricing_json
   pricing_json="$(jq -c --arg r "$name" '.[$r].pricing // null' "$profiles_file" 2>/dev/null)"
   [[ -n "$pricing_json" ]] || pricing_json="null"
+  # tokens are coerced to numbers first (a wrapper that wrote "1000000" as a
+  # string must not reach the runlog as a string, or leaderboard.sh's math
+  # crashes on the whole ledger later -- gemini-pro, PR #128 pass 2); an
+  # uncoercible value is dropped from the row rather than stamped.
   rjson="$(jq -c --argjson pricing "$pricing_json" '
-    if (.cost_usd != null) then
+    def num: if type == "number" then . elif type == "string" then (tonumber? // null) else null end;
+    (.tokens_prompt | num) as $tp | (.tokens_completion | num) as $tc
+    | (if has("tokens_prompt") then (if $tp == null then del(.tokens_prompt) else .tokens_prompt = $tp end) else . end)
+    | (if has("tokens_completion") then (if $tc == null then del(.tokens_completion) else .tokens_completion = $tc end) else . end)
+    | if (.cost_usd != null) then
       . + {cost_estimated: false}
-    elif (.tokens_prompt != null and .tokens_completion != null
+    elif ($tp != null and $tc != null
           and $pricing != null
           and ($pricing.prompt_per_m // null) != null
           and ($pricing.completion_per_m // null) != null) then
-      (((.tokens_prompt * $pricing.prompt_per_m)
-        + (.tokens_completion * $pricing.completion_per_m)) / 1000000) as $raw
+      ((($tp * $pricing.prompt_per_m)
+        + ($tc * $pricing.completion_per_m)) / 1000000) as $raw
       | (($raw * 1000000 | round) / 1000000) as $rounded
       | . + {cost_usd_estimated: $rounded, cost_estimated: true}
     else
