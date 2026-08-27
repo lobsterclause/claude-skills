@@ -11,11 +11,12 @@
 #
 # For each candidate seat over the window:
 #   draws            times roster_decision.selected included the seat
-#   expected         Sigma over entries of (seat weight / Sigma candidate
-#                     weights in that entry) * (number of seats selected that
-#                     entry) -- the seat's fair share of the draws it could
-#                     have won, given the weights actually logged
-#   ratio            draws / expected
+#   expected         Sigma over entries of the seat's INCLUSION PROBABILITY in
+#                     that entry's draw -- select_roster.sh draws without
+#                     replacement and renormalises after each pick, so this
+#                     is exact for 1..3 picks per entry (the default is 2)
+#                     and reported as n/a when an entry drew 4+ seats
+#   ratio            draws / expected (n/a when expected is unavailable)
 #   WARN over-drawn  ratio > 2   (only when the seat appeared as a candidate
 #   WARN under-drawn ratio < 0.5  in >= 10 entries; below that: "n/a (n<10)")
 #   last_drawn / days_since_drawn / rounds_since_drawn
@@ -30,13 +31,13 @@
 #
 # Usage:
 #   audit_roster.sh [--recent N] [--json] [--runlog PATH]
-#     --recent N     last N raw runlog entries (default: all)
+#     --recent N     last N raw runlog entries (default: all; 0 also means all)
 #     --json         machine-readable output instead of the text report
 #     --runlog PATH  override the runlog path (else $CROSS_REVIEW_RUNLOG, else
 #                     the skill's own runlog.jsonl)
 #
-# Read-only. Exit 0 always -- this is a report, not a gate. WARN lines start
-# with "WARN ".
+# Read-only. Exit 0 on a report (WARN lines start with "WARN "; this is a
+# report, not a gate), 2 on invalid arguments, 1 on jq/runtime errors.
 #
 # NOT yet wired into analyze_runlog.sh --mode report or /cross-review
 # --self-check -- deliberate for this change to avoid file collisions with
@@ -124,24 +125,34 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
   # select_roster.sh draws WITHOUT replacement, renormalising after each pick,
   # so a seat expectation per entry is its inclusion probability, not
   # nsel * weight / total (which exceeds 1 for a dominant seat and over-warns
-  # -- codex, PR #101 review). Exact for nsel <= 2 (the default --extras 2):
-  #   P(i) = p_i + sum_{j != i} p_j * p_i / (1 - p_j)
-  # For nsel >= 3 the closed form needs a subset DP; use min(1, nsel * p_i),
-  # which is the upper bound and never produces an impossible expectation.
+  # -- codex, PR #101 review). Exact sequential recursion over the remaining
+  # candidates:  incl(i, R, k) = p_i(R) + sum_{j != i} p_j(R) * incl(i, R - j, k-1)
+  # with p_i(R) = w_i / sum(w over R). O(n^k), so it is computed for k <= 3
+  # (the default --extras is 2; large diffs use 3) and reported as null for
+  # an entry that drew 4+ seats -- never a bound that can understate or
+  # overstate (codex, pass 2: min(1, k*p) is not a bound either way).
   | ($used | to_entries | map(
       .key as $idx
       | .value as $e
       | ($e.roster_decision.candidates // []) as $cands
       | ($cands | map(.weight // 0)) as $w
-      | ($w | add // 0) as $esum
-      | (if $esum > 0 then ($w | map(. / $esum)) else ($w | map(0)) end) as $p
       | ($cands | map(select(.selected == true)) | length) as $nsel
-      | (if $nsel <= 1 then ($p | map(. * $nsel))
-         elif $nsel == 2 then
-           ($p | to_entries | map(
-              .key as $i | .value as $pi
-              | $pi + ([ $p | to_entries[] | select(.key != $i and .value < 1) | .value * $pi / (1 - .value) ] | add // 0)))
-         else ($p | map([. * $nsel, 1] | min)) end) as $incl
+      | (if $nsel > 3 then ($w | map(null))
+         else
+           # incl(target, remaining index list, k)
+           def incl($t; $r; $k):
+             ([ $r[] | $w[.] ] | add) as $sum
+             | if $sum <= 0 then 0
+               else ($w[$t] / $sum) as $pt
+               | if $k <= 1 then $pt
+                 else $pt + ([ $r[] | select(. != $t) | . as $j
+                                | ($w[$j] / $sum) * incl($t; [ $r[] | select(. != $j) ]; $k - 1) ] | add // 0)
+                 end
+               end;
+           ([range(0; $w | length)]) as $all_idx
+           | ($all_idx | map(select($w[.] > 0))) as $live
+           | $all_idx | map(. as $t | if $w[$t] > 0 then incl($t; $live; $nsel) else 0 end)
+         end) as $incl
       | ($e.ts | fromdateiso8601) as $ets
       | range(0; $cands | length) as $i
       | $cands[$i] | {
@@ -159,7 +170,7 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
       reviewer: .[0].reviewer,
       candidate_count: length,
       draws: (map(select(.selected == true)) | length),
-      expected: (map(.share) | add),
+      expected: (if (map(.share) | any(. == null)) then null else (map(.share) | add) end),
       last_drawn_epoch: (
         (map(select(.selected == true) | .epoch)) as $de
         | if ($de | length) == 0 then null else ($de | max) end
@@ -183,7 +194,7 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
       newest_ts: ($used | map(.ts) | if length == 0 then null else max end),
       seats: ($seats | map(
         . as $s
-        | (if $s.expected > 0 then ($s.draws / $s.expected) else null end) as $ratio
+        | (if $s.expected != null and $s.expected > 0 then ($s.draws / $s.expected) else null end) as $ratio
         | (if $s.last_drawn_epoch == null or $newest_epoch == null then null
            else (($newest_epoch - $s.last_drawn_epoch) / 86400 | floor) end) as $days_since
         | (
@@ -199,7 +210,7 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
             reviewer: $s.reviewer,
             candidate_count: $s.candidate_count,
             draws: $s.draws,
-            expected: (($s.expected * 10000 | round) / 10000),
+            expected: (if $s.expected == null then null else (($s.expected * 10000 | round) / 10000) end),
             ratio: (if $ratio == null then null else (($ratio * 100 | round) / 100) end),
             last_drawn: $s.last_drawn_ts,
             days_since_drawn: $days_since,
@@ -234,7 +245,7 @@ printf '%s' "$result" | jq -r '.seats[] |
   [
     .reviewer,
     (.draws | tostring),
-    (.expected | tostring),
+    (.expected // "n/a" | tostring),
     (if .eligible_for_ratio_warn then (if .ratio == null then "n/a" else (.ratio | tostring) end) else "n/a (n<10)" end),
     (.candidate_count | tostring),
     (.last_drawn // "never"),

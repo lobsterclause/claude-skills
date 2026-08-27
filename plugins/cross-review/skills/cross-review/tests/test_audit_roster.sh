@@ -174,6 +174,34 @@ assert_eq "B expected" "$(printf '%s' "$MP" | jq -r '.seats[] | select(.reviewer
 assert_eq "C expected" "$(printf '%s' "$MP" | jq -r '.seats[] | select(.reviewer=="C") | .expected')" "0.4857"
 assert_eq "expectations sum to nsel" "$(printf '%s' "$MP" | jq -r '[.seats[].expected] | add | . * 1000 | round')" "2000"
 
+echo "── three-pick expectation is exact; four-pick is n/a ──"
+# Weights 98/1/1, all three selected: every seat's inclusion probability is 1.
+# (min(1, 3*p) would have said 1 / 0.03 / 0.03 -- codex, pass 2.)
+MP3LOG="$T/multipick3.jsonl"
+jq -nc '{ts:"2026-07-06T00:00:00Z", roster_decision:{candidates:[
+  {reviewer:"A", weight:98, selected:true},
+  {reviewer:"B", weight:1, selected:true},
+  {reviewer:"C", weight:1, selected:true}]}}' >"$MP3LOG"
+MP3="$(bash "$SCRIPT" --runlog "$MP3LOG" --json 2>&1)"
+assert_eq "3 of 3 drawn: A expected 1" "$(printf '%s' "$MP3" | jq -r '.seats[] | select(.reviewer=="A") | .expected')" "1"
+assert_eq "3 of 3 drawn: C expected 1" "$(printf '%s' "$MP3" | jq -r '.seats[] | select(.reviewer=="C") | .expected')" "1"
+# 3 picks among 4 with weights 50/30/10/10: exact recursion must sum to 3.
+MP3bLOG="$T/multipick3b.jsonl"
+jq -nc '{ts:"2026-07-06T00:00:00Z", roster_decision:{candidates:[
+  {reviewer:"A", weight:50, selected:true},{reviewer:"B", weight:30, selected:true},
+  {reviewer:"C", weight:10, selected:true},{reviewer:"D", weight:10, selected:false}]}}' >"$MP3bLOG"
+MP3b="$(bash "$SCRIPT" --runlog "$MP3bLOG" --json 2>&1)"
+assert_eq "3 of 4 drawn: expectations sum to 3" "$(printf '%s' "$MP3b" | jq -r '[.seats[].expected] | add | . * 1000 | round')" "3000"
+X
+MP4LOG="$T/multipick4.jsonl"
+jq -nc '{ts:"2026-07-06T00:00:00Z", roster_decision:{candidates:[
+  {reviewer:"A", weight:50, selected:true},{reviewer:"B", weight:30, selected:true},
+  {reviewer:"C", weight:10, selected:true},{reviewer:"D", weight:10, selected:true},{reviewer:"E", weight:5, selected:false}]}}' >"$MP4LOG"
+MP4="$(bash "$SCRIPT" --runlog "$MP4LOG" --json 2>&1)"
+assert_eq "4 picks: expected is null, not a bound" "$(printf '%s' "$MP4" | jq -r '.seats[] | select(.reviewer=="A") | .expected')" "null"
+assert_eq "4 picks: ratio is null" "$(printf '%s' "$MP4" | jq -r '.seats[] | select(.reviewer=="A") | .ratio')" "null"
+assert_contains "4 picks: text report prints n/a" "$(bash "$SCRIPT" --runlog "$MP4LOG" 2>&1)" "n/a"
+
 echo "── same-second entries and legacy tail ──"
 # Two entries in the same second: X drawn in the first, Y in the second, then
 # a legacy row 30 days later without roster_decision. rounds_since_drawn for X
