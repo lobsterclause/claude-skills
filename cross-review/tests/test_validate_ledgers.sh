@@ -159,6 +159,12 @@ FBOUT="$(CROSS_REVIEW_WRITERS_DIR="$T/no-writers" bash "$S/validate_ledgers.sh" 
 assert_contains "unreadable writers fall back to 1 with a WARN that is actually printed" "$FBOUT" "unable to read a writer's current schema_version"
 assert_eq "fallback still flags version 7 as future" "$(CROSS_REVIEW_WRITERS_DIR="$T/no-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null | jq -r '.runlog.current_schema_version')" "1"
 
+mkdir -p "$T/crlf-writers"
+printf 'SCHEMA_VERSION=3\r\n' >"$T/crlf-writers/append_runlog.sh"; printf 'SCHEMA_VERSION=2 \n' >"$T/crlf-writers/append_finding_event.sh"
+CRLFJ="$(CROSS_REVIEW_WRITERS_DIR="$T/crlf-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null)"
+assert_eq "a CRLF writer constant still parses (runlog current 3)" "$(printf '%s' "$CRLFJ" | jq -r '.runlog.current_schema_version')" "3"
+assert_eq "a trailing-space writer constant still parses (events current 2)" "$(printf '%s' "$CRLFJ" | jq -r '.events.current_schema_version')" "2"
+
 echo "── legacy no-ts rows (#111) ──"
 LEGLOG="$T/legacy-runlog.jsonl"
 cat >"$LEGLOG" <<'EOF'

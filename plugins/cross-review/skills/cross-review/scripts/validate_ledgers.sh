@@ -119,8 +119,10 @@ current_ver_warns=0
 writers_dir="${CROSS_REVIEW_WRITERS_DIR:-$skill_dir/scripts}"
 read_current_schema_version() {
   local writer="$1" target="$2" v
-  if [[ -r "$writer" ]]; then
-    v="$(grep -E '^SCHEMA_VERSION=' "$writer" 2>/dev/null | head -1 | cut -d= -f2)"
+  # -f as well as -r: a FIFO or device would block grep forever; trailing
+  # CR/spaces (a CRLF checkout) must not read as "unparseable" (gemini-pro)
+  if [[ -f "$writer" && -r "$writer" ]]; then
+    v="$(grep -E '^SCHEMA_VERSION=' "$writer" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \r')"
     if [[ "$v" =~ ^[0-9]+$ ]]; then
       printf -v "$target" '%s' "$v"
       return 0
