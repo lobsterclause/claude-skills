@@ -683,6 +683,45 @@ fetch_exemption() {
     '{labeled: true, actor: $a, actor_type: $t}'
 }
 
+# annotate_unverified <state> <description> — surface a degraded permission
+# check where a human will actually see it. The stderr warning and the
+# "(standing unverified)" suffix on the status both exist, and both were
+# missed: a job log is opened when a job is red, and this job is green by
+# design when it degrades. Under GitHub Actions this prints a workflow
+# `::warning` command (an annotation on the run summary and the PR's Checks
+# tab) and appends a paragraph to the step summary — once per run, not once
+# per author, so it cannot become the noise that gets ignored. Outside Actions
+# it prints nothing: the stderr line already covers a terminal. STDOUT on
+# purpose — workflow commands are only read from stdout — and only from
+# main(), whose stdout is the job log; never from currency_verdict, whose
+# stdout is a value the harness captures. Issue #65.
+annotate_unverified() {
+  local state="$1" description="$2"
+  [[ "${GITHUB_ACTIONS:-}" == "true" ]] || return 0
+  [[ "$description" == *"(standing unverified)"* ]] || return 0
+  # State-neutral on purpose: the suffix is attached to the ACCEPTED record,
+  # whatever verdict it then produced — `success` on a current one, `failure`
+  # on a stale one — so this must not say the status was "granted".
+  local msg="cross-review currency: the accepted review record's author was trusted on author_association alone. The repository-permission check could not run — on the stock GITHUB_TOKEN the collaborators/permission endpoint 403s — so it fell back to the association it exists to replace (CR_PERMISSION_UNREADABLE=trust). On an org repo, supply a token that can read permissions and set CR_PERMISSION_UNREADABLE=refuse, or narrow CR_TRUSTED_ASSOC to OWNER. See ci/README.md, 'Read this before believing step 2 is on'."
+  # Workflow-command PROPERTY values must have % : , CR LF percent-encoded
+  # (the message part only % CR LF) — actions/toolkit's escapeProperty. A bare
+  # ':' in the title is what a parser is allowed to mis-split on. Flagged by
+  # kimi in cross-review of PR #73.
+  local title="cross-review currency - write access not verified"
+  title="${title//%/%25}"; title="${title//$'\r'/%0D}"; title="${title//$'\n'/%0A}"
+  title="${title//:/%3A}";  title="${title//,/%2C}"
+  local body="$msg"
+  body="${body//%/%25}"; body="${body//$'\r'/%0D}"; body="${body//$'\n'/%0A}"
+  printf '::warning title=%s::%s\n' "$title" "$body"
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+      printf '### cross-review currency: standing unverified\n\n'
+      printf 'Verdict `%s` was computed from a record whose author was trusted on `author_association` alone; the repository-permission check did not run.\n\n' "$state"
+      printf '%s\n' "$msg"
+    } >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+  fi
+}
+
 main() {
   local pr="" repo="" post=0 sha=""
   while [[ $# -gt 0 ]]; do
@@ -729,6 +768,7 @@ main() {
   description="${verdict#*$'\t'}"
 
   printf '%s: %s\n' "$state" "$description"
+  annotate_unverified "$state" "$description"
 
   if [[ "$post" -eq 1 && -n "$sha" ]]; then
     # A commit status, not a check run: the same context can be updated from

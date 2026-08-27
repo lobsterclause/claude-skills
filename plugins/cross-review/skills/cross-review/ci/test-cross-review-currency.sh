@@ -55,6 +55,9 @@ assert_eq() {
 assert_contains() {
   if [[ "$2" == *"$3"* ]]; then ok "$1"; else bad "$1 (no '$3' in '$2')"; fi
 }
+assert_not_contains() {
+  if [[ "$2" != *"$3"* ]]; then ok "$1"; else bad "$1 (found '$3' in output)"; fi
+}
 
 HEAD40='4b03c063d540de4d62498da2d28cd20e798d7b02'
 OTHER40='37f0839938e45517b4e7007298f916ca412219c3'
@@ -1360,6 +1363,75 @@ PATH="$post_bin" "$(command -v bash)" "$HERE/cross-review-currency.sh" \
   --pr 1 --repo o/r --sha "$HEAD40" --post >/dev/null 2>&1
 assert_eq "control: a successful POST still exits 0" "$?" "0"
 rm -rf "$post_bin"
+
+echo
+echo "── an unverified standing is ANNOTATED under Actions, not only logged ──"
+#
+# The stderr warning and the status suffix both shipped in #63 and both went
+# unread: a green job's log is never opened. Under GITHUB_ACTIONS the degraded
+# check must surface as a workflow ::warning (run summary + Checks tab) and a
+# step-summary paragraph. Outside Actions, nothing — the terminal already has
+# stderr. Issue #65.
+ann_summary="$(mktemp)"
+ANN_OUT="$(GITHUB_ACTIONS=true GITHUB_STEP_SUMMARY="$ann_summary" \
+  annotate_unverified success "current for ${HEAD40:0:9} (standing unverified)")"
+assert_contains "under Actions, an unverified grant emits a ::warning annotation" \
+  "$ANN_OUT" "::warning title=cross-review currency"
+assert_contains "the annotation names the cause (the stock token cannot read permissions)" \
+  "$ANN_OUT" "GITHUB_TOKEN"
+assert_contains "and the fix" "$ANN_OUT" "CR_PERMISSION_UNREADABLE=refuse"
+assert_contains "the step summary gets a paragraph too" \
+  "$(cat "$ann_summary")" "standing unverified"
+# Workflow-command properties: ':' and ',' must be %-encoded or the parser
+# may mis-split the title. The raw title contains neither; the message part
+# may contain ':' freely (only % CR LF are encoded there).
+ANN_TITLE="${ANN_OUT#::warning title=}"; ANN_TITLE="${ANN_TITLE%%::*}"
+[[ "$ANN_TITLE" != *:* && "$ANN_TITLE" != *,* ]] \
+  && ok "the annotation title carries no raw ':' or ',' (kimi, PR #73)" \
+  || bad "annotation title has an unencoded ':' or ',': '$ANN_TITLE'"
+# The "granted" wording lived in the STEP SUMMARY, so that is what must be
+# checked — asserting on the ::warning line passed vacuously (kimi, PR #73
+# pass 2), and assert_not_contains was not even defined in this harness, so
+# the line was skipped uncounted (antigravity, PR #73 pass 2).
+ann_fail_summary="$(mktemp)"
+ANN_FAIL="$(GITHUB_ACTIONS=true GITHUB_STEP_SUMMARY="$ann_fail_summary" \
+  annotate_unverified failure "stale for ${OTHER40:0:9} (standing unverified)")"
+assert_contains "a failure verdict from an unverified author is annotated too" "$ANN_FAIL" "::warning"
+assert_not_contains "…and neither the warning nor the summary claims anything was granted" \
+  "$ANN_FAIL$(cat "$ann_fail_summary")" "granted"
+assert_contains "…the summary uses the state-neutral wording" \
+  "$(cat "$ann_fail_summary")" "computed from a record whose author was trusted"
+rm -f "$ann_fail_summary"
+# CONTROL: the helper really fails when the needle IS present.
+_nc_before=$FAIL; assert_not_contains "control-probe" "haystack" "hay" >/dev/null; \
+  [[ $FAIL -eq $((_nc_before + 1)) ]] && { FAIL=$_nc_before; ok "control: assert_not_contains can fail"; } \
+  || bad "assert_not_contains never fails"
+rm -f "$ann_summary"
+ANN_OFF="$(GITHUB_ACTIONS= annotate_unverified success "current for ${HEAD40:0:9} (standing unverified)")"
+assert_eq "outside Actions it prints nothing (stderr already covers a terminal)" "$ANN_OFF" ""
+ANN_VERIFIED="$(GITHUB_ACTIONS=true annotate_unverified success "current for ${HEAD40:0:9}")"
+assert_eq "control: a VERIFIED standing is not annotated — or the warning is noise on every run" "$ANN_VERIFIED" ""
+# END TO END: main() must actually call it. Same gh shim as the --post cases —
+# the comment is from a MEMBER with no readable permission.
+ann_bin="$(mktemp -d)"
+# --paginate --slurp yields an ARRAY OF PAGES; fetch_comments reads .[][].
+jq -nc --arg b "$MARKER_CURRENT" \
+  '[[{body: $b, user: {login: "someone"}, author_association: "MEMBER"}]]' >"$ann_bin/comments.json"
+cat >"$ann_bin/gh" <<GH
+#!/bin/sh
+case "\$*" in
+  *"/comments"*) cat "$ann_bin/comments.json" ;;
+  *"/timeline"*) printf '[]' ;;
+  *"/issues/"*) printf '{"labels": []}' ;;
+  *) exit 1 ;;   # the permission lookup 403s, as the stock token's does
+esac
+GH
+chmod +x "$ann_bin/gh"
+E2E="$(GITHUB_ACTIONS=true PATH="$ann_bin:$PATH" "$(command -v bash)" "$HERE/cross-review-currency.sh" \
+  --pr 1 --repo o/r --sha "$HEAD40" 2>/dev/null)"
+assert_contains "main() annotates when the run degrades" "$E2E" "::warning title=cross-review currency"
+assert_contains "control: the verdict line is still printed first" "$E2E" "standing unverified"
+rm -rf "$ann_bin"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

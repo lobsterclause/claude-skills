@@ -333,7 +333,18 @@ jobs:
 
       - name: Report cross-review currency
         env:
+          # The stock token CANNOT read repository permissions (the
+          # collaborators/permission endpoint needs push access, and this job
+          # holds contents: read), so the write-access check degrades to
+          # author_association and says so — a ::warning annotation, a
+          # "(standing unverified)" status suffix, a step-summary paragraph.
+          # That is fine on a personal repo (OWNER needs no lookup). On an ORG
+          # repo, mint a GitHub App token in a prior step and use it here
+          # with CR_PERMISSION_UNREADABLE=refuse — see ci/README.md, "Read this
+          # before believing step 2 is on". Interim: CR_TRUSTED_ASSOC=OWNER.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # CR_PERMISSION_UNREADABLE: refuse
+          # CR_TRUSTED_ASSOC: OWNER
           PR: ${{ github.event.pull_request.number || github.event.issue.number }}
           # On pull_request the head SHA is in the payload; on issue_comment it
           # is not, and the script fetches it.
