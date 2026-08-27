@@ -24,9 +24,15 @@ jobs:
       - name: Run planted-mutation drill (OpenRouter-only roster)
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        # The ledgers are written to $out (not the checkout's gitignored
+        # defaults) so the uploaded artifact actually carries the synthetic
+        # runlog row and the planted/caught/missed events this drill exists
+        # to produce.
         run: |
           out="$RUNNER_TEMP/planted-round"
           mkdir -p "$out"
+          export CROSS_REVIEW_RUNLOG="$out/runlog.jsonl"
+          export CROSS_REVIEW_FINDING_EVENTS="$out/finding_events.jsonl"
           bash cross-review/ci/planted_round.sh \
             --repo-root "$GITHUB_WORKSPACE" \
             --operators-file cross-review/references/mutation_operators.json \
