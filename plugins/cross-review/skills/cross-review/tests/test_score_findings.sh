@@ -298,6 +298,20 @@ assert_eq "…so kimi(0.5)+glm(1)+qwen(1) = 2.5" "$(cap2_field three-hunk-only c
   && ok "no --meta-dir hint when it was given" || bad "hint printed despite --meta-dir"
 bash "$S" --findings "$CAP_FINDINGS" --profiles "$CAP_PROFILES" --meta-dir "$T/nope" --out "$T/x.json" 2>/dev/null
 assert_eq "a --meta-dir that is not a directory is an error (rc=1)" "$?" "1"
+# An unknown observed value must not become a silent full vote (codex, PR #72).
+printf '{"exit_code": 0, "context_access": "fille_context"}\n' >"$META/glm.meta.json"
+bash "$S" --findings "$CAP_FINDINGS" --profiles "$CAP_PROFILES" --meta-dir "$META" --out "$T/cap_out4.json" 2>"$T/cap_err4.txt"
+assert_eq "a misspelled context_access in meta is ignored → glm back to its lane default" \
+  "$(jq -r '.findings[] | select(.id=="two-hunk-only") | .context_access.glm' "$T/cap_out4.json")" "diff_only"
+assert_eq "…so glm(0.5)+qwen(1.0 from meta) = 1.5" \
+  "$(jq -r '.findings[] | select(.id=="two-hunk-only") | .capability_votes' "$T/cap_out4.json")" "1.5"
+assert_contains "…and stderr names the bad value" "$(cat "$T/cap_err4.txt")" "unknown context_access 'fille_context'"
+printf '{"exit_code": 0, "context_access": "file_context"}\n' >"$META/glm.meta.json"
+# A source that is not a slug never becomes a path component (kimi, PR #72).
+jq '.findings += [{"id":"evil","severity":"High","file":"z.sh","line":1,"snippet":"q","claim":"c","sources":["../../etc/passwd","codex"]}]' "$CAP_FINDINGS" >"$T/evil.json"
+bash "$S" --findings "$T/evil.json" --profiles "$CAP_PROFILES" --meta-dir "$META" --out "$T/evil_out.json" 2>"$T/evil_err.txt"
+assert_eq "a path-shaped source does not break the run" "$?" "0"
+assert_contains "…and is refused as a slug" "$(cat "$T/evil_err.txt")" "not a reviewer slug"
 
 echo "── weights and floor are data in the profiles, not constants in the script ──"
 TUNED="$T/tuned_profiles.json"

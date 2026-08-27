@@ -136,14 +136,30 @@ fi
 # Only reviewers referenced by some finding's `sources` are looked up. A meta
 # file that exists but carries no context_access (pre-2026-08-26 runs) leaves
 # that reviewer on the profile-derived default.
+# Only a value the weight table knows is accepted. An unknown string (a typo
+# in a lane, a future access kind this scorer predates) is NOT silently a full
+# 1.0 vote — it is warned about and ignored, so the reviewer falls back to the
+# conservative lane-derived default (codex, PR #72 pass 1). The known set is
+# read from the profiles' context_access_weights merged over the defaults, so
+# a new kind added there is accepted here without a code change.
+known_access="$(jq -r --slurpfile profiles "$profiles" -n '
+  ({agent:1, workspace_read:1, file_context:1, snapshot:1, diff_only:1}
+   + (($profiles[0]._synthesis_rules // {}).context_access_weights // {})) | keys | join(" ")')"
 observed_json='{}'
 if [[ -n "$meta_dir" ]]; then
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
+    # Reviewer names come from findings `sources` — data, not config. Only a
+    # plain slug may become a path component (kimi, PR #72 pass 1).
+    [[ "$r" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "score_findings: ignoring source '$r' — not a reviewer slug" >&2; continue; }
     mf="$meta_dir/$r.meta.json"
     [[ -f "$mf" ]] || continue
     ca="$(jq -r '.context_access // empty' "$mf" 2>/dev/null || true)"
     [[ -n "$ca" ]] || continue
+    if [[ " $known_access " != *" $ca "* ]]; then
+      echo "score_findings: $mf carries unknown context_access '$ca' — ignoring it; '$r' falls back to its lane default" >&2
+      continue
+    fi
     observed_json="$(jq -c --arg r "$r" --arg ca "$ca" '. + {($r): $ca}' <<<"$observed_json")"
   done < <(jq -r '[ (.findings // [])[]?.sources[]? | select(type == "string") ] | unique | .[]' "$findings" 2>/dev/null)
 fi
