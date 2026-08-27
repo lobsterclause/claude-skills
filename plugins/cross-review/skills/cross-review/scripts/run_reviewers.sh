@@ -422,8 +422,12 @@ if [[ "$context_mode" == "files" ]]; then
   # numstat: "<added>\t<deleted>\t<path>"; binaries show "-\t-". Renames
   # print "old => new" braces in the path column, so resolve names from
   # --name-status (rename-clean) and use numstat only for the churn key.
-  _ctx_paths="$(git diff --name-only --diff-filter=d "$base"...HEAD 2>/dev/null || true)"
-  _ctx_order="$(git diff --numstat "$base"...HEAD 2>/dev/null \
+  # core.quotePath=false: git otherwise octal-escapes and double-quotes any
+  # path with non-ASCII bytes, `git show HEAD:"\303\274.txt"` then fails and
+  # the file would vanish from the block as neither included nor omitted
+  # (codex, PR #71 pass 1).
+  _ctx_paths="$(git -c core.quotePath=false diff --name-only --diff-filter=d "$base"...HEAD 2>/dev/null || true)"
+  _ctx_order="$(git -c core.quotePath=false diff --numstat "$base"...HEAD 2>/dev/null \
     | awk -F'\t' '$1 != "-" { print ($1 + $2) "\t" $3 }' | sort -t $'\t' -k1,1nr | cut -f2- || true)"
   # Walk churn order first, then anything --name-only knows that numstat did
   # not surface in a resolvable form (renames); a path is embedded once.
@@ -436,27 +440,42 @@ if [[ "$context_mode" == "files" ]]; then
     printf '%s' "$_ctx_paths" | grep -qxF -- "$_p" || continue
     [[ "$_ctx_seen" == *$'\n'"$_p"$'\n'* ]] && continue
     _ctx_seen+="$_p"$'\n'
+    # Size first, from the object header, BEFORE reading the blob: a
+    # generated bundle that is going to be omitted anyway must not be pulled
+    # into a shell variable first (kimi, PR #71 pass 1). The budget charges
+    # the whole serialized entry — path attribute, tags, newlines — not just
+    # the blob, so many tiny files cannot overrun the advertised cap
+    # (codex + kimi, PR #71 pass 1).
+    _ctx_size="$(git cat-file -s "HEAD:$_p" 2>/dev/null)" || {
+      echo "context: cannot read HEAD:$_p — skipped" >&2
+      continue
+    }
     # Binary guard: numstat filters "-\t-" out of the churn order, but the
     # --name-only pass has no such filter, and a text-looking file can still
     # carry NULs (fixtures, minified bundles). Compare byte counts with and
     # without NULs on the raw blob — $(...) would already have dropped them,
-    # so the check has to run on the stream, not on the variable.
-    if [[ "$(git show "HEAD:$_p" 2>/dev/null | wc -c | tr -d ' ')" \
-       != "$(git show "HEAD:$_p" 2>/dev/null | tr -d '\000' | wc -c | tr -d ' ')" ]]; then
+    # so the check has to run on the stream, not on the variable. It streams
+    # (never lands in a variable) and runs BEFORE the budget check, so a
+    # binary is never reported as "omitted by the budget".
+    if [[ "$_ctx_size" != "$(git show "HEAD:$_p" 2>/dev/null | tr -d '\000' | wc -c | tr -d ' ')" ]]; then
       continue
     fi
-    _ctx_blob="$(git show "HEAD:$_p" 2>/dev/null)" || continue
-    _ctx_len="$(printf '%s' "$_ctx_blob" | wc -c | tr -d ' ')"
-    if [[ $(( _ctx_used + _ctx_len )) -gt "$context_budget_bytes" ]]; then
+    _ctx_path_attr="${_p//&/&amp;}"; _ctx_path_attr="${_ctx_path_attr//\"/&quot;}"
+    _ctx_overhead=$(( ${#_ctx_path_attr} + 24 ))   # <file path="">\n … \n</file>\n
+    if [[ $(( _ctx_used + _ctx_size + _ctx_overhead )) -gt "$context_budget_bytes" ]]; then
       context_files_omitted=$((context_files_omitted + 1))
       _ctx_omitted_json="$(printf '%s' "$_ctx_omitted_json" | jq -c --arg p "$_p" '. + [$p]' 2>/dev/null || printf '%s' "$_ctx_omitted_json")"
       continue
     fi
-    # Defuse a literal closing tag inside untrusted file content — same
-    # prompt-injection guard as </diff> and </snapshot>.
+    _ctx_blob="$(git show "HEAD:$_p" 2>/dev/null)" || continue
+    # Defuse BOTH closing tags inside untrusted file content — </file> ends
+    # one entry, </files> ends the whole block — same prompt-injection guard
+    # as </diff> and </snapshot> (codex + kimi, PR #71 pass 1).
     _ctx_blob="${_ctx_blob//<\/file>/< \/file>}"
-    printf '<file path="%s">\n%s\n</file>\n' "$_p" "$_ctx_blob" >>"$context_files_path"
-    _ctx_used=$(( _ctx_used + _ctx_len ))
+    _ctx_blob="${_ctx_blob//<\/files>/< \/files>}"
+    _ctx_entry="$(printf '<file path="%s">\n%s\n</file>\n' "$_ctx_path_attr" "$_ctx_blob")"
+    printf '%s\n' "$_ctx_entry" >>"$context_files_path"
+    _ctx_used=$(( _ctx_used + $(printf '%s\n' "$_ctx_entry" | wc -c | tr -d ' ') ))
     context_files_included=$((context_files_included + 1))
   done <<<"$_ctx_order"$'\n'"$_ctx_paths"
   if [[ "$context_files_omitted" -gt 0 ]]; then
