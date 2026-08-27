@@ -229,14 +229,14 @@ assert_contains "report shows seed's files-mode drop rate (100%, all dropped)" "
 # ── PR #133 review: a deferred AFTER a kept neutralises the finding in the
 #    cost path too (it is not silently ignored) ──────────────────────────────
 DEFLOG="$T/def-runlog.jsonl"; DEFEV="$T/def-events.jsonl"
-printf '{"ts":"2026-08-10T00:00:00Z","run_id":"dfx1","reviewers":{"omega":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0.50,"model":"m1"}}}\n' >"$DEFLOG"
+printf '{"ts":"2026-08-10T00:00:00Z","run_id":"dfx1","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":10,"timeout_budget_s":600,"cost_usd":0.50,"model":"m1"}}}\n' >"$DEFLOG"
 cat >"$DEFEV" <<'EOF'
-{"event":"proposed","finding_id":"f-dx","run_id":"dfx1","reviewer":"omega","severity":"High","all_sources":["omega"],"ts":"2026-08-10T00:00:01Z"}
+{"event":"proposed","finding_id":"f-dx","run_id":"dfx1","reviewer":"glm","severity":"High","all_sources":["glm"],"ts":"2026-08-10T00:00:01Z"}
 {"event":"factcheck_kept","finding_id":"f-dx","run_id":"dfx1","ts":"2026-08-10T00:10:00Z"}
 {"event":"deferred","finding_id":"f-dx","run_id":"dfx1","ts":"2026-08-10T00:20:00Z"}
 EOF
-DEFJ="$(CROSS_REVIEW_RUNLOG="$DEFLOG" CROSS_REVIEW_FINDING_EVENTS="$DEFEV" bash "$S/leaderboard.sh" --mode json --profiles "$PROFILES" 2>/dev/null)"
-assert_eq "kept then deferred: no kept finding remains for cost_per_kept" "$(jq -r '.[] | select(.reviewer=="omega") | .cost_per_kept' <<<"$DEFJ")" "—"
+DEFJ="$(CROSS_REVIEW_RUNLOG="$DEFLOG" CROSS_REVIEW_FINDING_EVENTS="$DEFEV" bash "$S/leaderboard.sh" --mode json 2>/dev/null)"
+assert_eq "kept then deferred: no kept finding remains for cost_per_kept" "$(jq -r '.[] | select(.reviewer=="glm") | .cost_per_kept' <<<"$DEFJ")" "—"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"
