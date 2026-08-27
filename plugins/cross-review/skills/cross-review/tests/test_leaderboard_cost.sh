@@ -68,6 +68,8 @@ cat >"$EVENTS" <<'EOF'
 {"event":"proposed","finding_id":"f4","run_id":"r2","reviewer":"glm","severity":"Medium","all_sources":["glm"],"ts":"2026-08-27T02:00:01Z"}
 {"event":"factcheck_kept","finding_id":"f4","run_id":"r2","ts":"2026-08-27T02:00:02Z"}
 {"event":"proposed","finding_id":"f5","run_id":"r4","reviewer":"kat","severity":"Low","all_sources":["kat"],"ts":"2026-08-27T04:00:01Z"}
+{"event":"proposed","finding_id":"f6","run_id":"r5","reviewer":"devstral","severity":"High","all_sources":["devstral"],"ts":"2026-08-27T05:00:01Z"}
+{"event":"factcheck_kept","finding_id":"f6","run_id":"r5","ts":"2026-08-27T05:10:00Z"}
 {"event":"factcheck_dropped","finding_id":"f5","run_id":"r4","ts":"2026-08-27T04:00:02Z"}
 EOF
 
@@ -125,6 +127,15 @@ assert_contains "report mode prints a severity calibration heading" "$REPORT" "s
 assert_contains "report mode prints a fleet \$/round line" "$REPORT" "\$/round"
 assert_contains "report mode fleet line carries p50" "$REPORT" "p50"
 assert_contains "report mode fleet line carries p95" "$REPORT" "p95"
+
+# PR #121 review: a seat with kept findings but no cost data at all shows
+# "—", not "$0.00"; report mode works from another cwd.
+assert_eq "devstral kept but unpriced/unbilled: cost_per_kept is em dash" \
+  "$(jq -r '.[] | select(.reviewer=="devstral") | .cost_per_kept' <<<"$LB")" "—"
+assert_eq "devstral kept but unpriced/unbilled: cost_per_kept_ch is em dash" \
+  "$(jq -r '.[] | select(.reviewer=="devstral") | .cost_per_kept_ch' <<<"$LB")" "—"
+REPORT_CWD="$(cd "$T" && RUN_LB --mode report 2>&1)"
+assert_contains "report mode finds severity_calibration.sh from another cwd" "$REPORT_CWD" "severity calibration"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

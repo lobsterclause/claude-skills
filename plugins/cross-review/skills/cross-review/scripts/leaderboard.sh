@@ -336,16 +336,18 @@ score_reviewer() {
     | (["factcheck_dropped","parent_verified_dropped","human_rejected","duplicate_merged"]) as $term_dropped_names
     | ($events
        | map(select(.event as $e | ($kept_names + $term_dropped_names | index($e)) != null))
-       | reduce .[] as $e ({}; .[$e.finding_id + "::" + $e.run_id] =
+       | reduce .[] as $e ({}; .[([$e.finding_id, $e.run_id] | tojson)] =
            (if ($kept_names | index($e.event)) != null then "kept" else "dropped" end))) as $term_map
     | ($events | map(select(.event == "proposed" and .reviewer == $r))
                | unique_by([.finding_id, .run_id])
-               | map(. + {kstatus: ($term_map[.finding_id + "::" + .run_id] // "unresolved")})) as $props_terminal
+               | map(. + {kstatus: ($term_map[([.finding_id, .run_id] | tojson)] // "unresolved")})) as $props_terminal
     | ($props_terminal | map(select(.kstatus == "kept"))) as $kept_findings
     | ($kept_findings | length) as $kept_n
     | ($kept_findings | map(select(.severity == "Critical" or .severity == "High")) | length) as $kept_ch_n
-    | (if $kept_n == 0 then fmt2(null) else fmt2($total_cost / $kept_n) end) as $cost_per_kept
-    | (if $kept_ch_n == 0 then fmt2(null) else fmt2($total_cost / $kept_ch_n) end) as $cost_per_kept_ch
+    # no cost data at all (CLI lane, or unpriced seat with no billed cost) is
+    # "—", never "$0.00" -- a free-looking seat is a lie (antigravity, #121)
+    | (if ($costs | length) == 0 or $kept_n == 0 then fmt2(null) else fmt2($total_cost / $kept_n) end) as $cost_per_kept
+    | (if ($costs | length) == 0 or $kept_ch_n == 0 then fmt2(null) else fmt2($total_cost / $kept_ch_n) end) as $cost_per_kept_ch
     # Telemetry-only multiplier: 0.75 is a soft prior for reviewers not yet
     # observed enough to score on findings quality. Left flat, it became a
     # permanent haven for reviewers that reliably return NOTHING — see the
@@ -521,7 +523,7 @@ print_cost_report() {
   echo "──"
   echo
 
-  sev_script="$(dirname "$0")/severity_calibration.sh"
+  sev_script="$skill_dir/scripts/severity_calibration.sh"
   if [[ -x "$sev_script" || -f "$sev_script" ]]; then
     bash "$sev_script" || true
   else
