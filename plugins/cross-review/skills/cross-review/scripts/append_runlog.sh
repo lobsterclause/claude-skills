@@ -37,10 +37,31 @@
 #       select_roster.sh --json output for this pass's draw, attached
 #       verbatim as `roster_decision`. Never blocks the append: a
 #       missing/unreadable file just warns to stderr and omits the key.
+#     [--phases <json-file>]
+#       Object of `<name>_s` phase-duration numbers (e.g. worktree_s,
+#       dispatch_s, anchor_s, factcheck_s, synthesis_s, fix_s, post_s),
+#       attached verbatim as `phases`. Any phase the flow skipped is simply
+#       absent from the object — this script never fills in a 0. Fail-open
+#       like --roster-decision: a missing/unreadable file warns to stderr
+#       and omits the key.
 #
-# Both --run-id and --roster-decision are purely additive telemetry — leave
-# either off and this entry is byte-identical to what today's callers already
-# produce. Neither is read by leaderboard.sh or select_roster.sh yet.
+# round_wall_s and trailing_reviewer need no flag — they are derived:
+#   round_wall_s      now (UTC) minus `$run_dir/context.json`'s `started_at`
+#                     (worktree.sh start's own "%Y%m%dT%H%M%S" stamp),
+#                     computed only when that file and field exist.
+#   trailing_reviewer {reviewer, duration_s} of whichever reviewer meta
+#                     carried the largest `duration_s` this pass — the seat
+#                     that gated dispatch. Omitted when no reviewer meta has
+#                     a duration_s.
+#
+# --run-id, --findings, and --roster-decision are never required — omitting
+# any of them warns to stderr (telemetry gap) but never blocks the append.
+#
+# All of --run-id / --roster-decision / --phases / round_wall_s /
+# trailing_reviewer are purely additive telemetry — leave them all off (and
+# skip context.json / reviewer durations) and this entry is byte-identical to
+# what today's callers already produce. Neither is read by leaderboard.sh or
+# select_roster.sh yet.
 # Schema is documented in plans/the-miss-on-pr-eager-pond.md (Phase 2).
 # Additive — old hand-curated entries in the runlog remain valid.
 
@@ -65,6 +86,7 @@ notes=""
 findings_file=""
 run_id=""
 roster_decision_file=""
+phases_file=""
 
 need_val() {
   if [[ "$2" -lt 2 ]]; then
@@ -89,13 +111,14 @@ while [[ $# -gt 0 ]]; do
     --findings)   need_val "$1" "$#"; findings_file="$2"; shift 2 ;;
     --run-id)     need_val "$1" "$#"; run_id="$2";     shift 2 ;;
     --roster-decision) need_val "$1" "$#"; roster_decision_file="$2"; shift 2 ;;
+    --phases)     need_val "$1" "$#"; phases_file="$2";     shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 for required in run_dir project base pr pass verdict; do
   if [[ -z "${!required}" ]]; then
-    echo "usage: $0 --run-dir <p> --project <n> --base <b> --pr <num|-> --pass <n> --verdict <v> [--convergent <n>] [--top <s>] [--diff-files <n>] [--diff-lines <n>] [--notes <s>] [--findings <json>] [--run-id <id>] [--roster-decision <json>]" >&2
+    echo "usage: $0 --run-dir <p> --project <n> --base <b> --pr <num|-> --pass <n> --verdict <v> [--convergent <n>] [--top <s>] [--diff-files <n>] [--diff-lines <n>] [--notes <s>] [--findings <json>] [--run-id <id>] [--roster-decision <json>] [--phases <json>]" >&2
     exit 2
   fi
 done
@@ -104,6 +127,14 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "append_runlog: jq required (brew install jq)" >&2
   exit 1
 fi
+
+# Telemetry-completeness warnings (#89): never block the append, just say
+# what this pass is missing so a human scanning stderr — or
+# analyze_runlog.sh's completeness block — sees the gap immediately rather
+# than discovering it later as a silently-empty column in the report.
+[[ -z "$run_id" ]] && echo "append_runlog: --run-id not provided; this entry will have no run_id (can't be joined to finding_events.jsonl)" >&2
+[[ -z "$findings_file" ]] && echo "append_runlog: --findings not provided; reviewer entries will have no findings enrichment this pass" >&2
+[[ -z "$roster_decision_file" ]] && echo "append_runlog: --roster-decision not provided; this entry will have no roster_decision" >&2
 
 # Evidence gate (binding, not advisory): a finding dropped at triage MUST
 # carry its falsification evidence in factcheck.reason — the smoke test run,
@@ -298,6 +329,35 @@ inkling_json=$(enrich_with_findings inkling "$(reviewer_obj inkling)")
 kimi27_json=$(enrich_with_findings kimi27 "$(reviewer_obj kimi27)")
 kimi3_json=$(enrich_with_findings kimi3 "$(reviewer_obj kimi3)")
 
+# round_wall_s (#91): derived, no flag. worktree.sh start's context.json
+# stamps `started_at` as "%Y%m%dT%H%M%S" (UTC — see worktree.sh's `ts=`).
+# Fail-open like --roster-decision: missing file, missing field, or
+# malformed JSON just omits the key rather than blocking the append. jq's
+# strptime/mktime are used (not OS `date` flavor) so this is portable
+# between macOS and Linux runners.
+round_wall_s_val=""
+if [[ -f "$run_dir/context.json" ]]; then
+  now_compact="$(date -u +%Y%m%dT%H%M%S)"
+  round_wall_s_val="$(jq -e -r --arg now "$now_compact" '
+      (.started_at // empty) as $sa
+      | if ($sa | length) == 0 then empty
+        else (($now | strptime("%Y%m%dT%H%M%S") | mktime)
+              - ($sa  | strptime("%Y%m%dT%H%M%S") | mktime))
+        end
+    ' "$run_dir/context.json" 2>/dev/null)"
+fi
+
+# --phases (#91): additive, fail-open on a missing/unreadable file — losing
+# phase telemetry must never block a runlog append.
+phases_json="null"
+if [[ -n "$phases_file" ]]; then
+  if [[ -f "$phases_file" ]] && ph="$(jq -c . "$phases_file" 2>/dev/null)"; then
+    phases_json="$ph"
+  else
+    echo "append_runlog: --phases file unreadable or invalid JSON: $phases_file (omitting phases)" >&2
+  fi
+fi
+
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 entry=$(jq -nc \
@@ -336,7 +396,20 @@ entry=$(jq -nc \
   --arg run_id "$run_id" \
   --argjson roster_decision "$roster_decision_json" \
   --argjson schema_version "$SCHEMA_VERSION" \
-  '{
+  --arg round_wall_s "$round_wall_s_val" \
+  --argjson phases "$phases_json" \
+  '{codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, glm: $glm,
+    deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
+    devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
+    spark: $spark, seed: $seed, grok: $grok,
+    longcat: $longcat, inkling: $inkling,
+    kimi27: $kimi27, kimi3: $kimi3} as $reviewers
+  | ($reviewers | to_entries | map(select(.value.duration_s != null))) as $timed
+  | (if ($timed | length) == 0 then null
+     else ($timed | sort_by(.value.duration_s) | last
+                   | {reviewer: .key, duration_s: .value.duration_s})
+     end) as $trailing
+  | {
     ts: $ts,
     schema_version: $schema_version,
     project: $project,
@@ -346,19 +419,17 @@ entry=$(jq -nc \
     diff_size: (if $diff_files == "" and $diff_lines == "" then null
                 else {files: ($diff_files | tonumber? // null),
                       lines: ($diff_lines | tonumber? // null)} end),
-    reviewers: {codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, glm: $glm,
-                deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
-                devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
-                spark: $spark, seed: $seed, grok: $grok,
-                longcat: $longcat, inkling: $inkling,
-                kimi27: $kimi27, kimi3: $kimi3},
+    reviewers: $reviewers,
     convergent_count: $convergent,
     verdict: $verdict,
     top_finding: (if $top == "" then null else $top end),
     notes: (if $notes == "" then null else $notes end)
   }
   + (if $run_id == "" then {} else {run_id: $run_id} end)
-  + (if $roster_decision == null then {} else {roster_decision: $roster_decision} end)')
+  + (if $roster_decision == null then {} else {roster_decision: $roster_decision} end)
+  + (if $round_wall_s == "" then {} else {round_wall_s: ($round_wall_s | tonumber)} end)
+  + (if $trailing == null then {} else {trailing_reviewer: $trailing} end)
+  + (if $phases == null then {} else {phases: $phases} end)')
 
 # JSONL — one line, append-only. Wrap in flock to make it splitstream-safe:
 # POSIX guarantees write() atomicity below PIPE_BUF (4KB Linux, 512B macOS).
