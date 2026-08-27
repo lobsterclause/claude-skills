@@ -23,10 +23,16 @@
 #       allowlist below)
 #   (d) events whose run_id has no -> WARN   summary + up to 5 examples,
 #       matching runlog entry               "orphan run_id '<id>' (events:<n>)"
-#   (e) schema_version distribution -> info line per file, "missing" bucket
-#       for entries/events with no schema_version key (readers treat
-#       absence as 0, so it is reported as bucket "0" as well as counted
-#       under "missing" for clarity)
+#   (e) schema_version distribution -> info line per file; entries/events
+#       with no schema_version key land in the "missing" bucket (readers
+#       treat absence as 0 -- the bucket is named "missing", not "0", so
+#       pre-#96 rows stay distinguishable from an explicit 0)
+#
+# A line is malformed unless it is exactly ONE JSON object: a bare scalar,
+# an array, or two documents on one physical line all count as malformed
+# (codex, PR #109 review). Paths: an explicitly supplied --runlog/--events
+# that does not exist is an error (exit 2); an absent DEFAULT ledger is
+# treated as empty, since a fresh install has none yet.
 #
 # Exit: 0 if no ERROR-level findings, 1 if any malformed line or missing-ts
 # entry exists. WARN-level findings (unknown event, orphan run_id) do not
@@ -39,7 +45,13 @@ set -uo pipefail
 
 # Allowlisted event names (#96 spec). Anything else is a WARN, not an ERROR —
 # new event types are expected to show up before this list is updated.
-ALLOWED_EVENTS="proposed anchored factcheck_kept factcheck_dropped parent_verified_kept parent_verified_dropped fix_applied fix_verified fix_failed deferred human_accepted human_rejected regression_detected duplicate_merged planted caught missed"
+ALLOWED_EVENTS="proposed anchored factcheck_kept factcheck_dropped parent_verified_kept parent_verified_dropped fix_applied fix_verified fix_failed deferred unresolved human_accepted human_rejected regression_detected duplicate_merged planted caught missed"
+
+# Parse one physical line as exactly one JSON object; prints it compacted,
+# or nothing (malformed).
+parse_line() {
+  printf '%s' "$1" | jq -cs 'if length == 1 and (.[0] | type) == "object" then .[0] else empty end' 2>/dev/null
+}
 
 runlog=""
 events=""
@@ -64,6 +76,16 @@ done
 command -v jq >/dev/null 2>&1 || { echo "validate_ledgers: jq required" >&2; exit 1; }
 
 skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
+# An explicitly supplied path that does not exist is a usage error, not a
+# clean empty ledger -- a typo in --runlog must not validate as healthy
+# (codex, PR #109 review). Absent defaults stay equivalent to empty.
+for pair in "--runlog:$runlog" "--events:$events"; do
+  flag="${pair%%:*}"; path="${pair#*:}"
+  if [[ -n "$path" && ! -r "$path" ]]; then
+    echo "validate_ledgers: $flag '$path' does not exist or is not readable" >&2
+    exit 2
+  fi
+done
 runlog="${runlog:-${CROSS_REVIEW_RUNLOG:-$skill_dir/runlog.jsonl}}"
 events="${events:-${CROSS_REVIEW_FINDING_EVENTS:-$skill_dir/finding_events.jsonl}}"
 
@@ -79,6 +101,11 @@ run_ids_file="$(mktemp)"
 : >"$run_ids_file"
 sv_runlog_file="$(mktemp)"
 : >"$sv_runlog_file"
+orphan_run_ids_file="$(mktemp)"
+: >"$orphan_run_ids_file"
+sv_events_file="$(mktemp)"
+: >"$sv_events_file"
+trap 'rm -f "$run_ids_file" "$orphan_run_ids_file" "$sv_runlog_file" "$sv_events_file"' EXIT
 
 if [[ -f "$runlog" ]]; then
   lineno=0
@@ -86,7 +113,7 @@ if [[ -f "$runlog" ]]; then
     lineno=$((lineno + 1))
     [[ -z "$line" ]] && continue
     runlog_lines=$((runlog_lines + 1))
-    parsed="$(printf '%s' "$line" | jq -c '.' 2>/dev/null)"
+    parsed="$(parse_line "$line")"
     if [[ -z "$parsed" ]]; then
       runlog_malformed=$((runlog_malformed + 1))
       runlog_errlines+=("runlog:$lineno malformed")
@@ -109,10 +136,6 @@ events_unknown=0
 declare -a events_errlines=()
 declare -a events_warnlines=()
 declare -a unknown_event_names=()
-orphan_run_ids_file="$(mktemp)"
-: >"$orphan_run_ids_file"
-sv_events_file="$(mktemp)"
-: >"$sv_events_file"
 events_lines=0
 
 if [[ -f "$events" ]]; then
@@ -121,7 +144,7 @@ if [[ -f "$events" ]]; then
     lineno=$((lineno + 1))
     [[ -z "$line" ]] && continue
     events_lines=$((events_lines + 1))
-    parsed="$(printf '%s' "$line" | jq -c '.' 2>/dev/null)"
+    parsed="$(parse_line "$line")"
     if [[ -z "$parsed" ]]; then
       events_malformed=$((events_malformed + 1))
       events_errlines+=("events:$lineno malformed")
@@ -136,6 +159,7 @@ if [[ -f "$events" ]]; then
       if [[ "$allowed" -eq 0 ]]; then
         events_unknown=$((events_unknown + 1))
         events_warnlines+=("events:$lineno unknown event '$ev'")
+        unknown_event_names+=("$ev")
       fi
     fi
     erid="$(printf '%s' "$parsed" | jq -r '.run_id // empty')"
@@ -162,9 +186,12 @@ sv_dist() {
 }
 
 sv_dist_json() {
+  # Built through jq -R so an odd schema_version value (a string with a quote
+  # or a space) cannot break the JSON (codex, PR #109 review).
   local f="$1"
   [[ -s "$f" ]] || { echo '{}'; return; }
-  sort "$f" | uniq -c | awk '{printf "{\"%s\":%s}\n", $2, $1}' | jq -sc 'add // {}'
+  sort "$f" | uniq -c | sed -E 's/^ *([0-9]+) (.*)$/\2\t\1/' \
+    | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): (.[1] | tonumber)}) | add // {}'
 }
 
 if [[ "$json_out" -eq 1 ]]; then
@@ -174,7 +201,7 @@ if [[ "$json_out" -eq 1 ]]; then
   if [[ -s "$orphan_run_ids_file" ]]; then
     orphan_examples_json="$(cut -f1 "$orphan_run_ids_file" | sort -u | head -5 | jq -R . | jq -sc .)"
   fi
-  unknown_examples_json="$(printf '%s\n' "${events_warnlines[@]:-}" | grep -o "'[^']*'" | tr -d "'" | sort -u | head -5 | jq -R 'select(length>0)' | jq -sc . 2>/dev/null || echo '[]')"
+  unknown_examples_json="$(printf '%s\n' "${unknown_event_names[@]:-}" | sort -u | head -5 | jq -R 'select(length>0)' | jq -sc . 2>/dev/null || echo '[]')"
   jq -nc \
     --argjson runlog_lines "$runlog_lines" \
     --argjson runlog_malformed "$runlog_malformed" \
@@ -214,8 +241,6 @@ else
   echo "runlog: $runlog_lines lines, $runlog_malformed malformed, $runlog_missing_ts missing ts, schema_version: $(sv_dist "$sv_runlog_file")"
   echo "events: $events_lines lines, $events_malformed malformed, $events_unknown unknown event(s), $orphan_count orphan run_id(s), schema_version: $(sv_dist "$sv_events_file")"
 fi
-
-rm -f "$run_ids_file" "$orphan_run_ids_file" "$sv_runlog_file" "$sv_events_file"
 
 if [[ "$errors" -gt 0 ]]; then
   exit 1

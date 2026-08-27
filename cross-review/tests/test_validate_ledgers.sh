@@ -90,6 +90,43 @@ frc=$?
 assert_eq "fresh ledgers validate clean (exit 0)" "$frc" "0"
 assert_contains "fresh ledgers show schema_version distribution 1=..." "$FRESH_OUT" "1="
 
+echo "── strict line shape, paths, allowlist, json escaping (PR #109 review) ──"
+SHAPE_RUNLOG="$T/shape-runlog.jsonl"
+SHAPE_EVENTS="$T/shape-events.jsonl"
+cat >"$SHAPE_RUNLOG" <<'EOF'
+{"ts":"2026-08-01T00:00:00Z","run_id":"s1","schema_version":"a\"b c"}
+42
+{"ts":"2026-08-01T00:00:00Z","run_id":"s2"} {"ts":"2026-08-01T00:00:00Z","run_id":"s3"}
+["ts"]
+EOF
+cat >"$SHAPE_EVENTS" <<'EOF'
+{"finding_id":"f1","run_id":"s1","event":"unresolved","ts":"2026-08-01T00:00:00Z"}
+{"finding_id":"f2","run_id":"s1","event":"it's odd","ts":"2026-08-01T00:00:00Z"}
+EOF
+SOUT="$(bash "$S/validate_ledgers.sh" --runlog "$SHAPE_RUNLOG" --events "$SHAPE_EVENTS" 2>&1)"; src=$?
+assert_eq "scalar / multi-doc / array lines are errors (exit 1)" "$src" "1"
+assert_contains "a bare scalar line is malformed" "$SOUT" "runlog:2 malformed"
+assert_contains "two documents on one line are malformed" "$SOUT" "runlog:3 malformed"
+assert_contains "an array line is malformed" "$SOUT" "runlog:4 malformed"
+assert_contains "exactly 3 malformed" "$SOUT" "3 malformed"
+if printf '%s' "$SOUT" | grep -q "unknown event 'unresolved'"; then
+  bad "unresolved is an allowlisted event"
+else
+  ok "unresolved is an allowlisted event"
+fi
+SJ="$(bash "$S/validate_ledgers.sh" --runlog "$SHAPE_RUNLOG" --events "$SHAPE_EVENTS" --json 2>/dev/null)"
+if printf '%s' "$SJ" | jq -e . >/dev/null 2>&1; then
+  ok "--json stays valid with a quoted/spaced schema_version"
+else
+  bad "--json stays valid with a quoted/spaced schema_version (got: $SJ)"
+fi
+assert_eq "--json schema_version bucket keeps the odd value verbatim" \
+  "$(printf '%s' "$SJ" | jq -r '.runlog.schema_version | to_entries[0].key')" 'a"b c'
+assert_eq "--json unknown_event_examples keeps a quoted name whole" \
+  "$(printf '%s' "$SJ" | jq -r '.events.unknown_event_examples[0]')" "it's odd"
+bash "$S/validate_ledgers.sh" --runlog "$T/does-not-exist.jsonl" --events "$SHAPE_EVENTS" >/dev/null 2>&1; prc=$?
+assert_eq "an explicit --runlog path that does not exist exits 2" "$prc" "2"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1
