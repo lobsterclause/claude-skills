@@ -50,9 +50,12 @@
 # Moonshot seats (kimi27/kimi3) and the CLI lanes have no OpenRouter catalog to
 # check against.
 set -uo pipefail
-# printf %f honours LC_NUMERIC; jq always emits a period, so a comma-decimal
-# locale would turn every price into "invalid number" (gemini-pro, PR #125)
-export LC_NUMERIC=C
+# printf %f honours the locale; jq always emits a period, so a comma-decimal
+# locale would turn every price into "invalid number" (gemini-pro, PR #125).
+# LC_ALL, not LC_NUMERIC: an inherited LC_ALL would override LC_NUMERIC
+# (antigravity + gemini-pro, pass 2). Nothing here is locale-sensitive
+# otherwise.
+export LC_ALL=C
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 
@@ -78,7 +81,7 @@ while [[ $# -gt 0 ]]; do
     --catalog)          need_val "$1" "$#"; catalog_override="$2"; shift 2 ;;
     --pricing-json)     pricing_json=1; shift ;;
     --strict-pricing)   strict_pricing=1; shift ;;
-    -h|--help)          sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help)          sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d' | sed -E 's/^# ?//'; exit 0 ;;
     *)                  echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
