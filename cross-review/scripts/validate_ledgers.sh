@@ -80,7 +80,8 @@ ALLOWED_EVENTS="proposed anchored factcheck_kept factcheck_dropped parent_verifi
 # buckets keep the existing tab/newline/CR flatten so the bucket stays a
 # single field.
 #
-# Rows join fields with \x1F (ASCII unit separator), not a real tab: bash's
+# Rows join fields with \x1F (ASCII unit separator, spelled "\u001f" in the
+# jq program so no raw control byte sits in this file), not a real tab: bash's
 # `read` treats tab as "IFS whitespace" and collapses runs of it regardless
 # of what IFS is set to, silently dropping empty middle fields (e.g. a
 # non-numeric schema_version leaves sv_num empty) and shifting every field
@@ -92,7 +93,7 @@ foreach inputs as $raw (0; . + 1;
   else
     (try ($raw | fromjson) catch " ERR") as $p
     | if ($p == " ERR") or (($p|type) != "object") then
-        [., "malformed", "", "", "", "", ""] | join("")
+        [., "malformed", "", "", "", "", ""] | join("\u001f")
       else
         ($p) as $o
         | [., "ok",
@@ -101,7 +102,7 @@ foreach inputs as $raw (0; . + 1;
            ($o.schema_version | if type == "number" then tostring else "" end),
            ($o.run_id // ""),
            ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r]"; " ")) else "missing" end)
-          ] | join("")
+          ] | join("\u001f")
       end
   end
 )
@@ -112,7 +113,7 @@ foreach inputs as $raw (0; . + 1;
   else
     (try ($raw | fromjson) catch " ERR") as $p
     | if ($p == " ERR") or (($p|type) != "object") then
-        [., "malformed", "", "", "", "", ""] | join("")
+        [., "malformed", "", "", "", "", ""] | join("\u001f")
       else
         ($p) as $o
         | [., "ok",
@@ -121,7 +122,7 @@ foreach inputs as $raw (0; . + 1;
            ($o|has("schema_version")|if . then "1" else "0" end),
            ($o.schema_version | if type == "number" then tostring else "" end),
            ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r]"; " ")) else "missing" end)
-          ] | join("")
+          ] | join("\u001f")
       end
   end
 )
@@ -314,8 +315,12 @@ if [[ -f "$events" ]]; then
   # (run_id, lineno) pairs whose run_id is absent from that set -- the same
   # exact-match semantics as the old `grep -qxF`, without re-forking per
   # candidate.
+  # Membership is keyed on FILENAME, not the NR==FNR idiom: with an EMPTY
+  # run_ids_file (no runlog rows carried a run_id) NR==FNR stays true for
+  # the whole candidates file, every candidate lands in `seen`, and every
+  # real orphan is silently swallowed (found in parent verification of #139).
   if [[ -s "$erid_candidates_file" ]]; then
-    awk -F'\t' 'NR==FNR{seen[$0]=1; next} !($1 in seen)' "$run_ids_file" "$erid_candidates_file" >"$orphan_run_ids_file"
+    awk -F'\t' -v rf="$run_ids_file" 'FILENAME==rf{seen[$0]=1; next} !($1 in seen)' "$run_ids_file" "$erid_candidates_file" >"$orphan_run_ids_file"
   fi
 fi
 

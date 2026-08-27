@@ -189,6 +189,20 @@ VEROUT="$(bash "$S/validate_ledgers.sh" --runlog "$VERLOG" --events "$EVENTS" 2>
 assert_eq "a versioned row with no ts is still an ERROR (exit 1)" "$verrc" "1"
 assert_contains "versioned no-ts row reports missing ts" "$VEROUT" "missing ts"
 
+echo "── orphan run_id detection with an EMPTY runlog (every event is an orphan) ──"
+# Regression guard for the single-pass orphan check: an awk NR==FNR set-load
+# over an empty run_ids file treats the candidates file as the first file,
+# so every orphan was swallowed. The pre-#132 grep -qxF path reported them.
+EMPTY_RL="$T/empty-runlog.jsonl"; : >"$EMPTY_RL"
+ORPH_EV="$T/orphan-events.jsonl"
+printf '{"event":"proposed","ts":"2026-08-01T00:00:00Z","finding_id":"f-1","run_id":"run-only-in-events","schema_version":1}\n' >"$ORPH_EV"
+printf '{"event":"proposed","ts":"2026-08-01T00:00:01Z","finding_id":"f-2","run_id":"run-only-in-events-2","schema_version":1}\n' >>"$ORPH_EV"
+ORPH_OUT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$EMPTY_RL" --events "$ORPH_EV" 2>&1)"
+assert_contains "empty runlog: both events are reported as orphan run_ids" "$ORPH_OUT" "2 event(s) with a run_id absent from runlog"
+assert_contains "empty runlog: the orphan run_id is named" "$ORPH_OUT" "orphan run_id 'run-only-in-events'"
+ORPH_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$EMPTY_RL" --events "$ORPH_EV" --json 2>/dev/null)"
+assert_eq "empty runlog: --json orphan_run_id count is 2" "$(jq -r '.events.orphan_run_id' <<<"$ORPH_JSON")" "2"
+
 echo "── single-pass line extraction: parity + performance on a large fixture (#132) ──"
 # A fixture large enough to make the per-line-fork cost visible: mostly
 # valid rows, plus 3 malformed, 2 legacy no-ts, and 1 future schema_version
