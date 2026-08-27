@@ -130,7 +130,11 @@ case "$cmd" in
       exit 1
     fi
 
-    ts="$(date +%Y%m%dT%H%M%S)"
+    # UTC, not local (#118): append_runlog.sh's round_wall_s takes "now" on
+    # the UTC clock too, so pairing this started_at with that "now" can't
+    # drift onto two different clocks again (the class of bug #117/#118 both
+    # existed to close).
+    ts="$(date -u +%Y%m%dT%H%M%S)"
     pid="$$"
     # Slugify id so it's filesystem-safe.
     slug="$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
