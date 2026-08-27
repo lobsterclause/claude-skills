@@ -46,6 +46,11 @@
 
 set -uo pipefail
 
+# Ledger schema version stamped on every entry this script writes (#96).
+# Readers that don't know about this field treat its absence as 0 — bump this
+# only alongside a documented, additive schema change.
+SCHEMA_VERSION=1
+
 run_dir=""
 project=""
 base=""
@@ -330,8 +335,10 @@ entry=$(jq -nc \
   --argjson kimi3 "$kimi3_json" \
   --arg run_id "$run_id" \
   --argjson roster_decision "$roster_decision_json" \
+  --argjson schema_version "$SCHEMA_VERSION" \
   '{
     ts: $ts,
+    schema_version: $schema_version,
     project: $project,
     base: $base,
     pr: (if $pr == "-" then null else ($pr | tonumber? // $pr) end),
