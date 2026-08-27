@@ -365,3 +365,88 @@ jobs:
             rc=$?
             [[ $rc -eq 1 ]] || exit "$rc"
           }
+
+  # ---------------------------------------------------------------------
+  # OPTIONAL, OFF BY DEFAULT (issue #77). Turn on by setting the repo/org
+  # Actions variable CR_EMIT_SARIF to the literal string "true"
+  # (Settings -> Secrets and variables -> Actions -> Variables). Leave it
+  # unset and this job does not run at all — `vars.CR_EMIT_SARIF` is empty
+  # string on an unset variable, which fails the `== 'true'` check below.
+  #
+  # WHAT THIS JOB DOES AND DOES NOT DO.
+  #
+  # This workflow (cross-review-currency.yml) only ever checks whether an
+  # EXISTING cross-review record is bound to the current head — it does not
+  # run reviewers or produce a findings.verified.json itself. So this job
+  # cannot manufacture one either: it looks for a `cross-review-findings`
+  # artifact (a `findings.verified.json` produced by whatever runs the
+  # actual review pass — a separate workflow, or a human/agent uploading it)
+  # and, if one exists for this run, converts it to SARIF. If none exists
+  # the step is a documented no-op, not a failure: `continue-on-error` on
+  # the download plus an explicit existence check before invoking the
+  # emitter, so an unwired producer never turns this job red.
+  #
+  # WHY THE UPLOAD STEP BELOW IS INERT, NOT LIVE.
+  #
+  # `github/codeql-action/upload-sarif` needs `security-events: write` on
+  # the job token. Every job in this file up to here is deliberately scoped
+  # to the minimum it needs (see the `currency` job's own comment on
+  # `permissions:` being "spelled out rather than inherited, so that the one
+  # job holding statuses: write says on its own face what it can write").
+  # Bolting `security-events: write` onto a job that runs on
+  # `pull_request_target` — the same privileged trigger the `currency` job
+  # uses specifically to avoid handing a broad token to something a PR can
+  # influence — would cut directly against that stance: this job DOES
+  # consume an artifact whose contents originate from PR-adjacent findings
+  # text. The emitter itself is a pure, offline, deterministic jq transform
+  # (scripts/emit_sarif.sh) with no code-execution surface, but the SARIF it
+  # produces is uploaded data, and granting write access to GitHub's
+  # code-scanning API is a bigger step than this issue's "off by default,
+  # prove it first" ask covers. So: the emitter step is real and runs when
+  # the flag is on; the upload step is written out in full, `if: false`, so
+  # the exact shape to flip on is visible and reviewable, and enabling it is
+  # a deliberate follow-up that also adds `security-events: write` to this
+  # job's `permissions:` block at the same time — not a silent side effect
+  # of flipping one variable.
+  sarif:
+    if: >-
+      vars.CR_EMIT_SARIF == 'true' &&
+      github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Best-effort: this workflow has no producer of its own, so absence of
+      # the artifact is the expected common case until one exists.
+      - name: Fetch findings.verified.json, if a producer uploaded one
+        id: fetch
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: cross-review-findings
+          path: cr-sarif-input
+
+      - name: Emit SARIF from findings.verified.json
+        if: steps.fetch.outcome == 'success'
+        run: |
+          set -uo pipefail
+          in="cr-sarif-input/findings.verified.json"
+          if [[ ! -f "$in" ]]; then
+            echo "sarif: artifact fetched but findings.verified.json not found at $in — skipping" >&2
+            exit 0
+          fi
+          bash scripts/emit_sarif.sh --findings "$in" --out cross-review.sarif
+
+      # INERT ON PURPOSE — see the job-level comment above. Flipping this on
+      # requires also adding `security-events: write` to this job's
+      # `permissions:` block; that is a deliberate two-line change, not a
+      # side effect of toggling CR_EMIT_SARIF.
+      - name: Upload SARIF to code scanning (disabled — see comment above)
+        if: false
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: cross-review.sarif
