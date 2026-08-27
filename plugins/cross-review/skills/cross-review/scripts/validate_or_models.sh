@@ -50,6 +50,11 @@
 # Moonshot seats (kimi27/kimi3) and the CLI lanes have no OpenRouter catalog to
 # check against.
 set -uo pipefail
+# printf %f honours LC_NUMERIC; jq always emits a period, so a comma-decimal
+# locale would turn every price into "invalid number" (gemini-pro, PR #125)
+export LC_NUMERIC=C
+
+need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 profiles="$script_dir/../references/reviewer_profiles.json"
@@ -64,13 +69,13 @@ strict_pricing=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --profiles)         profiles="$2"; shift 2 ;;
-    --cache-ttl-hours)  cache_ttl_hours="$2"; shift 2 ;;
+    --profiles)         need_val "$1" "$#"; profiles="$2"; shift 2 ;;
+    --cache-ttl-hours)  need_val "$1" "$#"; cache_ttl_hours="$2"; shift 2 ;;
     --refresh)          refresh=1; shift ;;
     --no-fetch)         no_fetch=1; shift ;;
     --strict)           strict=1; shift ;;
     --json)             as_json=1; shift ;;
-    --catalog)          catalog_override="$2"; shift 2 ;;
+    --catalog)          need_val "$1" "$#"; catalog_override="$2"; shift 2 ;;
     --pricing-json)     pricing_json=1; shift ;;
     --strict-pricing)   strict_pricing=1; shift ;;
     -h|--help)          sed -n '2,25p' "$0"; exit 0 ;;
@@ -87,7 +92,11 @@ key="${OPENROUTER_API_KEY:-}"
 
 cache_dir="$HOME/.cross-review/cache"
 cache="$cache_dir/or_models.txt"
-catalog="${catalog_override:-$cache_dir/or_catalog.json}"
+# A fetch always writes the CACHE catalog; --catalog only changes what is
+# read, so a fixture or offline copy can never be overwritten by live data
+# (antigravity, PR #125 review).
+cache_catalog="$cache_dir/or_catalog.json"
+catalog="${catalog_override:-$cache_catalog}"
 mkdir -p "$cache_dir" 2>/dev/null || true
 
 # Same bounded-probe discipline as select_roster.sh's `agy models` guard: a slow
@@ -99,9 +108,11 @@ mkdir -p "$cache_dir" 2>/dev/null || true
 # no warning this round; the cache gets warmed by the explicit health-check step
 # or any --refresh run.
 if [[ "$no_fetch" -eq 0 ]] && \
-   [[ "$refresh" -eq 1 || ! -s "$cache" || -n "$(find "$cache" -mmin "+$((cache_ttl_hours * 60))" 2>/dev/null)" ]]; then
+   [[ "$refresh" -eq 1 || ! -s "$cache" || ! -s "$cache_catalog" || -n "$(find "$cache" -mmin "+$((cache_ttl_hours * 60))" 2>/dev/null)" ]]; then
+  # (! -s cache_catalog: a fresh or_models.txt from an older script version
+  # must not suppress the first catalog write -- antigravity, PR #125)
   tmp="$cache.tmp.$$"
-  tmp_catalog="$catalog.tmp.$$"
+  tmp_catalog="$cache_catalog.tmp.$$"
   resp="$(curl -fsS --max-time 20 "https://openrouter.ai/api/v1/models" \
        -H "Authorization: Bearer $key" 2>/dev/null)"
   if [[ -n "$resp" ]] \
@@ -109,8 +120,8 @@ if [[ "$no_fetch" -eq 0 ]] && \
     mv "$tmp" "$cache"
     # Best-effort: the full catalog (with pricing) feeds the drift check
     # below. A failure here must not undo the slug-list cache we just wrote.
-    if printf '%s' "$resp" | jq -c '.data' >"$tmp_catalog" 2>/dev/null && [[ -s "$tmp_catalog" ]]; then
-      mv "$tmp_catalog" "$catalog"
+    if { printf '%s' "$resp" | jq -c '.data' >"$tmp_catalog"; } 2>/dev/null && [[ -s "$tmp_catalog" ]]; then
+      mv "$tmp_catalog" "$cache_catalog"
     else
       rm -f "$tmp_catalog" 2>/dev/null || true
     fi
@@ -198,7 +209,8 @@ if [[ -s "$catalog" ]] && jq -e . "$catalog" >/dev/null 2>&1; then
         fi
         if [[ ${#parts[@]} -gt 0 ]]; then
           any_drift=1
-          joined="$(IFS=', '; echo "${parts[*]}")"
+          # IFS joins on its FIRST character only; build ", " explicitly
+          joined="$(printf '%s, ' "${parts[@]}")"; joined="${joined%, }"
           echo "WARN: $seat pricing drift: $joined" >&2
         fi
       fi

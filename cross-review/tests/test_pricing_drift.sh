@@ -125,6 +125,26 @@ HOME="$CACHEHOME" OPENROUTER_API_KEY=test-key bash "$S/validate_or_models.sh" \
   --profiles "$PROFILES" --no-fetch --catalog "$CATALOG" --strict-pricing >/dev/null 2>&1
 assert_eq "--strict-pricing exits 1 when any seat drifted" "$?" "1"
 
+# ── PR #125 review: both components drift → ", " join; comma-decimal locale;
+#    a live fetch never overwrites --catalog; flags need values ──────────────
+CAT2="$T/catalog2.json"
+jq '(.[] | select(.id == (input_filename | "" ) )) //= . | map(if .id == "z-ai/glm-5.3" then .pricing.completion = "0.0000050" else . end)' "$CATALOG" >"$CAT2" 2>/dev/null || jq 'map(if (.id | test("glm")) then .pricing.completion = "0.0000050" else . end)' "$CATALOG" >"$CAT2"
+OUT2="$(bash "$S/validate_or_models.sh" --profiles "$PROFILES" --catalog "$CAT2" --no-fetch 2>&1 >/dev/null)"
+assert_contains "two drifted components are joined with a comma and a space" "$OUT2" "/M (catalog), completion 4.40"
+if locale -a 2>/dev/null | grep -qi '^de_DE.UTF-8$'; then
+  OUT3="$(LC_ALL=de_DE.UTF-8 bash "$S/validate_or_models.sh" --profiles "$PROFILES" --catalog "$CATALOG" --no-fetch 2>&1 >/dev/null)"
+  assert_contains "comma-decimal locale still formats prices with a period" "$OUT3" "prompt 1.40"
+else
+  ok "comma-decimal locale still formats prices with a period (skipped: de_DE.UTF-8 not installed)"
+fi
+CAT_FIX="$T/catalog-fixture.json"; cp "$CATALOG" "$CAT_FIX"; before="$(cksum <"$CAT_FIX")"
+FAKEBIN="$T/bin"; mkdir -p "$FAKEBIN"
+printf '#!/bin/sh\nprintf %%s '"'"'{"data":[{"id":"z-ai/glm-5.3","pricing":{"prompt":"0.0000099","completion":"0.0000099"}}]}'"'"'\n' >"$FAKEBIN/curl"; chmod +x "$FAKEBIN/curl"
+HOME="$T/home" PATH="$FAKEBIN:$PATH" OPENROUTER_API_KEY=sk-or-test bash "$S/validate_or_models.sh" --profiles "$PROFILES" --catalog "$CAT_FIX" --refresh >/dev/null 2>&1
+assert_eq "a live fetch never overwrites the --catalog file" "$(cksum <"$CAT_FIX")" "$before"
+assert_eq "a live fetch writes the cache catalog instead" "$(jq -r '.[0].id' "$T/home/.cross-review/cache/or_catalog.json" 2>/dev/null)" "z-ai/glm-5.3"
+bash "$S/validate_or_models.sh" --profiles >/dev/null 2>&1; assert_eq "--profiles without a value exits 2" "$?" "2"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1
