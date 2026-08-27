@@ -241,6 +241,10 @@ case "$FAKE_JUDGE_ANSWER" in
   yes) printf "Yes. This matches the planted nullish-coalescing weakening exactly.\n" ;;
   no)  printf "No. This does not describe the planted defect.\n" ;;
   garbage) printf "Unclear, cannot determine either way.\n" ;;
+  multiline) printf "\nNo.\nThis finding is about a different line entirely.\n" ;;
+  utf8) printf "Yes. r\303\251sum\303\251 \360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\360\237\230\200\n" ;;
+  failout) printf "No route to model\n"; exit 1 ;;
+  seq) n=0; [ -f "$FAKE_JUDGE_COUNTER" ] && n=$(cat "$FAKE_JUDGE_COUNTER"); n=$((n + 1)); printf '%s' "$n" >"$FAKE_JUDGE_COUNTER"; if [ "$n" -eq 1 ]; then printf "No. Wrong site.\n"; else printf "Yes. This is it.\n"; fi ;;
   fail) exit 1 ;;
   *) printf "Yes.\n" ;;
 esac
@@ -331,6 +335,34 @@ assert_eq "judge none: candidates[0] stays a plain id string" \
 assert_eq "judge none: caught codex has no judged key" \
   "$(jq -r '.caught[] | select(.reviewer=="codex") | has("judged")' "$OUT10")" "false"
 assert_eq "judge none: recall unchanged" "$(jq -r '.recall' "$OUT10")" "0.67"
+# ── PR #126 review: multi-line verdicts, unparseable output, crash-with-stdout,
+#    UTF-8 note truncation, and a second candidate rescuing a seat ───────────
+OUT11="$T/grade11.json"
+FAKE_JUDGE_ANSWER=multiline PATH="$T/bin:$PATH" bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --judge agy --out "$OUT11" >/dev/null 2>&1
+assert_eq "multi-line 'No.' reply parses as no" "$(jq -r '.candidates[0].judge.verdict' "$OUT11")" "no"
+assert_eq "multi-line 'No.' reply demotes the seats" "$(jq -r '.caught | length' "$OUT11")" "0"
+OUT12="$T/grade12.json"
+FAKE_JUDGE_ANSWER=garbage PATH="$T/bin:$PATH" bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --judge agy --out "$OUT12" >/dev/null 2>&1
+assert_eq "unparseable reply is unavailable" "$(jq -r '.candidates[0].judge.verdict' "$OUT12")" "unavailable"
+assert_eq "unparseable reply fails open: caught but judged=false" "$(jq -r '[.caught[] | .judged] | unique | join(",")' "$OUT12")" "false"
+OUT13="$T/grade13.json"
+FAKE_JUDGE_ANSWER=failout PATH="$T/bin:$PATH" bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --judge agy --out "$OUT13" >/dev/null 2>&1
+assert_eq "a crashed agy that printed 'No route' is unavailable, not no" "$(jq -r '.candidates[0].judge.verdict' "$OUT13")" "unavailable"
+OUT14="$T/grade14.json"
+FAKE_JUDGE_ANSWER=utf8 PATH="$T/bin:$PATH" bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --judge agy --out "$OUT14" >/dev/null 2>&1
+assert_eq "a reply truncated inside a multibyte char still yields a grade" "$(jq -r '.candidates[0].judge.verdict' "$OUT14")" "yes"
+# two candidates for codex: the judge rejects the first and accepts the second
+cat >"$T/findings-two.json" <<'EOF'
+{"findings": [
+  {"id": "f-first", "file": "src/a.ts", "line": 8, "severity": "High", "sources": ["codex"], "claim": "wrong site", "snippet": "x", "anchor": {"resolved": true, "start_line": 8, "end_line": 8, "side": "new"}},
+  {"id": "f-second", "file": "src/a.ts", "line": 9, "severity": "High", "sources": ["codex"], "claim": "nullish weakened", "snippet": "y", "anchor": {"resolved": true, "start_line": 9, "end_line": 9, "side": "new"}}
+]}
+EOF
+OUT15="$T/grade15.json"; rm -f "$T/judge-counter"
+FAKE_JUDGE_ANSWER=seq FAKE_JUDGE_COUNTER="$T/judge-counter" PATH="$T/bin:$PATH" bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings-two.json" --roster "codex" --project "$PROJECT" --judge agy --out "$OUT15" >/dev/null 2>&1
+assert_eq "second candidate rescues the seat after the first is demoted" "$(jq -r '.caught[0].reviewer // "none"' "$OUT15")" "codex"
+assert_eq "the crediting candidate is the second one" "$(jq -r '.caught[0].matched_finding_id' "$OUT15")" "f-second"
+assert_eq "candidate verdicts are no,yes" "$(jq -r '[.candidates[].judge.verdict] | join(",")' "$OUT15")" "no,yes"
 rm -f "$T/bin/agy"
 
 echo ""

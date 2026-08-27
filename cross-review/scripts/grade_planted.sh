@@ -242,9 +242,12 @@ if [[ "$judge" != "none" ]]; then
   # any transport failure (agy missing, nonzero exit, empty stdout).
   judge_via_agy() {
     command -v agy >/dev/null 2>&1 || return 1
+    # a crashed/timed-out agy that left partial stdout ("No route ...") must
+    # not read as a verdict: the exit code gates, not just non-empty output
+    # (antigravity + gemini-pro, PR #126 review)
     run_to "$judge_timeout" agy --model "$agy_judge_model" --sandbox \
       --print-timeout "${judge_timeout}s" -p "$1" \
-      >"$judge_raw" 2>"$tmp_dir/judge_err.txt" </dev/null
+      >"$judge_raw" 2>"$tmp_dir/judge_err.txt" </dev/null || return 1
     [[ -s "$judge_raw" ]]
   }
 
@@ -273,7 +276,10 @@ if [[ "$judge" != "none" ]]; then
   # the first word (case-insensitive, punctuation stripped).
   parse_judge_verdict() {
     local first_word
-    first_word="$(head -c 200 "$judge_raw" | tr -d '\r' | awk '{print tolower($1)}' | sed -E 's/[^a-z]//g')"
+    # first word of the first NON-EMPTY line only -- awk over every line turned
+    # "No.\nBecause ..." into "no\nbecause", which matched nothing and failed
+    # open as yes (antigravity + gemini-pro, PR #126 review)
+    first_word="$(head -c 200 "$judge_raw" | tr -d '\r' | awk 'NF { print tolower($1); exit }' | sed -E 's/[^a-z]//g')"
     case "$first_word" in
       yes) echo "yes" ;;
       no)  echo "no" ;;
@@ -284,7 +290,9 @@ if [[ "$judge" != "none" ]]; then
   # judge_note — a terse note for the candidate record: the reply's first line
   # (verdict + one sentence), trimmed, capped so grade.json stays small.
   judge_note() {
-    head -c 240 "$judge_raw" 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+$//'
+    # byte-truncate, then drop any half UTF-8 sequence so jq --arg cannot
+    # reject the note (gemini-pro, PR #126 review)
+    head -c 240 "$judge_raw" 2>/dev/null | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+$//'
   }
 fi
 
