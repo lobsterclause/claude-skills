@@ -427,7 +427,11 @@ if [[ "$context_mode" == "files" ]]; then
   # path with non-ASCII bytes, `git show HEAD:"\303\274.txt"` then fails and
   # the file would vanish from the block as neither included nor omitted
   # (codex, PR #71 pass 1).
-  _ctx_paths="$(git -c core.quotePath=false diff --name-only --diff-filter=d "$base"...HEAD 2>/dev/null || true)"
+  # -z: git ALWAYS C-quotes a path containing `"` or a control character,
+  # whatever core.quotePath says, and a quoted name cannot be `git show`n.
+  # NUL-delimited output is never quoted; NUL→LF keeps the rest of this loop
+  # line-based (a path containing a newline is the one shape not supported).
+  _ctx_paths="$(git -c core.quotePath=false diff -z --name-only --diff-filter=d "$base"...HEAD 2>/dev/null | tr '\0' '\n' || true)"
   _ctx_order="$(git -c core.quotePath=false diff --numstat "$base"...HEAD 2>/dev/null \
     | awk -F'\t' '$1 != "-" { print ($1 + $2) "\t" $3 }' | sort -t $'\t' -k1,1nr | cut -f2- || true)"
   # Walk churn order first, then anything --name-only knows that numstat did
@@ -464,6 +468,12 @@ if [[ "$context_mode" == "files" ]]; then
     # Attribute escaping covers & " < > — a filename may legally contain
     # '<', and an unescaped '</files>' IN THE PATH would reproduce the outer
     # fence (codex + kimi, PR #71 pass 2).
+    # bash >= 5.2 enables `patsub_replacement`, under which a bare `&` in a
+    # ${x//pat/rep} replacement expands to the MATCHED text — "&quot;" would
+    # become "\"quot;" and the escape would silently not happen on the ubuntu
+    # CI runner while passing on macOS bash 3.2 (codex, PR #71 pass 3). Turn
+    # it off for this scope; the shopt is unknown (and harmless) on older bash.
+    shopt -u patsub_replacement 2>/dev/null || true
     _ctx_path_attr="${_p//&/&amp;}"; _ctx_path_attr="${_ctx_path_attr//\"/&quot;}"
     _ctx_path_attr="${_ctx_path_attr//</&lt;}";  _ctx_path_attr="${_ctx_path_attr//>/&gt;}"
     # Pre-read check is a LOWER bound (blob bytes + wrapper bytes, path

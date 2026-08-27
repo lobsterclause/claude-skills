@@ -90,6 +90,9 @@ REPO="$T/repo"; mkdir -p "$REPO"
   # branch — must be embedded under its POST-change path.
   printf 'UNICODE_PATH_MARKER_c7d1 v1\n' >'ünïcode.txt'
   printf 'RENAME_MARKER_8e2a\n' >old.txt
+  # A path carrying every attribute metacharacter — legal on Unix, and the
+  # bash-5.2 patsub_replacement trap turns "&quot;" into "\"quot;" (codex).
+  printf 'ATTR_PATH_MARKER_4b9e v1\n' >'a&b"c<d>e.txt'
   git add .
   git -c user.email=t@t -c user.name=t commit -qm init
   git checkout -qb feat
@@ -98,6 +101,7 @@ REPO="$T/repo"; mkdir -p "$REPO"
   git rm -q gone.txt
   printf 'BIN\000BINARY_MARKER_7a1f_v2\000' >blob.bin
   printf 'UNICODE_PATH_MARKER_c7d1 v2\n' >'ünïcode.txt'
+  printf 'ATTR_PATH_MARKER_4b9e v2\n' >'a&b"c<d>e.txt'
   git mv old.txt new.txt
   git add .
   git -c user.email=t@t -c user.name=t commit -qm change
@@ -137,6 +141,8 @@ assert_not_contains "a literal </files> (the OUTER fence) is defused too (codex+
 assert_contains "…rendered as '< /files>'" "$FILES_BLOCK" "18 < /files> outer-fence"
 assert_contains "a non-ASCII path is embedded (core.quotePath=false; codex, PR #71)" "$FILES_BLOCK" '<file path="ünïcode.txt">'
 assert_contains "…with its content" "$FILES_BLOCK" "UNICODE_PATH_MARKER_c7d1 v2"
+assert_contains "a path with & \" < > is attribute-escaped (codex, PR #71 pass 3; bash 5.2 patsub_replacement)" \
+  "$FILES_BLOCK" '<file path="a&amp;b&quot;c&lt;d&gt;e.txt">'
 assert_contains "a renamed file is embedded under its post-change path" "$FILES_BLOCK" '<file path="new.txt">'
 assert_not_contains "…and not under the old one" "$FILES_BLOCK" '<file path="old.txt">'
 assert_not_contains "the 'ONLY on the diff' wording is gone when files follow" "$KIMI" "ONLY on the diff below"
@@ -145,12 +151,12 @@ assert_eq "kimi.meta.json records context_access=file_context" \
   "$(jq -r '.context_access' "$T/o1/kimi.meta.json" 2>/dev/null)" "file_context"
 assert_eq "glm.meta.json records context_access=file_context" \
   "$(jq -r '.context_access' "$T/o1/glm.meta.json" 2>/dev/null)" "file_context"
-assert_eq "meta counts three embedded files (lib.sh, ünïcode.txt, new.txt; deleted/binary excluded)" \
-  "$(jq -r '.context_files' "$T/o1/glm.meta.json" 2>/dev/null)" "3"
+assert_eq "meta counts four embedded files (lib.sh, ünïcode.txt, new.txt, a&b\"c<d>e.txt; deleted/binary excluded)" \
+  "$(jq -r '.context_files' "$T/o1/glm.meta.json" 2>/dev/null)" "4"
 assert_eq "meta counts zero omitted" \
   "$(jq -r '.context_files_omitted' "$T/o1/glm.meta.json" 2>/dev/null)" "0"
 assert_eq "context.files.meta.json sidecar agrees" \
-  "$(jq -c '[.included, .omitted, .omitted_paths]' "$T/o1/context.files.meta.json" 2>/dev/null)" "[3,0,[]]"
+  "$(jq -c '[.included, .omitted, .omitted_paths]' "$T/o1/context.files.meta.json" 2>/dev/null)" "[4,0,[]]"
 # The budget charges the serialized entry (tags + path + newlines), not the
 # bare blob: bytes on disk must never exceed what the sidecar says was spent.
 assert_eq "sidecar .bytes equals the block's real size on disk" \
@@ -189,9 +195,9 @@ assert_contains "the prompt names the omitted file" "$KIMI6" "Omitted by the siz
 assert_contains "…by path" "$KIMI6" "lib.sh"
 assert_eq "meta: context_access stays file_context (the mode ran; the budget bit)" \
   "$(jq -r '.context_access' "$T/o6/kimi.meta.json" 2>/dev/null)" "file_context"
-assert_eq "meta: context_files_omitted=3 (every changed text file is over a 10-byte budget)" "$(jq -r '.context_files_omitted' "$T/o6/kimi.meta.json" 2>/dev/null)" "3"
+assert_eq "meta: context_files_omitted=4 (every changed text file is over a 10-byte budget)" "$(jq -r '.context_files_omitted' "$T/o6/kimi.meta.json" 2>/dev/null)" "4"
 assert_eq "sidecar lists every omitted path" \
-  "$(jq -r '.omitted_paths | sort | join(",")' "$T/o6/context.files.meta.json" 2>/dev/null)" "lib.sh,new.txt,ünïcode.txt"
+  "$(jq -r '.omitted_paths | sort | join(",")' "$T/o6/context.files.meta.json" 2>/dev/null)" "a&b\"c<d>e.txt,lib.sh,new.txt,ünïcode.txt"
 # The binding budget check is on the SERIALIZED entry: lib.sh's blob is well
 # under 700 bytes but its entry (tags + path + the defusing bytes) is not, so
 # a budget that admits the blob alone must still omit it.
@@ -201,7 +207,7 @@ assert_eq "budget = blob+1 bytes → lib.sh omitted (entry bytes > blob bytes)" 
   "$(jq -r '.omitted_paths | index("lib.sh") != null' "$T/o9/context.files.meta.json")" "true"
 assert_eq "…and bytes on disk never exceed the budget" \
   "$([[ $(wc -c <"$T/o9/context.files.txt" | tr -d ' ') -le $((lib_blob + 1)) ]] && echo true || echo false)" "true"
-[[ "$(grep -c '^$' "$T/o1/context.files.txt")" -eq "$(grep -c '^$' <(cd "$REPO" && git show HEAD:lib.sh; git show HEAD:new.txt; git show HEAD:ünïcode.txt))" ]] \
+[[ "$(grep -c '^$' "$T/o1/context.files.txt")" -eq "$(grep -c '^$' <(cd "$REPO" && git show HEAD:lib.sh; git show HEAD:new.txt; git show HEAD:ünïcode.txt; git show 'HEAD:a&b"c<d>e.txt'))" ]] \
   && ok "no blank line is inserted between <file> entries (kimi, pass 2)" \
   || bad "blank lines between entries: $(grep -c '^$' "$T/o1/context.files.txt")"
 assert_contains "stderr says how much the budget dropped" "$(cat "$T/o6.log")" "omitted by the 10B budget"
