@@ -255,6 +255,25 @@ jq '. + [.[0]]' "$OPERATORS" >"$BAD_OPS"
 bash "$S/plant_mutation.sh" --repo "$REPO_G" --base "$G_BASE" --head "$G_HEAD" --seed 1 --operators "$BAD_OPS" --out "$T/planted-g.json" >/dev/null 2>&1
 assert_eq "duplicate operator ids are rejected (exit 1)" "$?" "1"
 
+# (h) pass 2: a commit failure rolls back index, worktree and branch; a
+#     leading-zero seed is rejected before any mutation.
+REPO_H="$T/repo-h"; mk_fixture_repo "$REPO_H"
+H_BASE="$(git -C "$REPO_H" rev-parse HEAD~1)"; H_HEAD="$(git -C "$REPO_H" rev-parse HEAD)"
+H_BRANCH="$(git -C "$REPO_H" rev-parse --abbrev-ref HEAD)"
+git -C "$REPO_H" config commit.gpgsign true
+git -C "$REPO_H" config user.signingkey 0000000000000000
+git -C "$REPO_H" config gpg.program /nonexistent-gpg
+bash "$S/plant_mutation.sh" --repo "$REPO_H" --base "$H_BASE" --head "$H_HEAD" --seed 1 --operator nullish --run-id mutation-h --out "$T/planted-h.json" >/dev/null 2>"$T/stderr-h.log"
+assert_eq "commit failure exits 1" "$?" "1"
+assert_contains "commit failure is named" "$(cat "$T/stderr-h.log")" "git commit failed"
+assert_eq "commit failure: back on the original branch" "$(git -C "$REPO_H" rev-parse --abbrev-ref HEAD)" "$H_BRANCH"
+assert_eq "commit failure: index and worktree clean" "$(git -C "$REPO_H" status --porcelain --untracked-files=no | wc -l | tr -d ' ')" "0"
+assert_eq "commit failure: mutation branch removed" "$(git -C "$REPO_H" branch --list 'mutation/*' | wc -l | tr -d ' ')" "0"
+git -C "$REPO_H" config --unset commit.gpgsign
+bash "$S/plant_mutation.sh" --repo "$REPO_H" --base "$H_BASE" --head "$H_HEAD" --seed 007 --out "$T/planted-h2.json" >/dev/null 2>&1
+assert_eq "leading-zero --seed is rejected (exit 1)" "$?" "1"
+assert_eq "leading-zero seed created no branch" "$(git -C "$REPO_H" branch --list 'mutation/*' | wc -l | tr -d ' ')" "0"
+
 echo
 echo "── summary ──"
 echo "  PASS=$PASS FAIL=$FAIL"

@@ -91,7 +91,7 @@ command -v jq >/dev/null 2>&1 || { echo "plant_mutation: jq required" >&2; exit 
 # --seed feeds awk srand() and jq --argjson: anything but a non-negative
 # integer would be silently read as 0 by awk and then break the manifest
 # AFTER the mutation was committed (codex, PR #107 review).
-[[ "$seed" =~ ^[0-9]+$ ]] || { echo "plant_mutation: --seed must be a non-negative integer (got '$seed')" >&2; exit 1; }
+[[ "$seed" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "plant_mutation: --seed must be a non-negative integer without leading zeros (got '$seed')" >&2; exit 1; }
 
 # The operators table is data, but its `replace` strings are executed by
 # sed. Accept only a plain single substitution -- `s/<pat>/<repl>/` with an
@@ -241,6 +241,9 @@ git -C "$repo" switch -c "$mutation_branch" "$head_sha" -q || { echo "plant_muta
 # block the switch), then drop the branch (kimi, PR #107 review).
 abort_plant() {
   echo "plant_mutation: $1" >&2
+  # unstage first: after a failed commit the index still holds the mutation
+  # and `checkout --` would restore it from there (codex + deepseek, pass 2)
+  git -C "$repo" reset -q HEAD -- "$p_file" 2>/dev/null || true
   git -C "$repo" checkout -q -- "$p_file" 2>/dev/null || true
   git -C "$repo" switch - -q 2>/dev/null || true
   git -C "$repo" branch -D "$mutation_branch" -q 2>/dev/null || true
