@@ -65,11 +65,73 @@ set -uo pipefail
 # new event types are expected to show up before this list is updated.
 ALLOWED_EVENTS="proposed anchored factcheck_kept factcheck_dropped parent_verified_kept parent_verified_dropped fix_applied fix_verified fix_failed deferred unresolved human_accepted human_rejected regression_detected duplicate_merged planted caught missed"
 
-# Parse one physical line as exactly one JSON object; prints it compacted,
-# or nothing (malformed).
-parse_line() {
-  printf '%s' "$1" | jq -cs 'if length == 1 and (.[0] | type) == "object" then .[0] else empty end' 2>/dev/null
-}
+# Single-pass line extraction (#132): one jq process per ledger file, not
+# per line. jq's `-R` raw-input mode runs the filter once per physical
+# line inside ONE process; `foreach inputs` keeps our own line counter so a
+# final line with no trailing newline still numbers correctly (jq's builtin
+# input_line_number undercounts that case). Each line becomes exactly one
+# row: a blank physical line produces no row (matching the old
+# `[[ -z "$line" ]] && continue`); a line is malformed unless
+# `$raw | fromjson` succeeds AND the result is a JSON object -- a bare
+# scalar, an array, or two documents on one physical line (trailing
+# non-whitespace after the parsed value is a `fromjson` parse error) all
+# land in the "malformed" branch, same as the old `jq -cs` slurp check
+# (codex, PR #109 review). Fields that feed the schema_version distribution
+# buckets keep the existing tab/newline/CR flatten so the bucket stays a
+# single field. run_id and event get the same `tostring | gsub` treatment:
+# `join` aborts the whole jq process on an object/array element (every row
+# after it silently vanished — "runlog: 0 lines"), and a newline inside a
+# value split one row into two for the bash reader while a tab broke the
+# tab-keyed orphan join below; the \u001f delimiter itself is scrubbed too,
+# or a value carrying it would shift every later field (cross-review of #139).
+#
+# Rows join fields with \x1F (ASCII unit separator, spelled "\u001f" in the
+# jq program so no raw control byte sits in this file), not a real tab: bash's
+# `read` treats tab as "IFS whitespace" and collapses runs of it regardless
+# of what IFS is set to, silently dropping empty middle fields (e.g. a
+# non-numeric schema_version leaves sv_num empty) and shifting every field
+# after it. \x1F is not IFS whitespace, so `read` with IFS=$'\x1f' keeps
+# empty fields intact.
+runlog_extract_jq='
+foreach inputs as $raw (0; . + 1;
+  if $raw == "" then empty
+  else
+    (try ($raw | fromjson) catch " ERR") as $p
+    | if ($p == " ERR") or (($p|type) != "object") then
+        [., "malformed", "", "", "", "", ""] | join("\u001f")
+      else
+        ($p) as $o
+        | [., "ok",
+           ($o|has("ts")|if . then "1" else "0" end),
+           ($o|has("schema_version")|if . then "1" else "0" end),
+           ($o.schema_version | if type == "number" then tostring else "" end),
+           (($o.run_id // "") | tostring | gsub("[\t\n\r\u001f]"; " ")),
+           ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r\u001f]"; " ")) else "missing" end)
+          ] | join("\u001f")
+      end
+  end
+)
+'
+events_extract_jq='
+foreach inputs as $raw (0; . + 1;
+  if $raw == "" then empty
+  else
+    (try ($raw | fromjson) catch " ERR") as $p
+    | if ($p == " ERR") or (($p|type) != "object") then
+        [., "malformed", "", "", "", "", ""] | join("\u001f")
+      else
+        ($p) as $o
+        | [., "ok",
+           (($o.event // "") | tostring | gsub("[\t\n\r\u001f]"; " ")),
+           (($o.run_id // "") | tostring | gsub("[\t\n\r\u001f]"; " ")),
+           ($o|has("schema_version")|if . then "1" else "0" end),
+           ($o.schema_version | if type == "number" then tostring else "" end),
+           ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r\u001f]"; " ")) else "missing" end)
+          ] | join("\u001f")
+      end
+  end
+)
+'
 
 runlog=""
 events=""
@@ -135,6 +197,24 @@ read_current_schema_version() {
 read_current_schema_version "$writers_dir/append_runlog.sh" runlog_current_sv
 read_current_schema_version "$writers_dir/append_finding_event.sh" events_current_sv
 
+# True if $1 (a schema_version already known to be a JSON number, per jq's
+# `tostring`) is above the writer's current constant $2. $2 is always a
+# clean non-negative integer (validated above). $1 is almost always one
+# too -- forking `awk` for every single line to compare, once the per-line
+# jq calls were folded into one pass, became the new dominant cost on a
+# multi-thousand-line ledger (#132 perf follow-up). Bash integer compare
+# handles that common case with no fork; `awk` is still used, but only for
+# the rare non-integer schema_version (e.g. "1.5"), to keep that case
+# "handled exactly as today" (float precision, scientific notation, etc).
+sv_is_future() {
+  local v="$1" cur="$2"
+  if [[ "$v" =~ ^(0|-?[1-9][0-9]*)$ ]]; then
+    [[ "$v" -gt "$cur" ]]
+  else
+    awk -v a="$v" -v b="$cur" 'BEGIN{exit !(a > b)}'
+  fi
+}
+
 errors=0
 warns=0
 
@@ -153,26 +233,22 @@ sv_runlog_file="$(mktemp)"
 : >"$sv_runlog_file"
 orphan_run_ids_file="$(mktemp)"
 : >"$orphan_run_ids_file"
+erid_candidates_file="$(mktemp)"
+: >"$erid_candidates_file"
 sv_events_file="$(mktemp)"
 : >"$sv_events_file"
-trap 'rm -f "$run_ids_file" "$orphan_run_ids_file" "$sv_runlog_file" "$sv_events_file"' EXIT
+trap 'rm -f "$run_ids_file" "$orphan_run_ids_file" "$erid_candidates_file" "$sv_runlog_file" "$sv_events_file"' EXIT
 
 if [[ -f "$runlog" ]]; then
-  lineno=0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    lineno=$((lineno + 1))
-    [[ -z "$line" ]] && continue
+  while IFS=$'\x1f' read -r lineno status has_ts has_sv sv_num rid sv; do
     runlog_lines=$((runlog_lines + 1))
-    parsed="$(parse_line "$line")"
-    if [[ -z "$parsed" ]]; then
+    if [[ "$status" == "malformed" ]]; then
       runlog_malformed=$((runlog_malformed + 1))
       runlog_errlines+=("runlog:$lineno malformed")
       continue
     fi
-    has_ts="$(printf '%s' "$parsed" | jq -r 'has("ts")')"
-    has_sv="$(printf '%s' "$parsed" | jq -r 'has("schema_version")')"
-    if [[ "$has_ts" != "true" ]]; then
-      if [[ "$has_sv" != "true" ]]; then
+    if [[ "$has_ts" != "1" ]]; then
+      if [[ "$has_sv" != "1" ]]; then
         # Legacy row: no ts, no schema_version (version 0, the pre-#109
         # era). Valid when written -- WARN, not ERROR (#111, accepted by
         # decision, not backfilled).
@@ -183,19 +259,16 @@ if [[ -f "$runlog" ]]; then
         runlog_errlines+=("runlog:$lineno missing ts")
       fi
     fi
-    if [[ "$has_sv" == "true" ]]; then
-      sv_num="$(printf '%s' "$parsed" | jq -r '.schema_version | if type == "number" then . else empty end')"
-      if [[ -n "$sv_num" ]] && awk -v a="$sv_num" -v b="$runlog_current_sv" 'BEGIN{exit !(a > b)}'; then
+    if [[ "$has_sv" == "1" ]]; then
+      if [[ -n "$sv_num" ]] && sv_is_future "$sv_num" "$runlog_current_sv"; then
         runlog_future_version=$((runlog_future_version + 1))
         runlog_warnlines+=("runlog:$lineno schema_version $sv_num is above the writer's current $runlog_current_sv")
         runlog_future_examples+=("$sv_num")
       fi
     fi
-    rid="$(printf '%s' "$parsed" | jq -r '.run_id // empty')"
     [[ -n "$rid" ]] && printf '%s\n' "$rid" >>"$run_ids_file"
-    sv="$(printf '%s' "$parsed" | jq -r 'if has("schema_version") then (.schema_version|tostring|gsub("[\\t\\n\\r]"; " ")) else "missing" end')"
     printf '%s\n' "$sv" >>"$sv_runlog_file"
-  done <"$runlog"
+  done < <(jq -nR -r "$runlog_extract_jq" "$runlog")
 fi
 
 # ── events pass ──────────────────────────────────────────────────────────
@@ -209,18 +282,13 @@ declare -a events_future_examples=()
 events_lines=0
 
 if [[ -f "$events" ]]; then
-  lineno=0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    lineno=$((lineno + 1))
-    [[ -z "$line" ]] && continue
+  while IFS=$'\x1f' read -r lineno status ev erid has_sv esv_num sv; do
     events_lines=$((events_lines + 1))
-    parsed="$(parse_line "$line")"
-    if [[ -z "$parsed" ]]; then
+    if [[ "$status" == "malformed" ]]; then
       events_malformed=$((events_malformed + 1))
       events_errlines+=("events:$lineno malformed")
       continue
     fi
-    ev="$(printf '%s' "$parsed" | jq -r '.event // empty')"
     if [[ -n "$ev" ]]; then
       allowed=0
       for a in $ALLOWED_EVENTS; do
@@ -232,23 +300,33 @@ if [[ -f "$events" ]]; then
         unknown_event_names+=("$ev")
       fi
     fi
-    erid="$(printf '%s' "$parsed" | jq -r '.run_id // empty')"
-    if [[ -n "$erid" ]]; then
-      if ! grep -qxF "$erid" "$run_ids_file" 2>/dev/null; then
-        printf '%s\t%s\n' "$erid" "$lineno" >>"$orphan_run_ids_file"
-      fi
-    fi
-    if [[ "$(printf '%s' "$parsed" | jq -r 'has("schema_version")')" == "true" ]]; then
-      esv_num="$(printf '%s' "$parsed" | jq -r '.schema_version | if type == "number" then . else empty end')"
-      if [[ -n "$esv_num" ]] && awk -v a="$esv_num" -v b="$events_current_sv" 'BEGIN{exit !(a > b)}'; then
+    # Candidate (run_id, lineno) pairs, not yet filtered against run_ids_file
+    # -- forking `grep -qxF` once per event line was the dominant cost once
+    # the per-line jq calls above were folded away (#132 perf follow-up).
+    # The membership test itself becomes a single `awk` pass after this
+    # loop instead.
+    [[ -n "$erid" ]] && printf '%s\t%s\n' "$erid" "$lineno" >>"$erid_candidates_file"
+    if [[ "$has_sv" == "1" ]]; then
+      if [[ -n "$esv_num" ]] && sv_is_future "$esv_num" "$events_current_sv"; then
         events_future_version=$((events_future_version + 1))
         events_warnlines+=("events:$lineno schema_version $esv_num is above the writer's current $events_current_sv")
         events_future_examples+=("$esv_num")
       fi
     fi
-    sv="$(printf '%s' "$parsed" | jq -r 'if has("schema_version") then (.schema_version|tostring|gsub("[\\t\\n\\r]"; " ")) else "missing" end')"
     printf '%s\n' "$sv" >>"$sv_events_file"
-  done <"$events"
+  done < <(jq -nR -r "$events_extract_jq" "$events")
+  # One awk pass, not one grep fork per event line: load every runlog
+  # run_id into an in-memory set (NR==FNR), then keep only the candidate
+  # (run_id, lineno) pairs whose run_id is absent from that set -- the same
+  # exact-match semantics as the old `grep -qxF`, without re-forking per
+  # candidate.
+  # Membership is keyed on FILENAME, not the NR==FNR idiom: with an EMPTY
+  # run_ids_file (no runlog rows carried a run_id) NR==FNR stays true for
+  # the whole candidates file, every candidate lands in `seen`, and every
+  # real orphan is silently swallowed (found in parent verification of #139).
+  if [[ -s "$erid_candidates_file" ]]; then
+    awk -F'\t' -v rf="$run_ids_file" 'FILENAME==rf{seen[$0]=1; next} !($1 in seen)' "$run_ids_file" "$erid_candidates_file" >"$orphan_run_ids_file"
+  fi
 fi
 
 orphan_count=$(wc -l <"$orphan_run_ids_file" | tr -d ' ')

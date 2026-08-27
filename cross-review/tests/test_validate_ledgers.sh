@@ -189,6 +189,126 @@ VEROUT="$(bash "$S/validate_ledgers.sh" --runlog "$VERLOG" --events "$EVENTS" 2>
 assert_eq "a versioned row with no ts is still an ERROR (exit 1)" "$verrc" "1"
 assert_contains "versioned no-ts row reports missing ts" "$VEROUT" "missing ts"
 
+echo "── orphan run_id detection with an EMPTY runlog (every event is an orphan) ──"
+# Regression guard for the single-pass orphan check: an awk NR==FNR set-load
+# over an empty run_ids file treats the candidates file as the first file,
+# so every orphan was swallowed. The pre-#132 grep -qxF path reported them.
+EMPTY_RL="$T/empty-runlog.jsonl"; : >"$EMPTY_RL"
+ORPH_EV="$T/orphan-events.jsonl"
+printf '{"event":"proposed","ts":"2026-08-01T00:00:00Z","finding_id":"f-1","run_id":"run-only-in-events","schema_version":1}\n' >"$ORPH_EV"
+printf '{"event":"proposed","ts":"2026-08-01T00:00:01Z","finding_id":"f-2","run_id":"run-only-in-events-2","schema_version":1}\n' >>"$ORPH_EV"
+ORPH_OUT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$EMPTY_RL" --events "$ORPH_EV" 2>&1)"
+assert_contains "empty runlog: both events are reported as orphan run_ids" "$ORPH_OUT" "2 event(s) with a run_id absent from runlog"
+assert_contains "empty runlog: the orphan run_id is named" "$ORPH_OUT" "orphan run_id 'run-only-in-events'"
+ORPH_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$EMPTY_RL" --events "$ORPH_EV" --json 2>/dev/null)"
+assert_eq "empty runlog: --json orphan_run_id count is 2" "$(jq -r '.events.orphan_run_id' <<<"$ORPH_JSON")" "2"
+
+echo "── hostile field values: wrong JSON types and embedded newlines/tabs do not derail the pass ──"
+# A run_id/event that is an object or array used to abort the one jq process
+# (join cannot add an object), which the bash reader saw as end-of-input:
+# every later row vanished and the ledger reported "0 lines". A newline
+# inside a value split one row in two for the reader; a tab broke the
+# tab-keyed orphan join.
+HOSTILE_RL="$T/hostile-runlog.jsonl"
+printf '{"ts":"2026-08-01T00:00:00Z","run_id":{},"schema_version":1}\n' >"$HOSTILE_RL"
+printf '{"ts":"2026-08-01T00:00:01Z","run_id":"bad\\nrecord\\twith-tab","schema_version":1}\n' >>"$HOSTILE_RL"
+printf '{"ts":"2026-08-01T00:00:02Z","run_id":["arr"],"schema_version":1}\n' >>"$HOSTILE_RL"
+printf '{"ts":"2026-08-01T00:00:03Z","run_id":"run-good","schema_version":1}\n' >>"$HOSTILE_RL"
+# A value carrying the \u001f field delimiter itself must not shift the
+# fields after it (here it would smuggle a fake schema_version bucket "99").
+printf '{"ts":"2026-08-01T00:00:04Z","run_id":"smuggle\\u001f1\\u001f99","schema_version":1}\n' >>"$HOSTILE_RL"
+printf '{not json\n' >>"$HOSTILE_RL"
+HOSTILE_EV="$T/hostile-events.jsonl"
+printf '{"event":{"nested":true},"ts":"2026-08-01T00:00:00Z","finding_id":"f-1","run_id":"run-good","schema_version":1}\n' >"$HOSTILE_EV"
+printf '{"event":"proposed","ts":"2026-08-01T00:00:01Z","finding_id":"f-2","run_id":"run-orphan","schema_version":1}\n' >>"$HOSTILE_EV"
+HOSTILE_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$HOSTILE_RL" --events "$HOSTILE_EV" --json 2>/dev/null)"
+assert_eq "hostile runlog: every physical line is still counted (6, not 0)" "$(jq -r '.runlog.lines' <<<"$HOSTILE_JSON")" "6"
+assert_eq "hostile runlog: a \\u001f inside run_id cannot smuggle a schema_version bucket" "$(jq -c '.runlog.schema_version' <<<"$HOSTILE_JSON")" '{"1":5}'
+assert_eq "hostile runlog: the trailing malformed line is still reported" "$(jq -r '.runlog.malformed' <<<"$HOSTILE_JSON")" "1"
+assert_eq "hostile runlog: a newline inside run_id does not split the row (0 legacy rows)" "$(jq -r '.runlog.legacy_no_ts' <<<"$HOSTILE_JSON")" "0"
+assert_eq "hostile events: both event lines are counted" "$(jq -r '.events.lines' <<<"$HOSTILE_JSON")" "2"
+assert_eq "hostile events: an object-valued event is an unknown event, not a crash" "$(jq -r '.events.unknown_event' <<<"$HOSTILE_JSON")" "1"
+assert_eq "hostile events: only the truly absent run_id is an orphan" "$(jq -c '.events.orphan_run_id_examples' <<<"$HOSTILE_JSON")" '["run-orphan"]'
+
+echo "── sv_is_future: non-integer schema_version still takes the exact awk path ──"
+FRAC_RL="$T/frac-runlog.jsonl"
+printf '{"ts":"2026-08-01T00:00:00Z","run_id":"r-1","schema_version":1.5}\n' >"$FRAC_RL"
+printf '{"ts":"2026-08-01T00:00:01Z","run_id":"r-2","schema_version":0.5}\n' >>"$FRAC_RL"
+printf '{"ts":"2026-08-01T00:00:02Z","run_id":"r-3","schema_version":1}\n' >>"$FRAC_RL"
+FRAC_EV="$T/frac-events.jsonl"; : >"$FRAC_EV"
+FRAC_OUT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$FRAC_RL" --events "$FRAC_EV" 2>&1)"
+assert_contains "schema_version 1.5 (above current 1) warns as future" "$FRAC_OUT" "runlog:1 schema_version 1.5 is above the writer's current 1"
+assert_eq "schema_version 0.5 and 1 do not warn as future (exactly one future row)" "$(grep -c 'is above the writer' <<<"$FRAC_OUT")" "1"
+
+echo "── single-pass line extraction: parity + performance on a large fixture (#132) ──"
+# A fixture large enough to make the per-line-fork cost visible: mostly
+# valid rows, plus 3 malformed, 2 legacy no-ts, and 1 future schema_version
+# runlog row, scattered through it (near the start, the middle, and near
+# the end) so line numbering at every offset gets exercised. 1,000 lines
+# is the size the pinned baseline below was generated at (the pre-#132
+# script forked several jq/awk/grep processes per line and took about a
+# minute at this size; the single-pass script finishes in well under a
+# second).
+PERF_N=1000
+PERF_RUNLOG="$T/perf-runlog.jsonl"
+PERF_EVENTS="$T/perf-events.jsonl"
+: >"$PERF_RUNLOG"
+: >"$PERF_EVENTS"
+PERF_HALF=$((PERF_N / 2))
+PERF_NEAR_END1=$((PERF_N - 10))
+PERF_NEAR_END2=$((PERF_N - 20))
+for ((pi = 1; pi <= PERF_N; pi++)); do
+  if [[ "$pi" -eq 10 || "$pi" -eq "$PERF_HALF" || "$pi" -eq "$PERF_NEAR_END1" ]]; then
+    echo "{not valid json $pi" >>"$PERF_RUNLOG"
+  elif [[ "$pi" -eq 20 || "$pi" -eq "$PERF_NEAR_END2" ]]; then
+    printf '{"run_id":"legacy-%d"}\n' "$pi" >>"$PERF_RUNLOG"
+  elif [[ "$pi" -eq 30 ]]; then
+    printf '{"ts":"2026-08-01T00:00:00Z","run_id":"future-%d","schema_version":99}\n' "$pi" >>"$PERF_RUNLOG"
+  else
+    printf '{"ts":"2026-08-01T00:00:%02dZ","run_id":"run-%d","schema_version":1,"reviewers":{"codex":{"status":"ok"}}}\n' "$((pi % 60))" "$pi" >>"$PERF_RUNLOG"
+  fi
+  printf '{"event":"proposed","ts":"2026-08-01T00:00:%02dZ","finding_id":"f-%d","run_id":"run-%d","schema_version":1}\n' "$((pi % 60))" "$pi" "$pi" >>"$PERF_EVENTS"
+done
+
+# Expected output PINNED from the pre-#132 script (origin/master before
+# #139, generated 2026-08-27 on this exact fixture) -- not re-derived from
+# `git show HEAD:` at test time, which becomes a tautology the moment the
+# refactor merges and fails outright without history (cross-review of #137).
+# It also spares the ~60s-per-invocation run of the old per-line-fork script.
+# Paths never appear in the output, so no normalization is needed.
+PIN_TEXT=$(cat <<'PINNED'
+ERROR runlog:10 malformed
+ERROR runlog:500 malformed
+ERROR runlog:990 malformed
+WARN  legacy: runlog:20 has no ts (pre-schema entry)
+WARN  runlog:30 schema_version 99 is above the writer's current 1
+WARN  legacy: runlog:980 has no ts (pre-schema entry)
+WARN  events: 6 event(s) with a run_id absent from runlog (orphan run_id):
+  orphan run_id 'run-10'
+  orphan run_id 'run-20'
+  orphan run_id 'run-30'
+  orphan run_id 'run-500'
+  orphan run_id 'run-980'
+runlog: 1000 lines, 3 malformed, 0 missing ts, 2 legacy no-ts, 1 above-current schema_version, schema_version: 1=994, 99=1, missing=2
+events: 1000 lines, 0 malformed, 0 unknown event(s), 6 orphan run_id(s), 0 above-current schema_version, schema_version: 1=1000
+PINNED
+)
+PIN_JSON='{"runlog":{"lines":1000,"malformed":3,"missing_ts":0,"legacy_no_ts":2,"future_version":1,"future_version_examples":[99],"current_schema_version":1,"schema_version":{"1":994,"99":1,"missing":2}},"events":{"lines":1000,"malformed":0,"unknown_event":0,"unknown_event_examples":[],"orphan_run_id":6,"orphan_run_id_examples":["run-10","run-20","run-30","run-500","run-980"],"future_version":0,"future_version_examples":[],"current_schema_version":1,"schema_version":{"1":1000}},"errors":3,"warns":9}'
+NEW_TEXT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" 2>&1)"
+assert_eq "single-pass text output matches the pre-#132 script byte-for-byte on a $PERF_N-line fixture" "$NEW_TEXT" "$PIN_TEXT"
+NEW_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" --json 2>/dev/null)"
+assert_eq "single-pass --json output matches the pre-#132 script byte-for-byte on a $PERF_N-line fixture" "$NEW_JSON" "$PIN_JSON"
+
+PERF_START=$(date +%s)
+bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" >/dev/null 2>&1
+PERF_END=$(date +%s)
+PERF_ELAPSED=$((PERF_END - PERF_START))
+if [[ "$PERF_ELAPSED" -lt 10 ]]; then
+  ok "single-pass run finishes in under 10s on a $PERF_N-line fixture (${PERF_ELAPSED}s)"
+else
+  bad "single-pass run finishes in under 10s on a $PERF_N-line fixture (took ${PERF_ELAPSED}s)"
+fi
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1
