@@ -253,9 +253,32 @@ done
 # files rows: 1 kept, 1 dropped, 1 duplicate, 2 deferred -> resolved 2, kept 50%
 printf '{"event":"factcheck_kept","finding_id":"f-d1","run_id":"dd1","ts":"2026-08-20T00:00:00Z"}\n{"event":"factcheck_dropped","finding_id":"f-d2","run_id":"dd2","ts":"2026-08-20T00:00:00Z"}\n{"event":"duplicate_merged","finding_id":"f-d3","run_id":"dd3","ts":"2026-08-20T00:00:00Z"}\n{"event":"deferred","finding_id":"f-d4","run_id":"dd4","ts":"2026-08-20T00:00:00Z"}\n{"event":"deferred","finding_id":"f-d5","run_id":"dd5","ts":"2026-08-20T00:00:00Z"}\n' >>"$DEF2EV"
 DEF2REP="$(CROSS_REVIEW_RUNLOG="$DEF2LOG" CROSS_REVIEW_FINDING_EVENTS="$DEF2EV" bash "$S/leaderboard.sh" --mode report 2>/dev/null)"
-assert_contains "context-mode table: duplicate and deferred are excluded from resolved (files: 2 resolved, 50% kept)" "$DEF2REP" "files"
+assert_contains "context-mode table: duplicate and deferred are excluded from resolved (files: 2 resolved, 50% kept)" "$DEF2REP" "files kept=50% drop=50% (n=5, resolved=2)"
 DEF2J="$(CROSS_REVIEW_RUNLOG="$DEF2LOG" CROSS_REVIEW_FINDING_EVENTS="$DEF2EV" bash "$S/leaderboard.sh" --mode json 2>/dev/null)"
-ok "own drop rate ignores deferred findings (not exposed in json; covered by the report table)"
+# own_drop_rate is not exposed in json, but it drives the solo-credit
+# discount: 1 dropped + 4 unresolved + 2 deferred = 5 active -> 20% > 15%
+# threshold -> discount applies; had the 2 deferred padded own_n the rate
+# would be 1/7 = 14% and no discount. Control: same seat with the 2 deferred
+# replaced by 2 more unresolved (rate 1/7, no discount) must score HIGHER.
+mk_dr_fixture() {   # <dir> <third-mode: deferred|proposed-only>
+  local d="$1" mode="$2"; mkdir -p "$d"; : >"$d/r.jsonl"; : >"$d/e.jsonl"
+  for i in 1 2 3 4 5 6 7; do
+    printf '{"ts":"2026-08-%02dT00:00:00Z","run_id":"dr%d","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":10,"timeout_budget_s":600,"model":"m1"}}}\n' "$i" "$i" >>"$d/r.jsonl"
+    printf '{"event":"proposed","finding_id":"f-r%d","run_id":"dr%d","reviewer":"glm","severity":"High","all_sources":["glm"],"ts":"2026-08-%02dT00:00:01Z"}\n' "$i" "$i" "$i" >>"$d/e.jsonl"
+  done
+  printf '{"event":"factcheck_dropped","finding_id":"f-r1","run_id":"dr1","ts":"2026-08-20T00:00:00Z"}\n' >>"$d/e.jsonl"
+  if [[ "$mode" == "deferred" ]]; then
+    printf '{"event":"deferred","finding_id":"f-r6","run_id":"dr6","ts":"2026-08-20T00:00:00Z"}\n{"event":"deferred","finding_id":"f-r7","run_id":"dr7","ts":"2026-08-20T00:00:00Z"}\n' >>"$d/e.jsonl"
+  fi
+}
+mk_dr_fixture "$T/dr-a" deferred; mk_dr_fixture "$T/dr-b" none
+SCORE_A="$(CROSS_REVIEW_RUNLOG="$T/dr-a/r.jsonl" CROSS_REVIEW_FINDING_EVENTS="$T/dr-a/e.jsonl" bash "$S/leaderboard.sh" --mode json 2>/dev/null | jq -r '.[] | select(.reviewer=="glm") | .score')"
+SCORE_B="$(CROSS_REVIEW_RUNLOG="$T/dr-b/r.jsonl" CROSS_REVIEW_FINDING_EVENTS="$T/dr-b/e.jsonl" bash "$S/leaderboard.sh" --mode json 2>/dev/null | jq -r '.[] | select(.reviewer=="glm") | .score')"
+if awk -v a="$SCORE_A" -v b="$SCORE_B" 'BEGIN{exit !(a+0 < b+0)}'; then
+  ok "deferred findings do not pad own_n: 1/5 active trips the solo discount (score $SCORE_A) while 1/7 does not ($SCORE_B)"
+else
+  bad "deferred findings do not pad own_n (got A=$SCORE_A, B=$SCORE_B; want A < B)"
+fi
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"
