@@ -24,7 +24,7 @@
 # input is prose) — partial extraction from whichever reviewers cooperated is
 # the whole point; a fully-prose round should not look like a script failure.
 #
-# Usage: merge_raw_findings.sh --raw <dir> --out <findings.json> [--emit-events <run_id>] (--emit-events <run_id> [--project <name> | --repo-root <dir>])
+# Usage: merge_raw_findings.sh --raw <dir> --out <findings.json> [--emit-events <run_id> (--project <name> | --repo-root <dir>)]
 #
 # --emit-events <run_id>: optional, additive (#88). This script never merges
 # same-file/same-claim findings from different reviewers into one output row
