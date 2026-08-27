@@ -1,0 +1,52 @@
+name: cross-review planted-round (weekly)
+
+# Weekly ground-truth mutation-recall drill (#116): plants a synthetic
+# defect via cross-review/ci/planted_round.sh and runs the OpenRouter-only
+# roster against it (this runner has no codex/agy credentials). Recorded
+# ledger rows (runlog.jsonl, finding_events.jsonl) are NOT committed back —
+# they're gitignored working state, same as every other cross-review run;
+# this workflow only uploads them as a build artifact for a human to inspect
+# or fold into the live leaderboard by hand.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  planted-round:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run planted-mutation drill (OpenRouter-only roster)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        # The ledgers are written to $out (not the checkout's gitignored
+        # defaults) so the uploaded artifact actually carries the synthetic
+        # runlog row and the planted/caught/missed events this drill exists
+        # to produce.
+        run: |
+          out="$RUNNER_TEMP/planted-round"
+          # Exported BEFORE the drill runs so the if: always() upload still
+          # finds raw/ and meta.json when the script exits non-zero.
+          echo "PLANTED_ROUND_OUT=$out" >> "$GITHUB_ENV"
+          mkdir -p "$out"
+          export CROSS_REVIEW_RUNLOG="$out/runlog.jsonl"
+          export CROSS_REVIEW_FINDING_EVENTS="$out/finding_events.jsonl"
+          bash cross-review/ci/planted_round.sh \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --operators-file cross-review/references/mutation_operators.json \
+            --fixture auto \
+            --roster glm,deepseek,qwen \
+            --out "$out"
+
+      - name: Upload drill artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: planted-round-${{ github.run_id }}
+          path: ${{ env.PLANTED_ROUND_OUT }}
+          if-no-files-found: warn
