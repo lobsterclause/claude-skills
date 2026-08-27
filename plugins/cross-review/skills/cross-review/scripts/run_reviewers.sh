@@ -52,6 +52,7 @@
 #                    [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>]
 #                    [--timeout-glm <sec>]
 #                    [--snapshot-dir <dir>]
+#                    [--context-mode files|diff]
 #
 # No --reviewers → select_roster.sh chooses the round's roster (codex + kimi
 # baselines, ≥3 total, leaderboard-weighted rotation picks). Explicit
@@ -80,6 +81,24 @@
 # raw diff — never silently truncated (in practice keep agy snapshots under
 # ~90KB; see the size gate in run_agy_reviewer). Omitting --snapshot-dir
 # reproduces today's behavior byte-for-byte.
+#
+# --context-mode files|diff (default: files; env CROSS_REVIEW_CONTEXT_MODE):
+# what the TEXT-ONLY lanes (kimi, the OpenRouter pool, the Moonshot seats —
+# every reviewer with no file-reading tools and no workspace) get to look at
+# besides the diff. `files` appends the whole post-change contents of every
+# file the diff touches (deleted files and binaries omitted, ordered by
+# churn, capped at CROSS_REVIEW_CONTEXT_BUDGET_BYTES — default 300000 — with
+# the omitted files NAMED in the prompt so the reviewer knows what it cannot
+# see). `diff` is the pre-2026-08-26 behaviour: the hunk and nothing around
+# it. The default flipped to `files` because a seat that can only see a hunk
+# is asked a question its input cannot answer — every recurring false P0
+# shape on record (portability claims never run, "this invalidates the
+# suite", findings the enclosing function already handles) is a claim about
+# code OUTSIDE the hunk (issue #69; adjudicated precision 2026-08-24: codex
+# 25/26 with file access, qwen 0/4 and deepseek 0/3 without). A per-reviewer
+# snapshot (--snapshot-dir) still wins over both modes for that reviewer.
+# codex (agentic, own diffing) and the agy laps (workspace mounted) are
+# unaffected — they can already read files.
 #
 # Writes:
 #   <out>/codex.stdout         — codex review (stderr merged)
@@ -112,7 +131,17 @@
 #
 # meta.json extras: agy laps carry `failure_kind` (quota_exhausted | agy_panic |
 # empty_output | null) and `quota_resets_in`; OpenRouter runs carry
-# `cli: "openrouter"` and the exact `model` slug.
+# `cli: "openrouter"` and the exact `model` slug. EVERY lane's meta.json
+# carries `context_access` — what that seat could actually see this run:
+#   agent          — codex: roams the worktree with its own tools
+#   workspace_read — agy laps: repository mounted, file-reading tools on
+#   file_context   — text-only lane, diff + whole changed files (default)
+#   snapshot       — text-only lane, a --snapshot-dir file replaced the diff
+#   diff_only      — text-only lane, the hunk and nothing else
+# score_findings.sh --meta-dir reads this to weight convergence by what the
+# agreeing seats could see (issue #70); analyze_runlog/leaderboard can split
+# precision by it. Text-only lanes also carry `context_files` (count
+# embedded) and `context_files_omitted` (count dropped by the byte budget).
 #
 # Exit codes:
 #   0 — at least one reviewer succeeded, OR run was skipped intentionally (empty diff)
@@ -144,6 +173,10 @@ out=""
 # raw diff (see snapshot_for() below and SKILL.md step 2.5). Reviewers
 # without a matching file keep the raw-diff path unchanged.
 snapshot_dir=""
+# What the text-only lanes see besides the diff — see the --context-mode
+# header note. `files` by default; `diff` restores hunk-only prompts.
+context_mode="${CROSS_REVIEW_CONTEXT_MODE:-files}"
+context_budget_bytes="${CROSS_REVIEW_CONTEXT_BUDGET_BYTES:-300000}"
 # Empty default: resolved after arg parsing. If --reviewers is not passed,
 # select_roster.sh picks the round's roster (codex+kimi baselines + weighted
 # rotation picks); if the selector is missing, fall back to the fixed classic
@@ -210,14 +243,22 @@ while [[ $# -gt 0 ]]; do
     --timeout-kimi)       need_val --timeout-kimi       "$#"; timeout_kimi="$2";       shift 2 ;;
     --timeout-glm)        need_val --timeout-glm        "$#"; timeout_glm="$2";        shift 2 ;;
     --snapshot-dir)       need_val --snapshot-dir       "$#"; snapshot_dir="$2";       shift 2 ;;
+    --context-mode)       need_val --context-mode       "$#"; context_mode="$2";       shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--snapshot-dir <dir>]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--snapshot-dir <dir>] [--context-mode files|diff]" >&2
   exit 2
 fi
+case "$context_mode" in
+  files|diff) ;;
+  *) echo "--context-mode must be 'files' or 'diff' (got '$context_mode')" >&2; exit 2 ;;
+esac
+case "$context_budget_bytes" in
+  ''|*[!0-9]*) echo "CROSS_REVIEW_CONTEXT_BUDGET_BYTES must be a non-negative integer (got '$context_budget_bytes')" >&2; exit 2 ;;
+esac
 
 # Roster resolution: no --reviewers → ask select_roster.sh (weighted rotation,
 # codex+kimi baselines). The selector prints a comma list on stdout and its
@@ -355,6 +396,144 @@ if git diff --quiet "$base"...HEAD; then
   echo "no diff against $base — skipping reviewers" >&2
   exit 0
 fi
+
+# Whole-file context for the text-only lanes (--context-mode files). Built
+# ONCE here, before dispatch, because every text-only seat gets the identical
+# block and the lanes run as parallel background jobs. Lanes `cat` the file;
+# the sidecar meta tells them (and the runlog) how much was embedded.
+#
+#   <out>/context.files.txt        — the block, or absent in --context-mode diff
+#   <out>/context.files.meta.json  — {included, omitted, bytes, budget_bytes,
+#                                     omitted_paths}
+#
+# Ordering is by churn (numstat added+deleted, descending) so when the budget
+# bites it drops the file the diff touched least. A file that does not fit in
+# what is left of the budget is skipped, not truncated — half a file invites
+# the same out-of-hunk inference this block exists to remove, and the prompt
+# names every omitted path so the reviewer knows the boundary of its view.
+context_files_path=""
+context_files_included=0
+context_files_omitted=0
+if [[ "$context_mode" == "files" ]]; then
+  context_files_path="$out/context.files.txt"
+  : >"$context_files_path"
+  _ctx_used=0
+  _ctx_omitted_json='[]'
+  # numstat: "<added>\t<deleted>\t<path>"; binaries show "-\t-". Renames
+  # print "old => new" braces in the path column, so resolve names from
+  # --name-only (rename-clean: it prints the post-change path) and use
+  # numstat only for the churn key.
+  # core.quotePath=false: git otherwise octal-escapes and double-quotes any
+  # path with non-ASCII bytes, `git show HEAD:"\303\274.txt"` then fails and
+  # the file would vanish from the block as neither included nor omitted
+  # (codex, PR #71 pass 1).
+  # -z: git ALWAYS C-quotes a path containing `"` or a control character,
+  # whatever core.quotePath says, and a quoted name cannot be `git show`n.
+  # NUL-delimited output is never quoted; NUL→LF keeps the rest of this loop
+  # line-based (a path containing a newline is the one shape not supported).
+  _ctx_paths="$(git -c core.quotePath=false diff -z --name-only --diff-filter=d "$base"...HEAD 2>/dev/null | tr '\0' '\n' || true)"
+  _ctx_order="$(git -c core.quotePath=false diff --numstat "$base"...HEAD 2>/dev/null \
+    | awk -F'\t' '$1 != "-" { print ($1 + $2) "\t" $3 }' | sort -t $'\t' -k1,1nr | cut -f2- || true)"
+  # Walk churn order first, then anything --name-only knows that numstat did
+  # not surface in a resolvable form (renames); a path is embedded once.
+  _ctx_seen=$'\n'
+  while IFS= read -r _p; do
+    [[ -n "$_p" ]] || continue
+    # numstat renders renames as "a/{old => new}.ext" or "old => new"; the
+    # --name-only pass below embeds those under their real post-change path.
+    [[ "$_p" == *" => "* ]] && continue
+    printf '%s' "$_ctx_paths" | grep -qxF -- "$_p" || continue
+    [[ "$_ctx_seen" == *$'\n'"$_p"$'\n'* ]] && continue
+    _ctx_seen+="$_p"$'\n'
+    # Size first, from the object header, BEFORE reading the blob: a
+    # generated bundle that is going to be omitted anyway must not be pulled
+    # into a shell variable first (kimi, PR #71 pass 1). The budget charges
+    # the whole serialized entry — path attribute, tags, newlines — not just
+    # the blob, so many tiny files cannot overrun the advertised cap
+    # (codex + kimi, PR #71 pass 1).
+    _ctx_size="$(git cat-file -s "HEAD:$_p" 2>/dev/null)" || {
+      echo "context: cannot read HEAD:$_p — skipped" >&2
+      continue
+    }
+    # Binary guard: numstat filters "-\t-" out of the churn order, but the
+    # --name-only pass has no such filter, and a text-looking file can still
+    # carry NULs (fixtures, minified bundles). Compare byte counts with and
+    # without NULs on the raw blob — $(...) would already have dropped them,
+    # so the check has to run on the stream, not on the variable. It streams
+    # (never lands in a variable) and runs BEFORE the budget check, so a
+    # binary is never reported as "omitted by the budget".
+    if [[ "$_ctx_size" != "$(git show "HEAD:$_p" 2>/dev/null | tr -d '\000' | wc -c | tr -d ' ')" ]]; then
+      continue
+    fi
+    # Attribute escaping covers & " < > — a filename may legally contain
+    # '<', and an unescaped '</files>' IN THE PATH would reproduce the outer
+    # fence (codex + kimi, PR #71 pass 2).
+    # bash >= 5.2 enables `patsub_replacement`, under which a bare `&` in a
+    # ${x//pat/rep} replacement expands to the MATCHED text — "&quot;" would
+    # become "\"quot;" and the escape would silently not happen on the ubuntu
+    # CI runner while passing on macOS bash 3.2 (codex, PR #71 pass 3). Turn
+    # it off for this scope; the shopt is unknown (and harmless) on older bash.
+    shopt -u patsub_replacement 2>/dev/null || true
+    _ctx_path_attr="${_p//&/&amp;}"; _ctx_path_attr="${_ctx_path_attr//\"/&quot;}"
+    _ctx_path_attr="${_ctx_path_attr//</&lt;}";  _ctx_path_attr="${_ctx_path_attr//>/&gt;}"
+    # Pre-read check is a LOWER bound (blob bytes + wrapper bytes, path
+    # measured in bytes not locale characters); the binding check is on the
+    # serialized entry below, because defusing can add bytes
+    # (codex + kimi + seed, PR #71 pass 2).
+    _ctx_overhead=$(( $(printf '%s' "$_ctx_path_attr" | wc -c | tr -d ' ') + 24 ))   # <file path="">\n … \n</file>\n
+    if [[ $(( _ctx_used + _ctx_size + _ctx_overhead )) -gt "$context_budget_bytes" ]]; then
+      context_files_omitted=$((context_files_omitted + 1))
+      _ctx_omitted_json="$(printf '%s' "$_ctx_omitted_json" | jq -c --arg p "$_p" '. + [$p]' 2>/dev/null || printf '%s' "$_ctx_omitted_json")"
+      continue
+    fi
+    _ctx_blob="$(git show "HEAD:$_p" 2>/dev/null)" || continue
+    # Defuse BOTH closing tags inside untrusted file content — </file> ends
+    # one entry, </files> ends the whole block — same prompt-injection guard
+    # as </diff> and </snapshot> (codex + kimi, PR #71 pass 1).
+    _ctx_blob="${_ctx_blob//<\/file>/< \/file>}"
+    _ctx_blob="${_ctx_blob//<\/files>/< \/files>}"
+    # $(...) strips the trailing newline the format string adds; write it
+    # back with exactly one — no blank line between entries (kimi, pass 2).
+    _ctx_entry="$(printf '<file path="%s">\n%s\n</file>' "$_ctx_path_attr" "$_ctx_blob")"$'\n'
+    _ctx_entry_len="$(printf '%s' "$_ctx_entry" | wc -c | tr -d ' ')"
+    if [[ $(( _ctx_used + _ctx_entry_len )) -gt "$context_budget_bytes" ]]; then
+      context_files_omitted=$((context_files_omitted + 1))
+      _ctx_omitted_json="$(printf '%s' "$_ctx_omitted_json" | jq -c --arg p "$_p" '. + [$p]' 2>/dev/null || printf '%s' "$_ctx_omitted_json")"
+      continue
+    fi
+    printf '%s' "$_ctx_entry" >>"$context_files_path"
+    _ctx_used=$(( _ctx_used + _ctx_entry_len ))
+    context_files_included=$((context_files_included + 1))
+  done <<<"$_ctx_order"$'\n'"$_ctx_paths"
+  if [[ "$context_files_omitted" -gt 0 ]]; then
+    echo "context: embedded $context_files_included changed file(s) whole (${_ctx_used}B); $context_files_omitted omitted by the ${context_budget_bytes}B budget (CROSS_REVIEW_CONTEXT_BUDGET_BYTES)" >&2
+  fi
+  printf '{"included": %d, "omitted": %d, "bytes": %d, "budget_bytes": %d, "omitted_paths": %s}\n' \
+    "$context_files_included" "$context_files_omitted" "$_ctx_used" "$context_budget_bytes" "$_ctx_omitted_json" \
+    >"$out/context.files.meta.json"
+fi
+
+# context_files_block — prints the prompt section a text-only lane appends
+# after its <diff>: the whole-file block plus the list of files the budget
+# left out. Empty in --context-mode diff. Callers must NOT use this when a
+# --snapshot-dir file replaced the diff (a snapshot is its own context).
+context_files_block() {
+  [[ "$context_mode" == "files" && -n "$context_files_path" ]] || return 0
+  local omitted_note=""
+  if [[ "$context_files_omitted" -gt 0 ]]; then
+    omitted_note="
+Omitted by the size budget (you can NOT see these files whole — do not assert anything about their contents beyond their diff hunks): $(jq -r '.omitted_paths | join(", ")' "$out/context.files.meta.json" 2>/dev/null)"
+  fi
+  if [[ "$context_files_included" -eq 0 ]]; then
+    [[ -n "$omitted_note" ]] && printf '%s\n' "$omitted_note"
+    return 0
+  fi
+  printf '%s\n' "
+Whole-file contents (post-change) of the files this diff touches, so you can check each hunk against the code AROUND it — the enclosing function, its callers in the same file, the imports, the existing guards. Before reporting anything that depends on code outside a hunk (an unhandled case, a missing check, a portability claim, \"this breaks the tests\"), find the evidence for it in these files; if the surrounding code already handles it, do not report it. Deleted files and binaries are not included.${omitted_note}
+<files>
+$(cat "$context_files_path")
+</files>"
+}
 
 # Timeout shim: macOS has no `timeout` by default. `gtimeout` ships with
 # coreutils (brew install coreutils). Pick whichever is on PATH — and when
@@ -850,7 +1029,7 @@ run_codex() {
     fk_json='"no_verdict_output"'
     rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "agent"}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" "$fk_json" "$(wall_over_budget "$((end - start))" "$codex_timeout")" >"$out/codex.meta.json"
   # IMPORTANT: return $rc so the caller's `wait "$pid"` sees the real exit code.
   # Previous version ended with `printf` whose success (exit 0) masked every
@@ -985,6 +1164,19 @@ run_openrouter_reviewer() {
     context_tag_open="<diff>"
     context_tag_close="</diff>"
     context_intro="Base your review ONLY on the diff below."
+    if [[ "$context_mode" == "files" ]]; then
+      context_intro="Base your review on the diff below, checked against the whole-file contents that follow it."
+    fi
+  fi
+  # Whole changed files after the diff (--context-mode files, the default).
+  # Never alongside a snapshot: a snapshot is already the reviewer's whole
+  # view, and doubling it would blow the budget the snapshot was built to.
+  local files_block="" context_access="diff_only"
+  if [[ "$using_snapshot" == true ]]; then
+    context_access="snapshot"
+  elif [[ "$context_mode" == "files" ]]; then
+    files_block="$(context_files_block)"
+    context_access="file_context"
   fi
   local doc_note doc_file_list
   # Uncapped, rename-clean, and source-path-preserving by construction — see
@@ -1004,7 +1196,7 @@ $diff_summary
 $context_label
 $context_tag_open
 $diff_full
-$context_tag_close
+$context_tag_close${files_block}
 
 $json_findings_suffix"
 
@@ -1150,8 +1342,9 @@ $json_findings_suffix"
       fi
     fi
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$cli" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" >"$out/${slug}.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$cli" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" \
+    "$context_access" "$([[ "$context_access" == file_context ]] && echo "$context_files_included" || echo 0)" "$([[ "$context_access" == file_context ]] && echo "$context_files_omitted" || echo 0)" >"$out/${slug}.meta.json"
   return "$rc"
 }
 
@@ -1482,7 +1675,7 @@ $context_intro HARD CONSTRAINT: you are running headless with no interactive per
   [[ -n "$resolved_model" ]] && rm_json="\"$resolved_model\""
   [[ -n "$failure_kind" ]] && fk_json="\"$failure_kind\""
   [[ -n "$quota_resets_in" ]] && qr_json="\"$quota_resets_in\""
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s, "model_resolved": %s}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s, "model_resolved": %s, "context_access": "workspace_read"}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$rm_json" >"$out/${slug}.meta.json"
   cp -f "$out/${slug}.meta.json" "$out/${slug}.attempt${attempt_n}.meta.json" 2>/dev/null || true
   # No fallback: a failed agy lap stays failed (failure_kind says why). Roster
@@ -1611,6 +1804,19 @@ run_kimi() {
     context_tag_open="<diff>"
     context_tag_close="</diff>"
     context_intro="Base your review ONLY on the diff below."
+    if [[ "$context_mode" == "files" ]]; then
+      context_intro="Base your review on the diff below, checked against the whole-file contents that follow it."
+    fi
+  fi
+  # Whole changed files after the diff (--context-mode files, the default).
+  # Never alongside a snapshot: a snapshot is already the reviewer's whole
+  # view, and doubling it would blow the budget the snapshot was built to.
+  local files_block="" context_access="diff_only"
+  if [[ "$using_snapshot" == true ]]; then
+    context_access="snapshot"
+  elif [[ "$context_mode" == "files" ]]; then
+    files_block="$(context_files_block)"
+    context_access="file_context"
   fi
   local doc_note doc_file_list
   # Uncapped, rename-clean, and source-path-preserving by construction — see
@@ -1630,7 +1836,7 @@ $diff_summary
 $context_label
 $context_tag_open
 $diff_full
-$context_tag_close
+$context_tag_close${files_block}
 
 Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
 
@@ -1690,8 +1896,9 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     fk_json='"no_verdict_output"'
     rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_budget" "$fk_json" "$(wall_over_budget "$((end - start))" "$kimi_budget")" \
+    "$context_access" "$([[ "$context_access" == file_context ]] && echo "$context_files_included" || echo 0)" "$([[ "$context_access" == file_context ]] && echo "$context_files_omitted" || echo 0)" \
     >"$out/kimi.meta.json"
   return "$rc"
 }
