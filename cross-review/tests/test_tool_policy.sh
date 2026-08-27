@@ -7,6 +7,9 @@
 # Exit: 0 all green, 1 any failure.
 
 set -uo pipefail
+# run_tests.sh pins CROSS_REVIEW_TOOL_MODE=off for the single-shot suites; this
+# suite exercises the learner, so the inherited pin must not leak in.
+unset CROSS_REVIEW_TOOL_MODE
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 S="$SKILL_DIR/scripts"
@@ -44,9 +47,12 @@ export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"
 NOCHECK="$T/nocheck"; mkdir -p "$NOCHECK"
 WITHCHECK="$T/withcheck/.claude"; mkdir -p "$WITHCHECK"; printf 'true\n' >"$WITHCHECK/verify.sh"
 
-# run_entry <run_id> <reviewer> <status> <cli> <arm|-> <cost> <findings_total|null> <dropped>
+# run_entry <run_id> <reviewer> <status> <cli> <arm|-> <cost> <findings_total|null> <dropped> [extra json fields]
+# A failed row is only arm evidence when the model answered (tokens_prompt
+# set) — pass ',"tokens_prompt":N' for those; a bare failed row with no
+# tokens and no output is the provider-outage shape and is excluded.
 run_entry() {
-  local ts='{"status":"'"$3"'","cli":"'"$4"'","cost_usd":'"$6"',"findings_total":'"$7"',"findings_dropped":'"$8"
+  local ts='{"status":"'"$3"'","cli":"'"$4"'","cost_usd":'"$6"',"findings_total":'"$7"',"findings_dropped":'"$8"${9:-}
   if [[ "$5" != "-" ]]; then ts="$ts"',"tool_stats":{"mode":"'"$5"'"}'; fi
   ts="$ts}"
   printf '{"run_id":"%s","reviewers":{"%s":%s}}\n' "$1" "$2" "$ts" >>"$CROSS_REVIEW_RUNLOG"
@@ -112,7 +118,7 @@ assert_eq "learned → read" "$(jq -r .mode <<<"$D")" "read"
 
 echo "── demotion: an arm that breaks the model is taken out ──"
 reset
-for i in 1 2 3; do run_entry "t$i" glm failed openrouter read 0 null 0; done         # 0/3 delivered
+for i in 1 2 3; do run_entry "t$i" glm failed openrouter read 0 null 0 ',"tokens_prompt":800,"output_bytes":40'; done   # answered, then broke: 0/3 delivered
 for i in 1 2 3; do run_entry "o$i" glm ok openrouter off 0.05 4 3; done              # weak but reliable
 D="$(decide glm)"
 assert_eq "read reliability 0" "$(jq -r .arms.read.reliability <<<"$D")" "0"
@@ -120,7 +126,7 @@ assert_eq "read demoted (eligible=false)" "$(jq -r .arms.read.eligible <<<"$D")"
 assert_eq "read ucb=-1" "$(jq -r .arms.read.ucb <<<"$D")" "-1"
 assert_eq "learned → off despite read's failures being 'cheap'" "$(jq -r .mode <<<"$D")" "off"
 reset
-for i in 1 2; do run_entry "t$i" glm failed openrouter read 0 null 0; done           # below min_samples
+for i in 1 2; do run_entry "t$i" glm failed openrouter read 0 null 0 ',"tokens_prompt":800'; done   # below min_samples
 D="$(decide glm)"
 assert_eq "2 failures < min_samples: not demoted yet" "$(jq -r .arms.read.eligible <<<"$D")" "true"
 
@@ -135,6 +141,37 @@ reset
 run_entry m1 kimi3 ok moonshot read 0 3 0
 D="$(decide kimi3)"
 assert_eq "moonshot cli rows count" "$(jq -r .arms.read.n <<<"$D")" "1"
+
+echo "── provider outages are not arm evidence ──"
+reset
+# Three classified 402s on the read arm: pre-fix this demoted read (n>=3, rel 0).
+for i in 1 2 3; do printf '{"run_id":"b%d","reviewers":{"glm":{"status":"failed","cli":"openrouter","cost_usd":null,"findings_total":null,"findings_dropped":0,"failure_kind":"provider_billing","tokens_prompt":null,"output_bytes":0,"tool_stats":{"mode":"read","steps":0}}}}\n' "$i" >>"$CROSS_REVIEW_RUNLOG"; done
+run_entry o1 glm ok openrouter off 0.01 4 2
+D="$(decide glm)"
+assert_eq "billing rows excluded (excluded_runs=3)" "$(jq -r .excluded_runs <<<"$D")" "3"
+assert_eq "…read arm still untried" "$(jq -r .arms.read.n <<<"$D")" "0"
+assert_eq "…read stays eligible" "$(jq -r .arms.read.eligible <<<"$D")" "true"
+assert_eq "…window_runs counts only judged runs" "$(jq -r .window_runs <<<"$D")" "1"
+reset
+# Pre-classification rows (failure_kind null) with the outage shape: no tokens, no output.
+for i in 1 2 3; do printf '{"run_id":"l%d","reviewers":{"glm":{"status":"failed","cli":"openrouter","cost_usd":null,"findings_total":null,"findings_dropped":0,"failure_kind":null,"tokens_prompt":null,"output_bytes":0,"tool_stats":{"mode":"read","steps":0}}}}\n' "$i" >>"$CROSS_REVIEW_RUNLOG"; done
+D="$(decide glm)"
+assert_eq "legacy unclassified outage rows excluded" "$(jq -r .excluded_runs <<<"$D")" "3"
+assert_eq "…read not demoted" "$(jq -r .arms.read.eligible <<<"$D")" "true"
+reset
+# A generic provider_error (e.g. tools rejected on this route) IS arm evidence.
+for i in 1 2 3; do printf '{"run_id":"p%d","reviewers":{"glm":{"status":"failed","cli":"openrouter","cost_usd":null,"findings_total":null,"findings_dropped":0,"failure_kind":"provider_error","tokens_prompt":null,"output_bytes":0,"tool_stats":{"mode":"read","steps":0}}}}\n' "$i" >>"$CROSS_REVIEW_RUNLOG"; done
+D="$(decide glm)"
+assert_eq "provider_error rows are samples" "$(jq -r .arms.read.n <<<"$D")" "3"
+assert_eq "…and demote read" "$(jq -r .arms.read.eligible <<<"$D")" "false"
+assert_eq "…excluded_runs=0" "$(jq -r .excluded_runs <<<"$D")" "0"
+reset
+# quota_exhausted (the agy classification) on a fallback-to-OpenRouter row is likewise excluded;
+# a failed row WITH tokens (the model answered, then broke) is a sample.
+printf '{"run_id":"q1","reviewers":{"glm":{"status":"failed","cli":"openrouter","cost_usd":0,"findings_total":null,"findings_dropped":0,"failure_kind":"quota_exhausted","tokens_prompt":null,"output_bytes":0}}}\n' >>"$CROSS_REVIEW_RUNLOG"
+printf '{"run_id":"q2","reviewers":{"glm":{"status":"failed","cli":"openrouter","cost_usd":0.01,"findings_total":null,"findings_dropped":0,"failure_kind":null,"tokens_prompt":900,"output_bytes":0,"tool_stats":{"mode":"read","steps":2}}}}\n' >>"$CROSS_REVIEW_RUNLOG"
+D="$(decide glm)"
+assert_eq "quota_exhausted excluded, answered-then-failed kept" "$(jq -r '[.excluded_runs, .arms.read.n] | join("/")' <<<"$D")" "1/1"
 
 echo "── unanchored findings cost half a finding each ──"
 reset

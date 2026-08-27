@@ -116,3 +116,13 @@ perfect `off` run, mean 1.0) stays `off` until the bonus decays — also as inte
   will show `rf_dropped: true` and should get `supports_json_object: false`.
 - Two pre-existing `test_file_context.sh` failures (`< /file>` defuse rendering)
   reproduce on pristine HEAD `26f338e`; not introduced here.
+
+## 2026-08-27 — outages are not arm evidence
+
+claude-skills-31 flagged that OpenRouter's balance was at −$0.06 during the first live `read` rounds (PRs #107/#109/#121). Those rows landed as `status failed, failure_kind null, tokens null, output 0, steps 0` — byte-identical to "the read arm broke this model", and three of them on one seat would have demoted `read` for it.
+
+Fix (same branch):
+- `lib_tool_loop.sh tl_classify_api_error <resp>` names the failure from the error body: `provider_billing` (402 / credits / balance), `provider_rate_limited` (429), `provider_auth` (401/403), else `provider_error`; a non-timeout curl failure is `transport_error`. Both the loop (`TL_FAILURE_KIND`) and the single-shot lane write it to `meta.failure_kind`.
+- `tool_policy.sh` excludes those kinds plus `quota_exhausted`, and — for rows written before the classifier — any `failed` row with no `failure_kind`, no `tokens_prompt`, and no output. Reported as `excluded_runs`, never scored. A generic `provider_error` stays a sample: "tools not supported on this route" is exactly what demotion is for.
+- Tests: `test_tool_loop.sh` shim modes `bill402` / `err400` (both lanes classify; the learner ignores the 402 row), `test_tool_policy.sh` billing / legacy / provider_error / quota cases; the demotion fixture now models a model that answered then broke (`tokens_prompt` set).
+

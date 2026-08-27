@@ -1332,19 +1332,26 @@ $json_findings_suffix"
     echo "WARN: $slug: supports_json_object is '$want_json' (expected true/false) — treating as true" >&2
   fi
   local resp_file="$out/${slug}.response.json"
-  local tl_used=false
+  local tl_used=false api_failure_kind=""
   if [[ "$tl_mode" != "off" ]]; then
     # ── tool loop (lib_tool_loop.sh) ── multi-turn; the library owns the
     # request/response files per turn and leaves <slug>.request.json /
     # <slug>.response.json pointing at the last turn. Usage is summed over
     # every turn into TL_COST/TL_TOKP/TL_TOKC — the last response alone would
     # under-bill the seat on the leaderboard.
+    # rf_args is (--argjson rf <value>): the value is index 2, not 1. Reading
+    # index 1 compared the literal name "rf" against "null", never matched,
+    # and shipped response_format to every tool-loop seat — including seed,
+    # whose profile opts out and which OpenRouter 400s on it. The single-shot
+    # branch below was never affected (it passes the array to jq whole).
+    # Found by the PR #99 cross-review round, 2026-08-27.
     local rf_json='{"type":"json_object"}'
-    [[ "${rf_args[1]:-}" == "null" ]] && rf_json="null"
+    [[ "${rf_args[2]:-}" == "null" ]] && rf_json="null"
     tool_loop_run "$slug" "$model" "$cli" "$endpoint" "$key" "$timeout_budget" \
       "$prompt_tmp" "$rf_json" "$tl_mode" "$out" "$repo_root_tl"
     rc=$?
     tl_used=true
+    api_failure_kind="${TL_FAILURE_KIND:-}"
     rm -f "$prompt_tmp"
   else
   if [[ "$cli" == "openrouter" ]]; then
@@ -1387,11 +1394,16 @@ $json_findings_suffix"
   # curl exits 28 on --max-time; normalize to 124 so meta.timed_out and the
   # retry policy treat it exactly like a coreutils timeout.
   [[ $rc -eq 28 ]] && rc=124
+  # Same classification as the tool loop (lib_tool_loop.sh
+  # tl_classify_api_error): the learner must not read a billing outage as
+  # the off arm failing either.
+  [[ $rc -ne 0 && $rc -ne 124 ]] && api_failure_kind="transport_error"
   if [[ $rc -eq 0 ]]; then
     local api_error
     api_error="$(jq -r '.error.message // empty' "$resp_file" 2>/dev/null)"
     if [[ -n "$api_error" ]]; then
       echo "$slug: $cli API error: $api_error" >>"$out/${slug}.stderr"
+      api_failure_kind="$(tl_classify_api_error "$resp_file")"
       rc=1
     else
       jq -r '.choices[0].message.content // empty' "$resp_file" >"$out/${slug}.stdout" 2>>"$out/${slug}.stderr" || rc=1
@@ -1415,6 +1427,8 @@ $json_findings_suffix"
     echo "$slug: output is preamble-only (<512B, no severity or clean-verdict marker) — classifying as failed" >&2
     fk_json='"no_verdict_output"'
     rc=5
+  elif [[ $rc -ne 0 && "$timed_out" == false && -n "$api_failure_kind" ]]; then
+    fk_json="\"$api_failure_kind\""
   fi
   # Cost accounting (fugu lesson, PR #20): usage:{include:true} makes OR
   # return authoritative per-call cost; recording it in meta → runlog lets

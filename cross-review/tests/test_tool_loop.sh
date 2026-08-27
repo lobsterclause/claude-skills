@@ -11,6 +11,9 @@
 # Exit: 0 all green, 1 any failure.
 
 set -uo pipefail
+# run_tests.sh pins CROSS_REVIEW_TOOL_MODE=off for the single-shot suites; this
+# suite exercises the learner, so the inherited pin must not leak in.
+unset CROSS_REVIEW_TOOL_MODE
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 S="$SKILL_DIR/scripts"
@@ -37,6 +40,8 @@ export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"; : >"$CROSS_REVIEW_FINDING_
 #   default  — turn 1: a batch of tool calls; turn 2+: final answer
 #   always   — every turn asks for a tool call (exercises the step budget)
 #   rf400    — first request WITH response_format 400s; retried request without it succeeds
+#   bill402  — every request 402s (OpenRouter "Insufficient credits" shape)
+#   err400   — every request 400s with a tools complaint (survives the rf-drop retry)
 cat >"$HOME/.local/bin/curl" <<'SHIM'
 #!/bin/sh
 cat >/dev/null   # the --config stdin (bearer header)
@@ -52,6 +57,14 @@ tool_choice="$(jq -r '.tool_choice // ""' "$body" 2>/dev/null)"
 n_tools="$(jq -r '.tools | length' "$body" 2>/dev/null || echo 0)"
 mkdir -p "$SHIM_LOG_DIR" 2>/dev/null
 echo "turn tool_msgs=$have_tool_msgs rf=$has_rf tool_choice=$tool_choice tools=$n_tools" >>"$SHIM_LOG_DIR/shim.log"
+if [ "${SHIM_MODE:-default}" = "bill402" ]; then
+  printf '%s' '{"error":{"message":"Insufficient credits. Add more using https://openrouter.ai/settings/credits","code":402}}'
+  exit 0
+fi
+if [ "${SHIM_MODE:-default}" = "err400" ]; then
+  printf '%s' '{"error":{"message":"This endpoint does not support tools","code":400}}'
+  exit 0
+fi
 if [ "${SHIM_MODE:-default}" = "rf400" ] && [ "$has_rf" = "true" ]; then
   printf '%s' '{"error":{"message":"response_format json_object is not supported with tools","code":400}}'
   exit 0
@@ -190,6 +203,16 @@ assert_eq "rf_dropped=true"                  "$(jq -r .tool_stats.rf_dropped "$M
 assert_eq "retried request has no response_format" "$(jq -r 'has("response_format")' "$T/o7/glm.turn.1.request.json")" "false"
 assert_contains "stderr explains"            "$(cat "$T/o7/glm.stderr")" "retrying this turn without it"
 
+echo "── profile opt-out (supports_json_object=false) reaches the tool loop ──"
+# seed's profile opts out of response_format. The tool-loop branch used to read
+# rf_args[1] ("rf") instead of rf_args[2] ("null"), so the opt-out was logged
+# and then ignored, and seed 400'd on every tool-loop draw (PR #99 round).
+( cd "$REPO" && env CROSS_REVIEW_TOOL_MODE=read bash "$S/run_reviewers.sh" --base main --out "$T/o7b" --reviewers seed --timeout 60 >"$T/o7b.log" 2>&1 )
+assert_eq "seed turn-1 request has no response_format" "$(jq -r 'has("response_format")' "$T/o7b/seed.turn.1.request.json")" "false"
+assert_eq "seed lane succeeded"                 "$(jq -r .exit_code "$T/o7b/seed.meta.json")" "0"
+assert_eq "not a runtime drop — the profile did it" "$(jq -r .tool_stats.rf_dropped "$T/o7b/seed.meta.json")" "false"
+assert_contains "stderr says omitted by profile" "$(cat "$T/o7b.log" "$T/o7b/seed.stderr" 2>/dev/null)" "response_format omitted"
+
 echo "── tool_context=diff drops the whole-file paste when tools are on ──"
 run_lane "$T/o8" CROSS_REVIEW_TOOL_MODE=read CROSS_REVIEW_TOOL_CONTEXT=diff --
 assert_not_contains "no <files> block" "$(jq -r '.messages[0].content' "$T/o8/glm.turn.1.request.json")" "<files>"
@@ -230,6 +253,35 @@ assert_eq "Makefile verify beats check" "$(tl_resolve_check_cmd "$R")" "make ver
 mkdir -p "$R/.claude"; printf 'true\n' >"$R/.claude/verify.sh"
 assert_eq ".claude/verify.sh wins" "$(tl_resolve_check_cmd "$R")" "bash .claude/verify.sh"
 assert_eq "CROSS_REVIEW_CHECK_CMD wins over everything" "$(CROSS_REVIEW_CHECK_CMD='my check' tl_resolve_check_cmd "$R")" "my check"
+
+echo "── provider failures are classified, in both lanes ──"
+run_lane "$T/ob1" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=bill402 --
+META="$T/ob1/glm.meta.json"
+assert_eq "read arm 402 → failure_kind provider_billing" "$(jq -r .failure_kind "$META")" "provider_billing"
+assert_eq "…exit_code 1"                                  "$(jq -r .exit_code "$META")" "1"
+assert_eq "…no tool steps"                                "$(jq -r .tool_stats.steps "$META")" "0"
+assert_eq "…timed_out false"                              "$(jq -r .timed_out "$META")" "false"
+run_lane "$T/ob2" CROSS_REVIEW_TOOL_MODE=off SHIM_MODE=bill402 --
+assert_eq "off arm 402 → failure_kind provider_billing"   "$(jq -r .failure_kind "$T/ob2/glm.meta.json")" "provider_billing"
+run_lane "$T/ob3" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=err400 --
+META="$T/ob3/glm.meta.json"
+assert_eq "read arm generic 400 → provider_error"         "$(jq -r .failure_kind "$META")" "provider_error"
+assert_eq "…rf was dropped and retried first"             "$(jq -r .tool_stats.rf_dropped "$META")" "true"
+run_lane "$T/ob4" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=bill402 --
+# The learner must now ignore these: feed ob1's meta shape into the fixture ledger.
+printf '{"run_id":"x","reviewers":{"glm":%s}}\n' "$(jq -c '. + {status:"failed"}' "$T/ob1/glm.meta.json")" >>"$CROSS_REVIEW_RUNLOG"
+D="$(bash "$S/tool_policy.sh" --reviewer glm --repo-root "$REPO" 2>/dev/null)"
+assert_eq "tool_policy excludes the classified 402 row"    "$(jq -r '[.excluded_runs, .window_runs] | join("/")' <<<"$D")" "1/0"
+: >"$CROSS_REVIEW_RUNLOG"
+# tl_classify_api_error on the shapes we know
+printf '{"error":{"code":429,"message":"Rate limit exceeded"}}' >"$T/e1.json"
+printf '{"error":{"message":"Your account has an insufficient balance"}}' >"$T/e2.json"
+printf '{"error":{"code":401,"message":"No auth credentials found"}}' >"$T/e3.json"
+printf '{"error":{"message":"Provider returned error"}}' >"$T/e4.json"
+assert_eq "429 → provider_rate_limited"       "$(tl_classify_api_error "$T/e1.json")" "provider_rate_limited"
+assert_eq "balance message → provider_billing" "$(tl_classify_api_error "$T/e2.json")" "provider_billing"
+assert_eq "401 → provider_auth"                "$(tl_classify_api_error "$T/e3.json")" "provider_auth"
+assert_eq "anything else → provider_error"     "$(tl_classify_api_error "$T/e4.json")" "provider_error"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

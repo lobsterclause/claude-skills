@@ -306,6 +306,35 @@ tl_post() {
   return $rc
 }
 
+# tl_classify_api_error <response_file> — name the provider-level failure so
+# the learner can tell "the provider never judged this request" (billing,
+# rate limit, auth, transport) from "the model broke on this arm" (a generic
+# provider_error: bad tool schema for the route, refused response_format,
+# malformed output). Only the second kind is evidence about the arm; the
+# first would otherwise demote whichever arm happened to be drawn during an
+# outage — three 402s on one seat looked exactly like read breaking the model
+# (OpenRouter balance −$0.06, 2026-08-27). Matches OpenRouter/OpenAI-style
+# bodies: {"error":{"code":402,"message":"Insufficient credits..."}}.
+tl_classify_api_error() {
+  local resp="$1" code msg
+  code="$(jq -r '.error.code // .error.status // empty' "$resp" 2>/dev/null)"
+  msg="$(jq -r '.error.message // empty' "$resp" 2>/dev/null)"
+  case "$code" in
+    402) echo provider_billing; return ;;
+    429) echo provider_rate_limited; return ;;
+    401|403) echo provider_auth; return ;;
+  esac
+  if printf '%s' "$msg" | grep -qiE 'insufficient (credits|balance|funds)|credits? (are|is) (exhausted|depleted)|negative balance|top up|payment required|billing'; then
+    echo provider_billing
+  elif printf '%s' "$msg" | grep -qiE 'rate.?limit|too many requests|quota exceeded|exceeded_current_quota'; then
+    echo provider_rate_limited
+  elif printf '%s' "$msg" | grep -qiE 'invalid api key|unauthori[sz]ed|authentication|forbidden'; then
+    echo provider_auth
+  else
+    echo provider_error
+  fi
+}
+
 tl_num() { jq -r "$1 | if type==\"number\" then tostring else \"0\" end" "$2" 2>/dev/null || echo 0; }
 
 # tool_loop_run <slug> <model> <cli> <endpoint> <key> <timeout_budget>
@@ -321,6 +350,8 @@ tl_num() { jq -r "$1 | if type==\"number\" then tostring else \"0\" end" "$2" 2>
 #   TL_BUDGET_EXHAUSTED TL_READ_BYTES TL_CHECK_RAN TL_CHECK_RC (see above)
 #   TL_RF_DROPPED  true when response_format had to be dropped for this model
 #   TL_API_ERROR   the provider's error message, if any
+#   TL_FAILURE_KIND  provider_billing | provider_rate_limited | provider_auth |
+#                  provider_error | transport_error | "" (tl_classify_api_error)
 # Writes <out>/<slug>.stdout with the final content.
 tool_loop_run() {
   local slug="$1" model="$2" cli="$3" endpoint="$4" key="$5" budget="$6"
@@ -329,7 +360,7 @@ tool_loop_run() {
   TL_READ_BYTES=0; TL_BUDGET_EXHAUSTED=false; TL_CHECK_RAN=false; TL_CHECK_RC="null"
   TL_C_READ=0; TL_C_SEARCH=0; TL_C_LIST=0; TL_C_CHECK=0; TL_C_UNKNOWN=0
   TL_RC=0; TL_COST="null"; TL_TOKP="null"; TL_TOKC="null"; TL_STEPS=0; TL_TURNS=0
-  TL_RF_DROPPED=false; TL_API_ERROR=""
+  TL_RF_DROPPED=false; TL_API_ERROR=""; TL_FAILURE_KIND=""
   local check_avail=false
   [[ "$mode" == "check" ]] && tl_resolve_check_cmd "$root" >/dev/null 2>&1 && check_avail=true
   local tools; tools="$(tl_tool_defs "$mode" "$check_avail")"
@@ -360,7 +391,12 @@ tool_loop_run() {
     tl_post "$cli" "$key" "$body" "$resp" "$err" "$remaining" "$endpoint"
     local rc=$?
     cp "$resp" "$outd/${slug}.response.json" 2>/dev/null || true
-    if [[ $rc -ne 0 ]]; then TL_RC=$rc; break; fi
+    if [[ $rc -ne 0 ]]; then
+      # curl itself failed: timeout stays a timeout; anything else never
+      # reached a model and is not evidence about the arm.
+      [[ $rc -eq 124 ]] || TL_FAILURE_KIND="transport_error"
+      TL_RC=$rc; break
+    fi
     local api_error
     api_error="$(jq -r '.error.message // empty' "$resp" 2>/dev/null)"
     if [[ -n "$api_error" ]]; then
@@ -373,7 +409,7 @@ tool_loop_run() {
         TL_RF_DROPPED=true; turn=$((turn - 1)); continue
       fi
       echo "$slug: $cli API error: $api_error" >>"$err"
-      TL_API_ERROR="$api_error"; TL_RC=1; break
+      TL_API_ERROR="$api_error"; TL_FAILURE_KIND="$(tl_classify_api_error "$resp")"; TL_RC=1; break
     fi
     if [[ -s "$resp" ]] && jq -e '.usage' "$resp" >/dev/null 2>&1; then
       any_usage=true

@@ -13,6 +13,13 @@
 # timeout (gtimeout on macOS via brew).
 
 set -uo pipefail
+# The OpenRouter-lane blocks below drive run_reviewers.sh against a single-shot
+# curl shim. Pin the tool arm off so those runs never consult the LIVE ledger
+# (tool_policy.sh reads runlog.jsonl next to the scripts when no fixture is
+# set): a learned `read` decision would send tool calls the shim cannot serve.
+# Bit 2026-08-27 when a learner fix flipped live glm from off to read and the
+# cost-accounting block went red. The tool suites unset this themselves.
+export CROSS_REVIEW_TOOL_MODE=off
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 S="$SKILL_DIR/scripts"

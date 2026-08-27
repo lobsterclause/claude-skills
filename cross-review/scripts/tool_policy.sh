@@ -30,6 +30,16 @@
 #                  tool calls, loops, refusals)
 #
 #   choose argmax ucb; ties by fixed priority read > check > off.
+#
+#   Not a sample: a run the provider never judged — failure_kind in
+#   provider_billing | provider_rate_limited | provider_auth | transport_error
+#   | quota_exhausted (run_reviewers.sh / lib_tool_loop.sh classify these), or
+#   a pre-classification row that shows the same shape (status failed, no
+#   failure_kind, no tokens, no output). An outage says nothing about the arm
+#   that happened to be drawn; counting it demoted `read` on three 402s
+#   (2026-08-27). Those rows are reported as excluded_runs, never scored.
+#   A generic provider_error IS a sample: "tools not supported on this route"
+#   is exactly what demotion exists for.
 #   `check` is only an arm when the repo declares a verify entrypoint
 #   (lib_tool_loop.sh tl_resolve_check_cmd) — the model never chooses the
 #   command, so there is nothing to learn where there is nothing to run.
@@ -54,7 +64,7 @@
 # Env (fixture tests): CROSS_REVIEW_RUNLOG, CROSS_REVIEW_FINDING_EVENTS,
 #   CROSS_REVIEW_PROFILES.
 # Output (json): {reviewer, mode, basis, check_available, arms:{<arm>:{n, ok,
-#   reliability, mean, ucb, cost_avg, eligible}}, window_runs}
+#   reliability, mean, ucb, cost_avg, eligible}}, window_runs, excluded_runs}
 
 set -uo pipefail
 
@@ -98,7 +108,7 @@ window="$(jq -r '((._synthesis_rules // {}).tool_policy // {}).window // 40' "$p
 [[ "$window" =~ ^[0-9]+$ ]] || window=40
 if [[ -f "$runlog" ]]; then
   jq -c 'select(.reviewers != null)' "$runlog" 2>/dev/null | tail -n "$window" \
-    | jq -c '{run_id, reviewers: (.reviewers | with_entries(.value |= {status, cli, cost_usd, findings_total, findings_dropped, tool_stats}))}' \
+    | jq -c '{run_id, reviewers: (.reviewers | with_entries(.value |= {status, cli, cost_usd, findings_total, findings_dropped, tool_stats, failure_kind, tokens_prompt, output_bytes}))}' \
     | jq -c -s '.' >"$tp_tmp/runs.json" 2>/dev/null || echo '[]' >"$tp_tmp/runs.json"
 else
   echo '[]' >"$tp_tmp/runs.json"
@@ -127,9 +137,15 @@ decide_one() {
     | ($seat.tools // {}) as $pin
     | ($c.arms | map(select(. != "check" or $check_available))) as $arms
     | ($runs | if length > $c.window then .[-($c.window):] else . end) as $win
+    | def unjudged: ((.failure_kind // "") | IN("provider_billing","provider_rate_limited","provider_auth","transport_error","quota_exhausted"))
+        or (.status == "failed" and .failure_kind == null and .tokens_prompt == null and ((.output_bytes // 0) == 0));
+      ([ $win[] | (.reviewers[$r] // null)
+        | select(. != null and .status != "skipped" and ((.cli // "") | IN("openrouter","moonshot")))
+        | select(unjudged) ] | length) as $excluded
     | [ $win[] | . as $run
         | (.reviewers[$r] // null)
         | select(. != null and .status != "skipped" and ((.cli // "") | IN("openrouter","moonshot")))
+        | select(unjudged | not)
         | { arm: (.tool_stats.mode // "off"),
             ok: (if (.status == "ok" or .status == "fallback") then 1 else 0 end),
             cost: (.cost_usd | if type == "number" then . else 0 end),
@@ -162,13 +178,13 @@ decide_one() {
     | (if $d.mode == "check" and ($check_available | not)
        then {mode: "read", basis: ($d.basis + ":no_check_entrypoint")} else $d end) as $d
     | { reviewer: $r, mode: $d.mode, basis: $d.basis, check_available: $check_available,
-        window_runs: $N, arms: $stats,
+        window_runs: $N, excluded_runs: $excluded, arms: $stats,
         max_steps: ($pin.max_steps // null),
         read_budget_bytes: ($pin.read_budget_bytes // null) }'
 }
 
 print_table() {
-  jq -r '"\(.reviewer): mode=\(.mode) (\(.basis)) window_runs=\(.window_runs) check_available=\(.check_available)"
+  jq -r '"\(.reviewer): mode=\(.mode) (\(.basis)) window_runs=\(.window_runs) excluded_runs=\(.excluded_runs) check_available=\(.check_available)"
          + (.arms | to_entries | map("\n    \(.key | . + "     " | .[0:5])  n=\(.value.n)  ok=\(.value.ok)  rel=\(.value.reliability // "-")  mean=\(.value.mean)  ucb=\(.value.ucb)  cost_avg=\(.value.cost_avg)\(if .value.eligible then "" else "  DEMOTED" end)") | join(""))'
 }
 
