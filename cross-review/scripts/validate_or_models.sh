@@ -81,7 +81,7 @@ while [[ $# -gt 0 ]]; do
     --catalog)          need_val "$1" "$#"; catalog_override="$2"; shift 2 ;;
     --pricing-json)     pricing_json=1; shift ;;
     --strict-pricing)   strict_pricing=1; shift ;;
-    -h|--help)          sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d' | sed -E 's/^# ?//'; exit 0 ;;
+    -h|--help)          sed -n '2,/^set -uo pipefail/p' "${BASH_SOURCE[0]}" | sed '$d' | sed -E 's/^# ?//'; exit 0 ;;
     *)                  echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
