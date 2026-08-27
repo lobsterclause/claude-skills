@@ -66,6 +66,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$recent" != "0" && ! "$recent" =~ ^[1-9][0-9]*$ ]]; then
+  echo "audit_roster: invalid --recent value: $recent (want a non-negative integer)" >&2
+  exit 2
+fi
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "audit_roster: jq required (brew install jq)" >&2
   exit 1
@@ -101,30 +106,52 @@ fi
 # no dependence on OS `date` flavor (macOS `date -j` vs GNU `date -d`).
 result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
   . as $all
-  | ($all | map(.ts // empty)) as $all_ts
-  | (if ($all_ts | length) == 0 then null else ($all_ts | map(fromdateiso8601) | max) end) as $newest_epoch
   | (map(select(.roster_decision != null))) as $used
   | (map(select(.roster_decision == null)) | length) as $skipped
+  # newest ts over the USED entries only: a trailing legacy row without
+  # roster_decision must not inflate days_since_drawn (kat, PR #101 review).
+  | ($used | map(.ts // empty)) as $used_ts
+  | (if ($used_ts | length) == 0 then null else ($used_ts | map(fromdateiso8601) | max) end) as $newest_epoch
 
   # policy_version distribution over used entries.
   | ($used | reduce .[] as $e ({}; .[($e.roster_decision.policy_version // "missing")] += 1)) as $pv_dist
 
-  # Flatten every candidate row across every used entry, annotated with that
-  # entrys sum-of-weights and selected-count so expectation can be computed
-  # per row, then grouped by reviewer.
-  | ($used | map(
-      . as $e
+  # Flatten every candidate row across every used entry, annotated with the
+  # entry index (file order == chronological order; second-resolution ts can
+  # collide, so ordering never keys on ts) and that seat inclusion probability
+  # for the entry, then grouped by reviewer.
+  #
+  # select_roster.sh draws WITHOUT replacement, renormalising after each pick,
+  # so a seat expectation per entry is its inclusion probability, not
+  # nsel * weight / total (which exceeds 1 for a dominant seat and over-warns
+  # -- codex, PR #101 review). Exact for nsel <= 2 (the default --extras 2):
+  #   P(i) = p_i + sum_{j != i} p_j * p_i / (1 - p_j)
+  # For nsel >= 3 the closed form needs a subset DP; use min(1, nsel * p_i),
+  # which is the upper bound and never produces an impossible expectation.
+  | ($used | to_entries | map(
+      .key as $idx
+      | .value as $e
       | ($e.roster_decision.candidates // []) as $cands
-      | ($cands | map(.weight // 0) | add // 0) as $esum
+      | ($cands | map(.weight // 0)) as $w
+      | ($w | add // 0) as $esum
+      | (if $esum > 0 then ($w | map(. / $esum)) else ($w | map(0)) end) as $p
       | ($cands | map(select(.selected == true)) | length) as $nsel
+      | (if $nsel <= 1 then ($p | map(. * $nsel))
+         elif $nsel == 2 then
+           ($p | to_entries | map(
+              .key as $i | .value as $pi
+              | $pi + ([ $p | to_entries[] | select(.key != $i and .value < 1) | .value * $pi / (1 - .value) ] | add // 0)))
+         else ($p | map([. * $nsel, 1] | min)) end) as $incl
       | ($e.ts | fromdateiso8601) as $ets
-      | $cands[] | {
+      | range(0; $cands | length) as $i
+      | $cands[$i] | {
           reviewer: .reviewer,
           weight: (.weight // 0),
           selected: (.selected // false),
           ts: $e.ts,
           epoch: $ets,
-          share: (if $esum > 0 then ((.weight // 0) / $esum) * $nsel else 0 end)
+          idx: $idx,
+          share: $incl[$i]
         }
     )) as $rows
 
@@ -140,7 +167,11 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
       last_drawn_ts: (
         (map(select(.selected == true))) as $ds
         | if ($ds | length) == 0 then null
-          else ($ds | max_by(.epoch) | .ts) end
+          else ($ds | max_by(.idx) | .ts) end
+      ),
+      last_drawn_idx: (
+        (map(select(.selected == true) | .idx)) as $di
+        | if ($di | length) == 0 then null else ($di | max) end
       ),
       any_weight_positive_count: (map(select(.weight > 0)) | length)
     })) as $seats
@@ -156,11 +187,12 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
         | (if $s.last_drawn_epoch == null or $newest_epoch == null then null
            else (($newest_epoch - $s.last_drawn_epoch) / 86400 | floor) end) as $days_since
         | (
-            # rounds_since_drawn: entries-with-roster_decision strictly newer
-            # than the seats last draw; for a never-drawn seat, its total
-            # candidate appearances in the window.
-            if $s.last_drawn_epoch == null then $s.candidate_count
-            else ([$rows[] | select(.epoch > $s.last_drawn_epoch)] | map(.ts) | unique | length)
+            # rounds_since_drawn: entries-with-roster_decision strictly after
+            # the seats last draw, by entry index (not ts -- same-second rows
+            # were dropped); for a never-drawn seat, its total candidate
+            # appearances in the window.
+            if $s.last_drawn_idx == null then $s.candidate_count
+            else (($used | length) - $s.last_drawn_idx - 1)
             end
           ) as $rounds_since
         | {
@@ -172,12 +204,13 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
             last_drawn: $s.last_drawn_ts,
             days_since_drawn: $days_since,
             rounds_since_drawn: $rounds_since,
+            any_weight_positive_count: $s.any_weight_positive_count,
             eligible_for_ratio_warn: ($s.candidate_count >= 10),
             starved: ($s.any_weight_positive_count >= 10 and $s.draws == 0)
           }
       ) | sort_by(.reviewer))
     }
-')"
+')" || { echo "audit_roster: failed to aggregate runlog $runlog" >&2; exit 1; }
 
 if [[ "$emit_json" -eq 1 ]]; then
   printf '%s\n' "$result"
@@ -222,7 +255,7 @@ warn_lines="$(printf '%s' "$result" | jq -r '.seats[] |
 ')"
 starved_lines="$(printf '%s' "$result" | jq -r '.seats[] |
   select(.starved == true) |
-  "WARN \(.reviewer) starved (weight > 0 in \(.candidate_count) candidate rounds, never drawn; \(.rounds_since_drawn) rounds since it last had a chance)"
+  "WARN \(.reviewer) starved (weight > 0 in \(.any_weight_positive_count) of \(.candidate_count) candidate rounds, never drawn)"
 ')"
 
 all_warn="$(printf '%s\n%s\n' "$warn_lines" "$starved_lines" | sed '/^$/d')"

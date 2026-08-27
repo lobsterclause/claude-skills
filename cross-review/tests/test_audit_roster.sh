@@ -42,9 +42,6 @@ assert_gt() {
 FIXLOG="$T/runlog.jsonl"
 : >"$FIXLOG"
 
-peers=(alpha beta gamma)
-peer_weights=(60 65 70)
-
 for i in $(seq 0 39); do
   ts=$(printf '2026-07-%02dT%02d:00:00Z' $((1 + i / 24)) $((i % 24)))
   policy="v1"
@@ -147,12 +144,54 @@ ghost_starved="$(printf '%s' "$JOUT" | jq -r '.seats[] | select(.reviewer=="ghos
 assert_eq "ghost starved == true in json" "$ghost_starved" "true"
 
 echo "── audit_roster.sh --recent (window) ──"
-# Last 10 raw entries: entries 33..39 (7 with roster_decision) + 40,41,42
-# (3 without) -- nemotron drawn once in that slice (i=32 was outside the
-# window, i=40%8==0 not in range since only up to 39 exist with rd).
+# Last 10 raw entries: indices 33..39 (7 with roster_decision) + 40,41,42
+# (3 without). nemotron is drawn 0 times in the used window (i=32 is outside;
+# i=40 has no roster_decision).
 ROUT="$(CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$SCRIPT" --recent 10 2>&1)"
 assert_contains "--recent narrows the window" "$ROUT" "entries: 7"
 assert_contains "--recent still reports skipped legacy rows" "$ROUT" "skipped 3"
+
+echo "── argument validation ──"
+CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$SCRIPT" --recent abc >/dev/null 2>"$T/err"; rc=$?
+assert_eq "--recent abc exits 2" "$rc" "2"
+assert_contains "--recent abc names the bad value" "$(cat "$T/err")" "invalid --recent"
+CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$SCRIPT" --recent -5 >/dev/null 2>&1; rc=$?
+assert_eq "--recent -5 exits 2" "$rc" "2"
+
+echo "── multi-pick expectation (without replacement) ──"
+# One entry, two picks, weights 50/30/20. Inclusion probabilities:
+#   A: .5 + .3*.5/.7 + .2*.5/.8 = 0.8393   (nsel*w/total would say 1.0)
+#   B: .3 + .5*.3/.5 + .2*.3/.8 = 0.6750
+#   C: .2 + .5*.2/.5 + .3*.2/.7 = 0.4857   (sum = 2 = nsel)
+MPLOG="$T/multipick.jsonl"
+jq -nc '{ts:"2026-07-05T00:00:00Z", roster_decision:{policy_version:"v2", candidates:[
+  {reviewer:"A", weight:50, selected:true},
+  {reviewer:"B", weight:30, selected:true},
+  {reviewer:"C", weight:20, selected:false}]}}' >"$MPLOG"
+MP="$(bash "$SCRIPT" --runlog "$MPLOG" --json 2>&1)"
+assert_eq "A expected is inclusion probability, not nsel*share" "$(printf '%s' "$MP" | jq -r '.seats[] | select(.reviewer=="A") | .expected')" "0.8393"
+assert_eq "B expected" "$(printf '%s' "$MP" | jq -r '.seats[] | select(.reviewer=="B") | .expected')" "0.675"
+assert_eq "C expected" "$(printf '%s' "$MP" | jq -r '.seats[] | select(.reviewer=="C") | .expected')" "0.4857"
+assert_eq "expectations sum to nsel" "$(printf '%s' "$MP" | jq -r '[.seats[].expected] | add | . * 1000 | round')" "2000"
+
+echo "── same-second entries and legacy tail ──"
+# Two entries in the same second: X drawn in the first, Y in the second, then
+# a legacy row 30 days later without roster_decision. rounds_since_drawn for X
+# must count the same-second entry (1), and days_since_drawn must ignore the
+# legacy tail (0 for Y, not 30).
+SSLOG="$T/samesec.jsonl"
+{
+  jq -nc '{ts:"2026-07-05T00:00:00Z", roster_decision:{candidates:[{reviewer:"X",weight:50,selected:true},{reviewer:"Y",weight:50,selected:false}]}}'
+  jq -nc '{ts:"2026-07-05T00:00:00Z", roster_decision:{candidates:[{reviewer:"X",weight:50,selected:false},{reviewer:"Y",weight:50,selected:true}]}}'
+  jq -nc '{ts:"2026-08-04T00:00:00Z", verdict:"CLEAN"}'
+} >"$SSLOG"
+SS="$(bash "$SCRIPT" --runlog "$SSLOG" --json 2>&1)"
+assert_eq "X rounds_since_drawn counts the same-second entry" "$(printf '%s' "$SS" | jq -r '.seats[] | select(.reviewer=="X") | .rounds_since_drawn')" "1"
+assert_eq "Y days_since_drawn ignores the legacy tail" "$(printf '%s' "$SS" | jq -r '.seats[] | select(.reviewer=="Y") | .days_since_drawn')" "0"
+
+echo "── starved message counts positive-weight rounds ──"
+SOUT="$(CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$SCRIPT" 2>&1)"
+assert_contains "starved line reports positive-weight rounds" "$SOUT" "ghost starved (weight > 0 in 40 of 40 candidate rounds"
 
 echo ""
 echo "PASS=$PASS FAIL=$FAIL"
