@@ -78,6 +78,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Numeric flags are validated up front: an invalid --recent-days used to
+# silently disable the filter and an invalid --min-sample surfaced as a jq
+# failure that pipefail-without-errexit then swallowed into an empty report
+# (codex + kimi, PR #102 review). --recent-days 0 is rejected too: a cutoff of
+# "now" excludes everything.
+if [[ -n "$recent_days" && ! "$recent_days" =~ ^[1-9][0-9]*$ ]]; then
+  echo "severity_calibration: --recent-days requires a positive integer (got '$recent_days')" >&2
+  exit 2
+fi
+if [[ ! "$min_sample" =~ ^[0-9]+$ ]]; then
+  echo "severity_calibration: --min-sample requires a non-negative integer (got '$min_sample')" >&2
+  exit 2
+fi
+
 command -v jq >/dev/null 2>&1 || { echo "severity_calibration: jq required" >&2; exit 1; }
 
 skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -98,6 +112,10 @@ if [[ -n "$recent_days" ]]; then
     cutoff="$(date -u -v-"${recent_days}"d +%Y-%m-%dT%H:%M:%SZ)"
   else
     cutoff="$(date -u -d "-${recent_days} days" +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+  if [[ -z "$cutoff" ]]; then
+    echo "severity_calibration: could not compute the --recent-days cutoff" >&2
+    exit 1
   fi
 fi
 
@@ -122,19 +140,24 @@ report="$(jq -c -s --arg cutoff "$cutoff" --argjson min_sample "$min_sample" '
          (($a % 100) | tostring | if length == 1 then "0" + . else . end))
     end;
 
-  . as $all
+  (["factcheck_kept","parent_verified_kept","fix_verified","human_accepted"]) as $kept_names
+  | (["factcheck_dropped","parent_verified_dropped","human_rejected","duplicate_merged"]) as $dropped_names
+  | . as $all
+  # One proposed row per (finding, run, reviewer): fingerprint_findings.sh
+  # emits one proposed event per contributing reviewer, and a re-emitted
+  # --emit-events pass must not double-count (grok, PR #102 review).
   | ($all
      | map(select(.event == "proposed"))
      | (if $cutoff != "" then map(select((.ts // "") >= $cutoff)) else . end)
+     | unique_by([.finding_id, .run_id, .reviewer])
      | map(. + {sev: norm_sev})) as $proposed
-  | ($all | map(select(.event as $e |
-      (["factcheck_kept","parent_verified_kept","fix_verified","human_accepted"]
-       | index($e)) != null))) as $kept_ev
-  | ($all | map(select(.event as $e |
-      (["factcheck_dropped","parent_verified_dropped","human_rejected","duplicate_merged"]
-       | index($e)) != null))) as $dropped_ev
-  | (reduce $kept_ev[] as $e ({}; .[$e.finding_id + "::" + $e.run_id] = "kept")) as $tk
-  | (reduce $dropped_ev[] as $e ($tk; .[$e.finding_id + "::" + $e.run_id] = "dropped")) as $tmap
+  # Terminal status: the LATEST terminal event in ledger order wins, so a
+  # human_accepted appended after a factcheck_dropped reads as kept (codex +
+  # deepseek, PR #102 review). The ledger is append-only, so file order is
+  # event order.
+  | (reduce ($all[] | select(.event as $e | ($kept_names + $dropped_names | index($e)) != null)) as $e
+      ({}; .[$e.finding_id + "::" + $e.run_id] =
+             (if ($kept_names | index($e.event)) != null then "kept" else "dropped" end))) as $tmap
   | ($proposed
      | map(. + {status: ($tmap[.finding_id + "::" + .run_id] // "unresolved")})) as $rows
   | (["Critical","High","Medium","Low","Other"]) as $sevs
@@ -155,13 +178,19 @@ report="$(jq -c -s --arg cutoff "$cutoff" --argjson min_sample "$min_sample" '
         | ($items | map(select(.status == "unresolved")) | length) as $unresolved
         | ($items | map(select(.status == "kept")) | length) as $kept_total
         | ($items | map(select(.status == "dropped")) | length) as $dropped_total
-        | ($items | map(select(.sev == "Critical" or .sev == "High")) | length) as $ch_proposed
-        | (if $proposed_n == 0 then 0 else ($ch_proposed / $proposed_n) end) as $ch_proposed_share
+        # Inflation is measured over RESOLVED rows only: an unresolved
+        # Critical is not evidence of inflation, it is a finding nobody has
+        # adjudicated yet, and ~86% of proposed findings on the live ledger
+        # have no terminal event (grok, PR #102 review).
+        | ($kept_total + $dropped_total) as $resolved_n
+        | ($items | map(select(.status != "unresolved" and (.sev == "Critical" or .sev == "High")))
+                   | length) as $ch_resolved
+        | (if $resolved_n == 0 then 0 else ($ch_resolved / $resolved_n) end) as $ch_proposed_share
         | ($items | map(select(.status == "kept" and (.sev == "Critical" or .sev == "High")))
                    | length) as $ch_kept
         | (if $kept_total == 0 then 0 else ($ch_kept / $kept_total) end) as $ch_kept_share
-        | ($ch_proposed_share - $ch_kept_share) as $inflation
-        | (($inflation > 0.25) and ($proposed_n >= $min_sample)) as $warn
+        | (if $resolved_n == 0 then 0 else ($ch_proposed_share - $ch_kept_share) end) as $inflation
+        | (($resolved_n > 0) and ($inflation > 0.25) and ($proposed_n >= $min_sample)) as $warn
         | { reviewer: $reviewer,
             proposed: $proposed_n,
             severity_share: ($sevs | reduce .[] as $s ({};
@@ -172,12 +201,15 @@ report="$(jq -c -s --arg cutoff "$cutoff" --argjson min_sample "$min_sample" '
             kept: $kept_total,
             dropped: $dropped_total,
             unresolved: $unresolved,
+            resolved: $resolved_n,
+            ch_resolved_share: $ch_proposed_share,
+            ch_kept_share: $ch_kept_share,
             inflation: fmt2($inflation),
             inflation_raw: $inflation,
             warn: $warn }
       )
      | sort_by(-.proposed))
-' "$events_file")"
+' "$events_file")" || { echo "severity_calibration: failed to build the report from $events_file" >&2; exit 1; }
 
 if $json_mode; then
   printf '%s' "$report" | jq '.'
@@ -196,5 +228,5 @@ printf '%s' "$report" | jq -r '
    else "" end)
 ' --argjson min_sample "$min_sample"
 echo "──"
-echo "  inflation = (share of Critical+High among proposed) - (share of Critical+High among kept)"
+echo "  inflation = (share of Critical+High among resolved) - (share of Critical+High among kept); unresolved rows excluded"
 echo "  survival excludes unresolved findings (no terminal event yet) from the denominator"

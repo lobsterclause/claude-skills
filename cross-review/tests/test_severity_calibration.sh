@@ -53,8 +53,10 @@ if [[ $? -eq 0 ]]; then ok "--json output parses with jq"; else bad "--json outp
 
 assert_eq "alpha Critical survival is 0.33" \
   "$(jq -r '.[] | select(.reviewer=="alpha") | .survival.Critical' <<<"$J1")" "0.33"
-assert_eq "alpha C+H proposed share is 0.75" \
-  "$(jq -r '.[] | select(.reviewer=="alpha") | .severity_share.Critical' <<<"$J1")" "0.75"
+assert_eq "alpha C+H share among resolved is 0.75" \
+  "$(jq -r '.[] | select(.reviewer=="alpha") | .ch_resolved_share' <<<"$J1")" "0.75"
+assert_eq "alpha C+H share among kept is 0.5" \
+  "$(jq -r '.[] | select(.reviewer=="alpha") | .ch_kept_share' <<<"$J1")" "0.5"
 assert_eq "alpha inflation is 0.25" \
   "$(jq -r '.[] | select(.reviewer=="alpha") | .inflation' <<<"$J1")" "0.25"
 assert_eq "alpha inflation is NOT a WARN at exactly 0.25 (strict >)" \
@@ -92,6 +94,52 @@ assert_eq "alpha (fixture 2) inflation IS a WARN" \
 TBL2="$(bash "$S/severity_calibration.sh" --events "$FIX2" --min-sample 2)"
 assert_contains "table mode emits a WARN inflation line for alpha (fixture 2)" \
   "$TBL2" "WARN inflation: reviewer=alpha"
+
+# ── Fixture 3: ordering, dedupe, unresolved, validation ──────────────────────
+FIX3="$T/events3.jsonl"
+cat >"$FIX3" <<'EOF'
+{"reviewer":"gamma","severity":"Critical","finding_id":"h1","run_id":"run3","event":"proposed","ts":"2026-08-03T00:00:00Z"}
+{"reviewer":"gamma","severity":"Critical","finding_id":"h1","run_id":"run3","event":"proposed","ts":"2026-08-03T00:00:00Z"}
+{"reviewer":"gamma","severity":"High","finding_id":"h2","run_id":"run3","event":"proposed","ts":"2026-08-03T00:00:00Z"}
+{"reviewer":"gamma","severity":"Low","finding_id":"h3","run_id":"run3","event":"proposed","ts":"2026-08-03T00:00:00Z"}
+{"reviewer":"delta","severity":"Critical","finding_id":"h4","run_id":"run3","event":"proposed","ts":"2026-08-03T00:00:00Z"}
+{"reviewer":"delta","severity":"Critical","finding_id":"h5","run_id":"run3","event":"proposed","ts":"2026-08-03T00:00:00Z"}
+{"reviewer":"delta","severity":"Critical","finding_id":"h6","run_id":"run3","event":"proposed","ts":"2026-08-03T00:00:00Z"}
+{"reviewer":"delta","severity":"Low","finding_id":"h7","run_id":"run3","event":"proposed","ts":"2026-08-03T00:00:00Z"}
+{"finding_id":"h1","run_id":"run3","event":"factcheck_dropped","ts":"2026-08-03T01:00:00Z"}
+{"finding_id":"h1","run_id":"run3","event":"human_accepted","ts":"2026-08-03T02:00:00Z"}
+{"finding_id":"h2","run_id":"run3","event":"factcheck_kept","ts":"2026-08-03T01:00:00Z"}
+{"finding_id":"h2","run_id":"run3","event":"human_rejected","ts":"2026-08-03T02:00:00Z"}
+{"finding_id":"h3","run_id":"run3","event":"factcheck_kept","ts":"2026-08-03T01:00:00Z"}
+{"finding_id":"h7","run_id":"run3","event":"factcheck_kept","ts":"2026-08-03T01:00:00Z"}
+EOF
+
+echo "── severity_calibration.sh (fixture 3: ordering / dedupe / unresolved) ──"
+J3="$(bash "$S/severity_calibration.sh" --events "$FIX3" --min-sample 2 --json)"
+assert_eq "duplicate proposed events count once (gamma proposed=3)" \
+  "$(jq -r '.[] | select(.reviewer=="gamma") | .proposed' <<<"$J3")" "3"
+assert_eq "later human_accepted overrides earlier factcheck_dropped (h1 kept)" \
+  "$(jq -r '.[] | select(.reviewer=="gamma") | .survival.Critical' <<<"$J3")" "1.00"
+assert_eq "later human_rejected overrides earlier factcheck_kept (h2 dropped)" \
+  "$(jq -r '.[] | select(.reviewer=="gamma") | .survival.High' <<<"$J3")" "0.00"
+assert_eq "unresolved Critical findings are not inflation (delta inflation 0.00)" \
+  "$(jq -r '.[] | select(.reviewer=="delta") | .inflation' <<<"$J3")" "0.00"
+assert_eq "delta is not a WARN on unresolved rows" \
+  "$(jq -r '.[] | select(.reviewer=="delta") | .warn' <<<"$J3")" "false"
+assert_eq "delta unresolved is 3" \
+  "$(jq -r '.[] | select(.reviewer=="delta") | .unresolved' <<<"$J3")" "3"
+
+echo "── argument validation ──"
+bash "$S/severity_calibration.sh" --events "$FIX1" --min-sample foo >/dev/null 2>"$T/err"; rc=$?
+assert_eq "--min-sample foo exits 2" "$rc" "2"
+assert_contains "--min-sample foo names the flag" "$(cat "$T/err")" "--min-sample"
+bash "$S/severity_calibration.sh" --events "$FIX1" --recent-days 0 >/dev/null 2>&1; rc=$?
+assert_eq "--recent-days 0 exits 2" "$rc" "2"
+bash "$S/severity_calibration.sh" --events "$FIX1" --recent-days abc >/dev/null 2>&1; rc=$?
+assert_eq "--recent-days abc exits 2" "$rc" "2"
+printf '{not json\n' >"$T/bad.jsonl"
+bash "$S/severity_calibration.sh" --events "$T/bad.jsonl" --json >/dev/null 2>&1; rc=$?
+assert_eq "unparseable ledger exits 1 instead of an empty report" "$rc" "1"
 
 echo
 echo "── summary ──"
