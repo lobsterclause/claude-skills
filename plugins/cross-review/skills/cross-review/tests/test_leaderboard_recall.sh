@@ -104,6 +104,15 @@ JSON_WITH="$(CROSS_REVIEW_RUNLOG="$RUNLOG_WITH" CROSS_REVIEW_FINDING_EVENTS="$EV
 JSON_WITHOUT="$(CROSS_REVIEW_RUNLOG="$RUNLOG_WITHOUT" CROSS_REVIEW_FINDING_EVENTS="$EVENTS_WITHOUT" bash "$S/leaderboard.sh" --recent 200 --mode json 2>/dev/null)"
 assert_eq "--mode json byte-identical with vs without synthetic rows" "$JSON_WITH" "$JSON_WITHOUT"
 
+# Same check with the --recent window exactly full of production rows: a
+# synthetic row must not occupy a window slot (with the window cut before the
+# exclusion, syn-1/syn-2 displaced the two oldest real rounds).
+PROD_N="$(jq -c 'select(.reviewers != null)' "$PROD_RUNLOG" | wc -l | tr -d ' ')"
+JSON_WITH_FULL="$(CROSS_REVIEW_RUNLOG="$RUNLOG_WITH" CROSS_REVIEW_FINDING_EVENTS="$EVENTS_WITH" bash "$S/leaderboard.sh" --recent "$PROD_N" --mode json 2>/dev/null)"
+JSON_WITHOUT_FULL="$(CROSS_REVIEW_RUNLOG="$RUNLOG_WITHOUT" CROSS_REVIEW_FINDING_EVENTS="$EVENTS_WITHOUT" bash "$S/leaderboard.sh" --recent "$PROD_N" --mode json 2>/dev/null)"
+assert_eq "--mode json byte-identical with a --recent window exactly full of production rows ($PROD_N)" "$JSON_WITH_FULL" "$JSON_WITHOUT_FULL"
+assert_eq "a window exactly full of production rows scores the same as the unbounded window" "$JSON_WITH_FULL" "$JSON_WITHOUT"
+
 echo "── (e) the un-flagged synthetic run is excluded and WARNs by run_id ──"
 STDERR_WITH="$(CROSS_REVIEW_RUNLOG="$RUNLOG_WITH" CROSS_REVIEW_FINDING_EVENTS="$EVENTS_WITH" bash "$S/leaderboard.sh" --recent 200 --mode table 2>&1 >/dev/null)"
 assert_contains "WARN names syn-1 (explicitly flagged)" "$STDERR_WITH" "syn-1"

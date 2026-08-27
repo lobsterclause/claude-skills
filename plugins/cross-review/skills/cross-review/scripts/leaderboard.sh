@@ -268,9 +268,15 @@ profile_file="${profiles_arg:-$skill_dir/references/reviewer_profiles.json}"
 # Full fleet — keep in sync with run_reviewers.sh dispatch and analyze_runlog.sh.
 REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok longcat inkling kimi27 kimi3)
 
+# structured_raw is EVERY structured row, not yet windowed: the --recent
+# window is cut AFTER synthetic rows are excluded below, so a planted drill
+# never occupies a production slot (with the window cut first, one synthetic
+# row displaced the oldest real round — attempts 4 → 3, epoch_start shifted —
+# and the default output was not byte-identical with vs without it; parent
+# verification of #143).
 structured_raw=""
 if [[ -f "$runlog" ]]; then
-  structured_raw=$(jq -c 'select(.reviewers != null)' "$runlog" 2>/dev/null | tail -n "$recent")
+  structured_raw=$(jq -c 'select(.reviewers != null)' "$runlog" 2>/dev/null)
 fi
 
 # Events ledger path — shared by production scoring, synthetic-round
@@ -302,9 +308,9 @@ fi
 # to score, reliability, value, draw weight, or the epochs/context-mode
 # tables). Synthetic window: the complement, used only by the recall report.
 structured="$(printf '%s\n' "$structured_raw" | jq -c --argjson syn "$synthetic_run_ids" \
-  'select((.synthetic != true) and (((.run_id // null) as $x | $x == null or ($syn | index($x) == null))))' 2>/dev/null)"
+  'select((.synthetic != true) and (((.run_id // null) as $x | $x == null or ($syn | index($x) == null))))' 2>/dev/null | tail -n "$recent")"
 structured_synthetic="$(printf '%s\n' "$structured_raw" | jq -c --argjson syn "$synthetic_run_ids" \
-  'select((.synthetic == true) or (((.run_id // null) as $x | $x != null and ($syn | index($x) != null))))' 2>/dev/null)"
+  'select((.synthetic == true) or (((.run_id // null) as $x | $x != null and ($syn | index($x) != null))))' 2>/dev/null | tail -n "$recent")"
 
 # Events ledger, joined to the PRODUCTION window by run_id. Entries older
 # than the run_id field (or rounds run without --emit-events) simply
