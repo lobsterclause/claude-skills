@@ -214,12 +214,16 @@ printf '{"ts":"2026-08-01T00:00:00Z","run_id":{},"schema_version":1}\n' >"$HOSTI
 printf '{"ts":"2026-08-01T00:00:01Z","run_id":"bad\\nrecord\\twith-tab","schema_version":1}\n' >>"$HOSTILE_RL"
 printf '{"ts":"2026-08-01T00:00:02Z","run_id":["arr"],"schema_version":1}\n' >>"$HOSTILE_RL"
 printf '{"ts":"2026-08-01T00:00:03Z","run_id":"run-good","schema_version":1}\n' >>"$HOSTILE_RL"
+# A value carrying the \u001f field delimiter itself must not shift the
+# fields after it (here it would smuggle a fake schema_version bucket "99").
+printf '{"ts":"2026-08-01T00:00:04Z","run_id":"smuggle\\u001f1\\u001f99","schema_version":1}\n' >>"$HOSTILE_RL"
 printf '{not json\n' >>"$HOSTILE_RL"
 HOSTILE_EV="$T/hostile-events.jsonl"
 printf '{"event":{"nested":true},"ts":"2026-08-01T00:00:00Z","finding_id":"f-1","run_id":"run-good","schema_version":1}\n' >"$HOSTILE_EV"
 printf '{"event":"proposed","ts":"2026-08-01T00:00:01Z","finding_id":"f-2","run_id":"run-orphan","schema_version":1}\n' >>"$HOSTILE_EV"
 HOSTILE_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$HOSTILE_RL" --events "$HOSTILE_EV" --json 2>/dev/null)"
-assert_eq "hostile runlog: every physical line is still counted (5, not 0)" "$(jq -r '.runlog.lines' <<<"$HOSTILE_JSON")" "5"
+assert_eq "hostile runlog: every physical line is still counted (6, not 0)" "$(jq -r '.runlog.lines' <<<"$HOSTILE_JSON")" "6"
+assert_eq "hostile runlog: a \\u001f inside run_id cannot smuggle a schema_version bucket" "$(jq -c '.runlog.schema_version' <<<"$HOSTILE_JSON")" '{"1":5}'
 assert_eq "hostile runlog: the trailing malformed line is still reported" "$(jq -r '.runlog.malformed' <<<"$HOSTILE_JSON")" "1"
 assert_eq "hostile runlog: a newline inside run_id does not split the row (0 legacy rows)" "$(jq -r '.runlog.legacy_no_ts' <<<"$HOSTILE_JSON")" "0"
 assert_eq "hostile events: both event lines are counted" "$(jq -r '.events.lines' <<<"$HOSTILE_JSON")" "2"

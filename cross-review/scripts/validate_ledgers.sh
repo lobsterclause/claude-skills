@@ -82,7 +82,8 @@ ALLOWED_EVENTS="proposed anchored factcheck_kept factcheck_dropped parent_verifi
 # `join` aborts the whole jq process on an object/array element (every row
 # after it silently vanished — "runlog: 0 lines"), and a newline inside a
 # value split one row into two for the bash reader while a tab broke the
-# tab-keyed orphan join below (cross-review of #139).
+# tab-keyed orphan join below; the \u001f delimiter itself is scrubbed too,
+# or a value carrying it would shift every later field (cross-review of #139).
 #
 # Rows join fields with \x1F (ASCII unit separator, spelled "\u001f" in the
 # jq program so no raw control byte sits in this file), not a real tab: bash's
@@ -104,8 +105,8 @@ foreach inputs as $raw (0; . + 1;
            ($o|has("ts")|if . then "1" else "0" end),
            ($o|has("schema_version")|if . then "1" else "0" end),
            ($o.schema_version | if type == "number" then tostring else "" end),
-           (($o.run_id // "") | tostring | gsub("[\t\n\r]"; " ")),
-           ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r]"; " ")) else "missing" end)
+           (($o.run_id // "") | tostring | gsub("[\t\n\r\u001f]"; " ")),
+           ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r\u001f]"; " ")) else "missing" end)
           ] | join("\u001f")
       end
   end
@@ -121,11 +122,11 @@ foreach inputs as $raw (0; . + 1;
       else
         ($p) as $o
         | [., "ok",
-           (($o.event // "") | tostring | gsub("[\t\n\r]"; " ")),
-           (($o.run_id // "") | tostring | gsub("[\t\n\r]"; " ")),
+           (($o.event // "") | tostring | gsub("[\t\n\r\u001f]"; " ")),
+           (($o.run_id // "") | tostring | gsub("[\t\n\r\u001f]"; " ")),
            ($o|has("schema_version")|if . then "1" else "0" end),
            ($o.schema_version | if type == "number" then tostring else "" end),
-           ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r]"; " ")) else "missing" end)
+           ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r\u001f]"; " ")) else "missing" end)
           ] | join("\u001f")
       end
   end
