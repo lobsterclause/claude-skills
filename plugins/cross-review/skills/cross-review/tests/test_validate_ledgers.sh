@@ -126,6 +126,15 @@ assert_eq "--json unknown_event_examples keeps a quoted name whole" \
   "$(printf '%s' "$SJ" | jq -r '.events.unknown_event_examples[0]')" "it's odd"
 bash "$S/validate_ledgers.sh" --runlog "$T/does-not-exist.jsonl" --events "$SHAPE_EVENTS" >/dev/null 2>&1; prc=$?
 assert_eq "an explicit --runlog path that does not exist exits 2" "$prc" "2"
+bash "$S/validate_ledgers.sh" --runlog "$T" --events "$SHAPE_EVENTS" >/dev/null 2>&1; prc=$?
+assert_eq "an explicit --runlog path that is a directory exits 2" "$prc" "2"
+bash "$S/validate_ledgers.sh" --runlog "" --events "$SHAPE_EVENTS" >/dev/null 2>&1; prc=$?
+assert_eq "an explicit empty --runlog path exits 2" "$prc" "2"
+assert_contains "text mode keeps a spaced schema_version value whole" "$SOUT" 'a"b c=1'
+TABLOG="$T/tab-runlog.jsonl"
+printf '{"ts":"2026-08-01T00:00:00Z","schema_version":"x\\ty"}\n' >"$TABLOG"
+TJ="$(bash "$S/validate_ledgers.sh" --runlog "$TABLOG" --events "$SHAPE_EVENTS" --json 2>/dev/null)"
+assert_eq "a schema_version with a tab still yields valid --json" "$(printf '%s' "$TJ" | jq -r '.runlog.schema_version | to_entries[0].value')" "1"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

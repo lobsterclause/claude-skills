@@ -66,8 +66,8 @@ need_val() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --runlog) need_val "$1" "$#"; runlog="$2"; shift 2 ;;
-    --events) need_val "$1" "$#"; events="$2"; shift 2 ;;
+    --runlog) need_val "$1" "$#"; runlog="$2"; [[ -n "$runlog" ]] || { echo "validate_ledgers: --runlog needs a non-empty path" >&2; exit 2; }; shift 2 ;;
+    --events) need_val "$1" "$#"; events="$2"; [[ -n "$events" ]] || { echo "validate_ledgers: --events needs a non-empty path" >&2; exit 2; }; shift 2 ;;
     --json)   json_out=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -81,8 +81,8 @@ skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
 # (codex, PR #109 review). Absent defaults stay equivalent to empty.
 for pair in "--runlog:$runlog" "--events:$events"; do
   flag="${pair%%:*}"; path="${pair#*:}"
-  if [[ -n "$path" && ! -r "$path" ]]; then
-    echo "validate_ledgers: $flag '$path' does not exist or is not readable" >&2
+  if [[ -n "$path" && ( ! -f "$path" || ! -r "$path" ) ]]; then
+    echo "validate_ledgers: $flag '$path' is not a readable regular file" >&2
     exit 2
   fi
 done
@@ -125,7 +125,7 @@ if [[ -f "$runlog" ]]; then
     fi
     rid="$(printf '%s' "$parsed" | jq -r '.run_id // empty')"
     [[ -n "$rid" ]] && printf '%s\n' "$rid" >>"$run_ids_file"
-    sv="$(printf '%s' "$parsed" | jq -r 'if has("schema_version") then (.schema_version|tostring) else "missing" end')"
+    sv="$(printf '%s' "$parsed" | jq -r 'if has("schema_version") then (.schema_version|tostring|gsub("[\\t\\n\\r]"; " ")) else "missing" end')"
     printf '%s\n' "$sv" >>"$sv_runlog_file"
   done <"$runlog"
 fi
@@ -168,7 +168,7 @@ if [[ -f "$events" ]]; then
         printf '%s\t%s\n' "$erid" "$lineno" >>"$orphan_run_ids_file"
       fi
     fi
-    sv="$(printf '%s' "$parsed" | jq -r 'if has("schema_version") then (.schema_version|tostring) else "missing" end')"
+    sv="$(printf '%s' "$parsed" | jq -r 'if has("schema_version") then (.schema_version|tostring|gsub("[\\t\\n\\r]"; " ")) else "missing" end')"
     printf '%s\n' "$sv" >>"$sv_events_file"
   done <"$events"
 fi
@@ -178,11 +178,18 @@ orphan_count=$(wc -l <"$orphan_run_ids_file" | tr -d ' ')
 errors=$((runlog_malformed + runlog_missing_ts + events_malformed))
 warns=$((events_unknown + orphan_count))
 
+# uniq -c output is "<count> <value>"; the value may contain spaces, so
+# split on the first run of spaces only (awk sub), never on every field
+# (kimi, PR #109 pass 2). Tabs/newlines were flattened at extraction.
+sv_counts_tsv() {
+  sort "$1" | uniq -c | awk '{ c = $1; sub(/^ *[0-9]+ /, ""); printf "%s\t%s\n", $0, c }'
+}
+
 sv_dist() {
   # <file> -> "1=3, missing=1" style distribution string
   local f="$1"
   [[ -s "$f" ]] || { echo "(none)"; return; }
-  sort "$f" | uniq -c | awk '{printf "%s=%s, ", $2, $1}' | sed 's/, $//'
+  sv_counts_tsv "$f" | awk -F'\t' '{printf "%s=%s, ", $1, $2}' | sed 's/, $//'
 }
 
 sv_dist_json() {
@@ -190,7 +197,7 @@ sv_dist_json() {
   # or a space) cannot break the JSON (codex, PR #109 review).
   local f="$1"
   [[ -s "$f" ]] || { echo '{}'; return; }
-  sort "$f" | uniq -c | sed -E 's/^ *([0-9]+) (.*)$/\2\t\1/' \
+  sv_counts_tsv "$f" \
     | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): (.[1] | tonumber)}) | add // {}'
 }
 
