@@ -282,7 +282,9 @@ fi
 # This matches standard Unix conventions — explicit CLI always wins. The
 # previous order put profile above --timeout, which silently broke
 # `--timeout 30` smoke runs (caught by codex review on PR #10).
-profile_file="$(cd "$(dirname "$0")/.." && pwd)/references/reviewer_profiles.json"
+# CROSS_REVIEW_PROFILES_FILE overrides the location for tests, so a fixture
+# can drop or alter a seat without mutating the live profile in place.
+profile_file="${CROSS_REVIEW_PROFILES_FILE:-$(cd "$(dirname "$0")/.." && pwd)/references/reviewer_profiles.json}"
 profile_get() {
   # Usage: profile_get <reviewer> <key>; prints the string value from the
   # profile, or empty string if jq/file/key absent.

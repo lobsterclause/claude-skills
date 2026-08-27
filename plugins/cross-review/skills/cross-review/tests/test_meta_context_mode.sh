@@ -162,12 +162,10 @@ check_keys "antigravity.meta.json" "$T/o5/antigravity.meta.json" "$AGY_KEYS_BEFO
 echo "── (f) no_model_configured early exit stamps the INTENDED mode, not a constant ──"
 # The early exit fires before the prompt (and context_access) exists, so the
 # lane never received anything; the row must still say what the round asked
-# for. Same technique as run_tests.sh: drop .glm.model from the profile file
-# the script reads, restore on every exit path.
-PROFILES="$S/../references/reviewer_profiles.json"
-cp "$PROFILES" "$T/profiles.bak"
-trap 'cp "$T/profiles.bak" "$PROFILES"; rm -rf "$T"' EXIT
-jq 'del(.glm.model)' "$T/profiles.bak" >"$PROFILES"
+# for. The live profile is never touched: a copy without .glm.model goes to
+# $T and run_reviewers.sh reads it via CROSS_REVIEW_PROFILES_FILE.
+jq 'del(.glm.model)' "$S/../references/reviewer_profiles.json" >"$T/profiles_nomodel.json"
+export CROSS_REVIEW_PROFILES_FILE="$T/profiles_nomodel.json"
 bash "$S/run_reviewers.sh" --base main --out "$T/o6" \
   --reviewers glm --context-mode files >/dev/null 2>&1 || true
 assert_eq "no_model_configured row exists" \
@@ -182,7 +180,9 @@ bash "$S/run_reviewers.sh" --base main --out "$T/o8" \
   --reviewers glm --context-mode diff --snapshot-dir "$SNAP" >/dev/null 2>&1 || true
 assert_eq "no_model_configured + snapshot present -> context_mode files" \
   "$(jq -r '.context_mode' "$T/o8/glm.meta.json")" "files"
-cp "$T/profiles.bak" "$PROFILES"
+unset CROSS_REVIEW_PROFILES_FILE
+assert_eq "live reviewer_profiles.json still has glm.model" \
+  "$(jq -r '.glm.model != null' "$S/../references/reviewer_profiles.json")" "true"
 
 echo ""
 echo "══ $PASS passed, $FAIL failed ══"

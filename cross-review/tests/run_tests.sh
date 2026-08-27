@@ -1268,11 +1268,10 @@ assert_contains "models resolve from reviewer_profiles.json" \
 
 # A profile with no `.model` must skip the reviewer with a named failure_kind
 # rather than POSTing an empty model and reading the 404 as unreliability.
+# The live profile is not mutated: the fixture copy is handed to the script
+# via CROSS_REVIEW_PROFILES_FILE (#136).
 jq 'del(.glm.model)' "$SKILL_DIR/references/reviewer_profiles.json" >"$T/profiles_nomodel.json"
-cp "$SKILL_DIR/references/reviewer_profiles.json" "$T/profiles.bak"
-cp "$T/profiles_nomodel.json" "$SKILL_DIR/references/reviewer_profiles.json"
-OPENROUTER_API_KEY=test-key bash "$S/run_reviewers.sh" --base main --out "$T/o17" --reviewers glm --timeout 60 >/dev/null 2>"$T/o17.err" || true
-cp "$T/profiles.bak" "$SKILL_DIR/references/reviewer_profiles.json"
+CROSS_REVIEW_PROFILES_FILE="$T/profiles_nomodel.json" OPENROUTER_API_KEY=test-key bash "$S/run_reviewers.sh" --base main --out "$T/o17" --reviewers glm --timeout 60 >/dev/null 2>"$T/o17.err" || true
 assert_eq "a reviewer with no profile model stamps no_model_configured" \
   "$(jq -r '.failure_kind' "$T/o17/glm.meta.json" 2>/dev/null)" "no_model_configured"
 assert_contains "the skip names the file to edit" \
