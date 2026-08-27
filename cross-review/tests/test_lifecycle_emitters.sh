@@ -230,6 +230,60 @@ if [[ -x /bin/bash ]]; then
     "$(grep -c 'unbound variable' "$T/f5.err")" "0"
 fi
 
+# (f6) [RED: fails before #138's fix] A raw dir holding a SUCCESSFUL fallback's
+# <slug>.stdout alongside the primary lane's preserved forensic artifacts
+# (<slug>.primary-failed.stdout/.meta.json + <slug>.fallback.warning, written
+# by maybe_or_fallback() in run_reviewers.sh) must merge as ONE reviewer
+# (glm), not two. The primary-failed stdout is given a DIFFERENT valid
+# finding so a wrong merge is visible in both the count and the sources.
+FRAW6="$T/fraw6"; mkdir -p "$FRAW6"
+cat >"$FRAW6/glm.stdout" <<'EOF'
+{"findings":[{"severity":"High","file":"a.sh","line":3,"snippet":"x","claim":"real finding"}]}
+EOF
+cat >"$FRAW6/glm.primary-failed.stdout" <<'EOF'
+{"findings":[{"severity":"Low","file":"b.sh","line":9,"snippet":"y","claim":"forensic finding, different"}]}
+EOF
+cat >"$FRAW6/glm.primary-failed.meta.json" <<'EOF'
+{"exit_code":1,"failure_kind":"timeout"}
+EOF
+cat >"$FRAW6/glm.fallback.warning" <<'EOF'
+glm: PRIMARY LANE FAILED (timeout) -- falling back to OpenRouter
+EOF
+export CROSS_REVIEW_FINDING_EVENTS="$T/ev_f6.jsonl"
+bash "$S/merge_raw_findings.sh" --raw "$FRAW6" --out "$T/f6-merged.json" --emit-events rf6 >/dev/null 2>"$T/f6.err"
+RC_F6=$?
+unset CROSS_REVIEW_FINDING_EVENTS
+assert_eq "(f6) exits 0" "$RC_F6" "0"
+assert_eq "(f6) primary-failed stdout is NOT merged as a second reviewer: findings length is 1" \
+  "$(jq '.findings | length' "$T/f6-merged.json" 2>/dev/null)" "1"
+assert_eq "(f6) no reviewer named glm.primary-failed appears in any sources[]" \
+  "$(jq -r '[.findings[].sources[]] | index("glm.primary-failed") // "absent"' "$T/f6-merged.json" 2>/dev/null)" "absent"
+assert_eq "(f6) --emit-events produced no duplicate_merged/proposed event for glm.primary-failed" \
+  "$([[ -f "$T/ev_f6.jsonl" ]] && jq -r 'select((.event=="duplicate_merged" or .event=="proposed") and (.reviewer=="glm.primary-failed" or .first_reviewer=="glm.primary-failed" or (.sources // [] | index("glm.primary-failed")) != null))' "$T/ev_f6.jsonl" | jq -s 'length' || echo 0)" "0"
+
+# (f7) A raw dir holding ONLY forensic files -- primary-failed stdout plus an
+# attempt-stamped copy, no final <slug>.stdout at all -- must still yield
+# {"findings":[]} and exit 0, under both bash and /bin/bash (macOS 3.2).
+FRAW7="$T/fraw7"; mkdir -p "$FRAW7"
+cat >"$FRAW7/glm.primary-failed.stdout" <<'EOF'
+{"findings":[{"severity":"High","file":"z.sh","line":1,"snippet":"x","claim":"forensic only, primary-failed"}]}
+EOF
+cat >"$FRAW7/glm.attempt1.stdout" <<'EOF'
+{"findings":[{"severity":"High","file":"z.sh","line":1,"snippet":"x","claim":"forensic only, attempt1"}]}
+EOF
+bash "$S/merge_raw_findings.sh" --raw "$FRAW7" --out "$T/f7-bash.json" >/dev/null 2>"$T/f7-bash.err"
+RC_F7_BASH=$?
+assert_eq "(f7) forensic-only raw dir exits 0 under bash" "$RC_F7_BASH" "0"
+assert_eq "(f7) forensic-only raw dir yields {\"findings\":[]} under bash" \
+  "$(jq -c . "$T/f7-bash.json" 2>/dev/null)" '{"findings":[]}'
+if [[ -x /bin/bash ]]; then
+  /bin/bash "$S/merge_raw_findings.sh" --raw "$FRAW7" --out "$T/f7-binbash.json" >/dev/null 2>"$T/f7-binbash.err"
+  RC_F7_BINBASH=$?
+  assert_eq "(f7) forensic-only raw dir exits 0 under /bin/bash ($(/bin/bash -c 'echo $BASH_VERSION'))" "$RC_F7_BINBASH" "0"
+  assert_eq "(f7) forensic-only raw dir yields {\"findings\":[]} under /bin/bash" \
+    "$(jq -c . "$T/f7-binbash.json" 2>/dev/null)" '{"findings":[]}'
+fi
+
 echo "── (e) SKILL.md carries the lifecycle wiring literally (grep test) ──"
 SKILL_MD="$SKILL_DIR/SKILL.md"
 assert_contains "(e) SKILL.md has parent_verified_dropped" "$(cat "$SKILL_MD")" "parent_verified_dropped"
