@@ -155,7 +155,10 @@ if [[ ${#files[@]} -gt 0 ]]; then
   unset IFS
 fi
 
-for f in "${sorted[@]}"; do
+# ${sorted[@]+"${sorted[@]}"}: an EMPTY array expanded as "${sorted[@]}" is an
+# "unbound variable" under set -u on bash < 4.4 (macOS /bin/bash is 3.2), and
+# since #135 removed the raw-glob fallback the array really can be empty.
+for f in ${sorted[@]+"${sorted[@]}"}; do
   base="$(basename "$f")"
   reviewer="${base%.stdout}"
 
@@ -213,7 +216,7 @@ for f in "${sorted[@]}"; do
           '{hash: $hash, reviewer: $reviewer, file: $file, claim: $claim,
             local_id: ($local_id | if . == "" then null else . end)}' >>"$dup_track"
       done < <(printf '%s' "$parsed" \
-        | jq -j '.[] | (.file // ""), "", (.claim // ""), "", (.id // ""), ""')
+        | jq -j '.[] | (.file // ""), "\u001f", (.claim // ""), "\u001f", (.id // ""), "\u001e"')
     fi
   else
     echo "unparsed: $reviewer" >&2
