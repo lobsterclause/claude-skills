@@ -194,11 +194,10 @@ echo "── single-pass line extraction: parity + performance on a large fixtur
 # valid rows, plus 3 malformed, 2 legacy no-ts, and 1 future schema_version
 # runlog row, scattered through it (near the start, the middle, and near
 # the end) so line numbering at every offset gets exercised. 1,000 lines
-# keeps the *pre-#132* comparison script's run (invoked twice below, once
-# per output mode) well inside this test's time budget -- it forks
-# several jq/awk/grep processes per line and takes roughly a minute per
-# invocation at this size; the single-pass script finishes in a fraction
-# of a second regardless.
+# is the size the pinned baseline below was generated at (the pre-#132
+# script forked several jq/awk/grep processes per line and took about a
+# minute at this size; the single-pass script finishes in well under a
+# second).
 PERF_N=1000
 PERF_RUNLOG="$T/perf-runlog.jsonl"
 PERF_EVENTS="$T/perf-events.jsonl"
@@ -220,28 +219,34 @@ for ((pi = 1; pi <= PERF_N; pi++)); do
   printf '{"event":"proposed","ts":"2026-08-01T00:00:%02dZ","finding_id":"f-%d","run_id":"run-%d","schema_version":1}\n' "$((pi % 60))" "$pi" "$pi" >>"$PERF_EVENTS"
 done
 
-# The pre-#132 script, materialized from the last commit -- HEAD, not this
-# working tree -- so this compares the new extraction against whatever
-# shipped last, not against itself.
-ORIG_SCRIPT="$T/orig_validate_ledgers.sh"
-git -C "$SKILL_DIR" show HEAD:cross-review/scripts/validate_ledgers.sh >"$ORIG_SCRIPT" 2>/dev/null
-
-if [[ -s "$ORIG_SCRIPT" ]]; then
-  # $ORIG_SCRIPT lives under $T, with no sibling scripts/ dir next to it, so
-  # left to its own device-relative default it can't find append_runlog.sh
-  # / append_finding_event.sh and falls back with an extra WARN that the
-  # real, in-place $S/validate_ledgers.sh never hits. Point both at the
-  # same real writers dir so the comparison is apples-to-apples.
-  ORIG_TEXT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$ORIG_SCRIPT" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" 2>&1)"
-  NEW_TEXT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" 2>&1)"
-  assert_eq "single-pass text output matches the pre-#132 script byte-for-byte on a $PERF_N-line fixture" "$NEW_TEXT" "$ORIG_TEXT"
-
-  ORIG_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$ORIG_SCRIPT" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" --json 2>/dev/null)"
-  NEW_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" --json 2>/dev/null)"
-  assert_eq "single-pass --json output matches the pre-#132 script byte-for-byte on a $PERF_N-line fixture" "$NEW_JSON" "$ORIG_JSON"
-else
-  bad "could not materialize the pre-#132 script from git HEAD to compare against"
-fi
+# Expected output PINNED from the pre-#132 script (origin/master before
+# #139, generated 2026-08-27 on this exact fixture) -- not re-derived from
+# `git show HEAD:` at test time, which becomes a tautology the moment the
+# refactor merges and fails outright without history (cross-review of #137).
+# It also spares the ~60s-per-invocation run of the old per-line-fork script.
+# Paths never appear in the output, so no normalization is needed.
+PIN_TEXT=$(cat <<'PINNED'
+ERROR runlog:10 malformed
+ERROR runlog:500 malformed
+ERROR runlog:990 malformed
+WARN  legacy: runlog:20 has no ts (pre-schema entry)
+WARN  runlog:30 schema_version 99 is above the writer's current 1
+WARN  legacy: runlog:980 has no ts (pre-schema entry)
+WARN  events: 6 event(s) with a run_id absent from runlog (orphan run_id):
+  orphan run_id 'run-10'
+  orphan run_id 'run-20'
+  orphan run_id 'run-30'
+  orphan run_id 'run-500'
+  orphan run_id 'run-980'
+runlog: 1000 lines, 3 malformed, 0 missing ts, 2 legacy no-ts, 1 above-current schema_version, schema_version: 1=994, 99=1, missing=2
+events: 1000 lines, 0 malformed, 0 unknown event(s), 6 orphan run_id(s), 0 above-current schema_version, schema_version: 1=1000
+PINNED
+)
+PIN_JSON='{"runlog":{"lines":1000,"malformed":3,"missing_ts":0,"legacy_no_ts":2,"future_version":1,"future_version_examples":[99],"current_schema_version":1,"schema_version":{"1":994,"99":1,"missing":2}},"events":{"lines":1000,"malformed":0,"unknown_event":0,"unknown_event_examples":[],"orphan_run_id":6,"orphan_run_id_examples":["run-10","run-20","run-30","run-500","run-980"],"future_version":0,"future_version_examples":[],"current_schema_version":1,"schema_version":{"1":1000}},"errors":3,"warns":9}'
+NEW_TEXT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" 2>&1)"
+assert_eq "single-pass text output matches the pre-#132 script byte-for-byte on a $PERF_N-line fixture" "$NEW_TEXT" "$PIN_TEXT"
+NEW_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" --json 2>/dev/null)"
+assert_eq "single-pass --json output matches the pre-#132 script byte-for-byte on a $PERF_N-line fixture" "$NEW_JSON" "$PIN_JSON"
 
 PERF_START=$(date +%s)
 bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" >/dev/null 2>&1
