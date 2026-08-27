@@ -421,7 +421,8 @@ if [[ "$context_mode" == "files" ]]; then
   _ctx_omitted_json='[]'
   # numstat: "<added>\t<deleted>\t<path>"; binaries show "-\t-". Renames
   # print "old => new" braces in the path column, so resolve names from
-  # --name-status (rename-clean) and use numstat only for the churn key.
+  # --name-only (rename-clean: it prints the post-change path) and use
+  # numstat only for the churn key.
   # core.quotePath=false: git otherwise octal-escapes and double-quotes any
   # path with non-ASCII bytes, `git show HEAD:"\303\274.txt"` then fails and
   # the file would vanish from the block as neither included nor omitted
@@ -460,8 +461,16 @@ if [[ "$context_mode" == "files" ]]; then
     if [[ "$_ctx_size" != "$(git show "HEAD:$_p" 2>/dev/null | tr -d '\000' | wc -c | tr -d ' ')" ]]; then
       continue
     fi
+    # Attribute escaping covers & " < > — a filename may legally contain
+    # '<', and an unescaped '</files>' IN THE PATH would reproduce the outer
+    # fence (codex + kimi, PR #71 pass 2).
     _ctx_path_attr="${_p//&/&amp;}"; _ctx_path_attr="${_ctx_path_attr//\"/&quot;}"
-    _ctx_overhead=$(( ${#_ctx_path_attr} + 24 ))   # <file path="">\n … \n</file>\n
+    _ctx_path_attr="${_ctx_path_attr//</&lt;}";  _ctx_path_attr="${_ctx_path_attr//>/&gt;}"
+    # Pre-read check is a LOWER bound (blob bytes + wrapper bytes, path
+    # measured in bytes not locale characters); the binding check is on the
+    # serialized entry below, because defusing can add bytes
+    # (codex + kimi + seed, PR #71 pass 2).
+    _ctx_overhead=$(( $(printf '%s' "$_ctx_path_attr" | wc -c | tr -d ' ') + 24 ))   # <file path="">\n … \n</file>\n
     if [[ $(( _ctx_used + _ctx_size + _ctx_overhead )) -gt "$context_budget_bytes" ]]; then
       context_files_omitted=$((context_files_omitted + 1))
       _ctx_omitted_json="$(printf '%s' "$_ctx_omitted_json" | jq -c --arg p "$_p" '. + [$p]' 2>/dev/null || printf '%s' "$_ctx_omitted_json")"
@@ -473,9 +482,17 @@ if [[ "$context_mode" == "files" ]]; then
     # as </diff> and </snapshot> (codex + kimi, PR #71 pass 1).
     _ctx_blob="${_ctx_blob//<\/file>/< \/file>}"
     _ctx_blob="${_ctx_blob//<\/files>/< \/files>}"
-    _ctx_entry="$(printf '<file path="%s">\n%s\n</file>\n' "$_ctx_path_attr" "$_ctx_blob")"
-    printf '%s\n' "$_ctx_entry" >>"$context_files_path"
-    _ctx_used=$(( _ctx_used + $(printf '%s\n' "$_ctx_entry" | wc -c | tr -d ' ') ))
+    # $(...) strips the trailing newline the format string adds; write it
+    # back with exactly one — no blank line between entries (kimi, pass 2).
+    _ctx_entry="$(printf '<file path="%s">\n%s\n</file>' "$_ctx_path_attr" "$_ctx_blob")"$'\n'
+    _ctx_entry_len="$(printf '%s' "$_ctx_entry" | wc -c | tr -d ' ')"
+    if [[ $(( _ctx_used + _ctx_entry_len )) -gt "$context_budget_bytes" ]]; then
+      context_files_omitted=$((context_files_omitted + 1))
+      _ctx_omitted_json="$(printf '%s' "$_ctx_omitted_json" | jq -c --arg p "$_p" '. + [$p]' 2>/dev/null || printf '%s' "$_ctx_omitted_json")"
+      continue
+    fi
+    printf '%s' "$_ctx_entry" >>"$context_files_path"
+    _ctx_used=$(( _ctx_used + _ctx_entry_len ))
     context_files_included=$((context_files_included + 1))
   done <<<"$_ctx_order"$'\n'"$_ctx_paths"
   if [[ "$context_files_omitted" -gt 0 ]]; then

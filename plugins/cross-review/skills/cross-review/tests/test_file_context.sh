@@ -190,8 +190,20 @@ assert_contains "…by path" "$KIMI6" "lib.sh"
 assert_eq "meta: context_access stays file_context (the mode ran; the budget bit)" \
   "$(jq -r '.context_access' "$T/o6/kimi.meta.json" 2>/dev/null)" "file_context"
 assert_eq "meta: context_files_omitted=3 (every changed text file is over a 10-byte budget)" "$(jq -r '.context_files_omitted' "$T/o6/kimi.meta.json" 2>/dev/null)" "3"
-assert_contains "sidecar lists the omitted paths" \
-  "$(jq -r '.omitted_paths | join(",")' "$T/o6/context.files.meta.json" 2>/dev/null)" "lib.sh"
+assert_eq "sidecar lists every omitted path" \
+  "$(jq -r '.omitted_paths | sort | join(",")' "$T/o6/context.files.meta.json" 2>/dev/null)" "lib.sh,new.txt,ünïcode.txt"
+# The binding budget check is on the SERIALIZED entry: lib.sh's blob is well
+# under 700 bytes but its entry (tags + path + the defusing bytes) is not, so
+# a budget that admits the blob alone must still omit it.
+lib_blob=$(cd "$REPO" && git cat-file -s HEAD:lib.sh)
+CROSS_REVIEW_CONTEXT_BUDGET_BYTES=$((lib_blob + 1)) run "$T/o9" "$T/kimi9.txt"
+assert_eq "budget = blob+1 bytes → lib.sh omitted (entry bytes > blob bytes)" \
+  "$(jq -r '.omitted_paths | index("lib.sh") != null' "$T/o9/context.files.meta.json")" "true"
+assert_eq "…and bytes on disk never exceed the budget" \
+  "$([[ $(wc -c <"$T/o9/context.files.txt" | tr -d ' ') -le $((lib_blob + 1)) ]] && echo true || echo false)" "true"
+[[ "$(grep -c '^$' "$T/o1/context.files.txt")" -eq "$(grep -c '^$' <(cd "$REPO" && git show HEAD:lib.sh; git show HEAD:new.txt; git show HEAD:ünïcode.txt))" ]] \
+  && ok "no blank line is inserted between <file> entries (kimi, pass 2)" \
+  || bad "blank lines between entries: $(grep -c '^$' "$T/o1/context.files.txt")"
 assert_contains "stderr says how much the budget dropped" "$(cat "$T/o6.log")" "omitted by the 10B budget"
 ( cd "$REPO" && CROSS_REVIEW_CONTEXT_BUDGET_BYTES=lots bash "$S/run_reviewers.sh" --base main --out "$T/o7" --reviewers kimi >"$T/o7.log" 2>&1 )
 assert_eq "a non-integer budget is a usage error (rc=2)" "$?" "2"
