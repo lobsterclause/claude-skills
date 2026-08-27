@@ -203,6 +203,39 @@ assert_contains "empty runlog: the orphan run_id is named" "$ORPH_OUT" "orphan r
 ORPH_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$EMPTY_RL" --events "$ORPH_EV" --json 2>/dev/null)"
 assert_eq "empty runlog: --json orphan_run_id count is 2" "$(jq -r '.events.orphan_run_id' <<<"$ORPH_JSON")" "2"
 
+echo "── hostile field values: wrong JSON types and embedded newlines/tabs do not derail the pass ──"
+# A run_id/event that is an object or array used to abort the one jq process
+# (join cannot add an object), which the bash reader saw as end-of-input:
+# every later row vanished and the ledger reported "0 lines". A newline
+# inside a value split one row in two for the reader; a tab broke the
+# tab-keyed orphan join.
+HOSTILE_RL="$T/hostile-runlog.jsonl"
+printf '{"ts":"2026-08-01T00:00:00Z","run_id":{},"schema_version":1}\n' >"$HOSTILE_RL"
+printf '{"ts":"2026-08-01T00:00:01Z","run_id":"bad\\nrecord\\twith-tab","schema_version":1}\n' >>"$HOSTILE_RL"
+printf '{"ts":"2026-08-01T00:00:02Z","run_id":["arr"],"schema_version":1}\n' >>"$HOSTILE_RL"
+printf '{"ts":"2026-08-01T00:00:03Z","run_id":"run-good","schema_version":1}\n' >>"$HOSTILE_RL"
+printf '{not json\n' >>"$HOSTILE_RL"
+HOSTILE_EV="$T/hostile-events.jsonl"
+printf '{"event":{"nested":true},"ts":"2026-08-01T00:00:00Z","finding_id":"f-1","run_id":"run-good","schema_version":1}\n' >"$HOSTILE_EV"
+printf '{"event":"proposed","ts":"2026-08-01T00:00:01Z","finding_id":"f-2","run_id":"run-orphan","schema_version":1}\n' >>"$HOSTILE_EV"
+HOSTILE_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$HOSTILE_RL" --events "$HOSTILE_EV" --json 2>/dev/null)"
+assert_eq "hostile runlog: every physical line is still counted (5, not 0)" "$(jq -r '.runlog.lines' <<<"$HOSTILE_JSON")" "5"
+assert_eq "hostile runlog: the trailing malformed line is still reported" "$(jq -r '.runlog.malformed' <<<"$HOSTILE_JSON")" "1"
+assert_eq "hostile runlog: a newline inside run_id does not split the row (0 legacy rows)" "$(jq -r '.runlog.legacy_no_ts' <<<"$HOSTILE_JSON")" "0"
+assert_eq "hostile events: both event lines are counted" "$(jq -r '.events.lines' <<<"$HOSTILE_JSON")" "2"
+assert_eq "hostile events: an object-valued event is an unknown event, not a crash" "$(jq -r '.events.unknown_event' <<<"$HOSTILE_JSON")" "1"
+assert_eq "hostile events: only the truly absent run_id is an orphan" "$(jq -c '.events.orphan_run_id_examples' <<<"$HOSTILE_JSON")" '["run-orphan"]'
+
+echo "── sv_is_future: non-integer schema_version still takes the exact awk path ──"
+FRAC_RL="$T/frac-runlog.jsonl"
+printf '{"ts":"2026-08-01T00:00:00Z","run_id":"r-1","schema_version":1.5}\n' >"$FRAC_RL"
+printf '{"ts":"2026-08-01T00:00:01Z","run_id":"r-2","schema_version":0.5}\n' >>"$FRAC_RL"
+printf '{"ts":"2026-08-01T00:00:02Z","run_id":"r-3","schema_version":1}\n' >>"$FRAC_RL"
+FRAC_EV="$T/frac-events.jsonl"; : >"$FRAC_EV"
+FRAC_OUT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$FRAC_RL" --events "$FRAC_EV" 2>&1)"
+assert_contains "schema_version 1.5 (above current 1) warns as future" "$FRAC_OUT" "runlog:1 schema_version 1.5 is above the writer's current 1"
+assert_eq "schema_version 0.5 and 1 do not warn as future (exactly one future row)" "$(grep -c 'is above the writer' <<<"$FRAC_OUT")" "1"
+
 echo "── single-pass line extraction: parity + performance on a large fixture (#132) ──"
 # A fixture large enough to make the per-line-fork cost visible: mostly
 # valid rows, plus 3 malformed, 2 legacy no-ts, and 1 future schema_version

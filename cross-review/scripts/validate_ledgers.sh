@@ -78,7 +78,11 @@ ALLOWED_EVENTS="proposed anchored factcheck_kept factcheck_dropped parent_verifi
 # land in the "malformed" branch, same as the old `jq -cs` slurp check
 # (codex, PR #109 review). Fields that feed the schema_version distribution
 # buckets keep the existing tab/newline/CR flatten so the bucket stays a
-# single field.
+# single field. run_id and event get the same `tostring | gsub` treatment:
+# `join` aborts the whole jq process on an object/array element (every row
+# after it silently vanished — "runlog: 0 lines"), and a newline inside a
+# value split one row into two for the bash reader while a tab broke the
+# tab-keyed orphan join below (cross-review of #139).
 #
 # Rows join fields with \x1F (ASCII unit separator, spelled "\u001f" in the
 # jq program so no raw control byte sits in this file), not a real tab: bash's
@@ -100,7 +104,7 @@ foreach inputs as $raw (0; . + 1;
            ($o|has("ts")|if . then "1" else "0" end),
            ($o|has("schema_version")|if . then "1" else "0" end),
            ($o.schema_version | if type == "number" then tostring else "" end),
-           ($o.run_id // ""),
+           (($o.run_id // "") | tostring | gsub("[\t\n\r]"; " ")),
            ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r]"; " ")) else "missing" end)
           ] | join("\u001f")
       end
@@ -117,8 +121,8 @@ foreach inputs as $raw (0; . + 1;
       else
         ($p) as $o
         | [., "ok",
-           ($o.event // ""),
-           ($o.run_id // ""),
+           (($o.event // "") | tostring | gsub("[\t\n\r]"; " ")),
+           (($o.run_id // "") | tostring | gsub("[\t\n\r]"; " ")),
            ($o|has("schema_version")|if . then "1" else "0" end),
            ($o.schema_version | if type == "number" then tostring else "" end),
            ($o|if has("schema_version") then (.schema_version|tostring|gsub("[\t\n\r]"; " ")) else "missing" end)
