@@ -34,13 +34,14 @@ assert_not_contains() {
 }
 
 # UTC epoch->compact-stamp helper, portable across BSD (macOS) and GNU date.
-# LOCAL-clock stamp, the same clock worktree.sh uses for started_at
-local_stamp_for_epoch() {
+# UTC clock, the same clock worktree.sh uses for started_at as of #118 (it
+# was local before that fix, hence the -u/-r -u and rename here).
+utc_stamp_for_epoch() {
   local epoch="$1"
   if date -r 0 +%Y%m%dT%H%M%S >/dev/null 2>&1; then
-    date -r "$epoch" +%Y%m%dT%H%M%S
+    TZ=UTC date -r "$epoch" +%Y%m%dT%H%M%S
   else
-    date -d "@$epoch" +%Y%m%dT%H%M%S
+    date -u -d "@$epoch" +%Y%m%dT%H%M%S
   fi
 }
 
@@ -48,7 +49,7 @@ local_stamp_for_epoch() {
 # + reviewer meta ────────────────────────────────────────────────────────────
 echo "── append_runlog.sh: round_wall_s + trailing_reviewer (#91) ──"
 NOW_EPOCH="$(date +%s)"
-STARTED_90S_AGO="$(local_stamp_for_epoch $((NOW_EPOCH - 90)))"
+STARTED_90S_AGO="$(utc_stamp_for_epoch $((NOW_EPOCH - 90)))"
 RUN_A="$T/run-a"; mkdir -p "$RUN_A/raw"
 printf '{"started_at":"%s"}\n' "$STARTED_90S_AGO" >"$RUN_A/context.json"
 printf '{"exit_code":0,"duration_s":30,"timed_out":false,"output_bytes":10,"attempt":1,"timeout_budget_s":300}\n' >"$RUN_A/raw/codex.meta.json"

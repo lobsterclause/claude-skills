@@ -47,14 +47,18 @@
 #
 # round_wall_s and trailing_reviewer need no flag — they are derived:
 #   round_wall_s      now minus `$run_dir/context.json`'s `started_at`, both
-#                     on the LOCAL clock worktree.sh stamps (so the delta is
-#                     TZ-safe; DST jumps are the one known skew). It measures
-#                     from THIS run_dir's worktree start: per pass when each
-#                     pass starts its own worktree (the documented flow), or
-#                     cumulative if a caller reuses one run_dir across passes.
-#                     Omitted unless it parses to 0..604800 seconds.
-#                     (worktree.sh start's own "%Y%m%dT%H%M%S" stamp),
-#                     computed only when that file and field exist.
+#                     on the UTC clock (#118 — the LOCAL-clock pairing this
+#                     replaces skewed the delta by the runner's TZ offset
+#                     whenever "now" and `started_at` were computed on
+#                     different clocks; UTC at the source removes the class
+#                     rather than trying to keep two clocks in lockstep).
+#                     It measures from THIS run_dir's worktree start: per pass
+#                     when each pass starts its own worktree (the documented
+#                     flow), or cumulative if a caller reuses one run_dir
+#                     across passes. Omitted unless it parses to 0..604800
+#                     seconds, and only computed when context.json and its
+#                     `started_at` field both exist (worktree.sh start's own
+#                     UTC "%Y%m%dT%H%M%S" stamp).
 #   trailing_reviewer {reviewer, duration_s} of whichever reviewer meta
 #                     carried the largest `duration_s` this pass — the seat
 #                     that gated dispatch. Omitted when no reviewer meta has
@@ -93,6 +97,7 @@ findings_file=""
 run_id=""
 roster_decision_file=""
 phases_file=""
+profiles_arg=""
 
 need_val() {
   if [[ "$2" -lt 2 ]]; then
@@ -118,13 +123,14 @@ while [[ $# -gt 0 ]]; do
     --run-id)     need_val "$1" "$#"; run_id="$2";     shift 2 ;;
     --roster-decision) need_val "$1" "$#"; roster_decision_file="$2"; shift 2 ;;
     --phases)     need_val "$1" "$#"; phases_file="$2";     shift 2 ;;
+    --profiles)   need_val "$1" "$#"; profiles_arg="$2";    shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 for required in run_dir project base pr pass verdict; do
   if [[ -z "${!required}" ]]; then
-    echo "usage: $0 --run-dir <p> --project <n> --base <b> --pr <num|-> --pass <n> --verdict <v> [--convergent <n>] [--top <s>] [--diff-files <n>] [--diff-lines <n>] [--notes <s>] [--findings <json>] [--run-id <id>] [--roster-decision <json>] [--phases <json>]" >&2
+    echo "usage: $0 --run-dir <p> --project <n> --base <b> --pr <num|-> --pass <n> --verdict <v> [--convergent <n>] [--top <s>] [--diff-files <n>] [--diff-lines <n>] [--notes <s>] [--findings <json>] [--run-id <id>] [--roster-decision <json>] [--phases <json>] [--profiles <path>]" >&2
     exit 2
   fi
 done
@@ -132,6 +138,26 @@ done
 if ! command -v jq >/dev/null 2>&1; then
   echo "append_runlog: jq required (brew install jq)" >&2
   exit 1
+fi
+
+# --profiles override exists for the fixture tests (same contract as
+# leaderboard.sh --profiles / CROSS_REVIEW_RUNLOG) — production callers never
+# pass it. Default is this skill's own reviewer_profiles.json, read through
+# the same path leaderboard.sh --profiles uses.
+skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
+profiles_file="${profiles_arg:-$skill_dir/references/reviewer_profiles.json}"
+
+# Portable SHA-1 for profile_hash (#90) — same fallback chain as
+# fingerprint_findings.sh: shasum (macOS stock), sha1sum (most Linux),
+# openssl (either). No sha1 tool -> profile_hash is simply omitted from
+# every row rather than blocking the append (fail-open, like the other
+# additive telemetry in this script).
+if command -v shasum >/dev/null 2>&1; then
+  sha1_of() { shasum -a 1 | awk '{print $1}'; }
+elif command -v sha1sum >/dev/null 2>&1; then
+  sha1_of() { sha1sum | awk '{print $1}'; }
+elif command -v openssl >/dev/null 2>&1; then
+  sha1_of() { openssl dgst -sha1 -r | awk '{print $1}'; }
 fi
 
 # Telemetry-completeness warnings (#89): never block the append, just say
@@ -313,39 +339,112 @@ enrich_with_findings() {
   fi
 }
 
-codex_json=$(enrich_with_findings codex "$(reviewer_obj codex)")
-antigravity_json=$(enrich_with_findings antigravity "$(reviewer_obj antigravity)")
-gemini_pro_json=$(enrich_with_findings gemini-pro "$(reviewer_obj gemini-pro)")
-kimi_json=$(enrich_with_findings kimi "$(reviewer_obj kimi)")
-glm_json=$(enrich_with_findings glm "$(reviewer_obj glm)")
-deepseek_json=$(enrich_with_findings deepseek "$(reviewer_obj deepseek)")
-mimo_json=$(enrich_with_findings mimo "$(reviewer_obj mimo)")
-minimax_json=$(enrich_with_findings minimax "$(reviewer_obj minimax)")
-qwen_json=$(enrich_with_findings qwen "$(reviewer_obj qwen)")
-devstral_json=$(enrich_with_findings devstral "$(reviewer_obj devstral)")
-laguna_json=$(enrich_with_findings laguna "$(reviewer_obj laguna)")
-kat_json=$(enrich_with_findings kat "$(reviewer_obj kat)")
-north_json=$(enrich_with_findings north "$(reviewer_obj north)")
-nemotron_json=$(enrich_with_findings nemotron "$(reviewer_obj nemotron)")
-spark_json=$(enrich_with_findings spark "$(reviewer_obj spark)")
-seed_json=$(enrich_with_findings seed "$(reviewer_obj seed)")
-grok_json=$(enrich_with_findings grok "$(reviewer_obj grok)")
-longcat_json=$(enrich_with_findings longcat "$(reviewer_obj longcat)")
-inkling_json=$(enrich_with_findings inkling "$(reviewer_obj inkling)")
-kimi27_json=$(enrich_with_findings kimi27 "$(reviewer_obj kimi27)")
-kimi3_json=$(enrich_with_findings kimi3 "$(reviewer_obj kimi3)")
+# enrich_with_context_mode_cost_and_profile <reviewer> <reviewer_json> —
+# stamp context_mode (#93), cost_usd_estimated/cost_estimated (#123), and
+# profile_hash (#90). No-op for skipped reviewers, so a reviewer with no
+# meta this round gets no row change at all — status "skipped" stays the
+# entire object.
+enrich_with_context_and_profile() {
+  local name="$1" rjson="$2"
+  if [[ -z "$rjson" || "$(jq -r '.status // empty' <<<"$rjson")" == "skipped" ]]; then
+    printf '%s' "$rjson"
+    return
+  fi
+
+  # context_mode (#93): context_access wins when present (the wrapper's own
+  # classification of what this run actually saw); cli is the fallback for
+  # older meta.json rows written before context_access existed. Neither
+  # present -> "diff", the most conservative read (assume the seat only saw
+  # the raw diff unless told otherwise).
+  rjson="$(jq -c '
+    (.context_access // "") as $ca
+    | (.cli // "") as $cli
+    | . + {context_mode: (
+        if ($ca == "agent" or $ca == "workspace_read" or $ca == "tool_read") then "tools"
+        elif ($ca == "file_context" or $ca == "snapshot") then "files"
+        elif ($ca == "diff_only") then "diff"
+        elif ($cli == "codex" or $cli == "agy") then "tools"
+        else "diff" end
+      )}' <<<"$rjson" 2>/dev/null)"
+
+  # cost_usd_estimated / cost_estimated (#123): a billed row (cost_usd
+  # present) is authoritative and gets cost_estimated:false, no estimate
+  # key. An unbilled row with both token counts AND a priced seat gets an
+  # estimate (tokens x $/M, rounded to 6 decimals) and cost_estimated:true.
+  # Anything else (no tokens, or no pricing on file for this seat) gets
+  # neither key -- there is nothing honest to stamp.
+  local pricing_json
+  pricing_json="$(jq -c --arg r "$name" '.[$r].pricing // null' "$profiles_file" 2>/dev/null)"
+  [[ -n "$pricing_json" ]] || pricing_json="null"
+  rjson="$(jq -c --argjson pricing "$pricing_json" '
+    if (.cost_usd != null) then
+      . + {cost_estimated: false}
+    elif (.tokens_prompt != null and .tokens_completion != null
+          and $pricing != null
+          and ($pricing.prompt_per_m // null) != null
+          and ($pricing.completion_per_m // null) != null) then
+      (((.tokens_prompt * $pricing.prompt_per_m)
+        + (.tokens_completion * $pricing.completion_per_m)) / 1000000) as $raw
+      | (($raw * 1000000 | round) / 1000000) as $rounded
+      | . + {cost_usd_estimated: $rounded, cost_estimated: true}
+    else
+      .
+    end' <<<"$rjson" 2>/dev/null)"
+
+  # profile_hash (#90): first 12 hex of sha1(jq -cS of the seat's canonical
+  # profile entry). Absent when the seat has no profile entry, or when no
+  # sha1 tool is on PATH (fail-open, not fail-closed).
+  if [[ -n "$(type -t sha1_of 2>/dev/null)" ]]; then
+    local profile_entry phash
+    profile_entry="$(jq -cS --arg r "$name" '.[$r] // empty' "$profiles_file" 2>/dev/null)"
+    if [[ -n "$profile_entry" ]]; then
+      phash="$(printf '%s' "$profile_entry" | sha1_of | cut -c1-12)"
+      if [[ "$phash" =~ ^[0-9a-f]{12}$ ]]; then
+        rjson="$(jq -c --arg h "$phash" '. + {profile_hash: $h}' <<<"$rjson" 2>/dev/null)"
+      fi
+    fi
+  fi
+
+  printf '%s' "$rjson"
+}
+
+codex_json=$(enrich_with_findings codex "$(enrich_with_context_and_profile codex "$(reviewer_obj codex)")")
+antigravity_json=$(enrich_with_findings antigravity "$(enrich_with_context_and_profile antigravity "$(reviewer_obj antigravity)")")
+gemini_pro_json=$(enrich_with_findings gemini-pro "$(enrich_with_context_and_profile gemini-pro "$(reviewer_obj gemini-pro)")")
+kimi_json=$(enrich_with_findings kimi "$(enrich_with_context_and_profile kimi "$(reviewer_obj kimi)")")
+glm_json=$(enrich_with_findings glm "$(enrich_with_context_and_profile glm "$(reviewer_obj glm)")")
+deepseek_json=$(enrich_with_findings deepseek "$(enrich_with_context_and_profile deepseek "$(reviewer_obj deepseek)")")
+mimo_json=$(enrich_with_findings mimo "$(enrich_with_context_and_profile mimo "$(reviewer_obj mimo)")")
+minimax_json=$(enrich_with_findings minimax "$(enrich_with_context_and_profile minimax "$(reviewer_obj minimax)")")
+qwen_json=$(enrich_with_findings qwen "$(enrich_with_context_and_profile qwen "$(reviewer_obj qwen)")")
+devstral_json=$(enrich_with_findings devstral "$(enrich_with_context_and_profile devstral "$(reviewer_obj devstral)")")
+laguna_json=$(enrich_with_findings laguna "$(enrich_with_context_and_profile laguna "$(reviewer_obj laguna)")")
+kat_json=$(enrich_with_findings kat "$(enrich_with_context_and_profile kat "$(reviewer_obj kat)")")
+north_json=$(enrich_with_findings north "$(enrich_with_context_and_profile north "$(reviewer_obj north)")")
+nemotron_json=$(enrich_with_findings nemotron "$(enrich_with_context_and_profile nemotron "$(reviewer_obj nemotron)")")
+spark_json=$(enrich_with_findings spark "$(enrich_with_context_and_profile spark "$(reviewer_obj spark)")")
+seed_json=$(enrich_with_findings seed "$(enrich_with_context_and_profile seed "$(reviewer_obj seed)")")
+grok_json=$(enrich_with_findings grok "$(enrich_with_context_and_profile grok "$(reviewer_obj grok)")")
+longcat_json=$(enrich_with_findings longcat "$(enrich_with_context_and_profile longcat "$(reviewer_obj longcat)")")
+inkling_json=$(enrich_with_findings inkling "$(enrich_with_context_and_profile inkling "$(reviewer_obj inkling)")")
+kimi27_json=$(enrich_with_findings kimi27 "$(enrich_with_context_and_profile kimi27 "$(reviewer_obj kimi27)")")
+kimi3_json=$(enrich_with_findings kimi3 "$(enrich_with_context_and_profile kimi3 "$(reviewer_obj kimi3)")")
 
 # round_wall_s (#91): derived, no flag. worktree.sh start's context.json
-# stamps `started_at` as "%Y%m%dT%H%M%S" on the LOCAL clock (`date` without
-# -u) -- so "now" is taken on the same clock; mixing in `date -u` skewed the
-# value by the TZ offset (antigravity + #118, PR #117 review). Fail-open
-# like --roster-decision: missing file, missing field, malformed JSON, or a
-# value outside 0..7 days just omits the key rather than blocking the append.
-# jq's strptime/mktime are used (not OS `date` flavor) so this is portable
-# between macOS and Linux runners.
+# stamps `started_at` as "%Y%m%dT%H%M%S" on the UTC clock (`date -u`) as of
+# #118 -- so "now" is taken on the same UTC clock here, rather than pairing
+# a UTC started_at with a local "now" (or vice versa), which is the skew
+# class #117/#118 both existed to close: whichever single clock either side
+# used alone was TZ-safe, but the two sides drifting onto DIFFERENT clocks
+# was the actual bug, and it can recur in either direction. UTC on both ends
+# is the fix that can't drift again. Fail-open like --roster-decision:
+# missing file, missing field, malformed JSON, or a value outside 0..7 days
+# just omits the key rather than blocking the append. jq's strptime/mktime
+# are used (not OS `date` flavor) so this is portable between macOS and
+# Linux runners.
 round_wall_s_val=""
 if [[ -f "$run_dir/context.json" ]]; then
-  now_compact="$(date +%Y%m%dT%H%M%S)"
+  now_compact="$(date -u +%Y%m%dT%H%M%S)"
   round_wall_s_val="$(jq -e -r --arg now "$now_compact" '
       (.started_at // empty) as $sa
       | if ($sa | length) == 0 then empty
