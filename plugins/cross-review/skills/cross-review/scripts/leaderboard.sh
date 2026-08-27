@@ -192,12 +192,43 @@
 # is mapped: agent/workspace_read/tool_read -> tools, file_context/snapshot
 # -> files, diff_only -> diff; anything else -> unknown, excluded from the
 # buckets entirely.
+#
+# SYNTHETIC ROUNDS FAIL CLOSED (#116): a runlog row is synthetic when it
+# carries `synthetic: true` OR its run_id has a `planted` event in
+# finding_events.jsonl (checked independently of the row, so a forgotten
+# `append_runlog.sh --synthetic` can never leak a planted mutation drill
+# into production scoring) -- WARNs on stderr for every excluded run_id.
+# Synthetic rows are excluded ENTIRELY from `structured` (and their events
+# from the production `window_events`), so they never contribute to score,
+# reliability, value, draw weight, or the epochs/context-mode tables. Default
+# `--mode table`/`json` output is byte-identical with vs without synthetic
+# rows present in the ledgers.
+#
+# RECALL REPORT (#116): `--mode report` also prints a mutation-recall
+# section computed ONLY from synthetic rounds -- per seat, `recall` =
+# caught / (caught + missed) over planted rounds where the seat was on that
+# round's roster (i.e. appears in a `caught` or `missed` event for it),
+# broken down by the planted operator's `class` (read straight off the
+# `planted` event's payload -- grade_planted.sh --emit-events already stamps
+# it there) plus an `all` bucket across every class, and the mean
+# `severity_accuracy` over that seat's `caught` entries. Rates are 2-decimal
+# strings (jq 1.6 compatibility, matching grade_planted.sh's own
+# convention). A seat with zero planted rounds shows "—".
+#
+# --include-recall <weight> (#116): folds each seat's OVERALL (`all`-bucket)
+# recall into its score as `score = score*(1-weight) + recall*100*weight`
+# for seats with recall data; seats without recall data are left unchanged.
+# `weight` must satisfy 0 < weight <= 1 (exit 2 otherwise). Applies to every
+# `--mode` (table/json/report) once passed -- draw weights (which read the
+# json score) follow the folded score. The default (no `--include-recall`)
+# output gets no new column and is unaffected.
 
 set -uo pipefail
 
 recent=40
 mode="table"
 profiles_arg=""
+include_recall=""
 
 need_val() {
   if [[ "$2" -lt 2 ]]; then
@@ -211,11 +242,20 @@ while [[ $# -gt 0 ]]; do
     --recent)   need_val "$1" "$#"; recent="$2";       shift 2 ;;
     --mode)     need_val "$1" "$#"; mode="$2";         shift 2 ;;
     --profiles) need_val "$1" "$#"; profiles_arg="$2"; shift 2 ;;
+    --include-recall) need_val "$1" "$#"; include_recall="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 command -v jq >/dev/null 2>&1 || { echo "leaderboard: jq required" >&2; exit 1; }
+
+if [[ -n "$include_recall" ]]; then
+  if [[ ! "$include_recall" =~ ^[0-9]*\.?[0-9]+$ ]] || \
+     ! awk -v w="$include_recall" 'BEGIN{ exit !(w > 0 && w <= 1) }'; then
+    echo "leaderboard: --include-recall weight must be a number in (0, 1] (got '$include_recall')" >&2
+    exit 2
+  fi
+fi
 
 skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
 # CROSS_REVIEW_RUNLOG override exists for the fixture tests (tests/run_tests.sh)
@@ -228,15 +268,47 @@ profile_file="${profiles_arg:-$skill_dir/references/reviewer_profiles.json}"
 # Full fleet — keep in sync with run_reviewers.sh dispatch and analyze_runlog.sh.
 REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok longcat inkling kimi27 kimi3)
 
-structured=""
+structured_raw=""
 if [[ -f "$runlog" ]]; then
-  structured=$(jq -c 'select(.reviewers != null)' "$runlog" 2>/dev/null | tail -n "$recent")
+  structured_raw=$(jq -c 'select(.reviewers != null)' "$runlog" 2>/dev/null | tail -n "$recent")
 fi
 
-# Events ledger, joined to the window by run_id. Entries older than the
-# run_id field (or rounds run without --emit-events) simply contribute no
-# events — their reviewers score on the counts fallback.
+# Events ledger path — shared by production scoring, synthetic-round
+# detection, and the recall report below (#116).
 events_file="${CROSS_REVIEW_FINDING_EVENTS:-$skill_dir/finding_events.jsonl}"
+
+# Synthetic-round detection (#116) — see header comment. Fail closed: a run
+# is synthetic when its row says so OR its run_id carries a `planted` event,
+# whichever fires first. WARN on stderr for every excluded run_id.
+raw_run_ids="$(printf '%s\n' "$structured_raw" | jq -c -s '[.[] | .run_id // empty] | unique' 2>/dev/null)"
+[[ -n "$raw_run_ids" ]] || raw_run_ids="[]"
+planted_run_ids="[]"
+if [[ -f "$events_file" && "$raw_run_ids" != "[]" ]]; then
+  planted_run_ids="$(jq -c -s --argjson rids "$raw_run_ids" \
+    '[.[] | select(.event == "planted" and (.run_id as $x | $rids | index($x) != null)) | .run_id] | unique' \
+    "$events_file" 2>/dev/null)"
+  [[ -n "$planted_run_ids" ]] || planted_run_ids="[]"
+fi
+synthetic_run_ids="$(printf '%s\n' "$structured_raw" | jq -c -s --argjson planted "$planted_run_ids" \
+  '[.[] | select((.synthetic == true) or (((.run_id // null) as $x | $x != null and ($planted | index($x) != null)))) | .run_id // empty] | unique' 2>/dev/null)"
+[[ -n "$synthetic_run_ids" ]] || synthetic_run_ids="[]"
+if [[ "$synthetic_run_ids" != "[]" ]]; then
+  while IFS= read -r rid; do
+    [[ -n "$rid" ]] && echo "leaderboard: WARN run_id $rid is synthetic (planted round) — excluded from production scoring" >&2
+  done < <(jq -r '.[]' <<<"$synthetic_run_ids")
+fi
+
+# Production window: synthetic rows are excluded entirely (never contribute
+# to score, reliability, value, draw weight, or the epochs/context-mode
+# tables). Synthetic window: the complement, used only by the recall report.
+structured="$(printf '%s\n' "$structured_raw" | jq -c --argjson syn "$synthetic_run_ids" \
+  'select((.synthetic != true) and (((.run_id // null) as $x | $x == null or ($syn | index($x) == null))))' 2>/dev/null)"
+structured_synthetic="$(printf '%s\n' "$structured_raw" | jq -c --argjson syn "$synthetic_run_ids" \
+  'select((.synthetic == true) or (((.run_id // null) as $x | $x != null and ($syn | index($x) != null))))' 2>/dev/null)"
+
+# Events ledger, joined to the PRODUCTION window by run_id. Entries older
+# than the run_id field (or rounds run without --emit-events) simply
+# contribute no events — their reviewers score on the counts fallback.
 window_run_ids="$(printf '%s\n' "$structured" | jq -c -s '[.[] | .run_id // empty] | unique' 2>/dev/null)"
 window_events="[]"
 if [[ -f "$events_file" && -n "$window_run_ids" && "$window_run_ids" != "[]" ]]; then
@@ -245,6 +317,67 @@ if [[ -f "$events_file" && -n "$window_run_ids" && "$window_run_ids" != "[]" ]];
     "$events_file" 2>/dev/null)"
   [[ -n "$window_events" ]] || window_events="[]"
 fi
+
+# Recall events (#116): planted/caught/missed events for SYNTHETIC run_ids
+# only — never joined into production scoring above.
+synthetic_run_id_list="$(printf '%s\n' "$structured_synthetic" | jq -c -s '[.[] | .run_id // empty] | unique' 2>/dev/null)"
+[[ -n "$synthetic_run_id_list" ]] || synthetic_run_id_list="[]"
+recall_events="[]"
+if [[ -f "$events_file" && "$synthetic_run_id_list" != "[]" ]]; then
+  recall_events="$(jq -c -s --argjson rids "$synthetic_run_id_list" \
+    '[.[] | select(.event as $e | (["planted","caught","missed"] | index($e)) != null) | select(.run_id as $x | $rids | index($x) != null)]' \
+    "$events_file" 2>/dev/null)"
+  [[ -n "$recall_events" ]] || recall_events="[]"
+fi
+
+# recall_json (#116): per-seat mutation-recall, broken down by planted
+# operator `class` plus an `all` bucket. Lists every known reviewer (seats
+# with no planted rounds carry a null all.recall_raw -> printed as "—").
+# recall_by_seat: reviewer -> overall (all-bucket) recall_raw, used by
+# --include-recall to fold recall into the score below.
+recall_json="$(printf '%s' "$recall_events" | jq -c \
+  --argjson revs "$(printf '%s\n' "${REVIEWERS[@]}" | jq -R . | jq -cs .)" '
+  def fmt2($x):
+    if $x == null then "—"
+    else
+      (($x * 100) | round) as $ip
+      | (($ip / 100) | floor | tostring) + "." +
+        (($ip % 100) | tostring | if length == 1 then "0" + . else . end)
+    end;
+  . as $ev
+  | ($ev | map(select(.event == "planted"))
+         | reduce .[] as $p ({}; .[$p.run_id] = ($p.class // "unknown"))) as $class_by_run
+  | ($ev | map(select(.event == "caught"))
+         | map({reviewer: .reviewer, run_id: .run_id, sev_acc: (.severity_accuracy // null),
+                class: ($class_by_run[.run_id] // "unknown")})) as $caught
+  | ($ev | map(select(.event == "missed"))
+         | map({reviewer: .reviewer, run_id: .run_id, class: ($class_by_run[.run_id] // "unknown")})) as $missed
+  | [ $revs[] as $r |
+      ($caught | map(select(.reviewer == $r))) as $rc
+      | ($missed | map(select(.reviewer == $r))) as $rm
+      | (($rc | length) + ($rm | length)) as $rt
+      | (if $rt == 0 then null else (($rc | length) / $rt) end) as $rrecall
+      | (if ($rc | length) == 0 then null else (($rc | map(.sev_acc // 0) | add) / ($rc | length)) end) as $rsev
+      | (($rc | map(.class)) + ($rm | map(.class)) | unique) as $classes
+      | { reviewer: $r,
+          all: { caught: ($rc | length), missed: ($rm | length), recall_raw: $rrecall,
+                 recall: fmt2($rrecall),
+                 severity_accuracy: (if $rsev == null then null else fmt2($rsev) end) },
+          classes: [ $classes[] as $c |
+            ($rc | map(select(.class == $c))) as $cc
+            | ($rm | map(select(.class == $c))) as $cm
+            | (($cc | length) + ($cm | length)) as $ct
+            | (if $ct == 0 then null else (($cc | length) / $ct) end) as $crecall
+            | (if ($cc | length) == 0 then null else (($cc | map(.sev_acc // 0) | add) / ($cc | length)) end) as $csev
+            | { class: $c, caught: ($cc | length), missed: ($cm | length), recall_raw: $crecall,
+                recall: fmt2($crecall),
+                severity_accuracy: (if $csev == null then null else fmt2($csev) end) } ]
+        } ]
+' 2>/dev/null)"
+[[ -n "$recall_json" ]] || recall_json="[]"
+
+recall_by_seat="$(jq -c 'reduce .[] as $r ({}; .[$r.reviewer] = $r.all.recall_raw)' <<<"$recall_json" 2>/dev/null)"
+[[ -n "$recall_by_seat" ]] || recall_by_seat="{}"
 
 # Baseline seats (codex/kimi unless the profile file says otherwise) — a
 # finding corroborated by a baseline is the 0.7 credit tier.
@@ -775,6 +908,28 @@ print_context_mode_report() {
   echo "──"
 }
 
+# print_recall_report — #116: per-seat mutation recall from synthetic
+# planted rounds only, broken down by operator class plus an "all" bucket,
+# and mean severity_accuracy over caught entries. Seats with zero planted
+# rounds print "—".
+print_recall_report() {
+  echo "── mutation recall (synthetic planted rounds only) ──"
+  if [[ "$recall_json" == "[]" ]]; then
+    echo "  (no planted rounds in this window)"
+    echo "──"
+    return
+  fi
+  printf '%s' "$recall_json" | jq -r '
+    .[] | "  " + .reviewer + ": all recall=" + .all.recall +
+      " (caught \(.all.caught)/\(.all.caught + .all.missed))" +
+      (if .all.severity_accuracy != null then "  sev_acc=" + .all.severity_accuracy else "" end) +
+      ([.classes[] | "\n        " + .class + ": recall=" + .recall +
+        " (caught \(.caught)/\(.caught + .missed))" +
+        (if .severity_accuracy != null then "  sev_acc=" + .severity_accuracy else "" end)] | join(""))
+  '
+  echo "──"
+}
+
 # print_cost_report — #92/#105: per-seat $/kept-finding, a fleet $/round line
 # (p50/p95 over the window's structured runlog entries), and tokens-per-diff-
 # line, then the severity-calibration section from severity_calibration.sh.
@@ -828,6 +983,18 @@ for r in "${REVIEWERS[@]}"; do
   pricing_map="$(jq -c --arg r "$r" --argjson p "$(pricing_of "$r")" '. + {($r): $p}' <<<"$pricing_map")"
 done
 
+# --include-recall (#116): fold each seat's overall (all-bucket) recall into
+# its score; seats with no recall data are left unchanged. Applies to every
+# --mode once passed. Default (no flag) output is unaffected.
+if [[ -n "$include_recall" ]]; then
+  rows="$(printf '%s' "$rows" | jq -s --argjson recall "$recall_by_seat" --argjson w "$include_recall" '
+    .[] | . as $row | ($recall[$row.reviewer] // null) as $rc
+    | if $rc == null then $row
+      else $row + {score: (($row.score * (1 - $w)) + ($rc * 100 * $w))}
+      end
+  ')"
+fi
+
 case "$mode" in
   json)
     printf '%s' "$rows" | jq -s 'sort_by(-.score)'
@@ -841,6 +1008,8 @@ case "$mode" in
     print_epoch_report
     echo
     print_context_mode_report
+    echo
+    print_recall_report
     echo
     print_cost_report
     ;;

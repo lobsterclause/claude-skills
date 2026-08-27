@@ -44,6 +44,16 @@
 #       absent from the object — this script never fills in a 0. Fail-open
 #       like --roster-decision: a missing/unreadable file warns to stderr
 #       and omits the key.
+#     [--synthetic]
+#       Stamps `"synthetic": true` on this runlog entry (#116) — a planted-
+#       mutation drill (plant_mutation.sh / grade_planted.sh), not a real
+#       review round. leaderboard.sh excludes synthetic rows entirely from
+#       production scoring (score, reliability, value, draw weight, epochs/
+#       context-mode tables) and scores their recall separately. Independent
+#       of this flag: if --run-id names a run_id that has a `planted` event
+#       in finding_events.jsonl, this script auto-stamps synthetic: true
+#       anyway and WARNs on stderr — a forgotten --synthetic flag can never
+#       leak a planted round into production scoring.
 #
 # round_wall_s and trailing_reviewer need no flag — they are derived:
 #   round_wall_s      now minus `$run_dir/context.json`'s `started_at`, both
@@ -98,6 +108,7 @@ run_id=""
 roster_decision_file=""
 phases_file=""
 profiles_arg=""
+synthetic=0
 
 need_val() {
   if [[ "$2" -lt 2 ]]; then
@@ -124,13 +135,14 @@ while [[ $# -gt 0 ]]; do
     --roster-decision) need_val "$1" "$#"; roster_decision_file="$2"; shift 2 ;;
     --phases)     need_val "$1" "$#"; phases_file="$2";     shift 2 ;;
     --profiles)   need_val "$1" "$#"; profiles_arg="$2";    shift 2 ;;
+    --synthetic)  synthetic=1;                               shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 for required in run_dir project base pr pass verdict; do
   if [[ -z "${!required}" ]]; then
-    echo "usage: $0 --run-dir <p> --project <n> --base <b> --pr <num|-> --pass <n> --verdict <v> [--convergent <n>] [--top <s>] [--diff-files <n>] [--diff-lines <n>] [--notes <s>] [--findings <json>] [--run-id <id>] [--roster-decision <json>] [--phases <json>] [--profiles <path>]" >&2
+    echo "usage: $0 --run-dir <p> --project <n> --base <b> --pr <num|-> --pass <n> --verdict <v> [--convergent <n>] [--top <s>] [--diff-files <n>] [--diff-lines <n>] [--notes <s>] [--findings <json>] [--run-id <id>] [--roster-decision <json>] [--phases <json>] [--profiles <path>] [--synthetic]" >&2
     exit 2
   fi
 done
@@ -167,6 +179,21 @@ fi
 [[ -z "$run_id" ]] && echo "append_runlog: --run-id not provided; this entry will have no run_id (can't be joined to finding_events.jsonl)" >&2
 [[ -z "$findings_file" ]] && echo "append_runlog: --findings not provided; reviewer entries will have no findings enrichment this pass" >&2
 [[ -z "$roster_decision_file" ]] && echo "append_runlog: --roster-decision not provided; this entry will have no roster_decision" >&2
+
+# Synthetic-round fail-closed check (#116): independent of --synthetic, if
+# this run_id already has a `planted` event in finding_events.jsonl, this
+# entry is a planted-mutation drill whether or not the caller remembered the
+# flag. Auto-stamp and WARN rather than silently letting a forgotten flag
+# leak a synthetic round into production scoring (leaderboard.sh also
+# checks this independently, as a second line of defense).
+events_ledger="${CROSS_REVIEW_FINDING_EVENTS:-$skill_dir/finding_events.jsonl}"
+if [[ "$synthetic" -eq 0 && -n "$run_id" && -f "$events_ledger" ]]; then
+  if has_planted="$(jq -r --arg rid "$run_id" 'select(.event == "planted" and .run_id == $rid)' "$events_ledger" 2>/dev/null | head -n 1)" \
+     && [[ -n "$has_planted" ]]; then
+    synthetic=1
+    echo "WARN: run_id $run_id has planted events — recorded as synthetic" >&2
+  fi
+fi
 
 # Evidence gate (binding, not advisory): a finding dropped at triage MUST
 # carry its falsification evidence in factcheck.reason — the smoke test run,
@@ -526,6 +553,7 @@ entry=$(jq -nc \
   --argjson schema_version "$SCHEMA_VERSION" \
   --arg round_wall_s "$round_wall_s_val" \
   --argjson phases "$phases_json" \
+  --argjson synthetic "$([[ "$synthetic" -eq 1 ]] && echo true || echo false)" \
   '{codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, glm: $glm,
     deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
     devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
@@ -557,7 +585,8 @@ entry=$(jq -nc \
   + (if $roster_decision == null then {} else {roster_decision: $roster_decision} end)
   + (if $round_wall_s == "" then {} else {round_wall_s: ($round_wall_s | tonumber)} end)
   + (if $trailing == null then {} else {trailing_reviewer: $trailing} end)
-  + (if $phases == null then {} else {phases: $phases} end)')
+  + (if $phases == null then {} else {phases: $phases} end)
+  + (if $synthetic then {synthetic: true} else {} end)')
 
 # JSONL — one line, append-only. Wrap in flock to make it splitstream-safe:
 # POSIX guarantees write() atomicity below PIPE_BUF (4KB Linux, 512B macOS).
