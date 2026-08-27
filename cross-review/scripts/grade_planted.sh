@@ -79,7 +79,10 @@
 #     caught: [{reviewer, matched_finding_id, severity_called, severity_accuracy}],
 #     missed: [reviewer, ...],
 #     candidates: [finding id, ...],
-#     recall: caught_count / (caught_count + missed_count), 2 decimal places }
+#     recall: caught_count / (caught_count + missed_count) as a 2-decimal
+#             STRING (same convention as severity_calibration.sh), plus
+#     recall_raw: the same ratio as a JSON number (4 decimals);
+#     severity_accuracy is a JSON number (1 exact, 0.5 otherwise) }
 #
 # Exit: 0 on a successful grade (always, even 0 caught); 2 on bad usage or
 # unreadable input files; 3 if --judge is agy/openrouter (not wired yet).
@@ -164,8 +167,8 @@ p_expected_severity="$(jq -r '.expected_severity // ""' "$planted")"
 p_line0="$(jq -r '.line_range[0] // empty' "$planted")"
 p_line1="$(jq -r '.line_range[1] // empty' "$planted")"
 [[ -n "$p_file" && -n "$p_line0" && -n "$p_line1" ]] || { echo "grade_planted: planted.json missing file/line_range" >&2; exit 2; }
-[[ "$p_line0" =~ ^[1-9][0-9]*$ && "$p_line1" =~ ^[1-9][0-9]*$ && "$p_line0" -le "$p_line1" ]] \
-  || { echo "grade_planted: planted.json line_range must be two positive integers, low <= high (got [$p_line0, $p_line1])" >&2; exit 2; }
+jq -e '.line_range | type == "array" and length == 2 and all(.[]; type == "number" and floor == . and . > 0) and .[0] <= .[1]' "$planted" >/dev/null 2>&1 \
+  || { echo "grade_planted: planted.json line_range must be exactly two positive integers, low <= high (got $(jq -c '.line_range' "$planted"))" >&2; exit 2; }
 
 planted_norm="$(printf '%s\x1f%s\x1f%s@%s' "$project" "$p_file" "$p_operator" "$p_line0")"
 planted_hash="$(printf '%s' "$planted_norm" | sha1_of)"
@@ -218,15 +221,15 @@ for seat in "${roster_arr[@]}"; do
   if [[ -n "$match" ]]; then
     matched_id="$(jq -r '.id' <<<"$match")"
     severity_called="$(jq -r '.severity // ""' <<<"$match")"
+    # a JSON number consumers can do arithmetic on (codex, pass 2); written as
+    # 1 / 0.5 so no jq version reformats it
     if [[ "$severity_called" == "$p_expected_severity" ]]; then
-      accuracy="1.00"
+      accuracy="1"
     else
-      accuracy="0.50"
+      accuracy="0.5"
     fi
-    # 2-decimal STRINGS (same convention as severity_calibration.sh): a JSON
-    # number 1.0 renders as 1 on jq < 1.7 (codex + antigravity, PR #114 review)
     entry="$(jq -nc --arg reviewer "$seat" --arg matched_finding_id "$matched_id" \
-      --arg severity_called "$severity_called" --arg severity_accuracy "$accuracy" \
+      --arg severity_called "$severity_called" --argjson severity_accuracy "$accuracy" \
       '{reviewer: $reviewer, matched_finding_id: $matched_finding_id, severity_called: $severity_called, severity_accuracy: $severity_accuracy}')"
     caught_json="$(jq -c --argjson e "$entry" '. + [$e]' <<<"$caught_json")"
   else
@@ -243,6 +246,7 @@ else
   recall="$(awk -v c="$caught_n" -v t="$total_n" 'BEGIN{printf "%.2f", c/t}')"
 fi
 
+[[ -d "$out" ]] && { echo "grade_planted: --out '$out' is a directory" >&2; exit 2; }
 out_dir="$(dirname "$out")"
 mkdir -p "$out_dir" 2>/dev/null || { echo "grade_planted: cannot create output directory $out_dir" >&2; exit 2; }
 out_tmp="$(mktemp "$out_dir/.grade.XXXXXX" 2>/dev/null)" || { echo "grade_planted: cannot write in $out_dir" >&2; exit 2; }
@@ -291,7 +295,7 @@ if [[ "$emit_events" -eq 1 ]]; then
     severity_accuracy="$(jq -r '.severity_accuracy' <<<"$c")"
     fields="$(jq -nc --arg reviewer "$reviewer" --arg matched_finding_id "$matched_finding_id" \
       --arg severity_called "$severity_called" --arg expected_severity "$p_expected_severity" \
-      --arg severity_accuracy "$severity_accuracy" \
+      --argjson severity_accuracy "$severity_accuracy" \
       '{reviewer: $reviewer, matched_finding_id: $matched_finding_id, severity_called: $severity_called, expected_severity: $expected_severity, severity_accuracy: $severity_accuracy}')"
     bash "$script_dir/append_finding_event.sh" --event caught --finding-id "$planted_id" \
       --run-id "$run_id" --fields "$fields"

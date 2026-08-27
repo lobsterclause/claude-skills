@@ -113,9 +113,9 @@ MISSED_REVIEWERS="$(jq -r '.missed[]' "$OUT1" | sort | tr '\n' ',')"
 assert_eq "missed = kat" "$MISSED_REVIEWERS" "kat,"
 
 CODEX_ACC="$(jq -r '.caught[] | select(.reviewer=="codex") | .severity_accuracy' "$OUT1")"
-assert_eq "codex severity_accuracy 1.00" "$CODEX_ACC" "1.00"
+assert_eq "codex severity_accuracy 1" "$CODEX_ACC" "1"
 KIMI_ACC="$(jq -r '.caught[] | select(.reviewer=="kimi") | .severity_accuracy' "$OUT1")"
-assert_eq "kimi severity_accuracy 1.00" "$KIMI_ACC" "1.00"
+assert_eq "kimi severity_accuracy 1" "$KIMI_ACC" "1"
 
 RECALL1="$(jq -r '.recall' "$OUT1")"
 assert_eq "recall pinned format 0.67" "$RECALL1" "0.67"
@@ -148,7 +148,7 @@ OUT3="$T/grade3.json"
 bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" \
   --roster "$ROSTER" --project "$PROJECT" --out "$OUT3" >/dev/null 2>"$T/err3.txt"
 CODEX_ACC3="$(jq -r '.caught[] | select(.reviewer=="codex") | .severity_accuracy' "$OUT3")"
-assert_eq "medium call: severity_accuracy 0.50" "$CODEX_ACC3" "0.50"
+assert_eq "medium call: severity_accuracy 0.5" "$CODEX_ACC3" "0.5"
 mk_findings "High"
 
 # ── 4. --emit-events ────────────────────────────────────────────────────────
@@ -211,10 +211,23 @@ EOF
 bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings-noid.json" --roster "codex" --project "$PROJECT" --out "$T/g7e.json" >/dev/null 2>"$T/err7e.txt"
 assert_contains "id-less candidate is skipped with a WARN" "$(cat "$T/err7e.txt")" "no id"
 assert_eq "id-less candidate does not count as caught" "$(jq -r '.caught | length' "$T/g7e.json")" "0"
-mkdir -p "$T/ro" && chmod 500 "$T/ro"
-bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --out "$T/ro/g.json" >/dev/null 2>&1
-RC7=$?; chmod 700 "$T/ro"
-assert_eq "unwritable output directory exits 2" "$RC7" "2"
+if [[ "$(id -u)" -ne 0 ]]; then
+  mkdir -p "$T/ro" && chmod 500 "$T/ro"
+  bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --out "$T/ro/g.json" >/dev/null 2>&1
+  RC7=$?; chmod 700 "$T/ro"
+  assert_eq "unwritable output directory exits 2" "$RC7" "2"
+else
+  ok "unwritable output directory exits 2 (skipped as root)"
+fi
+mkdir -p "$T/outdir"
+bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --out "$T/outdir" >/dev/null 2>&1
+assert_eq "--out naming a directory exits 2" "$?" "2"
+jq '.line_range = [7, 7, 9]' "$PLANTED" >"$T/planted-3.json"
+bash "$S/grade_planted.sh" --planted "$T/planted-3.json" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --out "$T/g7f.json" >/dev/null 2>&1
+assert_eq "line_range with 3 elements exits 2" "$?" "2"
+jq '.line_range = ["7", "7"]' "$PLANTED" >"$T/planted-s.json"
+bash "$S/grade_planted.sh" --planted "$T/planted-s.json" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --out "$T/g7g.json" >/dev/null 2>&1
+assert_eq "line_range of numeric strings exits 2" "$?" "2"
 
 echo ""
 echo "PASS=$PASS FAIL=$FAIL"
