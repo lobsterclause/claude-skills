@@ -142,21 +142,27 @@ fi
 # conservative lane-derived default (codex, PR #72 pass 1). The known set is
 # read from the profiles' context_access_weights merged over the defaults, so
 # a new kind added there is accepted here without a code change.
-known_access="$(jq -r --slurpfile profiles "$profiles" -n '
+# Kept as a JSON array and tested for EXACT membership — a space-joined
+# string would accept "agent diff_only" as a substring of two adjacent kinds
+# (codex, PR #72 pass 2).
+known_access="$(jq -c --slurpfile profiles "$profiles" -n '
   ({agent:1, workspace_read:1, file_context:1, snapshot:1, diff_only:1}
-   + (($profiles[0]._synthesis_rules // {}).context_access_weights // {})) | keys | join(" ")')"
+   + (($profiles[0]._synthesis_rules // {}).context_access_weights // {})) | keys')"
 observed_json='{}'
 if [[ -n "$meta_dir" ]]; then
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
     # Reviewer names come from findings `sources` — data, not config. Only a
     # plain slug may become a path component (kimi, PR #72 pass 1).
-    [[ "$r" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "score_findings: ignoring source '$r' — not a reviewer slug" >&2; continue; }
+    # Must start alphanumeric: "." and ".." could never traverse (the
+    # .meta.json suffix is appended with no separator, so ".." names
+    # "<dir>/...meta.json"), but a slug that is only dots is not a reviewer.
+    [[ "$r" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "score_findings: ignoring source '$r' — not a reviewer slug" >&2; continue; }
     mf="$meta_dir/$r.meta.json"
     [[ -f "$mf" ]] || continue
     ca="$(jq -r '.context_access // empty' "$mf" 2>/dev/null || true)"
     [[ -n "$ca" ]] || continue
-    if [[ " $known_access " != *" $ca "* ]]; then
+    if ! jq -e --arg ca "$ca" 'index($ca) != null' <<<"$known_access" >/dev/null 2>&1; then
       echo "score_findings: $mf carries unknown context_access '$ca' — ignoring it; '$r' falls back to its lane default" >&2
       continue
     fi

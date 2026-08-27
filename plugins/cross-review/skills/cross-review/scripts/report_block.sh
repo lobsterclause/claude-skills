@@ -131,7 +131,7 @@ n_l="$(jq '[.[] | select(.f.severity == "Low")] | length' <<<"$kept")"
 n_convergent="$(jq '[.[] | select(if (.f.convergent | type) == "boolean" then .f.convergent else .f.provider_count >= 2 end)] | length' <<<"$kept")"
 
 top_line="$(jq -r '
-  sort_by([-(.f.sev_rank), -(.f.capability_votes // .f.provider_count), .orig_index])
+  sort_by([-(.f.sev_rank), -(if (.f.capability_votes | type) == "number" then .f.capability_votes else .f.provider_count end), .orig_index])
   | .[0]
   | if . == null then "—"
     else "\(.f.file):\(.f.line) — \(.f.claim) [\(.f.severity)][\((.f.sources // []) | join("+"))]"

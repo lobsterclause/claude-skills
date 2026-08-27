@@ -312,6 +312,17 @@ jq '.findings += [{"id":"evil","severity":"High","file":"z.sh","line":1,"snippet
 bash "$S" --findings "$T/evil.json" --profiles "$CAP_PROFILES" --meta-dir "$META" --out "$T/evil_out.json" 2>"$T/evil_err.txt"
 assert_eq "a path-shaped source does not break the run" "$?" "0"
 assert_contains "…and is refused as a slug" "$(cat "$T/evil_err.txt")" "not a reviewer slug"
+jq '.findings += [{"id":"dots","severity":"High","file":"z.sh","line":1,"snippet":"q","claim":"c","sources":["..","codex"]}]' "$CAP_FINDINGS" >"$T/dots.json"
+bash "$S" --findings "$T/dots.json" --profiles "$CAP_PROFILES" --meta-dir "$META" --out "$T/dots_out.json" 2>"$T/dots_err.txt"
+assert_contains "a dots-only source is refused as a slug too (seed, PR #72 pass 2)" "$(cat "$T/dots_err.txt")" "ignoring source '..'"
+# Membership is exact: two adjacent known kinds in one string are not a kind
+# (codex, PR #72 pass 2).
+printf '{"exit_code": 0, "context_access": "agent diff_only"}\n' >"$META/glm.meta.json"
+bash "$S" --findings "$CAP_FINDINGS" --profiles "$CAP_PROFILES" --meta-dir "$META" --out "$T/cap_out5.json" 2>"$T/cap_err5.txt"
+assert_eq "'agent diff_only' is not a known access → ignored" \
+  "$(jq -r '.findings[] | select(.id=="two-hunk-only") | .context_access.glm' "$T/cap_out5.json")" "diff_only"
+assert_contains "…and warned about" "$(cat "$T/cap_err5.txt")" "unknown context_access 'agent diff_only'"
+printf '{"exit_code": 0, "context_access": "file_context"}\n' >"$META/glm.meta.json"
 
 echo "── weights and floor are data in the profiles, not constants in the script ──"
 TUNED="$T/tuned_profiles.json"
