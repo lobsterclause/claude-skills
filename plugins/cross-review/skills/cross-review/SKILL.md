@@ -107,6 +107,8 @@ bash ~/.claude/skills/cross-review/scripts/validate_or_models.sh
 
 If a warning prints (e.g. *"WARN: gemini-pro timed out 35% of last 10 runs — consider --timeout-gemini-pro 1100"*), surface it to the user and ask whether to apply the suggested override for this run. Do not auto-apply — surface-and-confirm only. If no warning, proceed silently.
 
+- **Ledger hygiene:** `bash ~/.claude/skills/cross-review/scripts/validate_ledgers.sh --json | jq .errors` — a non-zero count is worth surfacing to the user, but never blocks the run.
+
 The analyzer has a separate `--mode report` that prints a full health snapshot; that's surfaced via `/cross-review --self-check`, not on every run.
 
 ### 2. Determine review scope and prepare an isolated worktree
@@ -747,6 +749,8 @@ The script reads each `$run_dir/<reviewer>.meta.json` to fill in per-reviewer te
 
 Append once per pass (not once per multi-pass run). The runlog is JSONL: one line per pass, append-only, safe under concurrent splitstream rounds.
 
+Every appended entry carries a `schema_version`; see `docs/decisions/2026-08-27-cross-review-ledger-schema-version-policy.md` for when that number is allowed to bump and what a reader must do about it.
+
 ## Reviewer-specific notes
 
 - **codex**: Uses `codex exec review --base <branch> --full-auto`. Writes review output to stderr (we merge streams with `2>&1`). `--json` mode emits reasoning/command events but does **not** flush the final review summary — use plain-text mode. `--base` and a positional `[PROMPT]` are mutually exclusive; with `--base`, codex uses its own built-in review instructions.
@@ -810,9 +814,13 @@ When invoked as `/cross-review --self-check`, skip the review pipeline and emit 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/analyze_runlog.sh --recent 20 --mode report
 bash ~/.claude/skills/cross-review/scripts/leaderboard.sh
+bash ~/.claude/skills/cross-review/scripts/validate_ledgers.sh
+bash ~/.claude/skills/cross-review/scripts/audit_roster.sh --recent 40
 ```
 
 The report shows per-reviewer reliability %, ok/timeout/empty/failed counts, p50/p95 duration, current timeout budget, and a list of suggested edits to `references/reviewer_profiles.json` (e.g. "bump gemini-pro.timeout_s from 900 → 1100 because timeout rate 25% over window"). Suggestions never apply themselves — the user (or Claude) edits the profile file with eyes on, the same way splitstream's pre-flight table needs explicit approval.
+
+`validate_ledgers.sh` exits 1 when it finds ERROR-level problems (malformed lines, runlog entries missing `ts`) — a WARN-only run (unknown event names, orphan `run_id`s) still exits 0, so fix the ERRORs first and only then look at the WARNs; four legacy entries with no `ts` are expected today and tracked in #111, so don't chase those. `audit_roster.sh --recent 40` WARNs on over-drawn, under-drawn, or starved seats — treat a WARN as a prompt to check `reviewer_profiles.json`'s `draw_boost`/weights for that seat, not as a failure to fix immediately.
 
 Use it: weekly, after a noticeably degraded round, before changing reviewer profiles, or when investigating "why did cross-review miss X?"
 
