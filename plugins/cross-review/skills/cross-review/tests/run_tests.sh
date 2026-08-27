@@ -1239,7 +1239,10 @@ printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings
 echo "── standalone suites: json-output / score / report-block / digest ──"
 # Each standalone suite exits 0 all-green, 1 on any failure; fold into this
 # harness as one assertion per suite so CI stays a single entrypoint.
-for suite in test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan; do
+# One list, used here AND by the auto-discovery loop near the end of this
+# file, so the two can never drift (kimi, PR #120 review).
+LEGACY_SUITES=(test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan)
+for suite in "${LEGACY_SUITES[@]}"; do
   if [[ -f "$SKILL_DIR/tests/$suite.sh" ]]; then
     if bash "$SKILL_DIR/tests/$suite.sh" >"$T/$suite.log" 2>&1; then
       ok "$suite suite green ($(grep -oE '[0-9]+ passed' "$T/$suite.log" | tail -1))"
@@ -2795,12 +2798,11 @@ echo "── standalone tests (tests/test_*.sh) ──"
 # are skipped here to avoid running them twice. Keyed on exit code, not on
 # each suite's own summary text — the four legacy files print that in
 # slightly different shapes (`PASS=n FAIL=m`, `PASS: n  FAIL: m`).
-ALREADY_RUN_SUITES=(test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan)
 for f in "$SKILL_DIR"/tests/test_*.sh; do
   [[ -f "$f" ]] || continue
   base="$(basename "$f" .sh)"
   skip=0
-  for s in "${ALREADY_RUN_SUITES[@]}"; do
+  for s in "${LEGACY_SUITES[@]}"; do
     [[ "$base" == "$s" ]] && { skip=1; break; }
   done
   [[ "$skip" -eq 1 ]] && continue

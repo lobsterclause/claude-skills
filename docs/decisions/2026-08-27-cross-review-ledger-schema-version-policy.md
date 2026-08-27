@@ -21,7 +21,9 @@ to guess whether adding a field warrants a bump, and so readers know what
    field, a changed meaning or unit for an existing field (e.g. seconds →
    milliseconds), or a changed key structure (e.g. a field that was a scalar
    becoming an object). Anything a reader can safely ignore if absent is not
-   breaking.
+   breaking. The one deliberate exception is version 1 itself: stamping the
+   field for the first time is what creates the baseline that later bumps are
+   measured from, so it increments from 0 to 1 without being a breaking change.
 3. **Additive fields never bump the version.** A new optional field — another
    lifecycle event type, another meta.json passthrough, another cost
    breakdown — ships at the current version. This is the common case and is
