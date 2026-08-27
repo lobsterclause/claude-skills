@@ -1029,6 +1029,52 @@ fi
 # took a 2.5 boost on 2026-08-14.
 assert_contains "unboosted rookie weight unchanged" \
   "$(grep 'spark' "$BOOST_ERR")" "weight=75.0"
+
+# draw_boost 0 means NEVER DRAWN, and it has to be enforced at the weight, not
+# just written in the profile. Regression pin for a real bug found 2026-08-27:
+# the awk guard read `if (boost <= 0) boost = 1`, which was meant to defend
+# against a malformed field but silently handed a seat pinned to 0 the FULL
+# default weight -- the precise opposite of the profile, and invisible unless
+# you counted draws across dozens of rounds. nemotron was benched at 0 and kept
+# being drawn. Both halves are pinned below because fixing only the first half
+# (honour 0) would reintroduce the second (garbage must still default to 1).
+BOOST0_ERR="$T/boost0.err"
+BOOST0_PROF="$T/boost0_profiles.json"
+jq '.spark.draw_boost = 0' "$SKILL_DIR/references/reviewer_profiles.json" > "$BOOST0_PROF"
+CROSS_REVIEW_PROFILES="$BOOST0_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
+  bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST0_ERR"
+BOOST0_LINE="$(grep ' spark ' "$BOOST0_ERR" || true)"
+if [[ "$BOOST0_LINE" == *"weight=0.0"* ]]; then
+  ok "draw_boost 0 produces weight 0 (a benched seat is truly benched)"
+else
+  bad "draw_boost 0 did not zero the weight -- got: ${BOOST0_LINE:-<no candidate line>}"
+fi
+# ...and the picker must actually skip a zero-weight candidate, not merely
+# rank it last. 25 seeds is enough that a non-zero weight would surface.
+BOOST0_DRAWN=0
+for _s in $(seq 1 25); do
+  if CROSS_REVIEW_PROFILES="$BOOST0_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
+     bash "$S/select_roster.sh" --seed "$_s" --extras 4 2>/dev/null | grep -q 'spark'; then
+    BOOST0_DRAWN=$((BOOST0_DRAWN + 1))
+  fi
+done
+if [[ "$BOOST0_DRAWN" -eq 0 ]]; then
+  ok "a draw_boost 0 seat is never selected across 25 seeds"
+else
+  bad "a draw_boost 0 seat was drawn in $BOOST0_DRAWN of 25 seeds"
+fi
+# The other half of the guard: a malformed boost is NOT a bench instruction.
+# `$7 + 0` coerces "abc" to 0, so without a shape check a typo would silently
+# retire a seat. Garbage must fall back to the 1.0 default weight of 75.0.
+for _bad_boost in '"abc"' '-1' '""'; do
+  BOOSTX_PROF="$T/boostx_profiles.json"
+  jq ".spark.draw_boost = $_bad_boost" "$SKILL_DIR/references/reviewer_profiles.json" > "$BOOSTX_PROF"
+  BOOSTX_ERR="$T/boostx.err"
+  CROSS_REVIEW_PROFILES="$BOOSTX_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
+    bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOSTX_ERR"
+  assert_contains "malformed draw_boost $_bad_boost falls back to the 1.0 default" \
+    "$(grep ' spark ' "$BOOSTX_ERR")" "weight=75.0"
+done
 # no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
 MOONSHOT_API_KEY= bash "$S/run_reviewers.sh" --base main --out "$T/o11" --reviewers kimi27 >/dev/null 2>"$T/k27skip.err"
 assert_eq "kimi27 without a key exits 1 (all requested reviewers failed)" "$?" "1"

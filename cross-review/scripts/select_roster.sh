@@ -187,7 +187,11 @@ lb_json="$(bash "$script_dir/leaderboard.sh" --mode json 2>/dev/null || echo '[]
 # to make a deliberately-seated reviewer (kimi27, 2026-07-03) come up
 # frequently while it earns leaderboard data; retire boosts once real scores
 # accumulate.
-profile_file="$script_dir/../references/reviewer_profiles.json"
+# CROSS_REVIEW_PROFILES overrides the profile path for fixture tests only,
+# same contract as CROSS_REVIEW_RUNLOG and CROSS_REVIEW_FINDING_EVENTS. It
+# exists so the draw_boost semantics (0 = never drawn, garbage = default 1)
+# can be pinned against a synthetic profile instead of mutating the real one.
+profile_file="${CROSS_REVIEW_PROFILES:-$script_dir/../references/reviewer_profiles.json}"
 draw_boost_of() {
   [[ -f "$profile_file" ]] || { echo 1; return; }
   jq -r --arg r "$1" '.[$r].draw_boost // 1' "$profile_file" 2>/dev/null || echo 1
@@ -238,8 +242,19 @@ draw_picks() {
     attempts = $3 + 0
     latest = $4
     cost = (NF >= 6 ? $6 + 0 : 0)
-    boost = (NF >= 7 ? $7 + 0 : 1)
-    if (boost <= 0) boost = 1
+    # draw_boost: 0 is a LEGITIMATE value meaning "never draw this seat" — a
+    # retired seat that stays fully wired (see the nemotron bench_note). The
+    # previous guard was `if (boost <= 0) boost = 1`, which silently gave a
+    # seat pinned to 0 FULL weight — the exact opposite of what the profile
+    # says, and undetectable except by counting draws over many rounds.
+    # Garbage still must default to 1, because `$7 + 0` coerces a typo like
+    # "abc" to 0 and would otherwise bench a seat by accident. So validate the
+    # SHAPE first and only then coerce: a well-formed non-negative decimal is
+    # taken at face value (0 included); anything else — negative, non-numeric,
+    # empty — is garbage and falls back to 1.
+    boost_raw = (NF >= 7 ? $7 : "1")
+    if (boost_raw !~ /^[0-9]+(\.[0-9]+)?$/) boost_raw = "1"
+    boost = boost_raw + 0
     # exploit * explore / latency / cost * boost — latency and COST shape the
     # draw, never the synthesis-time weighting of findings. The cost divisor is
     # the fugu lesson made structural (PR #20: $4.74/call, 94.9% of a week'"'"'s OR
