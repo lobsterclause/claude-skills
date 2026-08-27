@@ -192,7 +192,9 @@ jq -nc '{ts:"2026-07-06T00:00:00Z", roster_decision:{candidates:[
   {reviewer:"C", weight:10, selected:true},{reviewer:"D", weight:10, selected:false}]}}' >"$MP3bLOG"
 MP3b="$(bash "$SCRIPT" --runlog "$MP3bLOG" --json 2>&1)"
 assert_eq "3 of 4 drawn: expectations sum to 3" "$(printf '%s' "$MP3b" | jq -r '[.seats[].expected] | add | . * 1000 | round')" "3000"
-X
+# P(A excluded) = sum over orderings of {B,C,D} of the sequential product
+# (BCD .0071 x2, CBD/DBC .0056 x2, CDB/DCB .0042 x2) = 0.0337 -> 0.9663
+assert_eq "3 of 4 drawn: A expected 0.9663" "$(printf '%s' "$MP3b" | jq -r '.seats[] | select(.reviewer=="A") | .expected')" "0.9663"
 MP4LOG="$T/multipick4.jsonl"
 jq -nc '{ts:"2026-07-06T00:00:00Z", roster_decision:{candidates:[
   {reviewer:"A", weight:50, selected:true},{reviewer:"B", weight:30, selected:true},
