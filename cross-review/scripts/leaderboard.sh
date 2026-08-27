@@ -75,10 +75,15 @@
 # telemetry-only branch).
 #
 # Usage:
-#   leaderboard.sh [--recent <n>] [--mode table|json]
+#   leaderboard.sh [--recent <n>] [--mode table|json|report] [--profiles PATH]
 #     --recent <n>   window of structured runlog entries (default 40)
 #     --mode table   human-ranked leaderboard (default)
 #     --mode json    one JSON array, consumed by select_roster.sh
+#     --mode report  table output plus a per-round fleet cost line (p50/p95
+#                    $/round over the window) and a "severity calibration"
+#                    section shelled out to severity_calibration.sh (#105)
+#     --profiles PATH  override reviewer_profiles.json (fixture tests only,
+#                    same contract as CROSS_REVIEW_RUNLOG)
 #
 # JSON fields per reviewer: reviewer, provider, attempts, ok, quota,
 # reliability_pct, findings, convergent, dropped, latest_status, rookie, score,
@@ -88,6 +93,32 @@
 # | "rookie"), ev_findings, ev_solo, ev_dropped, ev_unanchored (all 0 when
 # the reviewer scored on a non-events basis).
 #
+# COST (#92): cost_usd is billed on OpenRouter seats only — first-party CLI
+# lanes (codex, antigravity, gemini-pro, kimi) never report it. Each seat's
+# reviewer_profiles.json entry may carry a `pricing: {prompt_per_m,
+# completion_per_m}` (USD per million tokens). When an attempt has no billed
+# cost_usd but does have tokens_prompt/tokens_completion and its seat has
+# pricing, cost is ESTIMATED at scoring time as tokens x pricing; avg_cost_usd
+# then blends billed and estimated dollars, and cost_estimated is true when
+# ANY dollar figure in the window was estimated rather than billed. Seats
+# with pricing: null, or attempts missing token counts, contribute nothing to
+# the estimate (an unbilled, unestimable attempt is simply excluded from the
+# average, same as today).
+#
+# cost_per_kept / cost_per_kept_ch: total window $ (billed + estimated) over
+# this reviewer's KEPT findings (any/Critical-or-High) from
+# finding_events.jsonl's terminal events (factcheck_kept/parent_verified_kept/
+# fix_verified/human_accepted = kept; the *_dropped/human_rejected/
+# duplicate_merged family = dropped; no terminal event = unresolved, excluded
+# from the denominator the same way severity_calibration.sh excludes it).
+# Formatted as a fixed 2-decimal string ("0.10"); a seat with zero kept
+# findings in the window reports "—", not a divide-by-zero.
+#
+# tokens_per_diff_line: average (tokens_prompt + tokens_completion) / diff
+# lines over structured runlog entries that stamped BOTH this seat's tokens
+# and diff_size.lines for that round (append_runlog.sh --diff-lines); null
+# when no entry in the window has both.
+#
 # The events ledger path defaults to finding_events.jsonl next to the runlog;
 # CROSS_REVIEW_FINDING_EVENTS overrides it (fixture tests only, same contract
 # as CROSS_REVIEW_RUNLOG).
@@ -96,6 +127,7 @@ set -uo pipefail
 
 recent=40
 mode="table"
+profiles_arg=""
 
 need_val() {
   if [[ "$2" -lt 2 ]]; then
@@ -106,8 +138,9 @@ need_val() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --recent) need_val "$1" "$#"; recent="$2"; shift 2 ;;
-    --mode)   need_val "$1" "$#"; mode="$2";   shift 2 ;;
+    --recent)   need_val "$1" "$#"; recent="$2";       shift 2 ;;
+    --mode)     need_val "$1" "$#"; mode="$2";         shift 2 ;;
+    --profiles) need_val "$1" "$#"; profiles_arg="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -118,7 +151,9 @@ skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
 # CROSS_REVIEW_RUNLOG override exists for the fixture tests (tests/run_tests.sh)
 # — production callers never set it.
 runlog="${CROSS_REVIEW_RUNLOG:-$skill_dir/runlog.jsonl}"
-profile_file="$skill_dir/references/reviewer_profiles.json"
+# --profiles override exists for the fixture tests (tests/test_leaderboard_cost.sh)
+# — production callers never pass it.
+profile_file="${profiles_arg:-$skill_dir/references/reviewer_profiles.json}"
 
 # Full fleet — keep in sync with run_reviewers.sh dispatch and analyze_runlog.sh.
 REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok longcat inkling kimi27 kimi3)
@@ -199,14 +234,38 @@ provider_of() {
   printf '%s' "$p"
 }
 
+# pricing_of <reviewer> — profile `.pricing` ({prompt_per_m, completion_per_m}
+# in USD/million tokens) or `null` when the seat has none on file (#92).
+pricing_of() {
+  local r="$1"
+  if [[ -f "$profile_file" ]]; then
+    jq -c --arg r "$r" '.[$r].pricing // null' "$profile_file" 2>/dev/null || echo null
+  else
+    echo null
+  fi
+}
+
 score_reviewer() {
-  local r="$1" provider="$2"
+  local r="$1" provider="$2" pricing="$3"
   printf '%s\n' "$structured" | jq -s --arg r "$r" --arg provider "$provider" \
     --argjson events "$window_events" --argjson provmap "$provmap" \
-    --argjson baselines "$baselines" \
+    --argjson baselines "$baselines" --argjson pricing "$pricing" \
     --argjson solo_discount_min_n "$solo_discount_min_n" \
     --argjson solo_discount_drop_rate_threshold "$solo_discount_drop_rate_threshold" \
     --argjson solo_discount_factor "$solo_discount_factor" '
+    # Fixed 2-decimal string formatter for the cost-per-kept fields (jq
+    # numbers drop trailing zeros, so 0.1 would otherwise render "0.1" not
+    # "0.10"). null in ("no kept findings" / "no cost data") -> em dash out,
+    # so a zero-kept seat reads as "not applicable", not a fake $0.00.
+    def fmt2($x):
+      if $x == null then "—"
+      else
+        (($x * 100) | round) as $ip
+        | (if $ip < 0 then -$ip else $ip end) as $a
+        | (if $ip < 0 then "-" else "" end) as $sign
+        | ($sign + (($a / 100) | floor | tostring) + "." +
+           (($a % 100) | tostring | if length == 1 then "0" + . else . end))
+      end;
     map(.reviewers[$r] // {status:"skipped"}) as $rs
     # Sleep-killed timeouts (2026-07-03): a timed_out sample whose wall-clock
     # duration overran the ENFORCED budget by >60s means the machine slept
@@ -231,12 +290,64 @@ score_reviewer() {
     | ($scored | map(.findings_dropped    // 0) | add // 0) as $dropped
     | (if $n == 0 then null else ($ok / $n) end) as $rel
     | (if $n == 0 then "never_run" else ($attempts | last | .status) end) as $latest
-    | ($attempts | map(.cost_usd // empty | select(type == "number"))) as $costs
+    # Cost (#92): billed cost_usd wins; absent that, ESTIMATE from
+    # tokens_prompt/tokens_completion x this seats pricing (null pricing or
+    # missing token counts contributes nothing — same as an unbilled attempt
+    # today). cost_estimated is true when ANY dollar figure in the window
+    # came from the estimate rather than a bill.
+    | ($attempts | map(
+        (if (.cost_usd | type) == "number" then .cost_usd else null end) as $billed
+        | if $billed != null then {cost: $billed, estimated: false}
+          elif ($pricing != null
+                and (.tokens_prompt // null) != null
+                and (.tokens_completion // null) != null) then
+            { cost: ((.tokens_prompt / 1000000 * $pricing.prompt_per_m)
+                     + (.tokens_completion / 1000000 * $pricing.completion_per_m)),
+              estimated: true }
+          else null end)
+      | map(select(. != null))) as $cost_entries
+    | ($cost_entries | map(.cost)) as $costs
     | (if ($costs | length) == 0 then 0
        else (($costs | add) / ($costs | length) * 1000000 | round) / 1000000 end) as $avg_cost
+    | (($costs | add) // 0) as $total_cost
+    | (($cost_entries | map(select(.estimated)) | length) > 0) as $cost_estimated
     | ($attempts | map(.duration_s // 0) | sort) as $durs
     | ($durs | length) as $dn
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
+    # tokens-per-diff-line (#92): average (tokens_prompt + tokens_completion)
+    # / diff_size.lines over structured entries that stamped BOTH this seats
+    # tokens and a diff line count for that round. `.` is still the full
+    # runlog-entry array here (every binding above uses `as`, which never
+    # reassigns the pipeline input).
+    | (map(select((.reviewers[$r].tokens_prompt // null) != null
+                  and (.reviewers[$r].tokens_completion // null) != null
+                  and (.diff_size.lines // null) != null
+                  and (.diff_size.lines // 0) > 0))
+       | map((((.reviewers[$r].tokens_prompt // 0) + (.reviewers[$r].tokens_completion // 0))
+              / .diff_size.lines))) as $tpl_samples
+    | (if ($tpl_samples | length) == 0 then null
+       else ((($tpl_samples | add) / ($tpl_samples | length) * 10 | round) / 10) end) as $tokens_per_diff_line
+    # kept findings (#92): terminal status per (finding_id, run_id), same
+    # kept/dropped event names severity_calibration.sh uses, joined onto this
+    # reviewers proposed events. No terminal event = unresolved, excluded
+    # from both the kept count and the kept-Critical-or-High count (an
+    # unadjudicated finding is not yet "kept").
+    | (["factcheck_kept","parent_verified_kept","fix_verified","human_accepted"]) as $kept_names
+    | (["factcheck_dropped","parent_verified_dropped","human_rejected","duplicate_merged"]) as $term_dropped_names
+    | ($events
+       | map(select(.event as $e | ($kept_names + $term_dropped_names | index($e)) != null))
+       | reduce .[] as $e ({}; .[([$e.finding_id, $e.run_id] | tojson)] =
+           (if ($kept_names | index($e.event)) != null then "kept" else "dropped" end))) as $term_map
+    | ($events | map(select(.event == "proposed" and .reviewer == $r))
+               | unique_by([.finding_id, .run_id])
+               | map(. + {kstatus: ($term_map[([.finding_id, .run_id] | tojson)] // "unresolved")})) as $props_terminal
+    | ($props_terminal | map(select(.kstatus == "kept"))) as $kept_findings
+    | ($kept_findings | length) as $kept_n
+    | ($kept_findings | map(select(.severity == "Critical" or .severity == "High")) | length) as $kept_ch_n
+    # no cost data at all (CLI lane, or unpriced seat with no billed cost) is
+    # "—", never "$0.00" -- a free-looking seat is a lie (antigravity, #121)
+    | (if ($costs | length) == 0 or $kept_n == 0 then fmt2(null) else fmt2($total_cost / $kept_n) end) as $cost_per_kept
+    | (if ($costs | length) == 0 or $kept_ch_n == 0 then fmt2(null) else fmt2($total_cost / $kept_ch_n) end) as $cost_per_kept_ch
     # Telemetry-only multiplier: 0.75 is a soft prior for reviewers not yet
     # observed enough to score on findings quality. Left flat, it became a
     # permanent haven for reviewers that reliably return NOTHING — see the
@@ -337,6 +448,10 @@ score_reviewer() {
         ev_solo: $ev_solo,
         ev_dropped: $ev_dropped,
         ev_unanchored: $ev_unanchored,
+        cost_estimated: $cost_estimated,
+        cost_per_kept: $cost_per_kept,
+        cost_per_kept_ch: $cost_per_kept_ch,
+        tokens_per_diff_line: $tokens_per_diff_line,
         score: $score }
   '
 }
@@ -350,8 +465,76 @@ done
 
 rows=""
 for r in "${REVIEWERS[@]}"; do
-  row="$(score_reviewer "$r" "$(provider_of "$r")")"
+  row="$(score_reviewer "$r" "$(provider_of "$r")" "$(pricing_of "$r")")"
   rows="$rows$row"$'\n'
+done
+
+print_table() {
+  echo "── cross-review leaderboard (window: last $recent structured runs) ──"
+  printf '%s' "$rows" | jq -s -r '
+    sort_by(-.score) | to_entries[] |
+    "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if (.value.sleep_excluded // 0) > 0 then " (sleep-excl ×\(.value.sleep_excluded))" else "" end)\(if .value.score_basis == "events" then "  ·  ev: \(.value.ev_findings) findings, \(.value.ev_solo) solo, \(.value.ev_dropped) disproven\(if (.value.ev_unanchored // 0) > 0 then ", \(.value.ev_unanchored) unanchored" else "" end)" elif .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)"
+  '
+  echo "──"
+  echo "  score = 45% reliability + 35% finding value + 20% fact-check survival"
+  echo "  (\"ev:\" rows score per-finding from finding_events.jsonl — severity-weighted,"
+  echo "   solo discoveries 1.0 > no-baseline corroboration 0.85 > baseline-corroborated 0.7,"
+  echo "   unanchored ×0.5, disproven 0 · rows without events use aggregate convergence counts"
+  echo "   · telemetry-only, never enriched: reliability × decaying prior — 0.75 for <=3 ok"
+  echo "   runs, -0.06/run beyond that, floor 0.15 · never-run reviewers: rookie prior 50)"
+}
+
+# print_cost_report — #92/#105: per-seat $/kept-finding, a fleet $/round line
+# (p50/p95 over the window's structured runlog entries), and tokens-per-diff-
+# line, then the severity-calibration section from severity_calibration.sh.
+print_cost_report() {
+  echo "── cost per kept finding (window: last $recent structured runs) ──"
+  printf '%s' "$rows" | jq -s -r '
+    sort_by(-.score) | .[] |
+    "  \(.reviewer) [\(.provider)] — \(if .cost_estimated then "~" else "" end)avg $\(.avg_cost_usd)/run\(if .cost_estimated then " (estimated)" else "" end)  ·  $/kept \(.cost_per_kept)  ·  $/kept C-or-H \(.cost_per_kept_ch)  ·  tokens/diff-line \(.tokens_per_diff_line // "—")"
+  '
+  echo "──"
+
+  # Fleet $/round: sum billed+estimated cost across every reviewer within
+  # each structured runlog entry, then p50/p95 over those per-round totals.
+  fleet_stats="$(printf '%s\n' "$structured" | jq -s --argjson pricing "$pricing_map" '
+    map(
+      (.reviewers // {}) as $revs
+      | ($revs | to_entries | map(
+          .value as $rv
+          | ($pricing[.key] // null) as $pr
+          | (if ($rv.cost_usd | type) == "number" then $rv.cost_usd else null end) as $billed
+          | if $billed != null then $billed
+            elif ($pr != null and ($rv.tokens_prompt // null) != null and ($rv.tokens_completion // null) != null) then
+              (($rv.tokens_prompt / 1000000 * $pr.prompt_per_m) + ($rv.tokens_completion / 1000000 * $pr.completion_per_m))
+            else 0 end
+        ) | add // 0)
+    ) as $round_totals
+    | ($round_totals | sort) as $s
+    | ($s | length) as $n
+    | (if $n == 0 then 0 else $s[(($n - 1) * 0.5 | floor)] end) as $p50
+    | (if $n == 0 then 0 else $s[(($n - 1) * 0.95 | floor)] end) as $p95
+    | {rounds: $n, p50: (($p50 * 1000000 | round) / 1000000), p95: (($p95 * 1000000 | round) / 1000000)}
+  ')"
+  fleet_n="$(jq -r '.rounds' <<<"$fleet_stats")"
+  fleet_p50="$(jq -r '.p50' <<<"$fleet_stats")"
+  fleet_p95="$(jq -r '.p95' <<<"$fleet_stats")"
+  echo "  fleet \$/round over $fleet_n round(s): p50 \$$fleet_p50  ·  p95 \$$fleet_p95"
+  echo "──"
+  echo
+
+  sev_script="$skill_dir/scripts/severity_calibration.sh"
+  if [[ -x "$sev_script" || -f "$sev_script" ]]; then
+    bash "$sev_script" || true
+  else
+    echo "severity_calibration.sh not found next to leaderboard.sh — skipping severity calibration section" >&2
+  fi
+}
+
+# reviewer -> pricing map, for the fleet $/round rollup in --mode report.
+pricing_map='{}'
+for r in "${REVIEWERS[@]}"; do
+  pricing_map="$(jq -c --arg r "$r" --argjson p "$(pricing_of "$r")" '. + {($r): $p}' <<<"$pricing_map")"
 done
 
 case "$mode" in
@@ -359,21 +542,15 @@ case "$mode" in
     printf '%s' "$rows" | jq -s 'sort_by(-.score)'
     ;;
   table)
-    echo "── cross-review leaderboard (window: last $recent structured runs) ──"
-    printf '%s' "$rows" | jq -s -r '
-      sort_by(-.score) | to_entries[] |
-      "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if (.value.sleep_excluded // 0) > 0 then " (sleep-excl ×\(.value.sleep_excluded))" else "" end)\(if .value.score_basis == "events" then "  ·  ev: \(.value.ev_findings) findings, \(.value.ev_solo) solo, \(.value.ev_dropped) disproven\(if (.value.ev_unanchored // 0) > 0 then ", \(.value.ev_unanchored) unanchored" else "" end)" elif .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)"
-    '
-    echo "──"
-    echo "  score = 45% reliability + 35% finding value + 20% fact-check survival"
-    echo "  (\"ev:\" rows score per-finding from finding_events.jsonl — severity-weighted,"
-    echo "   solo discoveries 1.0 > no-baseline corroboration 0.85 > baseline-corroborated 0.7,"
-    echo "   unanchored ×0.5, disproven 0 · rows without events use aggregate convergence counts"
-    echo "   · telemetry-only, never enriched: reliability × decaying prior — 0.75 for <=3 ok"
-    echo "   runs, -0.06/run beyond that, floor 0.15 · never-run reviewers: rookie prior 50)"
+    print_table
+    ;;
+  report)
+    print_table
+    echo
+    print_cost_report
     ;;
   *)
-    echo "unknown mode: $mode (use table|json)" >&2
+    echo "unknown mode: $mode (use table|json|report)" >&2
     exit 2
     ;;
 esac
