@@ -1326,6 +1326,13 @@ $json_findings_suffix"
     cost_json="$(jq -r '.usage.cost | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
     tokp_json="$(jq -r '.usage.prompt_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
     tokc_json="$(jq -r '.usage.completion_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+    # A response file that is non-empty but holds NO JSON value — the
+    # whitespace keepalives a streaming provider sends before curl's 600s
+    # timeout fires — makes jq print NOTHING and exit 0, so `|| echo null`
+    # never runs and the printf below splices `"cost_usd": ,` into meta.json.
+    # Every consumer then fails to parse the one sample the leaderboard most
+    # needs (a timeout). Observed twice 2026-08-26 (deepseek, nemotron); #74.
+    cost_json="${cost_json:-null}"; tokp_json="${tokp_json:-null}"; tokc_json="${tokc_json:-null}"
   fi
   # A retried attempt overwrites meta — but attempt 1's spend was real money
   # (a charged response classified degenerate/no-verdict still billed).
