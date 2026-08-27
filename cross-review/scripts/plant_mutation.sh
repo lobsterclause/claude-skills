@@ -211,23 +211,70 @@ if [[ "$dry_run" -eq 1 ]]; then
   exit 0
 fi
 
-# --- deterministic pick via awk srand(seed)/rand() (same technique as
-#     select_roster.sh's draw_picks) -------------------------------------------
+# --- deterministic full permutation via awk srand(seed)/rand() (same
+#     technique as select_roster.sh's draw_picks), then walk it in order,
+#     skipping any candidate whose replace is a no-op on that line (e.g.
+#     args_swap_pair on `f(a, a)`), until one produces a real change or the
+#     sequence is exhausted -----------------------------------------------
 # Same contract as the roster draw: deterministic for a given seed on a given
 # awk. Different awk implementations (gawk/mawk/BSD) seed differently, so a
 # seed reproduces on one machine, not across them -- acceptable for a drill,
-# recorded in planted.json via seed + operator + site.
-pick_idx="$(awk -v seed="$seed" -v n="$n_cand" 'BEGIN { srand(seed); print int(rand() * n) + 1 }')"
-picked_line="$(sed -n "${pick_idx}p" "$cand_tmp")"
-IFS=$'\t' read -r p_file p_line p_op <<<"$picked_line"
+# recorded in planted.json via seed + operator + site. For n_cand==1 (the
+# common --operator-forced case) this permutation always yields [1], the
+# same single candidate the old modulo pick gave.
+draw_tmp="$(mktemp)"
+trap 'rm -f "$added_tmp" "$cand_tmp" "$draw_tmp"' EXIT
+awk -v seed="$seed" -v n="$n_cand" 'BEGIN {
+  srand(seed);
+  for (i = 1; i <= n; i++) idx[i] = i;
+  for (i = n; i > 1; i--) {
+    j = int(rand() * i) + 1;
+    t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+  }
+  for (i = 1; i <= n; i++) print idx[i];
+}' >"$draw_tmp"
+
+p_file=""; p_line=""; p_op=""
+op_replace=""
+original_line=""
+found=0
+skipped_noop=0
+while IFS= read -r idx; do
+  cand_line="$(sed -n "${idx}p" "$cand_tmp")"
+  IFS=$'\t' read -r c_file c_line c_op <<<"$cand_line"
+
+  c_op_idx="$(jq -r --arg id "$c_op" 'to_entries[] | select(.value.id == $id) | .key' "$operators_path")"
+  c_op_replace="$(jq -r ".[$c_op_idx].replace" "$operators_path")"
+
+  c_original_line="$(git -C "$repo" show "${head_sha}:${c_file}" | sed -n "${c_line}p")"
+  c_simulated_line="$(printf '%s\n' "$c_original_line" | sed -E "$c_op_replace")"
+
+  if [[ "$c_simulated_line" == "$c_original_line" ]]; then
+    # e.g. args_swap_pair on `f(a, a)`: the swap reproduces the same text.
+    # Ineligible -- re-draw among the remaining candidates in sequence.
+    skipped_noop=$((skipped_noop + 1))
+    continue
+  fi
+
+  p_file="$c_file"; p_line="$c_line"; p_op="$c_op"
+  op_replace="$c_op_replace"
+  original_line="$c_original_line"
+  found=1
+  break
+done <"$draw_tmp"
+
+if [[ "$found" -ne 1 ]]; then
+  if [[ "$skipped_noop" -gt 0 ]]; then
+    echo "plant_mutation: all $n_cand candidate site(s) produced a no-op mutation (replace left the line unchanged) in diff $base_sha..$head_sha" >&2
+  else
+    echo "plant_mutation: no candidate sites (no added line matched any operator) in diff $base_sha..$head_sha" >&2
+  fi
+  exit 2
+fi
 
 op_idx="$(jq -r --arg id "$p_op" 'to_entries[] | select(.value.id == $id) | .key' "$operators_path")"
-op_match="$(jq -r ".[$op_idx].match" "$operators_path")"
-op_replace="$(jq -r ".[$op_idx].replace" "$operators_path")"
 op_class="$(jq -r ".[$op_idx].class" "$operators_path")"
 op_severity="$(jq -r ".[$op_idx].expected_severity" "$operators_path")"
-
-original_line="$(git -C "$repo" show "${head_sha}:${p_file}" | sed -n "${p_line}p")"
 
 # --- plant on a throwaway branch off HEAD -------------------------------------
 mutation_branch="mutation/$run_id"

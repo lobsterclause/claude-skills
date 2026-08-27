@@ -170,7 +170,7 @@ bash "$S/plant_mutation.sh" --repo "$REPO_C" --base "$C_BASE" --head "$C_HEAD" \
 if [[ -f "$OUT_C" ]]; then
   PICKED_OP="$(jq -r '.operator' "$OUT_C")"
   case "$PICKED_OP" in
-    nullish|bounds_lt_le) ok "unforced draw picks a real candidate op ($PICKED_OP)" ;;
+    nullish|bounds_lt_le|args_swap_pair) ok "unforced draw picks a real candidate op ($PICKED_OP)" ;;
     *) bad "unforced draw picks a real candidate op (got '$PICKED_OP')" ;;
   esac
 else
@@ -273,6 +273,57 @@ git -C "$REPO_H" config --unset commit.gpgsign
 bash "$S/plant_mutation.sh" --repo "$REPO_H" --base "$H_BASE" --head "$H_HEAD" --seed 007 --out "$T/planted-h2.json" >/dev/null 2>&1
 assert_eq "leading-zero --seed is rejected (exit 1)" "$?" "1"
 assert_eq "leading-zero seed created no branch" "$(git -C "$REPO_H" branch --list 'mutation/*' | wc -l | tr -d ' ')" "0"
+
+# (i) args_swap_pair: matching/non-matching call shapes (#108).
+REPO_I="$T/repo-i"
+mk_repo_with "$REPO_I" \
+  'return combine(left, right);' \
+  'nested(f(a), b);' \
+  'f("x", y);'
+I_BASE="$(git -C "$REPO_I" rev-parse HEAD~1)"; I_HEAD="$(git -C "$REPO_I" rev-parse HEAD)"
+IDRY="$(bash "$S/plant_mutation.sh" --repo "$REPO_I" --base "$I_BASE" --head "$I_HEAD" --seed 1 --dry-run 2>&1)"
+assert_contains "flat two-identifier call is an args_swap_pair candidate" "$IDRY" "src/b.ts:2  operator=args_swap_pair"
+assert_not_contains "nested call is not an args_swap_pair candidate" "$IDRY" "src/b.ts:3  operator=args_swap_pair"
+assert_not_contains "call with a string literal arg is not an args_swap_pair candidate" "$IDRY" "src/b.ts:4  operator=args_swap_pair"
+
+OUT_I="$T/planted-i.json"
+bash "$S/plant_mutation.sh" --repo "$REPO_I" --base "$I_BASE" --head "$I_HEAD" \
+  --seed 1 --operator args_swap_pair --run-id mutation-i --out "$OUT_I" >/dev/null 2>&1
+assert_eq "args_swap_pair plants (exit 0)" "$?" "0"
+assert_eq "args_swap_pair swaps the two identifiers" "$(jq -r '.mutated_line' "$OUT_I")" "return combine(right, left);"
+assert_eq "planted.json .operator is args_swap_pair" "$(jq -r '.operator' "$OUT_I")" "args_swap_pair"
+assert_eq "planted.json .class is args" "$(jq -r '.class' "$OUT_I")" "args"
+
+# (j) args_swap_pair no-op guard: the only two-identifier site is `f(a, a)`,
+#     which swaps to itself -- must be treated as ineligible, re-drawn among
+#     the (empty) remaining pool, and the plant must abort cleanly.
+REPO_J="$T/repo-j"
+mk_repo_with "$REPO_J" 'f(a, a);'
+J_BASE="$(git -C "$REPO_J" rev-parse HEAD~1)"; J_HEAD="$(git -C "$REPO_J" rev-parse HEAD)"
+bash "$S/plant_mutation.sh" --repo "$REPO_J" --base "$J_BASE" --head "$J_HEAD" \
+  --seed 1 --operator args_swap_pair --run-id mutation-j --out "$T/planted-j.json" \
+  >/dev/null 2>"$T/stderr-j.log"
+NOOP_ONLY_EXIT=$?
+if [[ "$NOOP_ONLY_EXIT" -ne 0 ]]; then ok "args_swap_pair no-op-only site: non-zero exit"; else bad "args_swap_pair no-op-only site: non-zero exit (got 0)"; fi
+assert_contains "no-op-only site names the cause" "$(cat "$T/stderr-j.log")" "no-op"
+assert_eq "no-op-only site: no planted.json written" "$([[ -f "$T/planted-j.json" ]] && echo yes || echo no)" "no"
+assert_eq "no-op-only site: file unchanged" "$(git -C "$REPO_J" show HEAD:src/b.ts | tail -1)" "f(a, a);"
+assert_eq "no-op-only site: tree clean" "$(git -C "$REPO_J" status --porcelain | wc -l | tr -d ' ')" "0"
+assert_eq "no-op-only site: no mutation branch created" "$(git -C "$REPO_J" branch --list 'mutation/*' | wc -l | tr -d ' ')" "0"
+
+# (k) mixed pool: an eligible args_swap_pair site alongside a no-op-only one
+#     -- the draw must skip the no-op and land on the real site.
+REPO_K="$T/repo-k"
+mk_repo_with "$REPO_K" \
+  'f(a, a);' \
+  'return combine(left, right);'
+K_BASE="$(git -C "$REPO_K" rev-parse HEAD~1)"; K_HEAD="$(git -C "$REPO_K" rev-parse HEAD)"
+OUT_K="$T/planted-k.json"
+bash "$S/plant_mutation.sh" --repo "$REPO_K" --base "$K_BASE" --head "$K_HEAD" \
+  --seed 1 --operator args_swap_pair --run-id mutation-k --out "$OUT_K" >/dev/null 2>&1
+assert_eq "mixed pool: plants (exit 0)" "$?" "0"
+assert_eq "mixed pool: re-draw skips the no-op and lands on the real site" "$(jq -r '.line_range[0]' "$OUT_K")" "3"
+assert_eq "mixed pool: mutated line is the real swap" "$(jq -r '.mutated_line' "$OUT_K")" "return combine(right, left);"
 
 echo
 echo "── summary ──"

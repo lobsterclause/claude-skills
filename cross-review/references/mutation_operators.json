@@ -124,5 +124,19 @@
       "js",
       "jsx"
     ]
+  },
+  {
+    "id": "args_swap_pair",
+    "class": "args",
+    "description": "Swap the two bare-identifier arguments of a call, e.g. `combine(left, right)` -> `combine(right, left)`. A member-call receiver (`obj.combine(a, b)`) is fine, since the match only anchors on the identifier immediately before the opening paren. Does NOT cover: nested calls (`f(g(a), b)`), string/numeric/other literals as an argument (`f(\"x\", y)`), more than two arguments, spread arguments, or a comma without exactly one following space (this repo's prettier style).",
+    "match": "[A-Za-z_][A-Za-z0-9_]*\\(([A-Za-z_][A-Za-z0-9_]*), ([A-Za-z_][A-Za-z0-9_]*)\\)",
+    "replace": "s/\\(([A-Za-z_][A-Za-z0-9_]*), ([A-Za-z_][A-Za-z0-9_]*)\\)/(\\2, \\1)/",
+    "expected_severity": "High",
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   }
 ]
