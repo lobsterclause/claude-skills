@@ -1379,6 +1379,16 @@ assert_contains "the annotation names the cause (the stock token cannot read per
 assert_contains "and the fix" "$ANN_OUT" "CR_PERMISSION_UNREADABLE=refuse"
 assert_contains "the step summary gets a paragraph too" \
   "$(cat "$ann_summary")" "standing unverified"
+# Workflow-command properties: ':' and ',' must be %-encoded or the parser
+# may mis-split the title. The raw title contains neither; the message part
+# may contain ':' freely (only % CR LF are encoded there).
+ANN_TITLE="${ANN_OUT#::warning title=}"; ANN_TITLE="${ANN_TITLE%%::*}"
+[[ "$ANN_TITLE" != *:* && "$ANN_TITLE" != *,* ]] \
+  && ok "the annotation title carries no raw ':' or ',' (kimi, PR #73)" \
+  || bad "annotation title has an unencoded ':' or ',': '$ANN_TITLE'"
+ANN_FAIL="$(GITHUB_ACTIONS=true annotate_unverified failure "stale for ${OTHER40:0:9} (standing unverified)")"
+assert_contains "a failure verdict from an unverified author is annotated too" "$ANN_FAIL" "::warning"
+assert_not_contains "…and the wording does not claim anything was granted" "$ANN_FAIL" "granted"
 rm -f "$ann_summary"
 ANN_OFF="$(GITHUB_ACTIONS= annotate_unverified success "current for ${HEAD40:0:9} (standing unverified)")"
 assert_eq "outside Actions it prints nothing (stderr already covers a terminal)" "$ANN_OFF" ""

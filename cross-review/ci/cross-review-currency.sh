@@ -699,12 +699,24 @@ annotate_unverified() {
   local state="$1" description="$2"
   [[ "${GITHUB_ACTIONS:-}" == "true" ]] || return 0
   [[ "$description" == *"(standing unverified)"* ]] || return 0
-  local msg="cross-review currency: the accepted record's author has write access by author_association only. The repository-permission check could not run — on the stock GITHUB_TOKEN the collaborators/permission endpoint 403s — so it fell back to the association it exists to replace (CR_PERMISSION_UNREADABLE=trust). On an org repo, supply a token that can read permissions and set CR_PERMISSION_UNREADABLE=refuse, or narrow CR_TRUSTED_ASSOC to OWNER. See ci/README.md, 'Read this before believing step 2 is on'."
-  printf '::warning title=cross-review currency: write access not verified::%s\n' "$msg"
+  # State-neutral on purpose: the suffix is attached to the ACCEPTED record,
+  # whatever verdict it then produced — `success` on a current one, `failure`
+  # on a stale one — so this must not say the status was "granted".
+  local msg="cross-review currency: the accepted review record's author was trusted on author_association alone. The repository-permission check could not run — on the stock GITHUB_TOKEN the collaborators/permission endpoint 403s — so it fell back to the association it exists to replace (CR_PERMISSION_UNREADABLE=trust). On an org repo, supply a token that can read permissions and set CR_PERMISSION_UNREADABLE=refuse, or narrow CR_TRUSTED_ASSOC to OWNER. See ci/README.md, 'Read this before believing step 2 is on'."
+  # Workflow-command PROPERTY values must have % : , CR LF percent-encoded
+  # (the message part only % CR LF) — actions/toolkit's escapeProperty. A bare
+  # ':' in the title is what a parser is allowed to mis-split on. Flagged by
+  # kimi in cross-review of PR #73.
+  local title="cross-review currency - write access not verified"
+  title="${title//%/%25}"; title="${title//$'\r'/%0D}"; title="${title//$'\n'/%0A}"
+  title="${title//:/%3A}";  title="${title//,/%2C}"
+  local body="$msg"
+  body="${body//%/%25}"; body="${body//$'\r'/%0D}"; body="${body//$'\n'/%0A}"
+  printf '::warning title=%s::%s\n' "$title" "$body"
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
       printf '### cross-review currency: standing unverified\n\n'
-      printf 'Status `%s` was granted on `author_association` alone; the repository-permission check did not run.\n\n' "$state"
+      printf 'Verdict `%s` was computed from a record whose author was trusted on `author_association` alone; the repository-permission check did not run.\n\n' "$state"
       printf '%s\n' "$msg"
     } >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
   fi
