@@ -530,8 +530,12 @@ score_reviewer() {
     # uses) — precision signal for the solo-credit discount below. Below
     # the minimum sample size, treat as unproven (rate 0, no discount)
     # rather than penalize a thin sample.
-    | ($props | length) as $own_n
+    # deferred findings are neutral here too: they neither pad the sample
+    # nor count as dropped (gemini-pro, PR #133 pass 2)
     | ($props | map(select(.finding_id as $fid | .run_id as $rid
+                            | ($term_map2[([$fid, $rid] | tojson)] // "unresolved") != "deferred"))) as $active_props
+    | ($active_props | length) as $own_n
+    | ($active_props | map(select(.finding_id as $fid | .run_id as $rid
                             | ($term_map2[([$fid, $rid] | tojson)] // "unresolved") == "dropped"))
               | length) as $own_dropped
     | (if $own_n < $solo_discount_min_n then 0
@@ -723,15 +727,19 @@ print_context_mode_report() {
           elif ($ca == "diff_only") then "diff"
           else "unknown" end
       end;
-    # same vocabulary as score_reviewer: duplicate_merged is the dropped family
+    # kept / dropped measure whether a finding held up. A duplicate held up
+    # (another seat found it too) but adds no net-new value, so it is its own
+    # third status: excluded from both kept_rate and drop_rate, same as
+    # deferred (gemini-pro, PR #133 pass 2 -- reversing its pass-1 ask).
     def kept_names: ["factcheck_kept","parent_verified_kept","fix_verified","human_accepted"];
-    def dropped_names: ["factcheck_dropped","parent_verified_dropped","human_rejected","duplicate_merged"];
+    def dropped_names: ["factcheck_dropped","parent_verified_dropped","human_rejected"];
     . as $rows
     | ($events
-       | map(select(.event as $e | ((kept_names + dropped_names + ["deferred"]) | index($e)) != null))
+       | map(select(.event as $e | ((kept_names + dropped_names + ["deferred","duplicate_merged"]) | index($e)) != null))
        | reduce .[] as $e ({}; .[([$e.finding_id, $e.run_id] | tojson)] =
            (if (kept_names | index($e.event)) != null then "kept"
             elif (dropped_names | index($e.event)) != null then "dropped"
+            elif $e.event == "duplicate_merged" then "duplicate"
             else "deferred" end))
       ) as $term_map
     | [ $revs[] as $r |

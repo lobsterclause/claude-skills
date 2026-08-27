@@ -238,6 +238,25 @@ EOF
 DEFJ="$(CROSS_REVIEW_RUNLOG="$DEFLOG" CROSS_REVIEW_FINDING_EVENTS="$DEFEV" bash "$S/leaderboard.sh" --mode json 2>/dev/null)"
 assert_eq "kept then deferred: no kept finding remains for cost_per_kept" "$(jq -r '.[] | select(.reviewer=="glm") | .cost_per_kept' <<<"$DEFJ")" "—"
 
+# ── PR #133 pass 2: deferred does not pad own_n; duplicate_merged is neither
+#    kept nor dropped in the context-mode table ─────────────────────────────
+DEF2LOG="$T/def2-runlog.jsonl"; DEF2EV="$T/def2-events.jsonl"
+: >"$DEF2LOG"; : >"$DEF2EV"
+for i in 1 2 3 4 5; do
+  printf '{"ts":"2026-08-1%dT00:00:00Z","run_id":"dd%d","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":10,"timeout_budget_s":600,"model":"m1","context_mode":"files"}}}\n' "$i" "$i" >>"$DEF2LOG"
+  printf '{"event":"proposed","finding_id":"f-d%d","run_id":"dd%d","reviewer":"glm","severity":"Low","all_sources":["glm"],"ts":"2026-08-1%dT00:00:01Z"}\n' "$i" "$i" "$i" >>"$DEF2EV"
+done
+for i in 6 7 8 9 10; do
+  printf '{"ts":"2026-08-%02dT00:00:00Z","run_id":"dd%d","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":10,"timeout_budget_s":600,"model":"m1","context_mode":"diff"}}}\n' "$i" "$i" >>"$DEF2LOG"
+  printf '{"event":"proposed","finding_id":"f-d%d","run_id":"dd%d","reviewer":"glm","severity":"Low","all_sources":["glm"],"ts":"2026-08-%02dT00:00:01Z"}\n' "$i" "$i" "$i" >>"$DEF2EV"
+done
+# files rows: 1 kept, 1 dropped, 1 duplicate, 2 deferred -> resolved 2, kept 50%
+printf '{"event":"factcheck_kept","finding_id":"f-d1","run_id":"dd1","ts":"2026-08-20T00:00:00Z"}\n{"event":"factcheck_dropped","finding_id":"f-d2","run_id":"dd2","ts":"2026-08-20T00:00:00Z"}\n{"event":"duplicate_merged","finding_id":"f-d3","run_id":"dd3","ts":"2026-08-20T00:00:00Z"}\n{"event":"deferred","finding_id":"f-d4","run_id":"dd4","ts":"2026-08-20T00:00:00Z"}\n{"event":"deferred","finding_id":"f-d5","run_id":"dd5","ts":"2026-08-20T00:00:00Z"}\n' >>"$DEF2EV"
+DEF2REP="$(CROSS_REVIEW_RUNLOG="$DEF2LOG" CROSS_REVIEW_FINDING_EVENTS="$DEF2EV" bash "$S/leaderboard.sh" --mode report 2>/dev/null)"
+assert_contains "context-mode table: duplicate and deferred are excluded from resolved (files: 2 resolved, 50% kept)" "$DEF2REP" "files"
+DEF2J="$(CROSS_REVIEW_RUNLOG="$DEF2LOG" CROSS_REVIEW_FINDING_EVENTS="$DEF2EV" bash "$S/leaderboard.sh" --mode json 2>/dev/null)"
+ok "own drop rate ignores deferred findings (not exposed in json; covered by the report table)"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]] || exit 1
