@@ -239,7 +239,8 @@ roster_audit_out() {
   if [[ -x "$a" ]]; then
     "$a" --recent "$recent" --runlog "$runlog" 2>&1
   else
-    echo "roster audit unavailable: $a missing or not executable" >&2
+    # stdout with the WARN prefix so warn mode captures and formats it
+    echo "WARN roster audit unavailable: $a missing or not executable"
   fi
 }
 

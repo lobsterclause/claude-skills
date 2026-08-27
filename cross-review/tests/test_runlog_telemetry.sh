@@ -29,10 +29,13 @@ assert_eq() {
 assert_contains() {
   if [[ "$2" == *"$3"* ]]; then ok "$1"; else bad "$1 (no '$3' in output)"; fi
 }
+assert_not_contains() {
+  if [[ "$2" != *"$3"* ]]; then ok "$1"; else bad "$1 (found '$3' in output)"; fi
+}
 
 # UTC epoch->compact-stamp helper, portable across BSD (macOS) and GNU date.
 # LOCAL-clock stamp, the same clock worktree.sh uses for started_at
-utc_stamp_for_epoch() {
+local_stamp_for_epoch() {
   local epoch="$1"
   if date -r 0 +%Y%m%dT%H%M%S >/dev/null 2>&1; then
     date -r "$epoch" +%Y%m%dT%H%M%S
@@ -45,7 +48,7 @@ utc_stamp_for_epoch() {
 # + reviewer meta ────────────────────────────────────────────────────────────
 echo "── append_runlog.sh: round_wall_s + trailing_reviewer (#91) ──"
 NOW_EPOCH="$(date +%s)"
-STARTED_90S_AGO="$(utc_stamp_for_epoch $((NOW_EPOCH - 90)))"
+STARTED_90S_AGO="$(local_stamp_for_epoch $((NOW_EPOCH - 90)))"
 RUN_A="$T/run-a"; mkdir -p "$RUN_A/raw"
 printf '{"started_at":"%s"}\n' "$STARTED_90S_AGO" >"$RUN_A/context.json"
 printf '{"exit_code":0,"duration_s":30,"timed_out":false,"output_bytes":10,"attempt":1,"timeout_budget_s":300}\n' >"$RUN_A/raw/codex.meta.json"
@@ -59,7 +62,7 @@ RWS_A="$(jq -r '.round_wall_s' <<<"$ENTRY_A")"
 if [[ "$RWS_A" =~ ^[0-9]+$ ]] && [[ "$RWS_A" -ge 89 && "$RWS_A" -le 121 ]]; then
   ok "round_wall_s in 89..121 from a context.json started 90s ago (got $RWS_A)"
 else
-  bad "round_wall_s >= 90 from a context.json started 90s ago (got: '$RWS_A' want: >=90)"
+  bad "round_wall_s in 89..121 from a context.json started 90s ago (got: '$RWS_A' want: 89..121)"
 fi
 assert_eq "trailing_reviewer.reviewer is the 75s seat" \
   "$(jq -r '.trailing_reviewer.reviewer' <<<"$ENTRY_A")" "kimi"
@@ -146,6 +149,10 @@ assert_eq "out-of-range started_at: round_wall_s omitted" "$(jq -r 'has("round_w
 assert_contains "out-of-range started_at is reported" "$(cat "$T/err-a2.txt")" "outside 0..604800"
 assert_eq "non-numeric phases file: phases omitted" "$(jq -r 'has("phases")' "$LOG_A2")" "false"
 assert_contains "non-numeric phases file is reported" "$(cat "$T/err-a2.txt")" "flat object"
+printf '{"worktree_s": 1}\n{"dispatch_s": 2}\n' >"$T/stream-phases.json"
+LOG_A3="$T/runlog-a3.jsonl"; : >"$LOG_A3"
+CROSS_REVIEW_RUNLOG="$LOG_A3" bash "$S/append_runlog.sh" --run-dir "$RUN_A2" --project t --base main --pr - --pass 1 --verdict CLEAN --run-id r-a3 --phases "$T/stream-phases.json" >/dev/null 2>&1
+assert_eq "a JSON-stream phases file is omitted, and the entry still lands" "$(jq -c '[has("phases"), .run_id]' "$LOG_A3")" '[false,"r-a3"]'
 
 # ── fixture (f): round wall-clock p50/p95 exclude wall_over_budget, critical
 # path table ──────────────────────────────────────────────────────────────
@@ -165,12 +172,24 @@ done
 # 10th entry: sleep-suspect, must be excluded from p50/p95.
 # the flag lives on the REVIEWER row, where run_reviewers.sh actually stamps it
 printf '{"ts":"2026-08-20T00:00:00Z","reviewers":{"codex":{"status":"ok","duration_s":5,"wall_over_budget":true}},"round_wall_s":99999,"trailing_reviewer":{"reviewer":"codex","duration_s":99999}}\n' >>"$WALLOG"
+# a top-level flag, should one ever land, is honoured too
+printf '{"ts":"2026-08-21T00:00:00Z","reviewers":{"codex":{"status":"ok","duration_s":5}},"round_wall_s":88888,"wall_over_budget":true,"trailing_reviewer":{"reviewer":"codex","duration_s":88888}}\n' >>"$WALLOG"
 N_WALL="$(wc -l <"$WALLOG" | tr -d ' ')"
-assert_eq "fixture has 10 entries" "$N_WALL" "10"
+assert_eq "fixture has 11 entries" "$N_WALL" "11"
 WALL_REPORT="$(CROSS_REVIEW_RUNLOG="$WALLOG" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
 assert_contains "report prints round wall-clock p50" "$WALL_REPORT" "p50=140s"
 assert_contains "report prints the clean sample count" "$WALL_REPORT" "n=9"
-assert_contains "report names the sleep-suspect exclusion" "$WALL_REPORT" "1 sleep-suspect excluded"
+assert_contains "report names the sleep-suspect exclusion" "$WALL_REPORT" "2 sleep-suspect excluded"
+case "$WALL_REPORT" in
+  *"88888"*) bad "top-level wall_over_budget entry leaked into p50/p95 stats" ;;
+  *) ok "top-level wall_over_budget entry excluded from p50/p95 stats" ;;
+esac
+# 2 clean samples: no percentiles, an honest n=
+SMALLLOG="$T/runlog-small.jsonl"
+printf '{"ts":"2026-08-11T00:00:00Z","reviewers":{"codex":{"status":"ok","duration_s":5}},"round_wall_s":100,"trailing_reviewer":{"reviewer":"codex","duration_s":100}}\n{"ts":"2026-08-12T00:00:00Z","reviewers":{"codex":{"status":"ok","duration_s":5}},"round_wall_s":200,"trailing_reviewer":{"reviewer":"codex","duration_s":200}}\n' >"$SMALLLOG"
+SMALL_REPORT="$(CROSS_REVIEW_RUNLOG="$SMALLLOG" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
+assert_contains "2 clean samples: too few for percentiles" "$SMALL_REPORT" "n=2 clean sample(s) -- too few for percentiles"
+assert_not_contains "2 clean samples: no round p50 printed" "$SMALL_REPORT" "n=2  p50="
 assert_contains "report prints round wall-clock p95" "$WALL_REPORT" "p95=180s"
 case "$WALL_REPORT" in
   *"99999"*) bad "wall_over_budget entry leaked into p50/p95 stats" ;;
@@ -187,7 +206,7 @@ ROSTERLOG="$T/roster-runlog.jsonl"
 # never selected -- audit_roster.sh's starved condition (weight>0 in >=10
 # candidate rounds, draws==0).
 for i in $(seq 1 12); do
-  printf '{"ts":"2026-08-%sT00:00:00Z","reviewers":{"codex":{"status":"ok","duration_s":5}},"roster_decision":{"policy_version":"weighted-draw-v1","candidates":[{"reviewer":"codex","weight":10,"selected":true},{"reviewer":"grok","weight":5,"selected":false}]}}\n' "$i" >>"$ROSTERLOG"
+  printf '{"ts":"2026-08-%02dT00:00:00Z","reviewers":{"codex":{"status":"ok","duration_s":5}},"roster_decision":{"policy_version":"weighted-draw-v1","candidates":[{"reviewer":"codex","weight":10,"selected":true},{"reviewer":"grok","weight":5,"selected":false}]}}\n' "$i" >>"$ROSTERLOG"
 done
 ROSTER_REPORT="$(CROSS_REVIEW_RUNLOG="$ROSTERLOG" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
 assert_contains "report contains the roster draw audit section header" "$ROSTER_REPORT" "roster draw audit"

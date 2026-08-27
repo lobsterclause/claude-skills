@@ -365,7 +365,10 @@ phases_json="null"
 if [[ -n "$phases_file" ]]; then
   # shape check: a flat object of non-negative numbers, nothing else, so the
   # readers' "iterate a flat numeric object" assumption holds (minimax)
-  if [[ -f "$phases_file" ]] && ph="$(jq -ce 'select(type == "object" and (to_entries | all(.value | type == "number" and . >= 0)))' "$phases_file" 2>/dev/null)"; then
+  # -s: the file must hold exactly ONE object -- a JSON stream would make
+  # jq print several lines and the entry's --argjson would then crash,
+  # dropping the whole runlog entry (gemini-pro, PR #117 pass 2)
+  if [[ -f "$phases_file" ]] && ph="$(jq -sce 'if length == 1 and (.[0] | type == "object" and (to_entries | all(.value | type == "number" and . >= 0))) then .[0] else empty end' "$phases_file" 2>/dev/null)"; then
     phases_json="$ph"
   else
     echo "append_runlog: --phases file unreadable, invalid JSON, or not a flat object of non-negative numbers: $phases_file (omitting phases)" >&2
