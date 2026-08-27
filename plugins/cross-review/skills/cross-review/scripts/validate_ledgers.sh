@@ -122,8 +122,9 @@ read_current_schema_version() {
   # -f as well as -r: a FIFO or device would block grep forever; trailing
   # CR/spaces (a CRLF checkout) must not read as "unparseable" (gemini-pro)
   if [[ -f "$writer" && -r "$writer" ]]; then
-    v="$(grep -E '^SCHEMA_VERSION=' "$writer" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \r')"
-    if [[ "$v" =~ ^[0-9]+$ ]]; then
+    v="$(grep -m 1 -E '^SCHEMA_VERSION=' -- "$writer" 2>/dev/null | cut -d= -f2 | tr -d ' \t\r')"
+    # no leading zeros: bash arithmetic would read 08 as octal (gemini-pro)
+    if [[ "$v" =~ ^(0|[1-9][0-9]*)$ ]]; then
       printf -v "$target" '%s' "$v"
       return 0
     fi

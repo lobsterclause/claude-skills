@@ -164,6 +164,11 @@ printf 'SCHEMA_VERSION=3\r\n' >"$T/crlf-writers/append_runlog.sh"; printf 'SCHEM
 CRLFJ="$(CROSS_REVIEW_WRITERS_DIR="$T/crlf-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null)"
 assert_eq "a CRLF writer constant still parses (runlog current 3)" "$(printf '%s' "$CRLFJ" | jq -r '.runlog.current_schema_version')" "3"
 assert_eq "a trailing-space writer constant still parses (events current 2)" "$(printf '%s' "$CRLFJ" | jq -r '.events.current_schema_version')" "2"
+mkdir -p "$T/octal-writers"
+printf 'SCHEMA_VERSION=08\n' >"$T/octal-writers/append_runlog.sh"; printf 'SCHEMA_VERSION=1\t\n' >"$T/octal-writers/append_finding_event.sh"
+OCTJ="$(CROSS_REVIEW_WRITERS_DIR="$T/octal-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null)"
+assert_eq "a leading-zero constant falls back to 1 instead of an octal crash" "$(printf '%s' "$OCTJ" | jq -r '.runlog.current_schema_version')" "1"
+assert_eq "a tab-trailed constant still parses" "$(printf '%s' "$OCTJ" | jq -r '.events.current_schema_version')" "1"
 
 echo "── legacy no-ts rows (#111) ──"
 LEGLOG="$T/legacy-runlog.jsonl"
