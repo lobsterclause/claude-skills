@@ -137,7 +137,8 @@ result="$(printf '%s\n' "$window" | jq -c 'select(length > 0)' | jq -s '
       | ($e.roster_decision.candidates // []) as $cands
       | ($cands | map(.weight // 0)) as $w
       | ($cands | map(select(.selected == true)) | length) as $nsel
-      | (if $nsel > 3 then ($w | map(null))
+      | (if $nsel == 0 then ($w | map(0))
+         elif $nsel > 3 then ($w | map(null))
          else
            # incl(target, remaining index list, k)
            def incl($t; $r; $k):

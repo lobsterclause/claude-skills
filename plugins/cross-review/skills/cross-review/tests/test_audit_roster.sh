@@ -204,6 +204,13 @@ assert_eq "4 picks: expected is null, not a bound" "$(printf '%s' "$MP4" | jq -r
 assert_eq "4 picks: ratio is null" "$(printf '%s' "$MP4" | jq -r '.seats[] | select(.reviewer=="A") | .ratio')" "null"
 assert_contains "4 picks: text report prints n/a" "$(bash "$SCRIPT" --runlog "$MP4LOG" 2>&1)" "n/a"
 
+# An entry that drew nobody (e.g. a round run with explicit --reviewers)
+# contributes zero expectation, not a one-pick probability (codex, pass 3).
+MP0LOG="$T/multipick0.jsonl"
+jq -nc '{ts:"2026-07-06T00:00:00Z", roster_decision:{candidates:[
+  {reviewer:"A", weight:50, selected:false},{reviewer:"B", weight:50, selected:false}]}}' >"$MP0LOG"
+assert_eq "0 picks: expected is 0" "$(bash "$SCRIPT" --runlog "$MP0LOG" --json 2>&1 | jq -r '.seats[] | select(.reviewer=="A") | .expected')" "0"
+
 echo "── same-second entries and legacy tail ──"
 # Two entries in the same second: X drawn in the first, Y in the second, then
 # a legacy row 30 days later without roster_decision. rounds_since_drawn for X
