@@ -149,6 +149,87 @@ fi
 bash "$S/merge_raw_findings.sh" --raw >/dev/null 2>&1; assert_eq "--raw without a value exits 2" "$?" "2"
 bash "$S/merge_raw_findings.sh" --raw "$MRAW" --out "$T/m5.json" --emit-events r8 --repo-root "$T/does-not-exist" >/dev/null 2>&1; assert_eq "--repo-root that is not a directory exits 2" "$?" "2"
 
+echo "── (f) merge_raw_findings.sh: no attempt-file fallback; one-jq-pass dup tracking is byte-identical (#135, #134) ──"
+
+# (f1) [RED: fails on the fallback today] A raw dir with ONLY attempt-stamped
+# forensic copies (no final <slug>.stdout at all) must yield ZERO findings and
+# ZERO duplicate_merged events -- not a merge of every attempt file as if each
+# were its own reviewer.
+FRAW1="$T/fraw1"; mkdir -p "$FRAW1"
+cat >"$FRAW1/alpha.attempt1.stdout" <<'EOF'
+{"findings":[{"severity":"High","file":"a.sh","line":3,"snippet":"x","claim":"same finding"}]}
+EOF
+cp "$FRAW1/alpha.attempt1.stdout" "$FRAW1/alpha.attempt2.stdout"
+export CROSS_REVIEW_FINDING_EVENTS="$T/ev_f1.jsonl"
+bash "$S/merge_raw_findings.sh" --raw "$FRAW1" --out "$T/f1-merged.json" --emit-events rf1 >/dev/null 2>"$T/f1.err"
+RC_F1=$?
+unset CROSS_REVIEW_FINDING_EVENTS
+assert_eq "(f1) exits 0 with only attempt copies present" "$RC_F1" "0"
+assert_eq "(f1) zero-file fallback is gone: findings length is 0" \
+  "$(jq '.findings | length' "$T/f1-merged.json" 2>/dev/null)" "0"
+assert_eq "(f1) zero duplicate_merged events (nothing was ever a reviewer)" \
+  "$([[ -f "$T/ev_f1.jsonl" ]] && jq -r 'select(.event=="duplicate_merged")' "$T/ev_f1.jsonl" | jq -s 'length' || echo 0)" "0"
+
+# (f2) A raw dir with a final <slug>.stdout AND its attempt copy: the attempt
+# copy is still ignored (pre-existing behaviour, pinned again post-refactor).
+FRAW2="$T/fraw2"; mkdir -p "$FRAW2"
+cat >"$FRAW2/alpha.stdout" <<'EOF'
+{"findings":[{"severity":"High","file":"a.sh","line":3,"snippet":"x","claim":"finding one"},{"severity":"Low","file":"b.sh","line":9,"snippet":"y","claim":"finding two"}]}
+EOF
+cp "$FRAW2/alpha.stdout" "$FRAW2/alpha.attempt1.stdout"
+bash "$S/merge_raw_findings.sh" --raw "$FRAW2" --out "$T/f2-merged.json" >/dev/null 2>&1
+assert_eq "(f2) final stdout present -> attempt copy still ignored (count matches alpha.stdout alone)" \
+  "$(jq '.findings | length' "$T/f2-merged.json" 2>/dev/null)" "2"
+
+# (f3)/(f4) the one-jq-pass refactor of the dup_track loop emits byte-identical
+# duplicate_merged events. The expected values are PINNED from the pre-refactor
+# script (origin/master before #137, computed 2026-08-27) -- not re-derived
+# from git at test time: `git show HEAD:` became a tautology the moment the
+# refactor merged, and fails outright without history (cross-review of #137).
+# (f3) reuses the (d) fixture (alpha/beta/gamma, one true duplicate) with a
+# project namespace so ids are stable f-<hash> (not f-dup-*).
+F3_PINNED='{"claim_hash":"903adffd","event":"duplicate_merged","file":"a.sh","finding_id":"f-903adffd","first_reviewer":"alpha","local_id":null,"reviewer":"beta","run_id":"rf3","schema_version":1,"sources":["alpha","beta"]}'
+export CROSS_REVIEW_FINDING_EVENTS="$T/ev_f3_new.jsonl"
+bash "$S/merge_raw_findings.sh" --raw "$MRAW" --out "$T/f3-new.json" \
+  --emit-events rf3 --project test-project >/dev/null 2>&1
+unset CROSS_REVIEW_FINDING_EVENTS
+F3_NEW="$(jq -cS 'select(.event=="duplicate_merged") | del(.ts)' "$T/ev_f3_new.jsonl" 2>/dev/null | sort)"
+assert_eq "(f3) duplicate_merged event (minus ts) is byte-identical to the pre-refactor script's" "$F3_NEW" "$F3_PINNED"
+
+# (f4) a claim containing a literal tab and a "|" still dedupes correctly,
+# and its claim_hash matches what the ORIGINAL script computed (pinned) --
+# proving the one-jq-pass extraction normalizes/hashes identically to the
+# 3-4-call version it replaces.
+FRAW4="$T/fraw4"; mkdir -p "$FRAW4"
+# \\t in the printf format is a literal backslash+t two-char sequence in the
+# OUTPUT -- i.e. the JSON escape for a tab -- so the fixture file is valid
+# JSON (an unescaped raw tab byte inside a JSON string is NOT valid JSON and
+# jq would reject the whole file as unparsed).
+printf '{"findings":[{"severity":"High","file":"a|b.sh","line":1,"snippet":"x","claim":"weird\\tclaim | with a pipe"}]}\n' >"$FRAW4/alpha.stdout"
+printf '{"findings":[{"severity":"High","file":"a|b.sh","line":1,"snippet":"x","claim":"WEIRD\\tCLAIM | WITH A PIPE"}]}\n' >"$FRAW4/beta.stdout"
+export CROSS_REVIEW_FINDING_EVENTS="$T/ev_f4_new.jsonl"
+bash "$S/merge_raw_findings.sh" --raw "$FRAW4" --out "$T/f4-new.json" \
+  --emit-events rf4 --project test-project >/dev/null 2>&1
+unset CROSS_REVIEW_FINDING_EVENTS
+F4_HASH_NEW="$(jq -r 'select(.event=="duplicate_merged") | .claim_hash' "$T/ev_f4_new.jsonl" 2>/dev/null)"
+assert_eq "(f4) claim_hash for a tab+pipe claim matches the pre-refactor script's pinned hash" "$F4_HASH_NEW" "9fd6d1b1"
+
+# (f5) an attempt-only raw dir (zero surviving final files) must yield an empty
+# findings array under macOS /bin/bash 3.2 too: with the raw-glob fallback gone
+# (#135) the sorted array is really empty, and "${sorted[@]}" on an empty array
+# is an unbound-variable crash under set -u on bash < 4.4.
+if [[ -x /bin/bash ]]; then
+  FRAW5="$T/fraw5"; mkdir -p "$FRAW5"
+  printf '{"findings":[{"severity":"High","file":"z.sh","line":1,"snippet":"x","claim":"forensic retry only"}]}\n' >"$FRAW5/glm.attempt1.stdout"
+  F5_RC=0
+  /bin/bash "$S/merge_raw_findings.sh" --raw "$FRAW5" --out "$T/f5.json" >/dev/null 2>"$T/f5.err" || F5_RC=$?
+  assert_eq "(f5) attempt-only raw dir exits 0 under /bin/bash ($(/bin/bash -c 'echo $BASH_VERSION'))" "$F5_RC" "0"
+  assert_eq "(f5) attempt-only raw dir yields zero findings under /bin/bash" \
+    "$(jq -c '.findings' "$T/f5.json" 2>/dev/null)" "[]"
+  assert_eq "(f5) no unbound-variable error under /bin/bash" \
+    "$(grep -c 'unbound variable' "$T/f5.err")" "0"
+fi
+
 echo "── (e) SKILL.md carries the lifecycle wiring literally (grep test) ──"
 SKILL_MD="$SKILL_DIR/SKILL.md"
 assert_contains "(e) SKILL.md has parent_verified_dropped" "$(cat "$SKILL_MD")" "parent_verified_dropped"

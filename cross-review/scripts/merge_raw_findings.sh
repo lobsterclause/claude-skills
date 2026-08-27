@@ -140,7 +140,11 @@ for _f in "$raw"/*.stdout; do
   esac
   files+=("$_f")
 done
-[[ ${#files[@]} -eq 0 ]] && files=("$raw"/*.stdout)
+# No fallback to the raw glob when zero final files survive the exclusion
+# above: that used to re-admit every *.attempt<N>.stdout as if it were its
+# own reviewer whenever a lane's only surviving artifacts were forensic
+# retries, double-counting that reviewer's findings (#135). Zero final files
+# means zero findings -- same as any other reviewer that produced nothing.
 shopt -u nullglob
 # Sorted, deterministic iteration order (glob order is filesystem-dependent).
 # Bash-3.2-compatible (macOS default /bin/bash lacks mapfile/readarray): split
@@ -151,7 +155,10 @@ if [[ ${#files[@]} -gt 0 ]]; then
   unset IFS
 fi
 
-for f in "${sorted[@]}"; do
+# ${sorted[@]+"${sorted[@]}"}: an EMPTY array expanded as "${sorted[@]}" is an
+# "unbound variable" under set -u on bash < 4.4 (macOS /bin/bash is 3.2), and
+# since #135 removed the raw-glob fallback the array really can be empty.
+for f in ${sorted[@]+"${sorted[@]}"}; do
   base="$(basename "$f")"
   reviewer="${base%.stdout}"
 
@@ -172,10 +179,30 @@ for f in "${sorted[@]}"; do
       # reviewer order, then this reviewer's own array order) — the later
       # reduce over this file relies on that order to know which reviewer
       # was first for a given (file, claim) pair.
-      while IFS= read -r finding; do
-        file="$(jq -r '.file // ""' <<<"$finding")"
-        claim="$(jq -r '.claim // ""' <<<"$finding")"
-        local_id="$(jq -r '.id // ""' <<<"$finding")"
+      #
+      # Before (#134): 3 jq invocations to pull file/claim/id off each
+      # finding one field at a time, plus a 4th to build the dup_track line
+      # -- 4 jq calls per finding. After: ONE jq -j pass extracts file/claim/id
+      # for EVERY finding in this reviewer's array (not per finding), joined
+      # with \x1e between findings and \x1f between fields (jq's own
+      # convention would be @tsv, but @tsv's per-field escaping turns an
+      # embedded real tab into the two literal characters "\t", which would
+      # normalize/hash differently than the ORIGINAL field-at-a-time jq -r
+      # extraction did -- \x1f can't appear in ordinary text, so it round-trips
+      # the raw bytes exactly, keeping the hash input identical). The hash
+      # itself is computed in the bash loop as before (never jq). Building
+      # the dup_track line still needs one jq -nc call per finding for
+      # correct JSON string escaping of arbitrary reviewer-supplied text --
+      # so this is 1 (whole reviewer) + 1-per-finding, down from 4-per-finding.
+      while IFS= read -r -d $'\x1e' record; do
+        # Split the record with parameter expansion, not a per-finding
+        # process substitution + three reads: zero forks, and no read that
+        # hits EOF with rc=1 (cross-review pass 2 of #137). \x1f cannot occur
+        # inside the fields, so the first/last-match splits are exact.
+        file="${record%%$'\x1f'*}"
+        rest="${record#*$'\x1f'}"
+        claim="${rest%%$'\x1f'*}"
+        local_id="${rest#*$'\x1f'}"
         claim_norm="$(printf '%s' "$claim" \
           | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' \
           | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
@@ -191,7 +218,8 @@ for f in "${sorted[@]}"; do
           --arg claim "$claim_norm" --arg local_id "$local_id" \
           '{hash: $hash, reviewer: $reviewer, file: $file, claim: $claim,
             local_id: ($local_id | if . == "" then null else . end)}' >>"$dup_track"
-      done < <(printf '%s' "$parsed" | jq -c '.[]')
+      done < <(printf '%s' "$parsed" \
+        | jq -j '.[] | (.file // ""), "\u001f", (.claim // ""), "\u001f", (.id // ""), "\u001e"')
     fi
   else
     echo "unparsed: $reviewer" >&2
