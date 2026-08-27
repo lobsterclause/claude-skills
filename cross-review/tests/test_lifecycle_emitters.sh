@@ -147,6 +147,7 @@ else
   ok "merge reports the failed append (skipped as root)"
 fi
 bash "$S/merge_raw_findings.sh" --raw >/dev/null 2>&1; assert_eq "--raw without a value exits 2" "$?" "2"
+bash "$S/merge_raw_findings.sh" --raw "$MRAW" --out "$T/m5.json" --emit-events r8 --repo-root "$T/does-not-exist" >/dev/null 2>&1; assert_eq "--repo-root that is not a directory exits 2" "$?" "2"
 
 echo "── (e) SKILL.md carries the lifecycle wiring literally (grep test) ──"
 SKILL_MD="$SKILL_DIR/SKILL.md"

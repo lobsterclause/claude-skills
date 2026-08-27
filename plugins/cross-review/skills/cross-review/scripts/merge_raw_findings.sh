@@ -24,7 +24,7 @@
 # input is prose) — partial extraction from whichever reviewers cooperated is
 # the whole point; a fully-prose round should not look like a script failure.
 #
-# Usage: merge_raw_findings.sh --raw <dir> --out <findings.json> [--emit-events <run_id>]
+# Usage: merge_raw_findings.sh --raw <dir> --out <findings.json> [--emit-events <run_id>] (--emit-events <run_id> [--project <name> | --repo-root <dir>])
 #
 # --emit-events <run_id>: optional, additive (#88). This script never merges
 # same-file/same-claim findings from different reviewers into one output row
@@ -79,13 +79,16 @@ if [[ -n "$project" && -n "$repo_root" ]]; then
   echo "merge_raw_findings: --project and --repo-root are mutually exclusive" >&2; exit 2
 fi
 if [[ -n "$repo_root" ]]; then
+  # derive_project requires a real directory (a failed cd would fall back
+  # to $PWD and mint a wrong namespace -- antigravity, PR #131 pass 2)
+  [[ -d "$repo_root" ]] || { echo "merge_raw_findings: --repo-root is not a directory: $repo_root" >&2; exit 2; }
   # shellcheck source=lib_project_namespace.sh
   source "$(cd "$(dirname "$0")" && pwd)/lib_project_namespace.sh"
   project="$(derive_project "$repo_root")"
 fi
 
 if [[ -z "$raw" || -z "$out" ]]; then
-  echo "usage: $0 --raw <dir> --out <findings.json>" >&2
+  echo "usage: $0 --raw <dir> --out <findings.json> [--emit-events <run_id> (--project <name> | --repo-root <dir>)]" >&2
   exit 2
 fi
 
