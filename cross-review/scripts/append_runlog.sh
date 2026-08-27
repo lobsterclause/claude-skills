@@ -46,7 +46,13 @@
 #       and omits the key.
 #
 # round_wall_s and trailing_reviewer need no flag — they are derived:
-#   round_wall_s      now (UTC) minus `$run_dir/context.json`'s `started_at`
+#   round_wall_s      now minus `$run_dir/context.json`'s `started_at`, both
+#                     on the LOCAL clock worktree.sh stamps (so the delta is
+#                     TZ-safe; DST jumps are the one known skew). It measures
+#                     from THIS run_dir's worktree start: per pass when each
+#                     pass starts its own worktree (the documented flow), or
+#                     cumulative if a caller reuses one run_dir across passes.
+#                     Omitted unless it parses to 0..604800 seconds.
 #                     (worktree.sh start's own "%Y%m%dT%H%M%S" stamp),
 #                     computed only when that file and field exist.
 #   trailing_reviewer {reviewer, duration_s} of whichever reviewer meta
@@ -330,14 +336,16 @@ kimi27_json=$(enrich_with_findings kimi27 "$(reviewer_obj kimi27)")
 kimi3_json=$(enrich_with_findings kimi3 "$(reviewer_obj kimi3)")
 
 # round_wall_s (#91): derived, no flag. worktree.sh start's context.json
-# stamps `started_at` as "%Y%m%dT%H%M%S" (UTC — see worktree.sh's `ts=`).
-# Fail-open like --roster-decision: missing file, missing field, or
-# malformed JSON just omits the key rather than blocking the append. jq's
-# strptime/mktime are used (not OS `date` flavor) so this is portable
+# stamps `started_at` as "%Y%m%dT%H%M%S" on the LOCAL clock (`date` without
+# -u) -- so "now" is taken on the same clock; mixing in `date -u` skewed the
+# value by the TZ offset (antigravity + #118, PR #117 review). Fail-open
+# like --roster-decision: missing file, missing field, malformed JSON, or a
+# value outside 0..7 days just omits the key rather than blocking the append.
+# jq's strptime/mktime are used (not OS `date` flavor) so this is portable
 # between macOS and Linux runners.
 round_wall_s_val=""
 if [[ -f "$run_dir/context.json" ]]; then
-  now_compact="$(date -u +%Y%m%dT%H%M%S)"
+  now_compact="$(date +%Y%m%dT%H%M%S)"
   round_wall_s_val="$(jq -e -r --arg now "$now_compact" '
       (.started_at // empty) as $sa
       | if ($sa | length) == 0 then empty
@@ -345,16 +353,22 @@ if [[ -f "$run_dir/context.json" ]]; then
               - ($sa  | strptime("%Y%m%dT%H%M%S") | mktime))
         end
     ' "$run_dir/context.json" 2>/dev/null)"
+  if [[ -n "$round_wall_s_val" ]] && ! { [[ "$round_wall_s_val" =~ ^[0-9]+$ ]] && [[ "$round_wall_s_val" -le 604800 ]]; }; then
+    echo "append_runlog: round_wall_s '$round_wall_s_val' is outside 0..604800s (bad started_at?) -- omitting" >&2
+    round_wall_s_val=""
+  fi
 fi
 
 # --phases (#91): additive, fail-open on a missing/unreadable file — losing
 # phase telemetry must never block a runlog append.
 phases_json="null"
 if [[ -n "$phases_file" ]]; then
-  if [[ -f "$phases_file" ]] && ph="$(jq -c . "$phases_file" 2>/dev/null)"; then
+  # shape check: a flat object of non-negative numbers, nothing else, so the
+  # readers' "iterate a flat numeric object" assumption holds (minimax)
+  if [[ -f "$phases_file" ]] && ph="$(jq -ce 'select(type == "object" and (to_entries | all(.value | type == "number" and . >= 0)))' "$phases_file" 2>/dev/null)"; then
     phases_json="$ph"
   else
-    echo "append_runlog: --phases file unreadable or invalid JSON: $phases_file (omitting phases)" >&2
+    echo "append_runlog: --phases file unreadable, invalid JSON, or not a flat object of non-negative numbers: $phases_file (omitting phases)" >&2
   fi
 fi
 

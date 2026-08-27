@@ -31,12 +31,13 @@ assert_contains() {
 }
 
 # UTC epoch->compact-stamp helper, portable across BSD (macOS) and GNU date.
+# LOCAL-clock stamp, the same clock worktree.sh uses for started_at
 utc_stamp_for_epoch() {
   local epoch="$1"
-  if date -u -r 0 +%Y%m%dT%H%M%S >/dev/null 2>&1; then
-    date -u -r "$epoch" +%Y%m%dT%H%M%S
+  if date -r 0 +%Y%m%dT%H%M%S >/dev/null 2>&1; then
+    date -r "$epoch" +%Y%m%dT%H%M%S
   else
-    date -u -d "@$epoch" +%Y%m%dT%H%M%S
+    date -d "@$epoch" +%Y%m%dT%H%M%S
   fi
 }
 
@@ -55,8 +56,8 @@ CROSS_REVIEW_RUNLOG="$LOG_A" bash "$S/append_runlog.sh" \
   --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
 ENTRY_A="$(tail -1 "$LOG_A")"
 RWS_A="$(jq -r '.round_wall_s' <<<"$ENTRY_A")"
-if [[ "$RWS_A" =~ ^[0-9]+$ ]] && [[ "$RWS_A" -ge 90 ]]; then
-  ok "round_wall_s >= 90 from a context.json started 90s ago (got $RWS_A)"
+if [[ "$RWS_A" =~ ^[0-9]+$ ]] && [[ "$RWS_A" -ge 89 && "$RWS_A" -le 121 ]]; then
+  ok "round_wall_s in 89..121 from a context.json started 90s ago (got $RWS_A)"
 else
   bad "round_wall_s >= 90 from a context.json started 90s ago (got: '$RWS_A' want: >=90)"
 fi
@@ -133,6 +134,19 @@ assert_contains "report lists model completeness" "$COMP_REPORT" "model="
 assert_contains "report lists cost_usd completeness" "$COMP_REPORT" "cost_usd="
 assert_contains "report lists context_access completeness" "$COMP_REPORT" "context_access="
 
+# ── (a2) an absurd started_at (year 2000) is omitted, not stamped; a phases
+#     file that is not a flat numeric object is omitted with a warning.
+RUN_A2="$T/run-a2"; mkdir -p "$RUN_A2/raw"
+printf '{"started_at":"20000101T000000"}\n' >"$RUN_A2/context.json"
+printf '{"exit_code":0,"duration_s":30,"timed_out":false,"output_bytes":10,"attempt":1,"timeout_budget_s":300}\n' >"$RUN_A2/raw/codex.meta.json"
+LOG_A2="$T/runlog-a2.jsonl"; : >"$LOG_A2"
+printf '{"worktree_s": 1, "nested": {"x": 1}}\n' >"$T/bad-phases.json"
+CROSS_REVIEW_RUNLOG="$LOG_A2" bash "$S/append_runlog.sh" --run-dir "$RUN_A2" --project t --base main --pr - --pass 1 --verdict CLEAN --run-id r-a2 --phases "$T/bad-phases.json" >/dev/null 2>"$T/err-a2.txt"
+assert_eq "out-of-range started_at: round_wall_s omitted" "$(jq -r 'has("round_wall_s")' "$LOG_A2")" "false"
+assert_contains "out-of-range started_at is reported" "$(cat "$T/err-a2.txt")" "outside 0..604800"
+assert_eq "non-numeric phases file: phases omitted" "$(jq -r 'has("phases")' "$LOG_A2")" "false"
+assert_contains "non-numeric phases file is reported" "$(cat "$T/err-a2.txt")" "flat object"
+
 # ── fixture (f): round wall-clock p50/p95 exclude wall_over_budget, critical
 # path table ──────────────────────────────────────────────────────────────
 echo "── analyze_runlog.sh: round wall-clock stats + critical path (#91) ──"
@@ -149,11 +163,14 @@ for d in "${durs[@]}"; do
     "$idx" "$d" "$trailer" "$d" >>"$WALLOG"
 done
 # 10th entry: sleep-suspect, must be excluded from p50/p95.
-printf '{"ts":"2026-08-20T00:00:00Z","reviewers":{"codex":{"status":"ok","duration_s":5}},"round_wall_s":99999,"wall_over_budget":true,"trailing_reviewer":{"reviewer":"codex","duration_s":99999}}\n' >>"$WALLOG"
+# the flag lives on the REVIEWER row, where run_reviewers.sh actually stamps it
+printf '{"ts":"2026-08-20T00:00:00Z","reviewers":{"codex":{"status":"ok","duration_s":5,"wall_over_budget":true}},"round_wall_s":99999,"trailing_reviewer":{"reviewer":"codex","duration_s":99999}}\n' >>"$WALLOG"
 N_WALL="$(wc -l <"$WALLOG" | tr -d ' ')"
 assert_eq "fixture has 10 entries" "$N_WALL" "10"
 WALL_REPORT="$(CROSS_REVIEW_RUNLOG="$WALLOG" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
 assert_contains "report prints round wall-clock p50" "$WALL_REPORT" "p50=140s"
+assert_contains "report prints the clean sample count" "$WALL_REPORT" "n=9"
+assert_contains "report names the sleep-suspect exclusion" "$WALL_REPORT" "1 sleep-suspect excluded"
 assert_contains "report prints round wall-clock p95" "$WALL_REPORT" "p95=180s"
 case "$WALL_REPORT" in
   *"99999"*) bad "wall_over_budget entry leaked into p50/p95 stats" ;;
@@ -169,14 +186,14 @@ ROSTERLOG="$T/roster-runlog.jsonl"
 # 12 entries where "grok" always has positive weight as a candidate but is
 # never selected -- audit_roster.sh's starved condition (weight>0 in >=10
 # candidate rounds, draws==0).
-for i in $(seq -w 1 12); do
+for i in $(seq 1 12); do
   printf '{"ts":"2026-08-%sT00:00:00Z","reviewers":{"codex":{"status":"ok","duration_s":5}},"roster_decision":{"policy_version":"weighted-draw-v1","candidates":[{"reviewer":"codex","weight":10,"selected":true},{"reviewer":"grok","weight":5,"selected":false}]}}\n' "$i" >>"$ROSTERLOG"
 done
 ROSTER_REPORT="$(CROSS_REVIEW_RUNLOG="$ROSTERLOG" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
 assert_contains "report contains the roster draw audit section header" "$ROSTER_REPORT" "roster draw audit"
 assert_contains "report surfaces the starved seat" "$ROSTER_REPORT" "grok starved"
 ROSTER_WARN="$(CROSS_REVIEW_RUNLOG="$ROSTERLOG" bash "$S/analyze_runlog.sh" --mode warn 2>&1)"
-assert_contains "warn mode surfaces the starved-seat WARN line" "$ROSTER_WARN" "WARN grok starved"
+assert_contains "warn mode surfaces the starved-seat WARN line, indented" "$ROSTER_WARN" "  WARN grok starved"
 
 echo ""
 echo "══ $PASS passed, $FAIL failed ══"

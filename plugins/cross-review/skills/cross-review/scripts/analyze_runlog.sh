@@ -172,16 +172,23 @@ done
 # in this script. Sleep-suspect rounds (`wall_over_budget: true` on the
 # entry) are excluded from wall-clock stats, matching the existing
 # sleep_suspect handling for per-reviewer duration stats above.
+# A round is sleep-suspect when any reviewer row carries wall_over_budget --
+# append_runlog.sh never stamps it at the entry top level (antigravity +
+# codex, PR #117 review); a top-level flag is honoured too if one ever lands.
 round_wall_stats=$(printf '%s\n' "$structured" | jq -s '
-  map(select(.round_wall_s != null and (.wall_over_budget // false) == false)) as $clean
-  | (map(select((.wall_over_budget // false) == true)) | length) as $suspect
+  def sleep_suspect: ((.wall_over_budget // false) == true)
+    or ((.reviewers // {}) | to_entries | any(.value.wall_over_budget == true));
+  map(select(.round_wall_s != null and (sleep_suspect | not))) as $clean
+  | (map(select(.round_wall_s != null and sleep_suspect)) | length) as $suspect
   | ($clean | map(.round_wall_s) | sort) as $durs
   | ($durs | length) as $dn
-  | (if $dn == 0 then null else $durs[($dn / 2 | floor)] end) as $p50
-  | (if $dn == 0 then null else $durs[($dn * 0.95 | floor) | (if . >= $dn then $dn - 1 else . end)] end) as $p95
-  | ($clean | map(select(.trailing_reviewer != null))) as $trailed
+  # percentiles need a sample: below 3 they are just the min/max in disguise
+  | (if $dn < 3 then null else $durs[($dn / 2 | floor)] end) as $p50
+  | (if $dn < 3 then null else $durs[($dn * 0.95 | floor) | (if . >= $dn then $dn - 1 else . end)] end) as $p95
+  | ($clean | map(select(.trailing_reviewer.reviewer != null and .trailing_reviewer.duration_s != null))) as $trailed
   | (($trailed | map(.trailing_reviewer.duration_s) | add) // 0) as $trail_sum
-  | (($clean | map(.round_wall_s) | add) // 0) as $wall_sum
+  # same denominator population as the numerator (antigravity)
+  | (($trailed | map(.round_wall_s) | add) // 0) as $wall_sum
   | (if $wall_sum == 0 then null else (($trail_sum * 100) / $wall_sum | floor) end) as $trail_share
   | ($trailed | reduce .[] as $e ({}; .[$e.trailing_reviewer.reviewer] += 1)) as $crit_path
   | { n_clean: $dn, sleep_suspect: $suspect,
@@ -228,7 +235,12 @@ completeness10=$(printf '%s\n' "$last10_structured" | jq -s "$completeness_filte
 # (which would agree today but silently diverge if the two scripts' default
 # precedence ever changes).
 roster_audit_out() {
-  "$(dirname "$0")/audit_roster.sh" --recent "$recent" --runlog "$runlog" 2>&1
+  local a="$(dirname "$0")/audit_roster.sh"
+  if [[ -x "$a" ]]; then
+    "$a" --recent "$recent" --runlog "$runlog" 2>&1
+  else
+    echo "roster audit unavailable: $a missing or not executable" >&2
+  fi
 }
 
 # Suggest timeout bump if p95 is within 10% of current budget OR timeout rate >20%.
@@ -357,8 +369,11 @@ case "$mode" in
     jq -r '
       if .n_clean == 0 then
         "  no clean round_wall_s samples in window" + (if .sleep_suspect > 0 then " (\(.sleep_suspect) sleep-suspect excluded)" else "" end)
+      elif .n_clean < 3 then
+        "  n=\(.n_clean) clean sample(s) -- too few for percentiles  trailer_share=\(.trailer_share_pct // "—")%" +
+        (if .sleep_suspect > 0 then "  (\(.sleep_suspect) sleep-suspect excluded)" else "" end)
       else
-        "  p50=\(.p50_round_wall_s)s  p95=\(.p95_round_wall_s)s  trailer_share=\(.trailer_share_pct // "—")%" +
+        "  n=\(.n_clean)  p50=\(.p50_round_wall_s)s  p95=\(.p95_round_wall_s)s  trailer_share=\(.trailer_share_pct // "—")%" +
         (if .sleep_suspect > 0 then "  (\(.sleep_suspect) sleep-suspect excluded)" else "" end)
       end' <<<"$round_wall_stats"
     echo "  critical path (times each seat was the trailer):"
