@@ -86,16 +86,60 @@ Two checks, because one is not enough:
 the *caller* having push access; the workflow token here holds `contents: read`,
 so the call 403s, `perm` comes back empty for everyone, and the gate falls back
 to the association — the very thing step 2 exists to replace. A warning naming
-the reason goes to the job log, and the status carries `(standing unverified)`,
-so it degrades loudly rather than silently. But it degrades.
+the reason goes to the job log, the status carries `(standing unverified)`, and
+under Actions the run gets a **`::warning` annotation** (run summary and the
+PR's Checks tab) plus a step-summary paragraph — once per run — so the
+degradation is visible without opening a green job's log. It degrades loudly
+rather than silently. But it degrades.
 
-To actually get step 2:
+To actually get step 2, give the `Report cross-review currency` step a token
+that can read repository permissions and make an unreadable one a refusal:
 
 ```yaml
 env:
-  GH_TOKEN: ${{ secrets.CROSS_REVIEW_TOKEN }}   # PAT or App token, repo admin
+  GH_TOKEN: ${{ steps.app.outputs.token }}     # or secrets.CROSS_REVIEW_TOKEN
   CR_PERMISSION_UNREADABLE: refuse
 ```
+
+**Prefer a GitHub App token over a PAT.** A PAT couples the gate to one
+person's account: it expires with them, it carries every repo they can see,
+and it walks out the door when they do. An App is installed on exactly the
+repos that need it, its token lives ~1 hour, and it has no human attached:
+
+```yaml
+      - name: Mint a token that can read repository permissions
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.CROSS_REVIEW_APP_ID }}
+          private-key: ${{ secrets.CROSS_REVIEW_APP_KEY }}
+          # Scope the token to this repo only; grant the App the narrowest
+          # permission set that makes the call below succeed and no more.
+          repositories: ${{ github.event.repository.name }}
+```
+
+Verify the token actually works before setting `refuse`, in a one-off step,
+against an account that is a non-owner collaborator:
+
+```bash
+gh api "repos/$GITHUB_REPOSITORY/collaborators/<login>/permission" --jq .permission
+```
+
+If that prints `write`/`admin`/`maintain`, the check is on. If it 403s, the
+token still cannot make the call — `refuse` would turn the gate permanently
+red, which is the failure mode this design exists to avoid.
+
+**Is there a read-scope endpoint that resolves write access?** Not that we
+have found. Every collaborator endpoint (`/collaborators`,
+`/collaborators/{login}`, `/collaborators/{login}/permission`) is documented
+as requiring the caller to have write, maintain, or admin on the repository,
+and the workflow token's `permissions:` block cannot grant that to a job
+that must stay `contents: read`. The PR's own `reviewDecision` (GraphQL)
+reflects branch-protection evaluation, which only counts approvals from
+write-access accounts — but it is a PR-level verdict, not a per-record one,
+and it says nothing about who posted a `## Cross-review` comment. If you find
+one, replace the lookup in `fetch_comments`; the tests already cover both
+policies.
 
 `refuse` is not the default, and deliberately so: on the stock token it would
 turn every repo permanently red, and a permanently red gate gets switched off
