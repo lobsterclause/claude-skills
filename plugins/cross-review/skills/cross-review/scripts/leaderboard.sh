@@ -122,6 +122,76 @@
 # The events ledger path defaults to finding_events.jsonl next to the runlog;
 # CROSS_REVIEW_FINDING_EVENTS overrides it (fixture tests only, same contract
 # as CROSS_REVIEW_RUNLOG).
+#
+# MODEL EPOCHS (#90): a seat's `.reviewers[$r].model` may change over time
+# (a swap to a new model behind the same seat name). Scoring keys on
+# (reviewer, model): a seat's rows are walked in append/ts order and split
+# into EPOCHS — rows before the first named model form the LEGACY epoch
+# (model: null); every model change opens a new epoch; a null-model row
+# (a round that didn't stamp model) inherits whichever epoch is already
+# open, it never opens one of its own once a named model has appeared. Only
+# the CURRENT (most recent) epoch's rows feed every scored/aggregate field
+# in a reviewer's row (attempts, ok, findings, the events-path axes, cost,
+# score, ...) — a swap starts that seat over on a clean slate, the same way
+# select_roster.sh already treats a genuinely new reviewer. Rows/events from
+# older epochs are excluded from that math entirely (events are additionally
+# joined by run_id against the CURRENT epoch's own run_ids, not just the
+# --recent window, so a corroborated finding from a retired model can never
+# leak into the new model's credit).
+#
+#   ROOKIE-PRIOR BLEND: this ONLY engages once a seat has swapped models at
+#   least once (epoch_count > 1) — a seat that has only ever run one model
+#   (every seat before this feature, and any seat whose profile never
+#   changes `model`) is never blended, so pre-#90 scores are unchanged. Once
+#   a seat is on its second-or-later epoch and that epoch has fewer than
+#   epoch_rookie_min_n (5, same sample-size precedent as the solo-discount
+#   guard above) samples, its raw epoch score is blended toward the rookie
+#   prior (50) in proportion to how under-sampled it is:
+#     weight = epoch_runs / epoch_rookie_min_n
+#     score  = round(weight * raw_epoch_score + (1 - weight) * 50)
+#   score_basis gets a "_blend" suffix (e.g. "events_blend") whenever this
+#   blend actually moved the score, so the table/report/json all show which
+#   scores are still provisional.
+#
+# `--mode json` additionally carries, per reviewer: `model` (current epoch's
+# model, string or null for legacy), `epoch_start` (ts of the first
+# current-epoch row), `epoch_runs` (row count in the current epoch), and
+# `previous_epochs` ([{model, runs, score}], most-recent-previous first,
+# each scored the same way but never blended — historical reference only,
+# not fed into the rotation draw). `--mode table` prints an indented line
+# per previous epoch under a seat that has swapped; `--mode report` prints
+# the epoch boundary date for every seat that has.
+#
+# TERMINAL EVENTS (#88): the events-path value/survival axes above now fold
+# in the newer finding_events.jsonl terminal events, matching the kept/
+# dropped vocabulary severity_calibration.sh already uses:
+#   parent_verified_dropped  — 0 credit, drives survival, same as
+#                               factcheck_dropped
+#   human_rejected            — 0 credit, drives survival (dropped)
+#   fix_verified               — the strongest positive signal: full credit
+#                               PLUS a bonus multiplier, fix_verified_bonus
+#                               (1.25, constant near the top of this file)
+#   duplicate_merged           — still a real finding, but discounted:
+#                               credit x duplicate_merged_discount (0.5)
+#   deferred                   — neutral: excluded from both the value
+#                               numerator and the survival denominator for
+#                               that finding, same treatment as an
+#                               unresolved finding with no terminal event
+#                               at all is NOT given (unresolved still scores
+#                               full credit today, unchanged by this PR) —
+#                               deferred is a deliberate "don't count this
+#                               one yet" signal, unresolved is "no verdict
+#                               reached".
+# The latest terminal event per (finding_id, run_id) in ledger order wins,
+# same precedence rule severity_calibration.sh uses.
+#
+# CONTEXT_MODE REPORT (#93): `--mode report` also prints a per-seat kept-
+# rate/drop-rate table broken down by `.reviewers[$r].context_mode`
+# (diff|files|tools) for any seat with >=5 rows in at least two of those
+# buckets over the window. A row with no context_mode but a context_access
+# is mapped: agent/workspace_read/tool_read -> tools, file_context/snapshot
+# -> files, diff_only -> diff; anything else -> unknown, excluded from the
+# buckets entirely.
 
 set -uo pipefail
 
@@ -200,6 +270,15 @@ solo_discount_min_n=5
 solo_discount_drop_rate_threshold=0.15
 solo_discount_factor=0.7
 
+# Model-epoch rookie-prior blend (#90) — see header comment. Only engages
+# once a seat has swapped models at least once; a single-epoch seat (every
+# seat before this feature) is never blended.
+epoch_rookie_min_n=5
+
+# Terminal-event credit adjustments (#88) — see header comment.
+fix_verified_bonus=1.25
+duplicate_merged_discount=0.5
+
 # provider_of <reviewer> — profile `.provider` wins, else the built-in map.
 provider_of() {
   local r="$1" p=""
@@ -252,7 +331,10 @@ score_reviewer() {
     --argjson baselines "$baselines" --argjson pricing "$pricing" \
     --argjson solo_discount_min_n "$solo_discount_min_n" \
     --argjson solo_discount_drop_rate_threshold "$solo_discount_drop_rate_threshold" \
-    --argjson solo_discount_factor "$solo_discount_factor" '
+    --argjson solo_discount_factor "$solo_discount_factor" \
+    --argjson epoch_rookie_min_n "$epoch_rookie_min_n" \
+    --argjson fix_verified_bonus "$fix_verified_bonus" \
+    --argjson duplicate_merged_discount "$duplicate_merged_discount" '
     # Fixed 2-decimal string formatter for the cost-per-kept fields (jq
     # numbers drop trailing zeros, so 0.1 would otherwise render "0.1" not
     # "0.10"). null in ("no kept findings" / "no cost data") -> em dash out,
@@ -266,21 +348,63 @@ score_reviewer() {
         | ($sign + (($a / 100) | floor | tostring) + "." +
            (($a % 100) | tostring | if length == 1 then "0" + . else . end))
       end;
-    map(.reviewers[$r] // {status:"skipped"}) as $rs
-    # Sleep-killed timeouts (2026-07-03): a timed_out sample whose wall-clock
-    # duration overran the ENFORCED budget by >60s means the machine slept
-    # mid-run (gtimeout/curl timers freeze during system sleep) — it says
-    # nothing about the provider and must not ding reliability. Excluded from
-    # the attempt set entirely. ok-status over-budget runs are KEPT: they
-    # delivered a review, and their durations feed the --fast speed signal.
-    | ($rs | map(select((.status == "timed_out")
-                        and ((.timeout_budget_s // 0) > 0)
-                        and ((.duration_s // 0) > ((.timeout_budget_s // 0) + 60))))
-           | length) as $sleep_excluded
-    | ($rs | map(select(.status != "skipped"
-                        and (((.status == "timed_out")
-                              and ((.timeout_budget_s // 0) > 0)
-                              and ((.duration_s // 0) > ((.timeout_budget_s // 0) + 60))) | not)))) as $attempts
+
+    # ── model epochs (#90) ──────────────────────────────────────────────
+    # Walk this reviewer rows (including skipped ones — they carry no
+    # model either way) in append/ts order, grouping into epochs by
+    # `.reviewers[$r].model`. Rows before the first named model form the
+    # LEGACY epoch (model: null); a model change opens a new epoch; a
+    # null-model row inherits whichever epoch is currently open (it never
+    # opens one of its own once a named model has appeared). The reviewer
+    # CURRENT epoch is the last one in this list — when no `model` field is
+    # ever stamped (every pre-#90 fixture), there is exactly one (legacy)
+    # epoch spanning the whole window, so nothing below changes behavior
+    # for a seat that has never swapped models.
+    (map({ts: .ts, run_id: (.run_id // null), rv: (.reviewers[$r] // {status:"skipped"}),
+           diff_lines: (.diff_size.lines // null)})
+     | map(select(.rv.status != "skipped"))) as $all_rows
+    | (reduce $all_rows[] as $row
+        ({epochs: []};
+         ($row.rv.model // null) as $m
+         | if $m == null then
+             (if (.epochs | length) == 0
+              then .epochs = [{model: null, rows: [$row]}]
+              else .epochs[-1].rows += [$row] end)
+           elif (.epochs | length) > 0 and $m == .epochs[-1].model then
+             .epochs[-1].rows += [$row]
+           else
+             .epochs += [{model: $m, rows: [$row]}]
+           end)
+      ).epochs as $epochs
+    | ($epochs | length) as $epoch_count
+    | (if $epoch_count == 0 then {model: null, rows: []} else $epochs[-1] end) as $cur_epoch
+    | ($cur_epoch.rows | length) as $epoch_runs
+    | (if $epoch_runs == 0 then null else ($cur_epoch.rows[0].ts // null) end) as $epoch_start
+    | (if $epoch_count > 1 then $epochs[0:-1] else [] end) as $prev_epochs_raw
+
+    # score_epoch($rows): the full per-epoch scoring pipeline (events / v1
+    # counts / telemetry-only / rookie — the formula documented at the top
+    # of this file) scoped to just this epoch own rows AND this epoch own
+    # run_ids, so a finding (or its corroboration) from a retired model can
+    # never leak into a new epoch credit.
+    | def score_epoch($rows):
+        ($rows | map(.rv)) as $rs
+        | ($rows | map(.run_id) | map(select(. != null))) as $run_ids
+        # Sleep-killed timeouts (2026-07-03): a timed_out sample whose
+        # wall-clock duration overran the ENFORCED budget by >60s means the
+        # machine slept mid-run (gtimeout/curl timers freeze during system
+        # sleep) — it says nothing about the provider and must not ding
+        # reliability. Excluded from the attempt set entirely. ok-status
+        # over-budget runs are KEPT: they delivered a review, and their
+        # durations feed the --fast speed signal.
+        | ($rs | map(select((.status == "timed_out")
+                            and ((.timeout_budget_s // 0) > 0)
+                            and ((.duration_s // 0) > ((.timeout_budget_s // 0) + 60))))
+               | length) as $sleep_excluded
+        | ($rs | map(select(.status != "skipped"
+                            and (((.status == "timed_out")
+                                  and ((.timeout_budget_s // 0) > 0)
+                                  and ((.duration_s // 0) > ((.timeout_budget_s // 0) + 60))) | not)))) as $attempts
     | ($attempts | length) as $n
     | ($attempts | map(select(.status == "ok"))    | length) as $ok
     | ($attempts | map(select(.status == "quota")) | length) as $quota
@@ -315,16 +439,16 @@ score_reviewer() {
     | ($durs | length) as $dn
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
     # tokens-per-diff-line (#92): average (tokens_prompt + tokens_completion)
-    # / diff_size.lines over structured entries that stamped BOTH this seats
-    # tokens and a diff line count for that round. `.` is still the full
-    # runlog-entry array here (every binding above uses `as`, which never
-    # reassigns the pipeline input).
-    | (map(select((.reviewers[$r].tokens_prompt // null) != null
-                  and (.reviewers[$r].tokens_completion // null) != null
-                  and (.diff_size.lines // null) != null
-                  and (.diff_size.lines // 0) > 0))
-       | map((((.reviewers[$r].tokens_prompt // 0) + (.reviewers[$r].tokens_completion // 0))
-              / .diff_size.lines))) as $tpl_samples
+    # / diff_size.lines over this epoch rows that stamped BOTH this seats
+    # tokens and a diff line count for that round. Scoped by $rows (not bare
+    # `.`) so this stays correct whether score_epoch is called on the
+    # current epoch directly or from inside a map() over previous epochs.
+    | ($rows | map(select((.rv.tokens_prompt // null) != null
+                  and (.rv.tokens_completion // null) != null
+                  and (.diff_lines // null) != null
+                  and (.diff_lines // 0) > 0))
+       | map((((.rv.tokens_prompt // 0) + (.rv.tokens_completion // 0))
+              / .diff_lines))) as $tpl_samples
     | (if ($tpl_samples | length) == 0 then null
        else ((($tpl_samples | add) / ($tpl_samples | length) * 10 | round) / 10) end) as $tokens_per_diff_line
     # kept findings (#92): terminal status per (finding_id, run_id), same
@@ -338,7 +462,8 @@ score_reviewer() {
        | map(select(.event as $e | ($kept_names + $term_dropped_names | index($e)) != null))
        | reduce .[] as $e ({}; .[([$e.finding_id, $e.run_id] | tojson)] =
            (if ($kept_names | index($e.event)) != null then "kept" else "dropped" end))) as $term_map
-    | ($events | map(select(.event == "proposed" and .reviewer == $r))
+    | ($events | map(select(.event == "proposed" and .reviewer == $r
+                             and (.run_id as $rid | $run_ids | index($rid)) != null))
                | unique_by([.finding_id, .run_id])
                | map(. + {kstatus: ($term_map[([.finding_id, .run_id] | tojson)] // "unresolved")})) as $props_terminal
     | ($props_terminal | map(select(.kstatus == "kept"))) as $kept_findings
@@ -362,33 +487,66 @@ score_reviewer() {
     # ── events path (v2): per-finding severity + unique-discovery credit ──
     # unique_by guards against a re-emitted (finding_id, run_id) pair; distinct
     # passes of the same PR mint distinct run_ids and legitimately count twice.
-    | ($events | map(select(.event == "proposed" and .reviewer == $r))
+    | ($events | map(select(.event == "proposed" and .reviewer == $r
+                             and (.run_id as $rid | $run_ids | index($rid)) != null))
                | unique_by([.finding_id, .run_id])) as $props
-    | ($events | map(select(.event == "factcheck_dropped")
-                     | {fid: .finding_id, rid: .run_id})) as $drop_keys
+    # Terminal-status map (#88): the LATEST terminal event per (finding_id,
+    # run_id) in ledger order wins, same precedence rule
+    # severity_calibration.sh uses. dropped/kept-ish/neutral vocabulary:
+    #   dropped          — factcheck_dropped, parent_verified_dropped,
+    #                       human_rejected: 0 credit, drives survival.
+    #   fix_verified     — strongest positive signal: full credit x
+    #                       fix_verified_bonus.
+    #   duplicate_merged — still real, but discounted: credit x
+    #                       duplicate_merged_discount.
+    #   deferred         — neutral: excluded from this finding value AND
+    #                       survival contribution entirely (unlike a plain
+    #                       unresolved finding with no terminal event at
+    #                       all, which still scores full credit today).
+    #   anything else (factcheck_kept/parent_verified_kept/human_accepted)
+    #   — plain kept: full credit, no adjustment.
+    | (["factcheck_dropped","parent_verified_dropped","human_rejected"]) as $dropped_ev_names
+    | (["factcheck_kept","parent_verified_kept","human_accepted"]) as $kept_ev_names
+    | ($events
+       | map(select(.event as $e
+                    | ($dropped_ev_names + $kept_ev_names + ["fix_verified","duplicate_merged","deferred"]
+                       | index($e)) != null))
+       | reduce .[] as $e ({}; .[([$e.finding_id, $e.run_id] | tojson)] =
+           (if ($dropped_ev_names | index($e.event)) != null then "dropped"
+            elif $e.event == "fix_verified" then "fix_verified"
+            elif $e.event == "duplicate_merged" then "duplicate_merged"
+            elif $e.event == "deferred" then "deferred"
+            else "kept" end))) as $term_map2
     | ($events | map(select(.event == "anchored" and .resolved == false)
                      | {fid: .finding_id, rid: .run_id})) as $unanch_keys
     | ($provmap[$r] // "unknown") as $rprov
-    # Own factcheck-drop rate for this reviewer over this window (same
-    # $props / $drop_keys the events path already builds) — precision signal
-    # for the solo-credit discount below. Below the minimum sample size,
-    # treat as unproven (rate 0, no discount) rather than penalize a thin
-    # sample.
+    # Own drop rate for this reviewer over this window (dropped-category
+    # findings from $term_map2, same vocabulary the events path already
+    # uses) — precision signal for the solo-credit discount below. Below
+    # the minimum sample size, treat as unproven (rate 0, no discount)
+    # rather than penalize a thin sample.
     | ($props | length) as $own_n
     | ($props | map(select(.finding_id as $fid | .run_id as $rid
-                            | ($drop_keys | any(.fid == $fid and .rid == $rid))))
+                            | ($term_map2[([$fid, $rid] | tojson)] // "unresolved") == "dropped"))
               | length) as $own_dropped
     | (if $own_n < $solo_discount_min_n then 0
        else ($own_dropped / $own_n) end) as $own_drop_rate
     | (if $own_drop_rate > $solo_discount_drop_rate_threshold
        then $solo_discount_factor else 1.0 end) as $solo_discount
+    # deferred findings are dropped from $evs entirely (map+select below) —
+    # neutral means excluded, not zero-credit (zero-credit still counts
+    # against survival; deferred counts against neither axis).
     | ($props | map(
         (if .severity == "Critical" then 5
          elif .severity == "High" then 3
          elif .severity == "Medium" then 2
          else 1 end) as $w
         | .finding_id as $fid | .run_id as $rid
-        | ($drop_keys   | any(.fid == $fid and .rid == $rid)) as $is_dropped
+        | ($term_map2[([$fid, $rid] | tojson)] // "unresolved") as $tstatus
+        | select($tstatus != "deferred")
+        | ($tstatus == "dropped") as $is_dropped
+        | ($tstatus == "fix_verified") as $is_fixverified
+        | ($tstatus == "duplicate_merged") as $is_dupe
         | ($unanch_keys | any(.fid == $fid and .rid == $rid)) as $is_unanch
         # null sources are legal upstream (score_findings.sh filters them the
         # same way; fingerprint may emit reviewer:null events) — filter before
@@ -399,8 +557,11 @@ score_reviewer() {
         | ($srcs | map(. as $s | $baselines | index($s) != null) | any) as $has_baseline
         | (if $is_solo then (1.0 * $solo_discount)
            elif $has_baseline then 0.7 else 0.85 end) as $tier
+        | ($tier * (if $is_unanch then 0.5 else 1 end)) as $base_credit
         | (if $is_dropped then 0
-           else ($tier * (if $is_unanch then 0.5 else 1 end)) end) as $credit
+           elif $is_fixverified then ($base_credit * $fix_verified_bonus)
+           elif $is_dupe then ($base_credit * $duplicate_merged_discount)
+           else $base_credit end) as $credit
         | {w: $w, credit: $credit, dropped: $is_dropped,
            solo: $is_solo, unanch: $is_unanch}
       )) as $evs
@@ -429,30 +590,59 @@ score_reviewer() {
        elif $findings > 0 then "counts"
        elif ($scored | length) == 0 then "telemetry"
        else "counts" end) as $basis
-    | { reviewer: $r,
-        provider: $provider,
-        attempts: $n,
-        ok: $ok,
-        quota: $quota,
-        reliability_pct: (if $rel == null then null else ($rel * 100 | round) end),
-        findings: $findings,
-        convergent: $convergent,
-        dropped: $dropped,
-        latest_status: $latest,
-        p50_duration_s: $p50,
-        avg_cost_usd: $avg_cost,
-        sleep_excluded: $sleep_excluded,
-        rookie: ($n == 0),
-        score_basis: $basis,
-        ev_findings: $ev_n,
-        ev_solo: $ev_solo,
-        ev_dropped: $ev_dropped,
-        ev_unanchored: $ev_unanchored,
-        cost_estimated: $cost_estimated,
-        cost_per_kept: $cost_per_kept,
+    | { n: $n, ok: $ok, quota: $quota, rel: $rel, latest: $latest,
+        p50: $p50, avg_cost: $avg_cost, cost_estimated: $cost_estimated,
+        sleep_excluded: $sleep_excluded, findings: $findings,
+        convergent: $convergent, dropped: $dropped,
+        ev_n: $ev_n, ev_solo: $ev_solo, ev_dropped: $ev_dropped,
+        ev_unanchored: $ev_unanchored, cost_per_kept: $cost_per_kept,
         cost_per_kept_ch: $cost_per_kept_ch,
         tokens_per_diff_line: $tokens_per_diff_line,
-        score: $score }
+        score: $score, basis: $basis }
+    ;
+
+    (score_epoch($cur_epoch.rows)) as $cur
+    # Rookie-prior blend (#90) — see header comment. Only engages once this
+    # seat has swapped models at least once; a single-epoch seat (every seat
+    # before this feature) is left completely unblended.
+    | (if $epoch_count > 1 and $epoch_runs > 0 and $epoch_runs < $epoch_rookie_min_n
+       then ($epoch_runs / $epoch_rookie_min_n)
+       else 1 end) as $blend_w
+    | (if $blend_w < 1
+       then (($blend_w * $cur.score) + ((1 - $blend_w) * 50) | round)
+       else $cur.score end) as $final_score
+    | (if $blend_w < 1 then ($cur.basis + "_blend") else $cur.basis end) as $final_basis
+    | ($prev_epochs_raw
+       | map({model: .model, runs: (.rows | length), score: (score_epoch(.rows).score)})
+       | reverse) as $previous_epochs
+    | { reviewer: $r,
+        provider: $provider,
+        attempts: $cur.n,
+        ok: $cur.ok,
+        quota: $cur.quota,
+        reliability_pct: (if $cur.rel == null then null else ($cur.rel * 100 | round) end),
+        findings: $cur.findings,
+        convergent: $cur.convergent,
+        dropped: $cur.dropped,
+        latest_status: $cur.latest,
+        p50_duration_s: $cur.p50,
+        avg_cost_usd: $cur.avg_cost,
+        sleep_excluded: $cur.sleep_excluded,
+        rookie: ($cur.n == 0),
+        score_basis: $final_basis,
+        ev_findings: $cur.ev_n,
+        ev_solo: $cur.ev_solo,
+        ev_dropped: $cur.ev_dropped,
+        ev_unanchored: $cur.ev_unanchored,
+        cost_estimated: $cur.cost_estimated,
+        cost_per_kept: $cur.cost_per_kept,
+        cost_per_kept_ch: $cur.cost_per_kept_ch,
+        tokens_per_diff_line: $cur.tokens_per_diff_line,
+        model: $cur_epoch.model,
+        epoch_start: $epoch_start,
+        epoch_runs: $epoch_runs,
+        previous_epochs: $previous_epochs,
+        score: $final_score }
   '
 }
 
@@ -473,7 +663,10 @@ print_table() {
   echo "── cross-review leaderboard (window: last $recent structured runs) ──"
   printf '%s' "$rows" | jq -s -r '
     sort_by(-.score) | to_entries[] |
-    "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if (.value.sleep_excluded // 0) > 0 then " (sleep-excl ×\(.value.sleep_excluded))" else "" end)\(if .value.score_basis == "events" then "  ·  ev: \(.value.ev_findings) findings, \(.value.ev_solo) solo, \(.value.ev_dropped) disproven\(if (.value.ev_unanchored // 0) > 0 then ", \(.value.ev_unanchored) unanchored" else "" end)" elif .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)"
+    "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)\(if (.value.score_basis | endswith("_blend")) then " (new-model rookie blend)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if (.value.sleep_excluded // 0) > 0 then " (sleep-excl ×\(.value.sleep_excluded))" else "" end)\(if (.value.score_basis | startswith("events")) then "  ·  ev: \(.value.ev_findings) findings, \(.value.ev_solo) solo, \(.value.ev_dropped) disproven\(if (.value.ev_unanchored // 0) > 0 then ", \(.value.ev_unanchored) unanchored" else "" end)" elif .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)\(if .value.model != null then "  ·  model \(.value.model)" else "" end)" +
+    (if (.value.previous_epochs | length) > 0 then
+       ([.value.previous_epochs[] | "\n        ↳ (prior epoch) \(.model // "legacy") — \(.runs) runs, score \(.score)"] | join(""))
+     else "" end)
   '
   echo "──"
   echo "  score = 45% reliability + 35% finding value + 20% fact-check survival"
@@ -482,6 +675,88 @@ print_table() {
   echo "   unanchored ×0.5, disproven 0 · rows without events use aggregate convergence counts"
   echo "   · telemetry-only, never enriched: reliability × decaying prior — 0.75 for <=3 ok"
   echo "   runs, -0.06/run beyond that, floor 0.15 · never-run reviewers: rookie prior 50)"
+  echo "  (a seat that has SWAPPED models scores only its current epoch's rows;"
+  echo "   prior epochs print as indented reference lines, never fed into the draw."
+  echo "   an under-sampled new epoch (<$epoch_rookie_min_n runs) blends toward the"
+  echo "   rookie prior 50, weighted by epoch_runs/$epoch_rookie_min_n)"
+}
+
+# print_epoch_report — #90: the epoch boundary date for every seat that has
+# swapped models at least once (single-epoch seats print nothing here).
+print_epoch_report() {
+  echo "── model epochs (seats that have swapped models) ──"
+  local body
+  body="$(printf '%s' "$rows" | jq -s -r '
+    map(select((.previous_epochs | length) > 0)) |
+    .[] | "  \(.reviewer) [\(.provider)] — now on \(.model // "legacy"), epoch started \((.epoch_start // "")[0:10]) (\(.epoch_runs) runs)  ·  \(.previous_epochs | length) previous epoch(s): " +
+          ([.previous_epochs[] | "\(.model // "legacy") (\(.runs) runs, score \(.score))"] | join(", "))
+  ')"
+  if [[ -z "$body" ]]; then
+    echo "  (no seat has swapped models in this window)"
+  else
+    printf '%s\n' "$body"
+  fi
+  echo "──"
+}
+
+# print_context_mode_report — #93: kept-rate/drop-rate broken down by
+# context_mode (diff|files|tools) for any seat with >=5 rows in at least two
+# of those buckets over the window. A row with no context_mode but a
+# context_access is mapped per the header comment; neither -> unknown,
+# excluded from the buckets entirely.
+print_context_mode_report() {
+  echo "── kept/drop rate by context_mode (seats with ≥5 rows in ≥2 modes) ──"
+  local out
+  out="$(printf '%s\n' "$structured" | jq -s --argjson events "$window_events" \
+    --argjson revs "$(printf '%s\n' "${REVIEWERS[@]}" | jq -R . | jq -cs .)" '
+    def ctx_mode(rv):
+      if (rv.context_mode // null) != null then rv.context_mode
+      else
+        (rv.context_access // null) as $ca
+        | if ($ca == "agent" or $ca == "workspace_read" or $ca == "tool_read") then "tools"
+          elif ($ca == "file_context" or $ca == "snapshot") then "files"
+          elif ($ca == "diff_only") then "diff"
+          else "unknown" end
+      end;
+    def kept_names: ["factcheck_kept","parent_verified_kept","fix_verified","human_accepted","duplicate_merged"];
+    def dropped_names: ["factcheck_dropped","parent_verified_dropped","human_rejected"];
+    . as $rows
+    | ($events
+       | map(select(.event as $e | ((kept_names + dropped_names) | index($e)) != null))
+       | reduce .[] as $e ({}; .[([$e.finding_id, $e.run_id] | tojson)] =
+           (if (kept_names | index($e.event)) != null then "kept" else "dropped" end))
+      ) as $term_map
+    | [ $revs[] as $r |
+        ($rows | map({run_id: (.run_id // null), rv: (.reviewers[$r] // null)})
+               | map(select(.rv != null and .rv.status != "skipped"))
+               | map(. + {mode: ctx_mode(.rv)})
+               | map(select(.mode != "unknown"))) as $rrows
+        | ($rrows | group_by(.mode) | map({mode: .[0].mode, run_ids: [.[].run_id], n: length})) as $buckets
+        | select(($buckets | map(select(.n >= 5)) | length) >= 2)
+        | { reviewer: $r,
+            buckets: [ $buckets[] | select(.n >= 5) | . as $b |
+              ($events | map(select(.event == "proposed" and .reviewer == $r
+                                     and (.run_id as $rid | $b.run_ids | index($rid)) != null))
+                       | unique_by([.finding_id, .run_id])) as $props
+              | ($props | map(.finding_id as $fid | .run_id as $rid
+                              | ($term_map[([$fid, $rid] | tojson)] // "unresolved"))) as $statuses
+              | ($statuses | map(select(. == "kept")) | length) as $k
+              | ($statuses | map(select(. == "dropped")) | length) as $d
+              | { mode: $b.mode, rows: $b.n, resolved: ($k + $d),
+                  kept_rate: (if ($k + $d) == 0 then null else (($k / ($k + $d)) * 100 | round) end),
+                  drop_rate: (if ($k + $d) == 0 then null else (($d / ($k + $d)) * 100 | round) end) }
+            ] } ]
+    | .[]
+  ' 2>/dev/null)"
+  if [[ -z "$out" ]]; then
+    echo "  (no seat has ≥5 rows in ≥2 context_mode buckets this window)"
+  else
+    printf '%s' "$out" | jq -s -r '
+      .[] | "  " + .reviewer + ": " +
+        ([.buckets[] | "\(.mode) kept=\(.kept_rate // "—")% drop=\(.drop_rate // "—")% (n=\(.rows), resolved=\(.resolved))"] | join("  ·  "))
+    '
+  fi
+  echo "──"
 }
 
 # print_cost_report — #92/#105: per-seat $/kept-finding, a fleet $/round line
@@ -546,6 +821,10 @@ case "$mode" in
     ;;
   report)
     print_table
+    echo
+    print_epoch_report
+    echo
+    print_context_mode_report
     echo
     print_cost_report
     ;;
