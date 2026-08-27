@@ -287,10 +287,11 @@ Every reviewer whose stdout parsed cleanly is folded into `findings.premerged.js
 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/score_findings.sh \
-  --findings "$run_dir/findings.json" --out "$run_dir/findings.scored.json"
+  --findings "$run_dir/findings.json" --meta-dir "$run_dir/raw" \
+  --out "$run_dir/findings.scored.json"
 ```
 
-`score_findings.sh` computes `providers`, `provider_votes`, `convergent`, `disposition` (from the `skip_unless_convergent`/`high_precision`/`trust_if_convergent` priors), and `rank_score` — the provider-vote and prior arithmetic below is now encoded there; trust its output over head-math.
+`score_findings.sh` computes `providers`, `provider_votes`, `context_access`, `capability_votes`, `convergent`, `disposition` (from the `skip_unless_convergent`/`high_precision`/`trust_if_convergent` priors), and `rank_score` — the provider-vote, capability and prior arithmetic below is encoded there; trust its output over head-math. **Pass `--meta-dir "$run_dir/raw"`**: that is where each seat's `meta.json` says what it could actually see this run (`context_access`). Without it the scorer assumes every text-only seat saw only the hunk, which under-counts — never over-trusts — and it prints a hint when that assumption changed a verdict.
 
 Read the remaining **unparsed** files under `raw/` yourself — for those free-form outputs you (the model) are still the extractor. For each such file:
 
@@ -328,11 +329,13 @@ When multiple reviewers flag the same issue at different severities, take the hi
 
 **Provider independence matters more than reviewer count.** `antigravity` and `gemini-pro` are the same provider (Google/Gemini, both via `agy`) — if only those two agree, that's effectively *one* independent vote, not two. Every profile in `reviewer_profiles.json` carries an explicit `provider` field (openai, google, moonshot, zhipu, deepseek, xiaomi, minimax, sakana, cohere, nvidia) — count convergence by distinct providers, not reviewer names. Weight a codex+gemini-pro+kimi agreement far above an antigravity+gemini-pro agreement even though both are "two reviewers." Routing wrinkle: the OpenRouter pool rides one router but each model is its own provider vote — OpenRouter is a router, not a provider. See `reviewer_profiles.json` `_synthesis_rules.provider_independence`.
 
+**Capability is the second independence axis.** The provider rule exists because two seats sharing a model share a blind spot. Two seats sharing an *input truncation* share one for the same reason: if neither could see past the hunk, their agreement is the same inference from the same partial input, not corroboration — that is how the false portability Highs and the "this invalidates the suite" claims got as far as they did looking corroborated. `score_findings.sh` therefore weights each provider's vote by the best `context_access` among its seats (`agent` / `workspace_read` / `file_context` / `snapshot` = 1.0, `diff_only` = 0.5; `_synthesis_rules.context_access_weights`) and a finding is `convergent` only when `provider_votes >= 2` **and** `capability_votes >= 1.5` (`_synthesis_rules.convergence_min_capability`). In practice: codex + one hunk-only seat converges (1.5); two hunk-only seats do not (1.0), however many providers they are; three hunk-only seats do (1.5). Where the floor blocked an agreement the finding carries a `convergence_note` naming each seat's access — read it before treating that agreement as evidence. A seat's access comes from its dispatch lane (`prompt_style`), upgraded by what `run_reviewers.sh` recorded in `meta.json` for this run (step 2.5's whole-file block makes the text-only seats `file_context`), never from a hand-maintained field.
+
 **Apply per-reviewer priors from `references/reviewer_profiles.json` when triaging:**
 
-- A finding tagged `skip_unless_convergent` for that reviewer's severity should be dropped if no other reviewer flagged the same area. Codex P3 nits and kimi Low/nit findings are the typical examples. (For "convergent" here, prefer a *different-provider* corroboration — antigravity backing gemini-pro doesn't lift a `skip_unless_convergent` finding much, since they're one provider.)
+- A finding tagged `skip_unless_convergent` for that reviewer's severity should be dropped unless it is `convergent` in the scorer's sense above. Codex P3 nits and kimi Low/nit findings are the typical examples. (Antigravity backing gemini-pro doesn't lift a `skip_unless_convergent` finding, since they're one provider — and neither does a second hunk-only seat backing a first.)
 - A finding tagged `high_precision` (codex P1 today) should rank as near-certain real even if solo.
-- `trust_if_convergent` means: keep when 2+ reviewers agree on it; downgrade or move to "verify" when solo.
+- `trust_if_convergent` means: keep when the finding is `convergent`; downgrade or move to "verify" when it is not — solo, same-provider, or hunk-only agreement alike.
 - When two reviewers disagree on severity, break the tie with `synthesis_weight` (higher weight wins).
 
 These priors live in `reviewer_profiles.json` — read once at synthesis time, edit there (not inline) when tuning. The analyzer's `--mode report` will eventually suggest edits to these values based on observed convergence and precision rates.
