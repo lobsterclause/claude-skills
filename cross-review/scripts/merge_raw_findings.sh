@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
     --out)         need_val "$1" "$#"; out="$2";                shift 2 ;;
     --emit-events) need_val "$1" "$#"; emit_events_run_id="$2"; shift 2 ;;
     --project)     need_val "$1" "$#"; project="$2";            shift 2 ;;
-    --repo-root)   need_val "$1" "$#"; repo_root="$2";          shift 2 ;;
+    --repo-root)   need_val "$1" "$#"; repo_root="$2"; [[ -n "$repo_root" ]] || { echo "merge_raw_findings: --repo-root needs a non-empty path" >&2; exit 2; }; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -79,9 +79,10 @@ if [[ -n "$project" && -n "$repo_root" ]]; then
   echo "merge_raw_findings: --project and --repo-root are mutually exclusive" >&2; exit 2
 fi
 if [[ -n "$repo_root" ]]; then
-  # derive_project requires a real directory (a failed cd would fall back
-  # to $PWD and mint a wrong namespace -- antigravity, PR #131 pass 2)
-  [[ -d "$repo_root" ]] || { echo "merge_raw_findings: --repo-root is not a directory: $repo_root" >&2; exit 2; }
+  # derive_project requires an enterable directory: on a failed cd its
+  # `$(cd ... && pwd -P)` yields "" and every bad path would collide into
+  # the same "path:" namespace (antigravity + gemini-pro, PR #131 review)
+  [[ -d "$repo_root" && -x "$repo_root" ]] || { echo "merge_raw_findings: --repo-root is not an enterable directory: $repo_root" >&2; exit 2; }
   # shellcheck source=lib_project_namespace.sh
   source "$(cd "$(dirname "$0")" && pwd)/lib_project_namespace.sh"
   project="$(derive_project "$repo_root")"
