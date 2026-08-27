@@ -229,6 +229,110 @@ jq '.line_range = ["7", "7"]' "$PLANTED" >"$T/planted-s.json"
 bash "$S/grade_planted.sh" --planted "$T/planted-s.json" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --out "$T/g7g.json" >/dev/null 2>&1
 assert_eq "line_range of numeric strings exits 2" "$?" "2"
 
+# ── 8. --judge agy: a per-candidate factcheck-lane verdict gates credit ─────
+# Fake agy on PATH ($T/bin, prepended only for these invocations — mirrors
+# run_tests.sh's PATH-shim convention). FAKE_JUDGE_ANSWER selects the canned
+# verdict so we can drive yes/no/garbage/fail without a real model.
+mkdir -p "$T/bin"
+cat >"$T/bin/agy" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "models" ]; then printf "Gemini 3.7 Flash (High)\n"; exit 0; fi
+case "$FAKE_JUDGE_ANSWER" in
+  yes) printf "Yes. This matches the planted nullish-coalescing weakening exactly.\n" ;;
+  no)  printf "No. This does not describe the planted defect.\n" ;;
+  garbage) printf "Unclear, cannot determine either way.\n" ;;
+  fail) exit 1 ;;
+  *) printf "Yes.\n" ;;
+esac
+SHIM
+chmod +x "$T/bin/agy"
+
+# (a) shim answers "no" for the sole matched candidate -> codex+kimi demoted,
+# nobody credited by it (kat was already missed — different file/out of window).
+OUT8A="$T/grade8a.json"
+FAKE_JUDGE_ANSWER=no PATH="$T/bin:$PATH" bash "$S/grade_planted.sh" --planted "$PLANTED" \
+  --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" \
+  --judge agy --out "$OUT8A" >/dev/null 2>"$T/err8a.txt"
+assert_eq "judge agy no: exits 0" "$?" "0"
+assert_eq "judge agy no: codex+kimi demoted to missed alongside kat" \
+  "$(jq -r '.missed[]' "$OUT8A" | sort | tr '\n' ',')" "codex,kat,kimi,"
+assert_eq "judge agy no: nobody caught" "$(jq -r '.caught | length' "$OUT8A")" "0"
+assert_eq "judge agy no: candidates[0].judge.verdict == no" \
+  "$(jq -r '.candidates[0].judge.verdict' "$OUT8A")" "no"
+
+# (b) shim answers "yes" -> caught, judged: true
+OUT8B="$T/grade8b.json"
+FAKE_JUDGE_ANSWER=yes PATH="$T/bin:$PATH" bash "$S/grade_planted.sh" --planted "$PLANTED" \
+  --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" \
+  --judge agy --out "$OUT8B" >/dev/null 2>"$T/err8b.txt"
+assert_eq "judge agy yes: codex+kimi caught" \
+  "$(jq -r '.caught[].reviewer' "$OUT8B" | sort | tr '\n' ',')" "codex,kimi,"
+assert_eq "judge agy yes: codex judged true" \
+  "$(jq -r '.caught[] | select(.reviewer=="codex") | .judged' "$OUT8B")" "true"
+assert_eq "judge agy yes: candidates[0].judge.verdict == yes" \
+  "$(jq -r '.candidates[0].judge.verdict' "$OUT8B")" "yes"
+
+# (c) shim exits 1 -> fail-open: still caught, judge.verdict == unavailable
+OUT8C="$T/grade8c.json"
+FAKE_JUDGE_ANSWER=fail PATH="$T/bin:$PATH" bash "$S/grade_planted.sh" --planted "$PLANTED" \
+  --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" \
+  --judge agy --out "$OUT8C" >/dev/null 2>"$T/err8c.txt"
+assert_eq "judge agy unavailable (agy exits 1): codex+kimi still caught (fail-open)" \
+  "$(jq -r '.caught[].reviewer' "$OUT8C" | sort | tr '\n' ',')" "codex,kimi,"
+assert_eq "judge agy unavailable: candidates[0].judge.verdict == unavailable" \
+  "$(jq -r '.candidates[0].judge.verdict' "$OUT8C")" "unavailable"
+assert_eq "judge agy unavailable: codex judged false" \
+  "$(jq -r '.caught[] | select(.reviewer=="codex") | .judged' "$OUT8C")" "false"
+
+# ── 9. --judge openrouter: request carries the planted mutation + candidate
+#      claim, and the API key never leaks to stdout/stderr ─────────────────
+cat >"$T/bin/curl" <<SHIM
+#!/bin/sh
+prev=""
+for a in "\$@"; do
+  case "\$prev" in
+    -d) case "\$a" in @*) cat "\${a#@}" > "$T/req.json" ;; esac ;;
+  esac
+  prev="\$a"
+done
+if [ "\$FAKE_JUDGE_ANSWER" = "no" ]; then
+  printf '{"choices":[{"message":{"content":"No. Does not match the planted mutation."}}]}\n'
+else
+  printf '{"choices":[{"message":{"content":"Yes. Matches the planted mutation exactly."}}]}\n'
+fi
+SHIM
+chmod +x "$T/bin/curl"
+
+OUT9="$T/grade9.json"
+FAKE_JUDGE_ANSWER=no OPENROUTER_API_KEY="sk-or-SECRET" PATH="$T/bin:$PATH" \
+  bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" \
+  --roster "$ROSTER" --project "$PROJECT" --judge openrouter --out "$OUT9" \
+  >"$T/out9.txt" 2>"$T/err9.txt"
+assert_eq "judge openrouter no: exits 0" "$?" "0"
+assert_eq "judge openrouter no: codex+kimi missed alongside kat" \
+  "$(jq -r '.missed[]' "$OUT9" | sort | tr '\n' ',')" "codex,kat,kimi,"
+assert_contains "openrouter judge request body carries the planted mutated_line" \
+  "$(cat "$T/req.json" 2>/dev/null)" "opts.timeout || 5000"
+assert_contains "openrouter judge request body carries the candidate claim" \
+  "$(cat "$T/req.json" 2>/dev/null)" "nullish coalescing weakened to logical OR"
+if grep -q 'SECRET' "$T/out9.txt" "$T/err9.txt" 2>/dev/null; then
+  bad "OpenRouter API key is never echoed to stdout/stderr"
+else
+  ok "OpenRouter API key is never echoed to stdout/stderr"
+fi
+rm -f "$T/bin/curl" "$T/req.json"
+
+# ── 10. --judge none: output unchanged for the base fixture ────────────────
+OUT10="$T/grade10.json"
+bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" \
+  --roster "$ROSTER" --project "$PROJECT" --judge none --out "$OUT10" >/dev/null 2>"$T/err10.txt"
+assert_eq "judge none: candidates[0] stays a plain id string" \
+  "$(jq -r '.candidates[0]' "$OUT10")" "f-aaaa1111"
+assert_eq "judge none: caught codex has no judged key" \
+  "$(jq -r '.caught[] | select(.reviewer=="codex") | has("judged")' "$OUT10")" "false"
+assert_eq "judge none: recall unchanged" "$(jq -r '.recall' "$OUT10")" "0.67"
+rm -f "$T/bin/agy"
+
 echo ""
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1
