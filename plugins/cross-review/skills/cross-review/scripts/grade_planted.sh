@@ -117,6 +117,10 @@ usage="usage: $0 --planted <json> --findings <json> --roster a,b,c (--project <n
 [[ -f "$findings" ]] || { echo "grade_planted: findings file not found: $findings" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || { echo "grade_planted: jq required" >&2; exit 2; }
 [[ "$window" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "grade_planted: --window must be a non-negative integer (got '$window')" >&2; exit 2; }
+# A malformed findings file must not grade as "everyone missed" (codex + kimi,
+# PR #114 review): require a .findings array of objects up front.
+jq -e '.findings | type == "array" and all(.[]; type == "object")' "$findings" >/dev/null 2>&1 \
+  || { echo "grade_planted: $findings must contain a .findings array of objects" >&2; exit 2; }
 
 case "$judge" in
   none) ;;
@@ -160,6 +164,8 @@ p_expected_severity="$(jq -r '.expected_severity // ""' "$planted")"
 p_line0="$(jq -r '.line_range[0] // empty' "$planted")"
 p_line1="$(jq -r '.line_range[1] // empty' "$planted")"
 [[ -n "$p_file" && -n "$p_line0" && -n "$p_line1" ]] || { echo "grade_planted: planted.json missing file/line_range" >&2; exit 2; }
+[[ "$p_line0" =~ ^[1-9][0-9]*$ && "$p_line1" =~ ^[1-9][0-9]*$ && "$p_line0" -le "$p_line1" ]] \
+  || { echo "grade_planted: planted.json line_range must be two positive integers, low <= high (got [$p_line0, $p_line1])" >&2; exit 2; }
 
 planted_norm="$(printf '%s\x1f%s\x1f%s@%s' "$project" "$p_file" "$p_operator" "$p_line0")"
 planted_hash="$(printf '%s' "$planted_norm" | sha1_of)"
@@ -172,20 +178,27 @@ tmp_dir="$(mktemp -d)"; trap 'rm -rf "$tmp_dir"' EXIT
 cand_jsonl="$tmp_dir/candidates.jsonl"
 : > "$cand_jsonl"
 
+skipped_no_id=0
 while IFS= read -r f; do
   file="$(jq -r '.file // ""' <<<"$f")"
   [[ "$file" == "$p_file" ]] || continue
+  # a candidate without an id cannot be reported as matched_finding_id (kimi)
+  if [[ "$(jq -r '.id // ""' <<<"$f")" == "" ]]; then skipped_no_id=$((skipped_no_id + 1)); continue; fi
   resolved="$(jq -r '.anchor.resolved // false' <<<"$f")"
   if [[ "$resolved" == "true" ]]; then
     eff_line="$(jq -r '.anchor.start_line // 0' <<<"$f")"
   else
     eff_line="$(jq -r '.line // 0' <<<"$f")"
   fi
-  [[ "$eff_line" =~ ^-?[0-9]+$ ]] || continue
+  # line 0 / unknown line is "no location", never a match -- with a mutation
+  # planted near line 1 the window reaches <= 0 and an unanchored finding
+  # would otherwise land inside it (antigravity, PR #114 review)
+  [[ "$eff_line" =~ ^[1-9][0-9]*$ ]] || continue
   if [[ "$eff_line" -ge "$low" && "$eff_line" -le "$high" ]]; then
     jq -c '.' <<<"$f" >> "$cand_jsonl"
   fi
 done < <(jq -c '.findings[]' "$findings")
+[[ "$skipped_no_id" -gt 0 ]] && echo "grade_planted: WARN skipped $skipped_no_id finding(s) at the planted file with no id" >&2
 
 # Dedup candidate ids for the output "candidates" list, preserving first-seen order.
 candidates_json="$(jq -c -s '[.[].id] | reduce .[] as $id ([]; if index($id) then . else . + [$id] end)' "$cand_jsonl" 2>/dev/null || echo '[]')"
@@ -193,20 +206,27 @@ candidates_json="$(jq -c -s '[.[].id] | reduce .[] as $id ([]; if index($id) the
 
 caught_json="[]"
 missed_json="[]"
-IFS=',' read -r -a roster_arr <<< "$roster"
+# roster: trim whitespace and dedupe, so "codex, kimi" matches sources and
+# "codex,codex" does not double-count (kimi + antigravity, PR #114 review)
+roster_arr=()
+while IFS= read -r seat; do
+  [[ -n "$seat" ]] && roster_arr+=("$seat")
+done < <(printf '%s' "$roster" | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | awk 'NF && !seen[$0]++')
+[[ "${#roster_arr[@]}" -gt 0 ]] || { echo "grade_planted: --roster has no seats" >&2; exit 2; }
 for seat in "${roster_arr[@]}"; do
-  [[ -z "$seat" ]] && continue
   match="$(jq -c --arg seat "$seat" 'select((.sources // []) | index($seat) != null)' "$cand_jsonl" 2>/dev/null | head -n 1)"
   if [[ -n "$match" ]]; then
     matched_id="$(jq -r '.id' <<<"$match")"
     severity_called="$(jq -r '.severity // ""' <<<"$match")"
     if [[ "$severity_called" == "$p_expected_severity" ]]; then
-      accuracy="1.0"
+      accuracy="1.00"
     else
-      accuracy="0.5"
+      accuracy="0.50"
     fi
+    # 2-decimal STRINGS (same convention as severity_calibration.sh): a JSON
+    # number 1.0 renders as 1 on jq < 1.7 (codex + antigravity, PR #114 review)
     entry="$(jq -nc --arg reviewer "$seat" --arg matched_finding_id "$matched_id" \
-      --arg severity_called "$severity_called" --argjson severity_accuracy "$accuracy" \
+      --arg severity_called "$severity_called" --arg severity_accuracy "$accuracy" \
       '{reviewer: $reviewer, matched_finding_id: $matched_finding_id, severity_called: $severity_called, severity_accuracy: $severity_accuracy}')"
     caught_json="$(jq -c --argjson e "$entry" '. + [$e]' <<<"$caught_json")"
   else
@@ -223,6 +243,9 @@ else
   recall="$(awk -v c="$caught_n" -v t="$total_n" 'BEGIN{printf "%.2f", c/t}')"
 fi
 
+out_dir="$(dirname "$out")"
+mkdir -p "$out_dir" 2>/dev/null || { echo "grade_planted: cannot create output directory $out_dir" >&2; exit 2; }
+out_tmp="$(mktemp "$out_dir/.grade.XXXXXX" 2>/dev/null)" || { echo "grade_planted: cannot write in $out_dir" >&2; exit 2; }
 jq -n \
   --arg run_id "$run_id" \
   --arg planted_id "$planted_id" \
@@ -234,7 +257,8 @@ jq -n \
   --argjson caught "$caught_json" \
   --argjson missed "$missed_json" \
   --argjson candidates "$candidates_json" \
-  --argjson recall "$recall" \
+  --arg recall "$recall" \
+  --argjson recall_raw "$( [[ "$total_n" -eq 0 ]] && echo 0 || awk -v c="$caught_n" -v t="$total_n" 'BEGIN{printf "%.4f", c/t}')" \
   '{
     schema_version: 1,
     synthetic: true,
@@ -244,8 +268,12 @@ jq -n \
     caught: $caught,
     missed: $missed,
     candidates: $candidates,
-    recall: $recall
-  }' > "$out"
+    recall: $recall,
+    recall_raw: $recall_raw
+  }' > "$out_tmp" || { rm -f "$out_tmp"; echo "grade_planted: failed to build $out" >&2; exit 2; }
+# write-then-rename so a failure never leaves a partial grade.json behind
+# (kimi High / codex Medium, PR #114 review)
+mv -f "$out_tmp" "$out" || { rm -f "$out_tmp"; echo "grade_planted: failed to write $out" >&2; exit 2; }
 
 echo "grade_planted: $caught_n/$total_n seat(s) caught the planted defect (recall $recall)" >&2
 
@@ -263,7 +291,7 @@ if [[ "$emit_events" -eq 1 ]]; then
     severity_accuracy="$(jq -r '.severity_accuracy' <<<"$c")"
     fields="$(jq -nc --arg reviewer "$reviewer" --arg matched_finding_id "$matched_finding_id" \
       --arg severity_called "$severity_called" --arg expected_severity "$p_expected_severity" \
-      --argjson severity_accuracy "$severity_accuracy" \
+      --arg severity_accuracy "$severity_accuracy" \
       '{reviewer: $reviewer, matched_finding_id: $matched_finding_id, severity_called: $severity_called, expected_severity: $expected_severity, severity_accuracy: $severity_accuracy}')"
     bash "$script_dir/append_finding_event.sh" --event caught --finding-id "$planted_id" \
       --run-id "$run_id" --fields "$fields"

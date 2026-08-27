@@ -113,9 +113,9 @@ MISSED_REVIEWERS="$(jq -r '.missed[]' "$OUT1" | sort | tr '\n' ',')"
 assert_eq "missed = kat" "$MISSED_REVIEWERS" "kat,"
 
 CODEX_ACC="$(jq -r '.caught[] | select(.reviewer=="codex") | .severity_accuracy' "$OUT1")"
-assert_eq "codex severity_accuracy 1.0" "$CODEX_ACC" "1.0"
+assert_eq "codex severity_accuracy 1.00" "$CODEX_ACC" "1.00"
 KIMI_ACC="$(jq -r '.caught[] | select(.reviewer=="kimi") | .severity_accuracy' "$OUT1")"
-assert_eq "kimi severity_accuracy 1.0" "$KIMI_ACC" "1.0"
+assert_eq "kimi severity_accuracy 1.00" "$KIMI_ACC" "1.00"
 
 RECALL1="$(jq -r '.recall' "$OUT1")"
 assert_eq "recall pinned format 0.67" "$RECALL1" "0.67"
@@ -148,7 +148,7 @@ OUT3="$T/grade3.json"
 bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" \
   --roster "$ROSTER" --project "$PROJECT" --out "$OUT3" >/dev/null 2>"$T/err3.txt"
 CODEX_ACC3="$(jq -r '.caught[] | select(.reviewer=="codex") | .severity_accuracy' "$OUT3")"
-assert_eq "medium call: severity_accuracy 0.5" "$CODEX_ACC3" "0.5"
+assert_eq "medium call: severity_accuracy 0.50" "$CODEX_ACC3" "0.50"
 mk_findings "High"
 
 # ── 4. --emit-events ────────────────────────────────────────────────────────
@@ -184,6 +184,37 @@ bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored
   --project "$PROJECT" --out "$T/grade6.json" >/dev/null 2>"$T/err6.txt"
 RC6=$?
 assert_eq "missing --roster exits 2" "$RC6" "2"
+
+# ── 7. PR #114 review: validation, roster hygiene, line-0 edge, output write ──
+mk_findings "High"
+printf '{"findings": "nope"}\n' >"$T/bad-findings.json"
+bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/bad-findings.json" --roster "$ROSTER" --project "$PROJECT" --out "$T/g7a.json" >/dev/null 2>&1
+assert_eq "findings without a .findings array exits 2" "$?" "2"
+jq '.line_range = ["seven", 7]' "$PLANTED" >"$T/bad-planted.json"
+bash "$S/grade_planted.sh" --planted "$T/bad-planted.json" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --out "$T/g7b.json" >/dev/null 2>&1
+assert_eq "non-integer line_range exits 2" "$?" "2"
+OUT7="$T/g7c.json"
+bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" --roster " codex , kimi,codex,kat" --project "$PROJECT" --out "$OUT7" >/dev/null 2>&1
+assert_eq "roster with spaces/duplicates: caught codex,kimi once each" "$(jq -r '.caught[].reviewer' "$OUT7" | sort | tr '\n' ',')" "codex,kimi,"
+assert_eq "roster with spaces/duplicates: recall over 3 unique seats" "$(jq -r '.recall' "$OUT7")" "0.67"
+assert_eq "recall_raw is numeric" "$(jq -r '.recall_raw * 100 | round' "$OUT7")" "67"
+# mutation at line 2: an unanchored finding with line 0 must NOT fall inside [-1, 5]
+jq '.line_range = [2, 2]' "$PLANTED" >"$T/planted-l2.json"
+cat >"$T/findings-l0.json" <<'EOF'
+{"findings": [{"id": "f-zero", "file": "src/a.ts", "line": 0, "severity": "High", "sources": ["codex"], "anchor": {"resolved": false, "start_line": 0, "end_line": 0, "side": "none"}}]}
+EOF
+bash "$S/grade_planted.sh" --planted "$T/planted-l2.json" --findings "$T/findings-l0.json" --roster "codex" --project "$PROJECT" --out "$T/g7d.json" >/dev/null 2>&1
+assert_eq "line-0 finding never matches a mutation near line 1" "$(jq -r '.missed | length' "$T/g7d.json")" "1"
+cat >"$T/findings-noid.json" <<'EOF'
+{"findings": [{"file": "src/a.ts", "line": 8, "severity": "High", "sources": ["codex"]}]}
+EOF
+bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings-noid.json" --roster "codex" --project "$PROJECT" --out "$T/g7e.json" >/dev/null 2>"$T/err7e.txt"
+assert_contains "id-less candidate is skipped with a WARN" "$(cat "$T/err7e.txt")" "no id"
+assert_eq "id-less candidate does not count as caught" "$(jq -r '.caught | length' "$T/g7e.json")" "0"
+mkdir -p "$T/ro" && chmod 500 "$T/ro"
+bash "$S/grade_planted.sh" --planted "$PLANTED" --findings "$T/findings.anchored.json" --roster "$ROSTER" --project "$PROJECT" --out "$T/ro/g.json" >/dev/null 2>&1
+RC7=$?; chmod 700 "$T/ro"
+assert_eq "unwritable output directory exits 2" "$RC7" "2"
 
 echo ""
 echo "PASS=$PASS FAIL=$FAIL"
