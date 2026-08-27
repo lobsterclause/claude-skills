@@ -89,7 +89,23 @@ fi
 [[ -z "$run_id" ]] && run_id="ci-planted-$seed"
 
 mkdir -p "$out" || { echo "planted_round: cannot create --out $out" >&2; exit 1; }
+# Absolute: several steps below run inside `( cd "$repo_root" && ... )`
+# subshells, where a relative --out would resolve against the target repo
+# instead of the caller's cwd (cross-review of #143).
+out="$(cd "$out" && pwd)"
 run_dir="$out/run"
+
+# The throwaway commits (the synthetic touch here, the mutation in
+# plant_mutation.sh) need an author. A pristine CI runner has none configured
+# and `git commit` would die with "Please tell me who you are"; supply one
+# via the environment ONLY when the repo has no identity of its own, so a
+# developer's local config is untouched (cross-review of #143).
+if [[ -z "$(git -C "$repo_root" config user.email 2>/dev/null)" ]]; then
+  export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-planted-round}"
+  export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-planted-round@localhost}"
+  export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-planted-round}"
+  export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-planted-round@localhost}"
+fi
 mkdir -p "$run_dir/raw"
 
 orig_ref="$(git -C "$repo_root" symbolic-ref --short -q HEAD || git -C "$repo_root" rev-parse HEAD)"
@@ -116,33 +132,52 @@ pick_fixture() {
     fi
     return 0
   fi
-  if [[ -f "$repo_root/evals/evals.json" ]]; then
-    printf 'evals/evals.json'
-    return 0
-  fi
-  # newest file (mtime desc) under cross-review/scripts/ with >=1 line
-  # matching an operator's regex for its own extension.
-  local scripts_root="$repo_root/cross-review/scripts"
-  [[ -d "$scripts_root" ]] || { echo "planted_round: no evals/evals.json and no cross-review/scripts/ under $repo_root" >&2; return 1; }
+  # auto: the newest TRACKED file anywhere under --repo-root whose extension
+  # has at least one operator and which contains a line matching one of
+  # them — the same match test plant_mutation.sh applies to candidate sites.
+  # (An earlier draft looked at evals/evals.json and cross-review/scripts/:
+  # .json and .sh have no operators, so auto could never succeed — flagged
+  # by cross-review of #143.) Falls back to the committed drill target
+  # cross-review/ci/fixtures/planted_target.ts for repos, like this one, with
+  # no tracked TypeScript/JavaScript of their own.
   local n_ops
   n_ops="$(jq 'length' "$operators_file")"
+  local ext_re
+  ext_re="$(jq -r '[.[].languages[]] | unique | join("|")' "$operators_file")"
+  [[ -n "$ext_re" ]] || { echo "planted_round: operators file lists no languages" >&2; return 1; }
+  local candidates
+  candidates="$(git -C "$repo_root" ls-files -z 2>/dev/null \
+    | tr '\0' '\n' | grep -E "\.(${ext_re})$" | grep -vE '(^|/)(node_modules|dist|build|vendor)/' \
+    | grep -vE '\.d\.ts$|/fixtures/planted_target\.' || true)"
+  local f
   while IFS= read -r f; do
-    local rel="${f#$repo_root/}"
-    local ext="${f##*.}"
-    local oi
-    for ((oi = 0; oi < n_ops; oi++)); do
-      local langs
-      langs="$(jq -r ".[$oi].languages | index(\"$ext\")" "$operators_file")"
-      [[ "$langs" == "null" ]] && continue
-      local match_re
-      match_re="$(jq -r ".[$oi].match" "$operators_file")"
-      if grep -Eq -- "$match_re" "$f" 2>/dev/null; then
-        printf '%s' "$rel"
-        return 0
-      fi
-    done
-  done < <(find "$scripts_root" -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null)
-  echo "planted_round: no fixture under $scripts_root has an applicable operator" >&2
+    [[ -n "$f" && -f "$repo_root/$f" ]] || continue
+    if fixture_line_for "$repo_root/$f" "${f##*.}" >/dev/null; then
+      printf '%s' "$f"
+      return 0
+    fi
+  done < <(printf '%s\n' "$candidates" | while IFS= read -r c; do [[ -n "$c" ]] && printf '%s\t%s\n' "$(stat -f %m "$repo_root/$c" 2>/dev/null || stat -c %Y "$repo_root/$c" 2>/dev/null || echo 0)" "$c"; done | sort -rn | cut -f2-)
+  local fallback="cross-review/ci/fixtures/planted_target.ts"
+  if [[ -f "$repo_root/$fallback" ]] && fixture_line_for "$repo_root/$fallback" ts >/dev/null; then
+    printf '%s' "$fallback"
+    return 0
+  fi
+  echo "planted_round: no tracked file under $repo_root has an applicable operator (and no $fallback)" >&2
+  return 1
+}
+
+# fixture_line_for <path> <ext> — prints the first line number in <path>
+# matching any operator defined for <ext>; returns 1 if none.
+fixture_line_for() {
+  local path="$1" fext="$2" n_ops oi langs match_re ln
+  n_ops="$(jq 'length' "$operators_file")"
+  for ((oi = 0; oi < n_ops; oi++)); do
+    langs="$(jq -r ".[$oi].languages | index(\"$fext\")" "$operators_file")"
+    [[ "$langs" == "null" ]] && continue
+    match_re="$(jq -r ".[$oi].match" "$operators_file")"
+    ln="$(grep -nE -- "$match_re" "$path" 2>/dev/null | head -n 1 | cut -d: -f1)"
+    if [[ -n "$ln" ]]; then printf '%s' "$ln"; return 0; fi
+  done
   return 1
 }
 
@@ -152,31 +187,20 @@ fixture_path="$repo_root/$fixture_rel"
 
 # ── synthetic touch: re-affirm an operator-matching line as an ADDED line
 #    on a throwaway commit, so plant_mutation.sh has a diff to work with ──
-n_ops="$(jq 'length' "$operators_file")"
 ext="${fixture_rel##*.}"
-touch_line_no=""
-for ((oi = 0; oi < n_ops; oi++)); do
-  langs="$(jq -r ".[$oi].languages | index(\"$ext\")" "$operators_file")"
-  [[ "$langs" == "null" ]] && continue
-  match_re="$(jq -r ".[$oi].match" "$operators_file")"
-  touch_line_no="$(grep -nE -- "$match_re" "$fixture_path" 2>/dev/null | head -n 1 | cut -d: -f1)"
-  [[ -n "$touch_line_no" ]] && break
-done
+touch_line_no="$(fixture_line_for "$fixture_path" "$ext")" || touch_line_no=""
 if [[ -z "$touch_line_no" ]]; then
   echo "planted_round: fixture '$fixture_rel' has no line matching any operator for its extension" >&2
   exit 2
 fi
 
 git -C "$repo_root" switch -c "$touch_branch" -q "$orig_ref" || { echo "planted_round: failed to create $touch_branch" >&2; exit 1; }
-# Re-write the matched line to itself: no semantic change, but git records
-# it as a removed+added pair, so it appears as an ADDED line to
-# plant_mutation.sh's diff parser.
-line_text="$(sed -n "${touch_line_no}p" "$fixture_path")"
-awk -v n="$touch_line_no" -v txt="$line_text" 'NR==n{print txt; next} {print}' "$fixture_path" >"$fixture_path.tmp" \
-  && mv "$fixture_path.tmp" "$fixture_path"
-# A pure rewrite-to-itself produces zero diff (git dedupes identical
-# content), so append one trailing space to force a real change while
-# preserving the operator match on the line.
+# Append one trailing space to the matched line: git records it as a
+# removed+added pair, so it appears as an ADDED line to plant_mutation.sh's
+# diff parser while the operator match on the line is preserved. (A prior
+# awk -v rewrite of the line to itself was both a no-op for git and unsafe —
+# awk -v interprets backslash escapes inside the line text; cross-review of
+# #143.)
 sed -i.bak -e "${touch_line_no}s/\$/ /" "$fixture_path"
 rm -f "$fixture_path.bak"
 git -C "$repo_root" add -- "$fixture_rel" || { echo "planted_round: git add failed" >&2; exit 1; }

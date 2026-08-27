@@ -920,7 +920,9 @@ print_context_mode_report() {
 # rounds print "—".
 print_recall_report() {
   echo "── mutation recall (synthetic planted rounds only) ──"
-  if [[ "$recall_json" == "[]" ]]; then
+  # recall_json always lists every known seat (with "—"), so the empty
+  # window is detected on the EVENTS, not on the table (cross-review of #143).
+  if [[ "$recall_events" == "[]" ]]; then
     echo "  (no planted rounds in this window)"
     echo "──"
     return

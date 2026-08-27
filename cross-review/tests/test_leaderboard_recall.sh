@@ -248,6 +248,74 @@ assert_eq "the synthetic runlog row carries the run_id" \
 REPO_STATUS="$(git -C "$REPO" status --porcelain 2>/dev/null)"
 assert_eq "the fixture repo is clean after the drill" "$REPO_STATUS" ""
 
+# (h2) --fixture auto picks a tracked .ts file (not the .sh/.json noise), with
+# NO git identity configured anywhere (a pristine CI runner) and a RELATIVE
+# --out given from a cwd that is not the repo root.
+echo "── (h2) planted_round.sh --fixture auto, no git identity, relative --out ──"
+REPO2="$T/target-repo-auto"
+mkdir -p "$REPO2/src" "$REPO2/scripts" "$REPO2/evals"
+printf 'echo "x && y"\n' >"$REPO2/scripts/noise.sh"
+printf '{"a":1}\n' >"$REPO2/evals/evals.json"
+cat >"$REPO2/src/foo.ts" <<'EOF'
+export function check(a: boolean, b: boolean): boolean {
+  return a && b;
+}
+EOF
+( cd "$REPO2" && git init -q -b main && git add -A \
+    && GIT_AUTHOR_NAME=seed GIT_AUTHOR_EMAIL=seed@x GIT_COMMITTER_NAME=seed GIT_COMMITTER_EMAIL=seed@x git commit -q -m init )
+PLANTED_RUNLOG2="$T/planted-runlog2.jsonl"; PLANTED_EVENTS2="$T/planted-events2.jsonl"
+: >"$PLANTED_RUNLOG2"; : >"$PLANTED_EVENTS2"
+mkdir -p "$T/cwd2"
+( cd "$T/cwd2" && PATH="$T/bin:$PATH" OPENROUTER_API_KEY="sk-or-test-shim" \
+    CROSS_REVIEW_RUNLOG="$PLANTED_RUNLOG2" CROSS_REVIEW_FINDING_EVENTS="$PLANTED_EVENTS2" \
+    HOME="$T/home-empty" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    bash "$CI_DIR/planted_round.sh" --repo-root "$REPO2" \
+      --operators-file "$SKILL_DIR/references/mutation_operators.json" \
+      --fixture auto --roster glm --seed 42 --run-id "ci-test-auto" \
+      --out "rel-out" >"$T/planted-round2.stdout" 2>"$T/planted-round2.stderr" )
+assert_eq "auto drill exits 0 with no git identity and a relative --out" "$?" "0"
+assert_eq "auto picked the tracked .ts file" "$(jq -r '.planted.file' "$T/cwd2/rel-out/grade.json" 2>/dev/null)" "src/foo.ts"
+assert_eq "relative --out resolved against the caller's cwd" "$([[ -f "$T/cwd2/rel-out/grade.json" ]] && echo yes || echo no)" "yes"
+assert_eq "auto drill left the repo clean" "$(git -C "$REPO2" status --porcelain 2>/dev/null)" ""
+
+# (h3) a repo with no tracked TS/JS falls back to the committed drill target.
+echo "── (h3) --fixture auto falls back to ci/fixtures/planted_target.ts ──"
+REPO3="$T/target-repo-fallback"
+mkdir -p "$REPO3/cross-review/ci/fixtures" "$REPO3/scripts"
+printf 'echo "only shell here"\n' >"$REPO3/scripts/a.sh"
+cp "$CI_DIR/fixtures/planted_target.ts" "$REPO3/cross-review/ci/fixtures/planted_target.ts"
+( cd "$REPO3" && git init -q -b main && git add -A \
+    && GIT_AUTHOR_NAME=seed GIT_AUTHOR_EMAIL=seed@x GIT_COMMITTER_NAME=seed GIT_COMMITTER_EMAIL=seed@x git commit -q -m init )
+PLANTED_RUNLOG3="$T/planted-runlog3.jsonl"; PLANTED_EVENTS3="$T/planted-events3.jsonl"
+: >"$PLANTED_RUNLOG3"; : >"$PLANTED_EVENTS3"
+PATH="$T/bin:$PATH" OPENROUTER_API_KEY="sk-or-test-shim" \
+  CROSS_REVIEW_RUNLOG="$PLANTED_RUNLOG3" CROSS_REVIEW_FINDING_EVENTS="$PLANTED_EVENTS3" \
+  HOME="$T/home-empty" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  bash "$CI_DIR/planted_round.sh" --repo-root "$REPO3" \
+    --operators-file "$SKILL_DIR/references/mutation_operators.json" \
+    --fixture auto --roster glm --seed 7 --run-id "ci-test-fallback" \
+    --out "$T/out3" >"$T/planted-round3.stdout" 2>"$T/planted-round3.stderr"
+assert_eq "fallback drill exits 0" "$?" "0"
+assert_eq "fallback picked the committed drill target" "$(jq -r '.planted.file' "$T/out3/grade.json" 2>/dev/null)" "cross-review/ci/fixtures/planted_target.ts"
+assert_eq "fallback drill left the repo clean" "$(git -C "$REPO3" status --porcelain 2>/dev/null)" ""
+
+# The committed drill target must offer every operator a site, so the seeded
+# draw can land on any class.
+N_OPS="$(jq 'length' "$SKILL_DIR/references/mutation_operators.json")"
+MATCHED=0
+for ((oi = 0; oi < N_OPS; oi++)); do
+  re="$(jq -r ".[$oi].match" "$SKILL_DIR/references/mutation_operators.json")"
+  grep -Eq -- "$re" "$CI_DIR/fixtures/planted_target.ts" && MATCHED=$((MATCHED + 1))
+done
+assert_eq "planted_target.ts matches every operator ($N_OPS)" "$MATCHED" "$N_OPS"
+
+# (i) --mode report with no planted rounds prints the empty-window line, not
+# 21 rows of "recall=—".
+echo "── (i) recall report on a window with no planted rounds ──"
+REPORT_EMPTY="$(CROSS_REVIEW_RUNLOG="$RUNLOG_WITHOUT" CROSS_REVIEW_FINDING_EVENTS="$EVENTS_WITHOUT" bash "$S/leaderboard.sh" --recent 200 --mode report 2>/dev/null)"
+assert_contains "empty window prints the no-planted-rounds line" "$REPORT_EMPTY" "(no planted rounds in this window)"
+assert_eq "empty window prints no per-seat recall rows" "$(grep -c 'all recall=' <<<"$REPORT_EMPTY")" "0"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]] || exit 1

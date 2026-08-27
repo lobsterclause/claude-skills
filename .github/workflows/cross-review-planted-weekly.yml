@@ -30,6 +30,9 @@ jobs:
         # to produce.
         run: |
           out="$RUNNER_TEMP/planted-round"
+          # Exported BEFORE the drill runs so the if: always() upload still
+          # finds raw/ and meta.json when the script exits non-zero.
+          echo "PLANTED_ROUND_OUT=$out" >> "$GITHUB_ENV"
           mkdir -p "$out"
           export CROSS_REVIEW_RUNLOG="$out/runlog.jsonl"
           export CROSS_REVIEW_FINDING_EVENTS="$out/finding_events.jsonl"
@@ -39,7 +42,6 @@ jobs:
             --fixture auto \
             --roster glm,deepseek,qwen \
             --out "$out"
-          echo "PLANTED_ROUND_OUT=$out" >> "$GITHUB_ENV"
 
       - name: Upload drill artifacts
         if: always()
