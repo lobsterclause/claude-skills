@@ -137,6 +137,14 @@ files=()
 for _f in "$raw"/*.stdout; do
   case "$(basename "$_f")" in
     *.attempt[0-9]*.stdout) continue ;;
+    # <slug>.primary-failed.stdout is the SAME reviewer's PRIOR (failed) attempt,
+    # preserved by maybe_or_fallback() in run_reviewers.sh only as forensic
+    # evidence that the primary lane is sick -- it sits alongside a successful
+    # <slug>.stdout from the fallback lane. The glob above only excluded
+    # *.attempt<N>.stdout, so a primary-failed file that happened to parse as
+    # findings JSON was merged as a second, fictitious reviewer named
+    # "<slug>.primary-failed" (#138).
+    *.primary-failed.stdout) continue ;;
   esac
   files+=("$_f")
 done
