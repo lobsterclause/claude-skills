@@ -189,6 +189,70 @@ VEROUT="$(bash "$S/validate_ledgers.sh" --runlog "$VERLOG" --events "$EVENTS" 2>
 assert_eq "a versioned row with no ts is still an ERROR (exit 1)" "$verrc" "1"
 assert_contains "versioned no-ts row reports missing ts" "$VEROUT" "missing ts"
 
+echo "── single-pass line extraction: parity + performance on a large fixture (#132) ──"
+# A fixture large enough to make the per-line-fork cost visible: mostly
+# valid rows, plus 3 malformed, 2 legacy no-ts, and 1 future schema_version
+# runlog row, scattered through it (near the start, the middle, and near
+# the end) so line numbering at every offset gets exercised. 1,000 lines
+# keeps the *pre-#132* comparison script's run (invoked twice below, once
+# per output mode) well inside this test's time budget -- it forks
+# several jq/awk/grep processes per line and takes roughly a minute per
+# invocation at this size; the single-pass script finishes in a fraction
+# of a second regardless.
+PERF_N=1000
+PERF_RUNLOG="$T/perf-runlog.jsonl"
+PERF_EVENTS="$T/perf-events.jsonl"
+: >"$PERF_RUNLOG"
+: >"$PERF_EVENTS"
+PERF_HALF=$((PERF_N / 2))
+PERF_NEAR_END1=$((PERF_N - 10))
+PERF_NEAR_END2=$((PERF_N - 20))
+for ((pi = 1; pi <= PERF_N; pi++)); do
+  if [[ "$pi" -eq 10 || "$pi" -eq "$PERF_HALF" || "$pi" -eq "$PERF_NEAR_END1" ]]; then
+    echo "{not valid json $pi" >>"$PERF_RUNLOG"
+  elif [[ "$pi" -eq 20 || "$pi" -eq "$PERF_NEAR_END2" ]]; then
+    printf '{"run_id":"legacy-%d"}\n' "$pi" >>"$PERF_RUNLOG"
+  elif [[ "$pi" -eq 30 ]]; then
+    printf '{"ts":"2026-08-01T00:00:00Z","run_id":"future-%d","schema_version":99}\n' "$pi" >>"$PERF_RUNLOG"
+  else
+    printf '{"ts":"2026-08-01T00:00:%02dZ","run_id":"run-%d","schema_version":1,"reviewers":{"codex":{"status":"ok"}}}\n' "$((pi % 60))" "$pi" >>"$PERF_RUNLOG"
+  fi
+  printf '{"event":"proposed","ts":"2026-08-01T00:00:%02dZ","finding_id":"f-%d","run_id":"run-%d","schema_version":1}\n' "$((pi % 60))" "$pi" "$pi" >>"$PERF_EVENTS"
+done
+
+# The pre-#132 script, materialized from the last commit -- HEAD, not this
+# working tree -- so this compares the new extraction against whatever
+# shipped last, not against itself.
+ORIG_SCRIPT="$T/orig_validate_ledgers.sh"
+git -C "$SKILL_DIR" show HEAD:cross-review/scripts/validate_ledgers.sh >"$ORIG_SCRIPT" 2>/dev/null
+
+if [[ -s "$ORIG_SCRIPT" ]]; then
+  # $ORIG_SCRIPT lives under $T, with no sibling scripts/ dir next to it, so
+  # left to its own device-relative default it can't find append_runlog.sh
+  # / append_finding_event.sh and falls back with an extra WARN that the
+  # real, in-place $S/validate_ledgers.sh never hits. Point both at the
+  # same real writers dir so the comparison is apples-to-apples.
+  ORIG_TEXT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$ORIG_SCRIPT" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" 2>&1)"
+  NEW_TEXT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" 2>&1)"
+  assert_eq "single-pass text output matches the pre-#132 script byte-for-byte on a $PERF_N-line fixture" "$NEW_TEXT" "$ORIG_TEXT"
+
+  ORIG_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$ORIG_SCRIPT" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" --json 2>/dev/null)"
+  NEW_JSON="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" --json 2>/dev/null)"
+  assert_eq "single-pass --json output matches the pre-#132 script byte-for-byte on a $PERF_N-line fixture" "$NEW_JSON" "$ORIG_JSON"
+else
+  bad "could not materialize the pre-#132 script from git HEAD to compare against"
+fi
+
+PERF_START=$(date +%s)
+bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" >/dev/null 2>&1
+PERF_END=$(date +%s)
+PERF_ELAPSED=$((PERF_END - PERF_START))
+if [[ "$PERF_ELAPSED" -lt 10 ]]; then
+  ok "single-pass run finishes in under 10s on a $PERF_N-line fixture (${PERF_ELAPSED}s)"
+else
+  bad "single-pass run finishes in under 10s on a $PERF_N-line fixture (took ${PERF_ELAPSED}s)"
+fi
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1
