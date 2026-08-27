@@ -230,6 +230,20 @@ echo "── starved message counts positive-weight rounds ──"
 SOUT="$(CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$SCRIPT" 2>&1)"
 assert_contains "starved line reports positive-weight rounds" "$SOUT" "ghost starved (weight > 0 in 40 of 40 candidate rounds"
 
+echo "── draw_boost annotation on under-drawn/starved WARNs (#104) ──"
+assert_contains "nemotron over-drawn WARN annotated with last recorded draw_boost 0" "$SOUT" "check draw_boost (last recorded 0)"
+NEM_WARN_LINE="$(printf '%s\n' "$SOUT" | grep 'nemotron')"
+GHOST_WARN_LINE="$(printf '%s\n' "$SOUT" | grep 'ghost starved')"
+if [[ "$GHOST_WARN_LINE" == *"check draw_boost"* ]]; then
+  bad "ghost (draw_boost 1) should NOT be annotated with check draw_boost, but was"
+else
+  ok "ghost (draw_boost 1) is not annotated with check draw_boost"
+fi
+assert_eq "--json last_draw_boost for nemotron == 0" \
+  "$(printf '%s' "$JOUT" | jq -r '.seats[] | select(.reviewer=="nemotron") | .last_draw_boost')" "0"
+assert_eq "--json last_draw_boost for ghost == 1" \
+  "$(printf '%s' "$JOUT" | jq -r '.seats[] | select(.reviewer=="ghost") | .last_draw_boost')" "1"
+
 echo ""
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]] || exit 1

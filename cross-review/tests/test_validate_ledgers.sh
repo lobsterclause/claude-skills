@@ -38,7 +38,7 @@ cat >"$RUNLOG" <<'EOF'
 {"ts":"2026-08-01T01:00:00Z","run_id":"r2","reviewers":{"codex":{"status":"ok"}}}
 {not json
 {"ts":"2026-08-01T02:00:00Z","run_id":"r3","reviewers":{"codex":{"status":"ok"}}}
-{"run_id":"r4","reviewers":{"codex":{"status":"ok"}}}
+{"schema_version":1,"run_id":"r4","reviewers":{"codex":{"status":"ok"}}}
 EOF
 
 # Fixture events: 2 events for r1, 1 event for orphan r9, 1 event with an
@@ -55,7 +55,7 @@ OUT="$(bash "$S/validate_ledgers.sh" --runlog "$RUNLOG" --events "$EVENTS" 2>&1)
 rc=$?
 assert_eq "exit code 1 on malformed/missing-ts errors" "$rc" "1"
 assert_contains "reports malformed runlog line" "$OUT" "runlog:3 malformed"
-assert_contains "reports missing ts" "$OUT" "missing ts"
+assert_contains "reports missing ts" "$OUT" "runlog:5 missing ts"
 assert_contains "reports orphan run_id" "$OUT" "r9"
 assert_contains "reports unknown event" "$OUT" "bogus"
 
@@ -135,6 +135,59 @@ TABLOG="$T/tab-runlog.jsonl"
 printf '{"ts":"2026-08-01T00:00:00Z","schema_version":"x\\ty"}\n' >"$TABLOG"
 TJ="$(bash "$S/validate_ledgers.sh" --runlog "$TABLOG" --events "$SHAPE_EVENTS" --json 2>/dev/null)"
 assert_eq "a schema_version with a tab still yields valid --json" "$(printf '%s' "$TJ" | jq -r '.runlog.schema_version | to_entries[0].value')" "1"
+
+echo "── future schema_version WARN (#122) ──"
+FUTLOG="$T/future-runlog.jsonl"
+cat >"$FUTLOG" <<'EOF'
+{"schema_version": 7, "ts": "2026-08-01T00:00:00Z", "run_id": "fut1"}
+EOF
+FUTOUT="$(bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$EVENTS" 2>&1)"; futrc=$?
+assert_eq "future schema_version does not fail the run (exit 0)" "$futrc" "0"
+assert_contains "future schema_version WARN names it" "$FUTOUT" "above the writer's current"
+FUTJ="$(bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$EVENTS" --json 2>/dev/null)"
+assert_eq "--json runlog.future_version == 1" "$(printf '%s' "$FUTJ" | jq -r '.runlog.future_version')" "1"
+
+# events ledger: the same future-version rule; and the writer-fallback WARN
+# must survive (it is counted in this shell, not a subshell)
+FUTEV="$T/future-events.jsonl"
+printf '{"schema_version":7,"finding_id":"f1","run_id":"s1","event":"proposed","ts":"2026-08-01T00:00:00Z"}\n' >"$FUTEV"
+FUTEJ="$(bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null)"
+assert_eq "--json events.future_version == 1" "$(printf '%s' "$FUTEJ" | jq -r '.events.future_version')" "1"
+assert_contains "events future schema_version WARN names the line" "$(bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" 2>&1)" "events:1 schema_version 7 is above the writer's current"
+mkdir -p "$T/no-writers"
+FBOUT="$(CROSS_REVIEW_WRITERS_DIR="$T/no-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" 2>&1)"
+assert_contains "unreadable writers fall back to 1 with a WARN that is actually printed" "$FBOUT" "unable to read a writer's current schema_version"
+assert_eq "fallback still flags version 7 as future" "$(CROSS_REVIEW_WRITERS_DIR="$T/no-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null | jq -r '.runlog.current_schema_version')" "1"
+
+mkdir -p "$T/crlf-writers"
+printf 'SCHEMA_VERSION=3\r\n' >"$T/crlf-writers/append_runlog.sh"; printf 'SCHEMA_VERSION=2 \n' >"$T/crlf-writers/append_finding_event.sh"
+CRLFJ="$(CROSS_REVIEW_WRITERS_DIR="$T/crlf-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null)"
+assert_eq "a CRLF writer constant still parses (runlog current 3)" "$(printf '%s' "$CRLFJ" | jq -r '.runlog.current_schema_version')" "3"
+assert_eq "a trailing-space writer constant still parses (events current 2)" "$(printf '%s' "$CRLFJ" | jq -r '.events.current_schema_version')" "2"
+mkdir -p "$T/octal-writers"
+printf 'SCHEMA_VERSION=08\n' >"$T/octal-writers/append_runlog.sh"; printf 'SCHEMA_VERSION=1\t\n' >"$T/octal-writers/append_finding_event.sh"
+OCTJ="$(CROSS_REVIEW_WRITERS_DIR="$T/octal-writers" bash "$S/validate_ledgers.sh" --runlog "$FUTLOG" --events "$FUTEV" --json 2>/dev/null)"
+assert_eq "a leading-zero constant falls back to 1 instead of an octal crash" "$(printf '%s' "$OCTJ" | jq -r '.runlog.current_schema_version')" "1"
+assert_eq "a tab-trailed constant still parses" "$(printf '%s' "$OCTJ" | jq -r '.events.current_schema_version')" "1"
+
+echo "── legacy no-ts rows (#111) ──"
+LEGLOG="$T/legacy-runlog.jsonl"
+cat >"$LEGLOG" <<'EOF'
+{"run_id":"legacy1"}
+EOF
+LEGOUT="$(bash "$S/validate_ledgers.sh" --runlog "$LEGLOG" --events "$EVENTS" 2>&1)"; legrc=$?
+assert_eq "a legacy no-ts/no-schema_version row is a WARN, not an ERROR (exit 0)" "$legrc" "0"
+assert_contains "legacy no-ts row is reported as WARN legacy" "$LEGOUT" "WARN  legacy: runlog:1 has no ts (pre-schema entry)"
+LEGJ="$(bash "$S/validate_ledgers.sh" --runlog "$LEGLOG" --events "$EVENTS" --json 2>/dev/null)"
+assert_eq "--json runlog.legacy_no_ts == 1" "$(printf '%s' "$LEGJ" | jq -r '.runlog.legacy_no_ts')" "1"
+
+VERLOG="$T/versioned-noTS-runlog.jsonl"
+cat >"$VERLOG" <<'EOF'
+{"schema_version":1,"run_id":"x"}
+EOF
+VEROUT="$(bash "$S/validate_ledgers.sh" --runlog "$VERLOG" --events "$EVENTS" 2>&1)"; verrc=$?
+assert_eq "a versioned row with no ts is still an ERROR (exit 1)" "$verrc" "1"
+assert_contains "versioned no-ts row reports missing ts" "$VEROUT" "missing ts"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

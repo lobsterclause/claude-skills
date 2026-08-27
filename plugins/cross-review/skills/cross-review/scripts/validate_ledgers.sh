@@ -17,7 +17,12 @@
 # Checks:
 #   (a) malformed lines            -> ERROR  "runlog:<n> malformed" /
 #                                              "events:<n> malformed"
-#   (b) runlog entries missing ts  -> ERROR  "runlog:<n> missing ts"
+#   (b) runlog entries missing ts  -> ERROR  "runlog:<n> missing ts", UNLESS
+#       the entry is a legacy row (no ts AND no schema_version -- version 0,
+#       the pre-#109 era): that shape was valid when written, so it is
+#       instead a WARN (see (f) below). A row that DOES carry a
+#       schema_version (>= 1) and has no ts stays an ERROR -- a writer that
+#       already stamps schema_version has no excuse to drop ts (#111).
 #   (c) events with an unknown     -> WARN   "events:<n> unknown event
 #       `event` name (not in the             '<name>'"
 #       allowlist below)
@@ -27,6 +32,19 @@
 #       with no schema_version key land in the "missing" bucket (readers
 #       treat absence as 0 -- the bucket is named "missing", not "0", so
 #       pre-#96 rows stay distinguishable from an explicit 0)
+#   (f) legacy no-ts rows (#111)   -> WARN   "legacy: runlog:<n> has no ts
+#       (schema_version absent, i.e.        (pre-schema entry)"; counted
+#       version 0, and no ts)               under runlog.legacy_no_ts.
+#       Accepted by decision, not backfilled -- see #111 and
+#       docs/decisions/2026-08-27-cross-review-ledger-rotation.md.
+#   (g) schema_version above the   -> WARN   "runlog:<n> schema_version <v>
+#       writer's current constant           is above the writer's current
+#       (#122)                              <c>" / same for events; up to 5
+#       examples + a count, under runlog.future_version /
+#       events.future_version. The writer's current constant is read live
+#       from append_runlog.sh / append_finding_event.sh (SCHEMA_VERSION=N);
+#       if that can't be read, current_schema_version falls back to 1 with
+#       a WARN rather than silently skipping the check.
 #
 # A line is malformed unless it is exactly ONE JSON object: a bare scalar,
 # an array, or two documents on one physical line all count as malformed
@@ -35,8 +53,8 @@
 # treated as empty, since a fresh install has none yet.
 #
 # Exit: 0 if no ERROR-level findings, 1 if any malformed line or missing-ts
-# entry exists. WARN-level findings (unknown event, orphan run_id) do not
-# affect the exit code.
+# (non-legacy) entry exists. WARN-level findings (unknown event, orphan
+# run_id, legacy no-ts, future schema_version) do not affect the exit code.
 #
 # Portability: macOS bash 3.2 + ubuntu bash 5; needs jq. set -uo pipefail
 # (no -e: we want to keep scanning after a bad line, not abort).
@@ -89,14 +107,46 @@ done
 runlog="${runlog:-${CROSS_REVIEW_RUNLOG:-$skill_dir/runlog.jsonl}}"
 events="${events:-${CROSS_REVIEW_FINDING_EVENTS:-$skill_dir/finding_events.jsonl}}"
 
+# Current writer schema_version constants (#122). Read live from the writer
+# scripts rather than duplicating the number here, so a bump in the writer
+# is picked up automatically. Falls back to 1 (the version both writers
+# stamp as of #109) with a WARN if the constant can't be read.
+current_ver_warns=0
+# Sets the named variable in THIS shell (printf -v): a $(...) call would run
+# in a subshell and lose the warning counter increment (antigravity +
+# gemini-pro, PR #127 review). Writers can be pointed elsewhere for tests via
+# $CROSS_REVIEW_WRITERS_DIR.
+writers_dir="${CROSS_REVIEW_WRITERS_DIR:-$skill_dir/scripts}"
+read_current_schema_version() {
+  local writer="$1" target="$2" v
+  # -f as well as -r: a FIFO or device would block grep forever; trailing
+  # CR/spaces (a CRLF checkout) must not read as "unparseable" (gemini-pro)
+  if [[ -f "$writer" && -r "$writer" ]]; then
+    v="$(grep -m 1 -E '^SCHEMA_VERSION=' -- "$writer" 2>/dev/null | cut -d= -f2 | tr -d ' \t\r')"
+    # no leading zeros: bash arithmetic would read 08 as octal (gemini-pro)
+    if [[ "$v" =~ ^(0|[1-9][0-9]*)$ ]]; then
+      printf -v "$target" '%s' "$v"
+      return 0
+    fi
+  fi
+  current_ver_warns=$((current_ver_warns + 1))
+  printf -v "$target" '1'
+}
+read_current_schema_version "$writers_dir/append_runlog.sh" runlog_current_sv
+read_current_schema_version "$writers_dir/append_finding_event.sh" events_current_sv
+
 errors=0
 warns=0
 
 # ── runlog pass ──────────────────────────────────────────────────────────
 runlog_malformed=0
 runlog_missing_ts=0
+runlog_legacy_no_ts=0
+runlog_future_version=0
 runlog_lines=0
 declare -a runlog_errlines=()
+declare -a runlog_warnlines=()
+declare -a runlog_future_examples=()
 run_ids_file="$(mktemp)"
 : >"$run_ids_file"
 sv_runlog_file="$(mktemp)"
@@ -119,9 +169,27 @@ if [[ -f "$runlog" ]]; then
       runlog_errlines+=("runlog:$lineno malformed")
       continue
     fi
-    if [[ "$(printf '%s' "$parsed" | jq -r 'has("ts")')" != "true" ]]; then
-      runlog_missing_ts=$((runlog_missing_ts + 1))
-      runlog_errlines+=("runlog:$lineno missing ts")
+    has_ts="$(printf '%s' "$parsed" | jq -r 'has("ts")')"
+    has_sv="$(printf '%s' "$parsed" | jq -r 'has("schema_version")')"
+    if [[ "$has_ts" != "true" ]]; then
+      if [[ "$has_sv" != "true" ]]; then
+        # Legacy row: no ts, no schema_version (version 0, the pre-#109
+        # era). Valid when written -- WARN, not ERROR (#111, accepted by
+        # decision, not backfilled).
+        runlog_legacy_no_ts=$((runlog_legacy_no_ts + 1))
+        runlog_warnlines+=("legacy: runlog:$lineno has no ts (pre-schema entry)")
+      else
+        runlog_missing_ts=$((runlog_missing_ts + 1))
+        runlog_errlines+=("runlog:$lineno missing ts")
+      fi
+    fi
+    if [[ "$has_sv" == "true" ]]; then
+      sv_num="$(printf '%s' "$parsed" | jq -r '.schema_version | if type == "number" then . else empty end')"
+      if [[ -n "$sv_num" ]] && awk -v a="$sv_num" -v b="$runlog_current_sv" 'BEGIN{exit !(a > b)}'; then
+        runlog_future_version=$((runlog_future_version + 1))
+        runlog_warnlines+=("runlog:$lineno schema_version $sv_num is above the writer's current $runlog_current_sv")
+        runlog_future_examples+=("$sv_num")
+      fi
     fi
     rid="$(printf '%s' "$parsed" | jq -r '.run_id // empty')"
     [[ -n "$rid" ]] && printf '%s\n' "$rid" >>"$run_ids_file"
@@ -133,9 +201,11 @@ fi
 # ── events pass ──────────────────────────────────────────────────────────
 events_malformed=0
 events_unknown=0
+events_future_version=0
 declare -a events_errlines=()
 declare -a events_warnlines=()
 declare -a unknown_event_names=()
+declare -a events_future_examples=()
 events_lines=0
 
 if [[ -f "$events" ]]; then
@@ -168,6 +238,14 @@ if [[ -f "$events" ]]; then
         printf '%s\t%s\n' "$erid" "$lineno" >>"$orphan_run_ids_file"
       fi
     fi
+    if [[ "$(printf '%s' "$parsed" | jq -r 'has("schema_version")')" == "true" ]]; then
+      esv_num="$(printf '%s' "$parsed" | jq -r '.schema_version | if type == "number" then . else empty end')"
+      if [[ -n "$esv_num" ]] && awk -v a="$esv_num" -v b="$events_current_sv" 'BEGIN{exit !(a > b)}'; then
+        events_future_version=$((events_future_version + 1))
+        events_warnlines+=("events:$lineno schema_version $esv_num is above the writer's current $events_current_sv")
+        events_future_examples+=("$esv_num")
+      fi
+    fi
     sv="$(printf '%s' "$parsed" | jq -r 'if has("schema_version") then (.schema_version|tostring|gsub("[\\t\\n\\r]"; " ")) else "missing" end')"
     printf '%s\n' "$sv" >>"$sv_events_file"
   done <"$events"
@@ -176,7 +254,7 @@ fi
 orphan_count=$(wc -l <"$orphan_run_ids_file" | tr -d ' ')
 
 errors=$((runlog_malformed + runlog_missing_ts + events_malformed))
-warns=$((events_unknown + orphan_count))
+warns=$((events_unknown + orphan_count + runlog_legacy_no_ts + runlog_future_version + events_future_version + current_ver_warns))
 
 # uniq -c output is "<count> <value>"; the value may contain spaces, so
 # split on the first run of spaces only (awk sub), never on every field
@@ -209,14 +287,23 @@ if [[ "$json_out" -eq 1 ]]; then
     orphan_examples_json="$(cut -f1 "$orphan_run_ids_file" | sort -u | head -5 | jq -R . | jq -sc .)"
   fi
   unknown_examples_json="$(printf '%s\n' "${unknown_event_names[@]:-}" | sort -u | head -5 | jq -R 'select(length>0)' | jq -sc . 2>/dev/null || echo '[]')"
+  runlog_future_examples_json="$(printf '%s\n' "${runlog_future_examples[@]:-}" | sort -u | head -5 | jq -R 'select(length>0) | tonumber' | jq -sc . 2>/dev/null || echo '[]')"
+  events_future_examples_json="$(printf '%s\n' "${events_future_examples[@]:-}" | sort -u | head -5 | jq -R 'select(length>0) | tonumber' | jq -sc . 2>/dev/null || echo '[]')"
   jq -nc \
     --argjson runlog_lines "$runlog_lines" \
     --argjson runlog_malformed "$runlog_malformed" \
     --argjson runlog_missing_ts "$runlog_missing_ts" \
+    --argjson runlog_legacy_no_ts "$runlog_legacy_no_ts" \
+    --argjson runlog_future_version "$runlog_future_version" \
+    --argjson runlog_future_examples "$runlog_future_examples_json" \
+    --argjson runlog_current_sv "$runlog_current_sv" \
     --argjson runlog_sv "$runlog_sv_json" \
     --argjson events_lines "$events_lines" \
     --argjson events_malformed "$events_malformed" \
     --argjson events_unknown "$events_unknown" \
+    --argjson events_future_version "$events_future_version" \
+    --argjson events_future_examples "$events_future_examples_json" \
+    --argjson events_current_sv "$events_current_sv" \
     --argjson events_sv "$events_sv_json" \
     --argjson orphan_count "$orphan_count" \
     --argjson orphan_examples "$orphan_examples_json" \
@@ -224,8 +311,8 @@ if [[ "$json_out" -eq 1 ]]; then
     --argjson errors "$errors" \
     --argjson warns "$warns" \
     '{
-      runlog: {lines: $runlog_lines, malformed: $runlog_malformed, missing_ts: $runlog_missing_ts, schema_version: $runlog_sv},
-      events: {lines: $events_lines, malformed: $events_malformed, unknown_event: $events_unknown, unknown_event_examples: $unknown_examples, orphan_run_id: $orphan_count, orphan_run_id_examples: $orphan_examples, schema_version: $events_sv},
+      runlog: {lines: $runlog_lines, malformed: $runlog_malformed, missing_ts: $runlog_missing_ts, legacy_no_ts: $runlog_legacy_no_ts, future_version: $runlog_future_version, future_version_examples: $runlog_future_examples, current_schema_version: $runlog_current_sv, schema_version: $runlog_sv},
+      events: {lines: $events_lines, malformed: $events_malformed, unknown_event: $events_unknown, unknown_event_examples: $unknown_examples, orphan_run_id: $orphan_count, orphan_run_id_examples: $orphan_examples, future_version: $events_future_version, future_version_examples: $events_future_examples, current_schema_version: $events_current_sv, schema_version: $events_sv},
       errors: $errors,
       warns: $warns
     }'
@@ -236,6 +323,9 @@ else
   for l in "${events_errlines[@]:-}"; do
     [[ -n "$l" ]] && echo "ERROR $l"
   done
+  for l in "${runlog_warnlines[@]:-}"; do
+    [[ -n "$l" ]] && echo "WARN  $l"
+  done
   for l in "${events_warnlines[@]:-}"; do
     [[ -n "$l" ]] && echo "WARN  $l"
   done
@@ -245,8 +335,11 @@ else
       echo "  orphan run_id '$rid'"
     done
   fi
-  echo "runlog: $runlog_lines lines, $runlog_malformed malformed, $runlog_missing_ts missing ts, schema_version: $(sv_dist "$sv_runlog_file")"
-  echo "events: $events_lines lines, $events_malformed malformed, $events_unknown unknown event(s), $orphan_count orphan run_id(s), schema_version: $(sv_dist "$sv_events_file")"
+  if [[ "$current_ver_warns" -gt 0 ]]; then
+    echo "WARN  unable to read a writer's current schema_version constant; falling back to 1 ($current_ver_warns writer(s))"
+  fi
+  echo "runlog: $runlog_lines lines, $runlog_malformed malformed, $runlog_missing_ts missing ts, $runlog_legacy_no_ts legacy no-ts, $runlog_future_version above-current schema_version, schema_version: $(sv_dist "$sv_runlog_file")"
+  echo "events: $events_lines lines, $events_malformed malformed, $events_unknown unknown event(s), $orphan_count orphan run_id(s), $events_future_version above-current schema_version, schema_version: $(sv_dist "$sv_events_file")"
 fi
 
 if [[ "$errors" -gt 0 ]]; then
