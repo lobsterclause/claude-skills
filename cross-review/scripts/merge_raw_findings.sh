@@ -24,17 +24,42 @@
 # input is prose) — partial extraction from whichever reviewers cooperated is
 # the whole point; a fully-prose round should not look like a script failure.
 #
-# Usage: merge_raw_findings.sh --raw <dir> --out <findings.json>
+# Usage: merge_raw_findings.sh --raw <dir> --out <findings.json> [--emit-events <run_id>]
+#
+# --emit-events <run_id>: optional, additive (#88). This script never merges
+# same-file/same-claim findings from different reviewers into one output row
+# — each reviewer's findings are tagged with sources:[<its own name>] and
+# concatenated (that merge, if any, happens later — SKILL.md step 4's
+# synthesis, or fingerprint_findings.sh). What --emit-events adds is
+# DETECTION: across all reviewers processed in this run, a (file, normalized
+# claim) pair seen from more than one reviewer is a duplicate — the same bug
+# independently reported (or echoed) by multiple seats. For every 2nd+
+# reviewer to report a given (file, claim) pair, one "duplicate_merged" event
+# is appended, naming that reviewer plus the first (originating) reviewer —
+# so a seat that only echoes others is visible in the ledger. This never
+# changes --out or the exit code; a missing sha1 tool or an event-append
+# failure only WARNs on stderr (fail-open, same contract as the other
+# --emit-events passes).
+#
+# Findings at this stage predate fingerprint_findings.sh, so there is no
+# stable f-<hash> id yet. The event's finding_id reuses fingerprint's own
+# hashing rule (sha1, first 8 hex chars, same claim normalization: lowercase,
+# whitespace-collapsed, trimmed) but over `file|claim` only (no project
+# namespace — that isn't known at this stage) so the event can still be
+# recognized later, prefixed "f-dup-" to keep it visually distinct from a
+# real fingerprinted id and to avoid ever colliding with one.
 
 set -uo pipefail
 
 raw=""
 out=""
+emit_events_run_id=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --raw) raw="${2:-}"; shift 2 ;;
-    --out) out="${2:-}"; shift 2 ;;
+    --raw)         raw="${2:-}";                shift 2 ;;
+    --out)         out="${2:-}";                 shift 2 ;;
+    --emit-events) emit_events_run_id="${2:-}";  shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -54,8 +79,27 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
+# Portable SHA-1: shasum (macOS stock), sha1sum (most Linux), openssl (either)
+# — same detection chain as fingerprint_findings.sh, duplicated rather than
+# sourced since each script must stay runnable standalone. Only needed for
+# --emit-events's duplicate_merged detection; a missing tool degrades that to
+# a WARN, never a hard failure (this script's exit is always 0).
+sha1_available="false"
+if command -v shasum >/dev/null 2>&1; then
+  sha1_of() { shasum -a 1 | awk '{print $1}'; }
+  sha1_available="true"
+elif command -v sha1sum >/dev/null 2>&1; then
+  sha1_of() { sha1sum | awk '{print $1}'; }
+  sha1_available="true"
+elif command -v openssl >/dev/null 2>&1; then
+  sha1_of() { openssl dgst -sha1 -r | awk '{print $1}'; }
+  sha1_available="true"
+fi
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+dup_track="$work/dup_track.jsonl"
+: > "$dup_track"
 
 n=0
 shopt -s nullglob
@@ -98,6 +142,28 @@ for f in "${sorted[@]}"; do
     tagged="$(printf '%s' "$parsed" | jq -c --arg r "$reviewer" '[.[] | . + {sources: [$r]}]')"
     printf '%s' "$tagged" >"$work/$n.json"
     n=$((n + 1))
+
+    if [[ -n "$emit_events_run_id" && "$sha1_available" == "true" ]]; then
+      # Record one dup_track line per finding, in encounter order (sorted
+      # reviewer order, then this reviewer's own array order) — the later
+      # reduce over this file relies on that order to know which reviewer
+      # was first for a given (file, claim) pair.
+      while IFS= read -r finding; do
+        file="$(jq -r '.file // ""' <<<"$finding")"
+        claim="$(jq -r '.claim // ""' <<<"$finding")"
+        local_id="$(jq -r '.id // ""' <<<"$finding")"
+        claim_norm="$(printf '%s' "$claim" \
+          | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' \
+          | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        # \x1f (unit separator) joins file/claim, same convention as
+        # fingerprint_findings.sh, so a literal "|" in either can't collide.
+        hash="$(printf '%s\x1f%s' "$file" "$claim_norm" | sha1_of)"
+        jq -nc --arg hash "$hash" --arg reviewer "$reviewer" --arg file "$file" \
+          --arg claim "$claim_norm" --arg local_id "$local_id" \
+          '{hash: $hash, reviewer: $reviewer, file: $file, claim: $claim,
+            local_id: ($local_id | if . == "" then null else . end)}' >>"$dup_track"
+      done < <(printf '%s' "$parsed" | jq -c '.[]')
+    fi
   else
     echo "unparsed: $reviewer" >&2
   fi
@@ -107,6 +173,44 @@ if [[ "$n" -eq 0 ]]; then
   printf '{"findings":[]}\n' >"$out"
 else
   jq -s -c 'add' "$work"/*.json | jq -c '{findings: .}' >"$out"
+fi
+
+# ── --emit-events: duplicate_merged detection ────────────────────────────────
+if [[ -n "$emit_events_run_id" ]]; then
+  if [[ "$sha1_available" != "true" ]]; then
+    echo "WARN: merge_raw_findings: no sha1 tool found (need shasum, sha1sum, or openssl) — skipping duplicate_merged event detection" >&2
+  elif [[ -s "$dup_track" ]]; then
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    dup_events="$(jq -c -s '
+      reduce .[] as $e (
+        {seen: {}, events: []};
+        if (.seen[$e.hash] // null) == null
+        then .seen[$e.hash] = {first: $e.reviewer, sources: [$e.reviewer]}
+        else (
+          .seen[$e.hash].sources += [$e.reviewer]
+          | .events += [{
+              reviewer: $e.reviewer,
+              first_reviewer: .seen[$e.hash].first,
+              sources: .seen[$e.hash].sources,
+              file: $e.file,
+              claim_hash: $e.hash[0:8],
+              local_id: $e.local_id
+            }]
+        )
+        end
+      ) | .events[]
+    ' "$dup_track")"
+    while IFS= read -r ev; do
+      [[ -z "$ev" ]] && continue
+      finding_id="f-dup-$(jq -r '.claim_hash' <<<"$ev")"
+      fields="$(jq -c '{reviewer, first_reviewer, sources, local_id, file, claim_hash}' <<<"$ev")"
+      stderr_out="$(bash "$script_dir/append_finding_event.sh" --event duplicate_merged \
+        --finding-id "$finding_id" --run-id "$emit_events_run_id" --fields "$fields" 2>&1 >/dev/null)"
+      if [[ "$(printf '%s\n' "$stderr_out" | grep -c .)" -gt 1 ]]; then
+        echo "WARN: merge_raw_findings: event append failed for duplicate_merged finding_id=$finding_id: $stderr_out" >&2
+      fi
+    done < <(printf '%s\n' "$dup_events")
+  fi
 fi
 
 exit 0

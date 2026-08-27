@@ -290,8 +290,10 @@ The wrapper logs timing and exit codes per reviewer. If one fails, continue with
 
 ```bash
 bash ~/.claude/skills/cross-review/scripts/merge_raw_findings.sh \
-  --raw "$run_dir/raw" --out "$run_dir/findings.premerged.json"
+  --raw "$run_dir/raw" --out "$run_dir/findings.premerged.json" --emit-events "$run_id"
 ```
+
+`--emit-events` appends one `duplicate_merged` event per reviewer that reported a (file, claim) pair already reported by an earlier reviewer this pass — so a seat that only echoes others is visible in `finding_events.jsonl` even before fingerprinting.
 
 Every reviewer whose stdout parsed cleanly is folded into `findings.premerged.json` with `sources` tags; reviewers listed as `unparsed:` on stderr (the CLI prose lanes — codex, agy laps, kimi CLI — plus any curl-lane reviewer that ignored the schema) are yours to extract by hand. Then score the merged set deterministically:
 
@@ -407,6 +409,18 @@ Each finding gains `factcheck: {verdict: "keep"|"drop", reason}`. The pass can *
 
 **Parent direct-source verification may replace this pass entirely.** When you (the orchestrating session) have already verified each finding against the actual source files, test runs, or a live smoke test — evidence *stronger* than a diff-only LLM veto — running the LLM fact-check adds nothing: skip it. Two conditions bind: (1) the evidence gate still applies — every `verdict:"drop"` needs concrete falsification evidence in `factcheck.reason` (`append_runlog.sh` rejects reasonless drops regardless of who did the verifying); (2) record the substitution in the runlog `notes` (e.g. "factcheck replaced by parent direct-source verification") so the self-improvement loop can distinguish a skipped gate from a substituted one. This formalizes the de facto pattern from the 2026-07-03 rounds (PRs #2619–#2621).
 
+For each finding you verify this way, emit the lifecycle event directly (there is no script for this — it's the parent's own verdict, not a script's):
+
+```bash
+bash ~/.claude/skills/cross-review/scripts/append_finding_event.sh \
+  --event parent_verified_kept --finding-id "$finding_id" --run-id "$run_id" \
+  --fields '{"reason": "confirmed against source at <file:line>"}'
+# or, on a drop — a reason is mandatory here too, same rule as append_runlog.sh:
+bash ~/.claude/skills/cross-review/scripts/append_finding_event.sh \
+  --event parent_verified_dropped --finding-id "$finding_id" --run-id "$run_id" \
+  --fields '{"reason": "<concrete falsification evidence, e.g. what you read/ran that disproves it>"}'
+```
+
 **(c) Runtime-behavior claims — smoke-test in BOTH directions.** When a finding, or your reason for *declining* one, rests on a claim about runtime behavior — coreutils/awk/bash semantics, what an API actually returns, how a CLI parses a flag — run the 5-second smoke test before acting, whichever way you lean. The history cuts both ways: convergent findings have been falsified by one command (the 137→124 remap on PR #21 — two providers shared the same wrong `timeout -k` assumption; the `node -e` argv "Critical" on PR #13), and a solo finding that pattern-matched "probable false positive" was **confirmed** the same way (the awk backslash `od` test on PR #23). Pattern-matching on which reviewer said it, or how many agreed, is not verification. Record the outcome where it binds: a drop's evidence goes in `factcheck.reason` — **`append_runlog.sh` rejects reasonless drops** — and a confirmed falsification becomes a code comment at the exact line plus a regression test, so the guarantee travels with the code instead of living in session memory.
 
 This gate is **cheap** (anchor is free; fact-check is one Flash-tier call) and most valuable exactly when auto-fix is opted in. Skip it only for a quick report-only sniff test. The `convergent` count and `Top` in the report block (step 9) should reflect the post-verification set.
@@ -431,8 +445,9 @@ For each fix:
    git diff -- <the file(s) you just edited> > "$fix_diff_file"
    bash ~/.claude/skills/cross-review/scripts/verify_fix_safety.sh \
      --diff "$fix_diff_file" --out "$run_dir/fix_safety.json" \
-     --finding-id "$finding_id"
+     --finding-id "$finding_id" --applied --emit-events "$run_id"
    ```
+   `--applied` and `--emit-events` append `fix_applied` (the edit landed) and then `fix_verified`/`fix_failed` (this gate's own verdict) to `finding_events.jsonl` — pass `--applied` only after the edit is actually on disk, since it's the caller's own claim that the fix was applied, not something this script infers.
    `git diff` (unstaged, scoped to the touched paths) is what makes `fix_diff_file` real — it reflects exactly the edit that was just made, not a pre-apply guess. Anchor and factcheck verify the *finding* — where it points, and whether the diff contradicts the claim. Neither checks whether the reviewer's *suggested fix* is itself safe to auto-apply, which is exactly the gap a crafted diff can exploit: get reviewers to converge on a plausible-sounding but dangerous suggestion ("remove this redundant check", "this validation is now unnecessary", "this auth guard is dead code") and let it ride the already-verified pipeline straight to a commit. `verify_fix_safety.sh` is a deterministic, no-LLM pattern check over the fix's own diff — removed auth/permission guards, weakened input validation, disabled or deleted tests, broadened security-relevant regexes — and returns `{"safe": bool, "reason", "matched": [...]}`. On `safe:false`, treat it exactly like an `anchor.resolved:false` finding: **revert the edit** (`git checkout -- <the file(s)>` or equivalent, since nothing was staged), hold for human confirmation, do not auto-commit. Its fail-safe direction is the opposite of factcheck's — ambiguity (empty/unreadable diff) defaults to `safe:false`, since this gate exists specifically to catch the case where everything else in the pipeline already said "proceed."
 5. On `safe:true`, keep the change and run local checks if cheap: `pnpm lint` on touched packages, relevant unit tests. Don't run the full suite between every fix — batch and run once at the end of the pass.
 
@@ -701,7 +716,18 @@ Notes:   <≤1 sentence if something non-obvious happened — reviewer disagreem
 
 - **CLEAN** — No Critical/High after this pass. The skill is done; caller can merge.
 - **FIXES_APPLIED** — Critical/High found *and auto-fixed* in this pass. Another pass will run to verify; caller should not intervene yet.
-- **NEEDS_DECISION** — Critical/High found but requires human judgment (design decision, scope question, semantic ambiguity). Caller must respond before the skill can continue.
+- **NEEDS_DECISION** — Critical/High found but requires human judgment (design decision, scope question, semantic ambiguity). Caller must respond before the skill can continue. Before yielding, emit `deferred` for every finding still open at this verdict (unfixed, un-dropped, waiting on the human) so the ledger shows it was surfaced, not silently forgotten:
+  ```bash
+  bash ~/.claude/skills/cross-review/scripts/append_finding_event.sh \
+    --event deferred --finding-id "$finding_id" --run-id "$run_id" \
+    --fields '{"reason": "awaiting human decision"}'
+  ```
+  If the user then declines a proposed fix outright (rather than just deferring), emit `human_rejected` instead, with the reason they gave:
+  ```bash
+  bash ~/.claude/skills/cross-review/scripts/append_finding_event.sh \
+    --event human_rejected --finding-id "$finding_id" --run-id "$run_id" \
+    --fields '{"reason": "<why the user declined>"}'
+  ```
 - **BLOCKED** — Cannot proceed: all reviewers failed, auth missing, iteration cap hit with findings still outstanding, same finding recurs across passes. Caller needs to investigate.
 
 **Convergent** counts findings that two or more reviewers independently flagged on the same file/area — but weight by *provider*, not raw reviewer count (each profile's `provider` field is the truth). Agreement between `antigravity` and `gemini-pro` alone is one provider agreeing with itself, so discount it toward single-reviewer skepticism. Three-plus distinct-provider convergence (e.g. codex + a Gemini lap + kimi, or codex + kimi + a rotation pick) is the strongest signal of all — treat those findings as near-certain to be real.
@@ -718,6 +744,17 @@ Notes:   <≤1 sentence if something non-obvious happened — reviewer disagreem
 Keep the block exactly this shape — parent agents key off the field names. Anything else (longer analysis, reviewer prose) goes in `findings.md`, not in the report block.
 
 ### 9.5 Append runlog entry
+
+**Phase timing (#119).** Since the runlog entry below accepts `--phases`, record where this pass's wall-clock actually went: `phase_start=$(date +%s)` right before starting step 2 (worktree setup), step 3 (reviewer dispatch), step 4.5a (anchor), step 4.5b (factcheck), step 4 (synthesis), step 5 (fix triage/apply, only if opted in), and step 7 (posting the record); at the end of each, fold that phase's elapsed seconds into `$run_dir/phases.json` under its key (`worktree_s`, `dispatch_s`, `anchor_s`, `factcheck_s`, `synthesis_s`, `fix_s`, `post_s`). A phase this pass skipped (no auto-fix opted in, so no `fix_s`) is simply absent — `append_runlog.sh` treats a missing key as "not measured," not zero. Example for one phase (repeat the pattern at each step boundary above):
+
+```bash
+dispatch_start=$(date +%s)
+# ... step 3 work ...
+dispatch_s=$(( $(date +%s) - dispatch_start ))
+jq -n --slurpfile prev <(cat "$run_dir/phases.json" 2>/dev/null || echo '{}') \
+  --argjson dispatch_s "$dispatch_s" '$prev[0] + {dispatch_s: $dispatch_s}' \
+  > "$run_dir/phases.json.tmp" && mv "$run_dir/phases.json.tmp" "$run_dir/phases.json"
+```
 
 After the report block — and before worktree teardown — append a structured JSONL entry to `~/.claude/skills/cross-review/runlog.jsonl`. This is what the Phase 1.5 pre-run check and `/cross-review --self-check` read; without it, the self-improvement loop has no data.
 
@@ -738,7 +775,8 @@ bash ~/.claude/skills/cross-review/scripts/append_runlog.sh \
   --notes "<≤1 sentence on anything non-obvious>" \
   --findings "$run_dir/findings.verified.json" \
   --run-id "$run_id" \
-  --roster-decision "$run_dir/roster_decision.json"
+  --roster-decision "$run_dir/roster_decision.json" \
+  --phases "$run_dir/phases.json"
 ```
 
 The script reads each `$run_dir/<reviewer>.meta.json` to fill in per-reviewer telemetry — duration, exit code, timed_out, output_bytes, attempt — so you only pass the high-level verdict and one-line summary. Pass `-` for `--pr` on branch-only runs (no GitHub PR).

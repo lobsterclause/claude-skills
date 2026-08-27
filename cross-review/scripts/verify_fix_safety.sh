@@ -26,6 +26,7 @@
 #
 # Usage:
 #   verify_fix_safety.sh --diff <patch-file> [--out <json>] [--finding-id <id>]
+#                        [--applied] [--emit-events <run_id>]
 #
 # patch-file: a unified diff of ONLY the proposed fix (e.g. `git diff`/
 # `git show` output for the change about to be committed, or a hand-built
@@ -36,19 +37,35 @@
 #   { "safe": bool, "reason": "...", "matched": ["<category>", ...],
 #     "finding_id": "<id-or-null>" }
 #
+# --emit-events <run_id>: optional, additive (#88). Requires --finding-id —
+# without it, event emission is skipped with a WARN (there is nothing to key
+# the event on). After the verdict is computed: a "fix_applied" event is
+# appended first if --applied was also passed (the caller passes --applied
+# right after actually applying the edit, so this script never claims a fix
+# was applied on its own say-so), then "fix_verified" (safe:true) or
+# "fix_failed" (safe:false, with {reason, matched} in --fields). Fail-open
+# like anchor_findings.sh/factcheck_findings.sh's --emit-events: an event
+# append failure only WARNs on stderr — it never changes the verdict or exit
+# code.
+#
+# --applied: informational flag, no value. Only affects event emission (see
+# above) — never affects the computed verdict.
+#
 # Exit: 0 always — the verdict lives in the JSON (`.safe`), same as callers
 # branch on `.factcheck.verdict` rather than on exit code. 2 on usage error.
 
 set -uo pipefail
 
-diff_file="" ; out="" ; finding_id=""
+diff_file="" ; out="" ; finding_id="" ; emit_events_run_id="" ; applied="false"
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --diff)       need_val "$1" "$#"; diff_file="$2";  shift 2 ;;
-    --out)        need_val "$1" "$#"; out="$2";         shift 2 ;;
-    --finding-id) need_val "$1" "$#"; finding_id="$2";  shift 2 ;;
+    --diff)         need_val "$1" "$#"; diff_file="$2";        shift 2 ;;
+    --out)          need_val "$1" "$#"; out="$2";               shift 2 ;;
+    --finding-id)   need_val "$1" "$#"; finding_id="$2";        shift 2 ;;
+    --emit-events)  need_val "$1" "$#"; emit_events_run_id="$2"; shift 2 ;;
+    --applied)      applied="true";                             shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -57,6 +74,48 @@ done
 command -v jq >/dev/null 2>&1 || { echo "verify_fix_safety: jq required" >&2; exit 1; }
 
 tmp_dir="$(mktemp -d)"; trap 'rm -rf "$tmp_dir"' EXIT
+
+# _emit_lifecycle_event <event> <fields-json> — append one lifecycle event via
+# append_finding_event.sh. Fail-open: append_finding_event.sh itself always
+# exits 0 (even on an unwritable ledger path — the failing redirect is a shell
+# error, not a script exit), so a write failure is detected here by inspecting
+# its stderr: on success it prints exactly one "appended finding event: ..."
+# line; on failure (e.g. unwritable directory) bash also prints its own
+# redirection error line first, so stderr has >1 line. That extra line is
+# treated as a failure and turned into an explicit WARN — this script's own
+# verdict/exit code are never touched either way.
+_emit_lifecycle_event() {
+  local event="$1" fields="$2"
+  local script_dir stderr_out
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  stderr_out="$(bash "$script_dir/append_finding_event.sh" --event "$event" \
+    --finding-id "$finding_id" --run-id "$emit_events_run_id" --fields "$fields" 2>&1 >/dev/null)"
+  if [[ "$(printf '%s\n' "$stderr_out" | grep -c .)" -gt 1 ]]; then
+    echo "WARN: verify_fix_safety: event append failed for event=$event finding_id=$finding_id: $stderr_out" >&2
+  fi
+}
+
+# emit_lifecycle_events <safe:true|false> <matched-json> <reason> — no-op
+# unless --emit-events was passed. Emits fix_applied (if --applied) then
+# fix_verified/fix_failed, in that order (#88).
+emit_lifecycle_events() {
+  local safe="$1" matched_json="$2" reason="$3"
+  [[ -n "$emit_events_run_id" ]] || return 0
+  if [[ -z "$finding_id" ]]; then
+    echo "WARN: verify_fix_safety: --emit-events requires --finding-id; skipping event emission" >&2
+    return 0
+  fi
+  if [[ "$applied" == "true" ]]; then
+    _emit_lifecycle_event "fix_applied" "{}"
+  fi
+  if [[ "$safe" == "true" ]]; then
+    _emit_lifecycle_event "fix_verified" "{}"
+  else
+    local fields
+    fields="$(jq -nc --arg reason "$reason" --argjson matched "$matched_json" '{reason: $reason, matched: $matched}')"
+    _emit_lifecycle_event "fix_failed" "$fields"
+  fi
+}
 
 # write_verdict <safe:true|false> <reason> [category...] — writes the JSON to
 # --out (if given) and to stdout, then exits 0. Single exit path so every
@@ -75,6 +134,7 @@ write_verdict() {
   doc="$(jq -n --argjson safe "$safe" --arg reason "$reason" --argjson matched "$matched_json" --argjson fid "$fid_json" \
     '{safe: $safe, reason: $reason, matched: $matched, finding_id: $fid}')"
   if [[ -n "$out" ]]; then printf '%s\n' "$doc" > "$out"; fi
+  emit_lifecycle_events "$safe" "$matched_json" "$reason"
   printf '%s\n' "$doc"
   exit 0
 }
