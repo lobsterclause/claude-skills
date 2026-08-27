@@ -1,0 +1,98 @@
+# Investigation: a wrapper-owned tool loop for the text-only seats
+
+Date: 2026-08-27. Branch: `feat/cross-review-tool-loop` (off `fix/cross-review-seat-audit-draw-boost`).
+
+## Why
+
+`codex` is the only seat that can execute anything during a review. The other
+17 seats are single-shot chat completions with the diff + whole changed files
+pasted in. Checked live 2026-08-27, the reasons in the wrapper are choices or
+stale, not constraints:
+
+- All 15 OpenRouter pool models list `tools` in `supported_parameters`
+  (`/api/v1/models`, checked against the exact pinned slugs).
+- Kimi CLI is 1.48, a full agent; the `reasoning_content` blocker in
+  `run_kimi` only applies with thinking on, and `~/.kimi/config.toml` has
+  `default_thinking = false`.
+- The agy read-only `permissions.allow` list is still "proposed, NOT verified
+  live"; the settings file still allows only `echo`.
+
+And the OpenRouter lane is also where `codex` lands when its first-party lane
+fails (`status: fallback`, seen on the skoolie run 2026-08-27T19:07Z) — so a
+tool-capable OR lane also restores codex's agent-ness in fallback.
+
+## Design
+
+**The wrapper is the harness.** `run_openrouter_reviewer` gains a bounded
+multi-turn loop with a fixed toolset the wrapper executes itself, in the
+parent's sandbox. One implementation covers 17 seats plus every fallback.
+
+Tools (OpenAI function-calling schema, `lib_tool_loop.sh`):
+
+| tool | what | guards |
+|---|---|---|
+| `read_file(path, start_line?, end_line?)` | post-change file in the checkout | realpath inside repo root, no `.git/`, per-call cap, per-seat cumulative read budget, secret-content scan |
+| `search(pattern, path_glob?)` | `git grep -n -I -E` over tracked files | args not eval; pattern length cap; line cap |
+| `list_files(dir?)` | `git ls-files` | line cap |
+| `run_check()` | the repo's **declared** verify entrypoint | mode `check` only; command is the repo's, never the model's; run once per round and cached across seats; timeout; output tail cap |
+
+The model never chooses a command. `run_check` resolves, in order,
+`CROSS_REVIEW_CHECK_CMD` → `.claude/verify.sh` → `package.json` `verify`
+script → `Makefile` `verify`/`check` target. No entrypoint → the `check` arm
+is unavailable for that repo (the model is told so).
+
+Arms: `off` (today's behaviour), `read` (file tools), `check` (file tools +
+`run_check`). Whole-file paste (`--context-mode files`) stays independent —
+tools add on top by default; `CROSS_REVIEW_TOOL_CONTEXT=diff` drops the paste
+when tools are on.
+
+### Tunable
+
+Global (env / flag): `--tool-mode off|read|check|auto` /
+`CROSS_REVIEW_TOOL_MODE` (default `auto` = learned), `CROSS_REVIEW_TOOL_MAX_STEPS`,
+`CROSS_REVIEW_TOOL_READ_BUDGET_BYTES`, `CROSS_REVIEW_TOOL_CALL_CAP_BYTES`,
+`CROSS_REVIEW_CHECK_CMD`, `CROSS_REVIEW_CHECK_TIMEOUT_S`, `CROSS_REVIEW_TOOL_CONTEXT`.
+
+Profile (`reviewer_profiles.json`): `_synthesis_rules.tool_policy` holds the
+defaults and the learner's constants; a seat's `tools: {mode, max_steps}`
+pins that seat (pinned seats are not learned).
+
+### Self-learning
+
+`tool_policy.sh --reviewer <slug>` decides the arm for a seat from the
+ledgers already kept (`runlog.jsonl` + `finding_events.jsonl`), stateless,
+the same way `leaderboard.sh` scores. Per (seat, arm) over the window:
+
+    reward(run) = 0.6 * r_q + 0.4 * r_ok - cost_lambda * cost_usd
+    r_ok = 1 if status ok else 0
+    r_q  = 0.5 if no findings (uninformative)
+         = (findings - dropped - 0.5*unanchored) / findings otherwise
+
+    ucb(arm) = mean_reward + ucb_c * sqrt(ln(N+1) / (n_arm+1))
+    untried arm → optimistic prior (0.75), so every arm gets sampled
+
+Pick argmax; ties by fixed priority `read > check > off`. An arm with
+≥ `min_samples` runs and reliability < 0.5 is demoted (the tool loop breaks
+that model — malformed tool calls, loops). `check` is skipped when the repo
+has no entrypoint. Every decision (`mode`, `basis`, per-arm stats) is stamped
+into the seat's `meta.json` → runlog, so the next decision sees it and a human
+can audit it with `tool_policy.sh --explain`.
+
+Deterministic on purpose: no randomness in a shell tool, reproducible from
+the ledgers, testable with fixtures.
+
+### Telemetry
+
+`meta.json` gains `tool_stats` `{mode, steps, calls{...}, read_bytes,
+budget_exhausted, check_ran, check_rc}` and `tool_policy` `{mode, basis}`;
+`context_access` becomes `tool_read` / `tool_check` (weight 1.0) so
+`score_findings.sh` and the leaderboard can split precision by arm.
+
+## Progress
+
+- [x] Live checks (above)
+- [ ] `lib_tool_loop.sh` + loop in `run_openrouter_reviewer`
+- [ ] `tool_policy.sh`
+- [ ] profiles + score_findings context kinds
+- [ ] tests (`test_tool_loop.sh`, `test_tool_policy.sh`) wired into `run_tests.sh`
+- [ ] SKILL.md + header docs

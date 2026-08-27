@@ -35,6 +35,11 @@ mkdir -p "$HOME/.local/bin"; export PATH="$HOME/.local/bin:$PATH"
 # CROSS_REVIEW_CONTEXT_MODE=diff cannot fail the context_access assertion
 # for an unrelated reason (kimi, PR #79).
 export CROSS_REVIEW_CONTEXT_MODE=files
+# This suite asserts the SINGLE-SHOT lane contract. The tool loop (default
+# --tool-mode auto, 2026-08-27) is covered by tests/test_tool_loop.sh; pin it
+# off here so a learned `read` arm cannot change the meta/prompt shape under
+# these assertions.
+export CROSS_REVIEW_TOOL_MODE=off
 
 # curl shim: stream whitespace keepalives to stdout, then fail like a timeout.
 cat >"$HOME/.local/bin/curl" <<'SHIM'
