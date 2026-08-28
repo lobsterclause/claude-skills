@@ -306,26 +306,35 @@ tl_provider_slug() {
   [[ -n "$name" ]] || return 0
   if [[ -z "$f" ]]; then
     f="$HOME/.cross-review/cache/or_providers.json"
-    # At most ONE refresh attempt per process. A failed fetch writes nothing,
-    # so TL_PROVIDER_PIN stays empty, so the caller's `-z` guard is still true
-    # on the next turn and would pay another --max-time 10 for the same dead
-    # endpoint — up to 9 turns, ~90s of the lane's budget, for an optimization
-    # that is optional by construction (codex+grok P2, this PR).
-    if [[ -z "${TL_PROVIDERS_FETCH_TRIED:-}" \
-          && ( ! -s "$f" || -n "$(find "$f" -mmin +1440 2>/dev/null)" ) ]]; then
-      TL_PROVIDERS_FETCH_TRIED=1
+    if [[ ! -s "$f" || -n "$(find "$f" -mmin +1440 2>/dev/null)" ]]; then
       mkdir -p "$(dirname "$f")" 2>/dev/null
-      # mktemp, not "$f.tmp.$$": the seats run as background subshells of one
-      # run_reviewers.sh, and $$ is the PARENT's pid in every one of them, so
-      # concurrent cold-cache refreshes would all write, validate, mv and rm
-      # the same path and could leave no cache at all (codex P2, this PR).
-      local tmp
-      tmp="$(mktemp "$f.tmp.XXXXXX" 2>/dev/null)" || tmp=""
-      if [[ -n "$tmp" ]] && curl -sS --max-time 10 "https://openrouter.ai/api/v1/providers" >"$tmp" 2>/dev/null \
-         && jq -e '.data | type == "array"' "$tmp" >/dev/null 2>&1; then
-        mv "$tmp" "$f"
-      else
-        [[ -n "$tmp" ]] && rm -f "$tmp"
+      # Negative-cache a FAILED refresh in a marker file rather than a shell
+      # variable. A failed fetch writes no catalog, so TL_PROVIDER_PIN stays
+      # empty and the caller's `-z` guard is true again next turn — up to 9
+      # turns paying `curl --max-time 10` each, ~90s of the lane's budget, for
+      # an optimization that is optional by construction (codex+grok P2).
+      # It must be a FILE: the real caller is pin_slug="$(tl_provider_slug …)",
+      # so anything assigned here dies with the command-substitution subshell —
+      # the first attempt at this fix used a variable and its test called the
+      # function directly, so it passed while production stayed broken
+      # (codex+deepseek P2, pass 3). A file also spans the concurrent seats,
+      # which share $HOME and would otherwise each re-pay the same dead fetch.
+      # 60m TTL: the cost of holding the marker is a lost pin, not a lost review.
+      if [[ -z "$(find "$f.fetch-failed" -mmin -60 2>/dev/null)" ]]; then
+        # mktemp, not "$f.tmp.$$": the seats run as background subshells of one
+        # run_reviewers.sh, and $$ is the PARENT's pid in every one of them, so
+        # concurrent cold-cache refreshes would all write, validate, mv and rm
+        # the same path and could leave no cache at all (codex P2, this PR).
+        local tmp
+        tmp="$(mktemp "$f.tmp.XXXXXX" 2>/dev/null)" || tmp=""
+        if [[ -n "$tmp" ]] && curl -sS --max-time 10 "https://openrouter.ai/api/v1/providers" >"$tmp" 2>/dev/null \
+           && jq -e '.data | type == "array"' "$tmp" >/dev/null 2>&1; then
+          mv "$tmp" "$f"
+          rm -f "$f.fetch-failed"
+        else
+          [[ -n "$tmp" ]] && rm -f "$tmp"
+          : >"$f.fetch-failed" 2>/dev/null
+        fi
       fi
     fi
   fi

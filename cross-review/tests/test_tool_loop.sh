@@ -314,26 +314,47 @@ assert_eq "balance message → provider_billing" "$(tl_classify_api_error "$T/e2
 assert_eq "401 → provider_auth"                "$(tl_classify_api_error "$T/e3.json")" "provider_auth"
 assert_eq "anything else → provider_error"     "$(tl_classify_api_error "$T/e4.json")" "provider_error"
 
-# ── the provider catalog is fetched at most once per process ──
-# A dead /api/v1/providers writes no cache, so the caller's `-z $TL_PROVIDER_PIN`
-# guard stays true and every later turn would re-pay `curl --max-time 10`.
-mkdir -p "$T/fakehome" "$T/curlshim"
+# ── a dead provider catalog is fetched once, not once per turn ──
+# The production caller is pin_slug="$(tl_provider_slug …)" — a command
+# substitution — so the "already tried" state must survive a subshell. Every
+# call below uses that exact shape; a shell-variable guard passes a direct
+# call and still re-fetches here.
+mkdir -p "$T/curlshim"
 cat >"$T/curlshim/curl" <<'SH'
 #!/bin/bash
 echo call >>"$CURL_CALLS"
-exit 7
+[[ -n "${CURL_BODY:-}" ]] || exit 7
+cat "$CURL_BODY"
 SH
 chmod +x "$T/curlshim/curl"
+
+mkdir -p "$T/home_dead"
 (
-  export CURL_CALLS="$T/curl.calls"; : >"$CURL_CALLS"
-  export HOME="$T/fakehome"; export PATH="$T/curlshim:$PATH"
-  unset CROSS_REVIEW_OR_PROVIDERS_FILE TL_PROVIDERS_FETCH_TRIED
-  tl_provider_slug "Ambient"   >/dev/null
-  tl_provider_slug "Ambient"   >/dev/null
-  tl_provider_slug "Inceptron" >/dev/null
+  export CURL_CALLS="$T/curl.dead"; : >"$CURL_CALLS"
+  export HOME="$T/home_dead"; export PATH="$T/curlshim:$PATH"
+  unset CROSS_REVIEW_OR_PROVIDERS_FILE
+  a="$(tl_provider_slug "Ambient")"; b="$(tl_provider_slug "Ambient")"
+  c="$(tl_provider_slug "Inceptron")"
 )
 assert_eq "a dead provider catalog is fetched once, not once per turn" \
-  "$(wc -l <"$T/curl.calls" | tr -d ' ')" "1"
+  "$(wc -l <"$T/curl.dead" | tr -d ' ')" "1"
+
+# …and the success path still caches, resolves, and is not re-fetched.
+mkdir -p "$T/home_ok"
+printf '{"data":[{"name":"Ambient","slug":"ambient"}]}' >"$T/providers_body.json"
+(
+  export CURL_CALLS="$T/curl.ok"; : >"$CURL_CALLS"
+  export CURL_BODY="$T/providers_body.json"
+  export HOME="$T/home_ok"; export PATH="$T/curlshim:$PATH"
+  unset CROSS_REVIEW_OR_PROVIDERS_FILE
+  printf '%s\n' "$(tl_provider_slug "Ambient")" >"$T/slug1"
+  printf '%s\n' "$(tl_provider_slug "Ambient")" >"$T/slug2"
+)
+assert_eq "a live catalog resolves the display name to its slug" "$(cat "$T/slug1")" "ambient"
+assert_eq "a fresh cache is reused, not re-fetched"              "$(wc -l <"$T/curl.ok" | tr -d ' ')" "1"
+assert_eq "the second call still resolves off the cache"         "$(cat "$T/slug2")" "ambient"
+assert_eq "a successful refresh leaves no failure marker" \
+  "$([[ -e "$T/home_ok/.cross-review/cache/or_providers.json.fetch-failed" ]] && echo yes || echo no)" "no"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"
