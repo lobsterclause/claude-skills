@@ -69,7 +69,7 @@ if [ "${SHIM_MODE:-default}" = "rf400" ] && [ "$has_rf" = "true" ]; then
   printf '%s' '{"error":{"message":"response_format json_object is not supported with tools","code":400}}'
   exit 0
 fi
-final='{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"findings\":[{\"severity\":\"Low\",\"file\":\"src/a.txt\",\"line\":2,\"snippet\":\"beta\",\"claim\":\"verified via tools\",\"suggested_fix\":\"\"}]}"}}],"usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.002}}'
+final='{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"findings\":[{\"severity\":\"Low\",\"file\":\"src/a.txt\",\"line\":2,\"snippet\":\"beta\",\"claim\":\"verified via tools\",\"suggested_fix\":\"\"}]}"}}],"usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.002,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":0}},"provider":"Shimco"}'
 calls='{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[
   {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/a.txt\"}"}},
   {"id":"c2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"../outside.txt\"}"}},
@@ -77,7 +77,7 @@ calls='{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","
   {"id":"c4","type":"function","function":{"name":"search","arguments":"{\"pattern\":\"HUNK_NEIGHBOUR\",\"path_glob\":\"src/**/*.txt\"}"}},
   {"id":"c5","type":"function","function":{"name":"run_check","arguments":"{}"}},
   {"id":"c6","type":"function","function":{"name":"list_files","arguments":"{\"dir\":\"src\"}"}}
-]}}],"usage":{"prompt_tokens":50,"completion_tokens":30,"cost":0.001}}'
+]}}],"usage":{"prompt_tokens":50,"completion_tokens":30,"cost":0.001,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":50}},"provider":"Shimco"}'
 one='{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"cx","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/a.txt\",\"start_line\":1,\"end_line\":2}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"cost":0.0005}}'
 case "${SHIM_MODE:-default}" in
   always) if [ "$tool_choice" = "none" ]; then printf '%s' "$final"; else printf '%s' "$one"; fi ;;
@@ -87,6 +87,11 @@ exit 0
 SHIM
 chmod +x "$HOME/.local/bin/curl"
 export SHIM_LOG_DIR="$T/shim"
+# Provider display-name → slug table the pin resolves against (never the live
+# /api/v1/providers here — curl is the shim). "Nameless Host" has no slug on
+# purpose: the loop must then decline to pin rather than send a bad order.
+printf '{"data":[{"name":"Shimco","slug":"shimco"},{"name":"Nameless Host","slug":""}]}' >"$T/or_providers.json"
+export CROSS_REVIEW_OR_PROVIDERS_FILE="$T/or_providers.json"
 
 # ── fixture repo ─────────────────────────────────────────────────────────────
 REPO="$T/repo"; mkdir -p "$REPO/src"
@@ -126,6 +131,19 @@ assert_eq "check_ran=false in read mode"       "$(jq -r .tool_stats.check_ran "$
 assert_eq "cost summed over both turns"        "$(jq -r .cost_usd "$META")" "0.003"
 assert_eq "prompt tokens summed"               "$(jq -r .tokens_prompt "$META")" "150"
 assert_eq "completion tokens summed"           "$(jq -r .tokens_completion "$META")" "50"
+assert_eq "cached tokens summed over both turns" "$(jq -r .tokens_cached "$META")" "40"
+assert_eq "cache-write tokens summed"           "$(jq -r .tokens_cache_write "$META")" "50"
+assert_eq "upstream provider recorded"          "$(jq -r .upstream_provider "$META")" "Shimco"
+assert_eq "turn 1 carries no provider pin"      "$(jq -r '.provider // "none"' "$T/o1/glm.turn.1.request.json")" "none"
+assert_eq "turn 2 pins turn 1's upstream"       "$(jq -c '.provider' "$T/o1/glm.turn.2.request.json")" '{"order":["shimco"],"allow_fallbacks":true}'
+assert_contains "pin is logged"                 "$(cat "$T/o1/glm.stderr")" "pinning later turns to upstream 'Shimco'"
+# Prompt order: the per-round --stat summary must sit AFTER the diff so the
+# cacheable prefix is header + diff, not header alone.
+P1="$(jq -r '.messages[0].content' "$T/o1/glm.turn.1.request.json")"
+[[ "${P1%%Changed files (diff --stat*}" == *"</diff>"* ]] && ok "diff --stat summary comes after the diff" || bad "diff --stat summary precedes the diff"
+L_STAT="$(printf '%s\n' "$P1" | grep -n 'Changed files (diff --stat' | head -1 | cut -d: -f1)"
+L_JSON="$(printf '%s\n' "$P1" | grep -n 'Output nothing but the single JSON object' | head -1 | cut -d: -f1)"
+[[ -n "$L_STAT" && -n "$L_JSON" && "$L_JSON" -gt "$L_STAT" ]] && ok "JSON suffix stays last (line $L_JSON > stat line $L_STAT)" || bad "JSON suffix not after the summary (stat=$L_STAT json=$L_JSON)"
 assert_contains "final content lands in stdout" "$(cat "$T/o1/glm.stdout")" "verified via tools"
 [[ -f "$T/o1/glm.turn.1.request.json" && -f "$T/o1/glm.turn.2.request.json" ]] && ok "per-turn request files kept for audit" || bad "per-turn request files missing"
 assert_eq "request.json points at the LAST turn" "$(jq -r '[.messages[] | select(.role == "tool")] | length' "$T/o1/glm.request.json")" "6"
