@@ -150,7 +150,7 @@ assert_eq "worktree.sh start: non-git skill dir -> wrapper_sha is JSON null" \
 # A skill dir that merely sits UNTRACKED inside someone else's repo is not a
 # wrapper checkout either (#148 pass 1: a zip-extracted skill under a tracked
 # ~/.dotfiles must not report the dotfiles' HEAD, nor read as dirty).
-NEST="$T/nest"; mkdir -p "$NEST"; git -C "$NEST" init -q -b main
+NEST="$T/nest"; mkdir -p "$NEST"; git -C "$NEST" init -q -b main 2>/dev/null || git -C "$NEST" init -q
 git -C "$NEST" -c user.email=t@t -c user.name=t commit -q --allow-empty -m outer
 mkdir -p "$NEST/skill/scripts"; cp "$S/worktree.sh" "$NEST/skill/scripts/"
 OUT_E="$(cd "$TARGET" && CROSS_REVIEW_WORKTREE_ROOT="$WT_ROOT" CROSS_REVIEW_RUN_ROOT="$RUN_ROOT" \
