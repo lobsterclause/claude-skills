@@ -314,6 +314,27 @@ assert_eq "balance message → provider_billing" "$(tl_classify_api_error "$T/e2
 assert_eq "401 → provider_auth"                "$(tl_classify_api_error "$T/e3.json")" "provider_auth"
 assert_eq "anything else → provider_error"     "$(tl_classify_api_error "$T/e4.json")" "provider_error"
 
+# ── the provider catalog is fetched at most once per process ──
+# A dead /api/v1/providers writes no cache, so the caller's `-z $TL_PROVIDER_PIN`
+# guard stays true and every later turn would re-pay `curl --max-time 10`.
+mkdir -p "$T/fakehome" "$T/curlshim"
+cat >"$T/curlshim/curl" <<'SH'
+#!/bin/bash
+echo call >>"$CURL_CALLS"
+exit 7
+SH
+chmod +x "$T/curlshim/curl"
+(
+  export CURL_CALLS="$T/curl.calls"; : >"$CURL_CALLS"
+  export HOME="$T/fakehome"; export PATH="$T/curlshim:$PATH"
+  unset CROSS_REVIEW_OR_PROVIDERS_FILE TL_PROVIDERS_FETCH_TRIED
+  tl_provider_slug "Ambient"   >/dev/null
+  tl_provider_slug "Ambient"   >/dev/null
+  tl_provider_slug "Inceptron" >/dev/null
+)
+assert_eq "a dead provider catalog is fetched once, not once per turn" \
+  "$(wc -l <"$T/curl.calls" | tr -d ' ')" "1"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ $FAIL -eq 0 ]]

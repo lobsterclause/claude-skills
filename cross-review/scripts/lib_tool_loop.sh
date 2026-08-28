@@ -306,7 +306,14 @@ tl_provider_slug() {
   [[ -n "$name" ]] || return 0
   if [[ -z "$f" ]]; then
     f="$HOME/.cross-review/cache/or_providers.json"
-    if [[ ! -s "$f" || -n "$(find "$f" -mmin +1440 2>/dev/null)" ]]; then
+    # At most ONE refresh attempt per process. A failed fetch writes nothing,
+    # so TL_PROVIDER_PIN stays empty, so the caller's `-z` guard is still true
+    # on the next turn and would pay another --max-time 10 for the same dead
+    # endpoint — up to 9 turns, ~90s of the lane's budget, for an optimization
+    # that is optional by construction (codex+grok P2, this PR).
+    if [[ -z "${TL_PROVIDERS_FETCH_TRIED:-}" \
+          && ( ! -s "$f" || -n "$(find "$f" -mmin +1440 2>/dev/null)" ) ]]; then
+      TL_PROVIDERS_FETCH_TRIED=1
       mkdir -p "$(dirname "$f")" 2>/dev/null
       # mktemp, not "$f.tmp.$$": the seats run as background subshells of one
       # run_reviewers.sh, and $$ is the PARENT's pid in every one of them, so
