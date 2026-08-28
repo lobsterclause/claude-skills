@@ -1497,6 +1497,29 @@ $json_findings_suffix"
         cost_json="$(awk -v a="$cost_json" -v b="$prior_cost" 'BEGIN{printf "%.6f", a + b}')"
       fi
     fi
+    # The token counters accumulate the same way, or a retried run's
+    # cache-hit rate is computed from the second prompt alone — which is
+    # exactly the one most likely to have hit the cache attempt 1 wrote
+    # (codex P2, cache-telemetry PR). Integer sums; null + null stays null.
+    local _k _prior _cur
+    for _k in tokens_prompt tokens_completion tokens_cached tokens_cache_write; do
+      _prior="$(jq -r --arg k "$_k" '.[$k] | if type=="number" then tostring else "null" end' "$out/${slug}.meta.json" 2>/dev/null || echo null)"
+      _prior="${_prior:-null}"
+      [[ "$_prior" == "null" ]] && continue
+      case "$_k" in
+        tokens_prompt)      _cur="$tokp_json" ;;
+        tokens_completion)  _cur="$tokc_json" ;;
+        tokens_cached)      _cur="$tokcached_json" ;;
+        tokens_cache_write) _cur="$tokcw_json" ;;
+      esac
+      if [[ "$_cur" == "null" ]]; then _cur="$_prior"; else _cur=$(( ${_cur%%.*} + ${_prior%%.*} )); fi
+      case "$_k" in
+        tokens_prompt)      tokp_json="$_cur" ;;
+        tokens_completion)  tokc_json="$_cur" ;;
+        tokens_cached)      tokcached_json="$_cur" ;;
+        tokens_cache_write) tokcw_json="$_cur" ;;
+      esac
+    done
   fi
   # tool_policy {mode, basis} is what tool_policy.sh decided and why;
   # tool_stats is what the loop actually did. Both are the learner's input

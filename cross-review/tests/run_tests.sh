@@ -395,6 +395,10 @@ chmod +x "$T/bin/curl"
 bash "$S/run_reviewers.sh" --base main --out "$T/o7" --reviewers glm >/dev/null 2>&1 || true
 assert_eq "retried run reports summed cost" "$(jq -r '.cost_usd' "$T/o7/glm.meta.json")" "0.030000"
 assert_eq "second attempt recorded" "$(jq -r '.attempt' "$T/o7/glm.meta.json")" "2"
+# token counters accumulate across attempts like cost (codex P2, cache-telemetry PR)
+assert_eq "retried run sums prompt tokens"     "$(jq -r '.tokens_prompt' "$T/o7/glm.meta.json")" "1800"
+assert_eq "retried run sums completion tokens" "$(jq -r '.tokens_completion' "$T/o7/glm.meta.json")" "49"
+assert_eq "retried run keeps cache null when neither attempt reported it" "$(jq -r '.tokens_cached' "$T/o7/glm.meta.json")" "null"
 rm -f "$T/bin/curl" "$T/curl_calls"
 
 # leaderboard: avg_cost_usd aggregates; roster draw halves a $0.50 reviewer

@@ -42,6 +42,8 @@ export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"; : >"$CROSS_REVIEW_FINDING_
 #   rf400    — first request WITH response_format 400s; retried request without it succeeds
 #   bill402  — every request 402s (OpenRouter "Insufficient credits" shape)
 #   err400   — every request 400s with a tools complaint (survives the rf-drop retry)
+#   nocache  — normal flow, but usage carries NO prompt_tokens_details (the
+#              Moonshot-direct shape: a host that reports no cache counters)
 cat >"$HOME/.local/bin/curl" <<'SHIM'
 #!/bin/sh
 cat >/dev/null   # the --config stdin (bearer header)
@@ -81,6 +83,7 @@ calls='{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","
 one='{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"cx","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/a.txt\",\"start_line\":1,\"end_line\":2}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"cost":0.0005}}'
 case "${SHIM_MODE:-default}" in
   always) if [ "$tool_choice" = "none" ]; then printf '%s' "$final"; else printf '%s' "$one"; fi ;;
+  nocache) if [ "$have_tool_msgs" = "0" ]; then printf '%s' "$calls" | jq -c 'del(.usage.prompt_tokens_details)'; else printf '%s' "$final" | jq -c 'del(.usage.prompt_tokens_details)'; fi ;;
   *)      if [ "$have_tool_msgs" = "0" ]; then printf '%s' "$calls"; else printf '%s' "$final"; fi ;;
 esac
 exit 0
@@ -212,6 +215,16 @@ run_lane "$T/o6" CROSS_REVIEW_TOOL_MODE=read CROSS_REVIEW_TOOL_READ_BUDGET_BYTES
 MSGS2="$T/o6/glm.turn.2.request.json"
 assert_eq "budget_exhausted=true"            "$(jq -r .tool_stats.budget_exhausted "$T/o6/glm.meta.json")" "true"
 assert_contains "first read is served and flagged" "$(tool_result c1)" "read budget exhausted"
+
+echo "── a host that reports no cache counters stays null, not a measured 0% ──"
+# Moonshot-direct omits usage.prompt_tokens_details entirely. Summing it as 0
+# would enter the run in analyze_runlog's hit-rate denominator as a real 0%
+# sample, dragging every seat's average toward zero (codex P2, this PR).
+run_lane "$T/o6c" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=nocache --
+assert_eq "no cache counters reported → tokens_cached null" "$(jq -r .tokens_cached "$T/o6c/glm.meta.json")" "null"
+assert_eq "…and tokens_cache_write null too"                "$(jq -r .tokens_cache_write "$T/o6c/glm.meta.json")" "null"
+assert_eq "cost/tokens still recorded"                      "$(jq -r .tokens_prompt "$T/o6c/glm.meta.json")" "150"
+assert_eq "provider still recorded"                         "$(jq -r .upstream_provider "$T/o6c/glm.meta.json")" "Shimco"
 
 echo "── response_format rejected alongside tools → dropped and retried ──"
 run_lane "$T/o7" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=rf400 --

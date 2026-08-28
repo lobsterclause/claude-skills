@@ -308,12 +308,17 @@ tl_provider_slug() {
     f="$HOME/.cross-review/cache/or_providers.json"
     if [[ ! -s "$f" || -n "$(find "$f" -mmin +1440 2>/dev/null)" ]]; then
       mkdir -p "$(dirname "$f")" 2>/dev/null
-      local tmp="$f.tmp.$$"
-      if curl -sS --max-time 10 "https://openrouter.ai/api/v1/providers" >"$tmp" 2>/dev/null \
+      # mktemp, not "$f.tmp.$$": the seats run as background subshells of one
+      # run_reviewers.sh, and $$ is the PARENT's pid in every one of them, so
+      # concurrent cold-cache refreshes would all write, validate, mv and rm
+      # the same path and could leave no cache at all (codex P2, this PR).
+      local tmp
+      tmp="$(mktemp "$f.tmp.XXXXXX" 2>/dev/null)" || tmp=""
+      if [[ -n "$tmp" ]] && curl -sS --max-time 10 "https://openrouter.ai/api/v1/providers" >"$tmp" 2>/dev/null \
          && jq -e '.data | type == "array"' "$tmp" >/dev/null 2>&1; then
         mv "$tmp" "$f"
       else
-        rm -f "$tmp"
+        [[ -n "$tmp" ]] && rm -f "$tmp"
       fi
     fi
   fi
@@ -403,7 +408,7 @@ tool_loop_run() {
   jq -n --rawfile p "$prompt_file" '[{role:"user", content:$p}]' >"$msgs"
   local start now elapsed remaining
   start=$(date +%s)
-  local cost_sum=0 tokp_sum=0 tokc_sum=0 tokcached_sum=0 tokcw_sum=0 any_usage=false
+  local cost_sum=0 tokp_sum=0 tokc_sum=0 tokcached_sum=0 tokcw_sum=0 any_usage=false any_cache=false
   local turn=0 final_content="" force_final=false
   while :; do
     turn=$((turn + 1)); TL_TURNS=$turn
@@ -462,7 +467,11 @@ tool_loop_run() {
       # Prompt-cache counters (OpenRouter normalises every host to
       # prompt_tokens_details.{cached_tokens,cache_write_tokens}; hosts that
       # do not cache report 0, Moonshot-direct omits the object → 0).
+      # any_cache gates publishing: a host that omits the object (Moonshot
+      # direct) must stay null → excluded from the hit-rate denominator, not
+      # a measured 0% sample (codex P2, this PR).
       local t_cached t_cw
+      jq -e '.usage.prompt_tokens_details | type == "object"' "$resp" >/dev/null 2>&1 && any_cache=true
       t_cached="$(tl_num .usage.prompt_tokens_details.cached_tokens "$resp" | cut -d. -f1)"
       t_cw="$(tl_num .usage.prompt_tokens_details.cache_write_tokens "$resp" | cut -d. -f1)"
       tokcached_sum=$((tokcached_sum + t_cached)); tokcw_sum=$((tokcw_sum + t_cw))
@@ -528,7 +537,7 @@ tool_loop_run() {
   rm -f "$msgs.assistant" "$msgs.tmp" "$outd/${slug}.tool.result.txt"
   if [[ "$any_usage" == true ]]; then
     TL_COST="$cost_sum"; TL_TOKP="$tokp_sum"; TL_TOKC="$tokc_sum"
-    TL_TOKCACHED="$tokcached_sum"; TL_TOKCW="$tokcw_sum"
+    if [[ "$any_cache" == true ]]; then TL_TOKCACHED="$tokcached_sum"; TL_TOKCW="$tokcw_sum"; fi
   fi
   if [[ $TL_RC -eq 0 ]]; then
     printf '%s' "$final_content" >"$outd/${slug}.stdout"
