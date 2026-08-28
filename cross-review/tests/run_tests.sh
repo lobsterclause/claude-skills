@@ -2502,7 +2502,16 @@ fbe() { bash "$FBE" --name "$1" --rc "$2" --out "$FBT" 2>/dev/null; }
 : >"$FBT/kimi.stdout"
 printf 'Error code: 429 - account is suspended due to insufficient balance\n' >"$FBT/kimi.stdout"
 assert_eq "an account wall is eligible"        "$(fbe kimi 75)"  "account_limit"
-assert_eq "a success is never eligible"        "$(fbe kimi 0)"   ""
+
+# The rc=0 case gets its own fixture now, and the reason is worth stating: this
+# assertion used to reuse the wall fixture above, which is a 60-byte account-
+# suspended message. That is now precisely the shape the vacuous-success carve-
+# out treats as eligible, so reusing it would assert the opposite of the intent.
+# What "a success is never eligible" means is that a lane which actually
+# REVIEWED something is never eligible -- so the fixture is a review.
+printf 'Reviewed 3 files. No findings. The 429 retry path in client.ts is correct.\n' >"$FBT/kimiok.stdout"
+: >"$FBT/kimiok.stderr"
+assert_eq "a success is never eligible"        "$(fbe kimiok 0)" ""
 # A timeout must never fall back: the budget was already spent.
 assert_eq "a timeout (124) is never eligible"  "$(fbe kimi 124)" ""
 assert_eq "a SIGKILLed timeout (137) is never eligible" "$(fbe kimi 137)" ""
@@ -2525,6 +2534,73 @@ assert_eq "review prose containing 401/403/429/authentication is NOT eligible" "
 # but a genuine HTTP error still is
 printf 'openrouter API error: HTTP 429 Too Many Requests\n' >"$FBT/grok.stdout"
 assert_eq "a real HTTP 429 is eligible" "$(fbe grok 1)" "rate_limited"
+
+# LATE WALL + VACUOUS SUCCESS -- the two defects that made a genuinely walled
+# codex seat permanently ineligible for the fallback built for it.
+# (kindred-mama-ai #3582, 2026-08-27.)
+#
+# Replayed at real scale rather than in miniature: the whole point is that the
+# message is far enough into the file to fall outside a 4KB head window, so a
+# fixture that fits inside one would pass against the unfixed code.
+_fe_pad() { head -c "$1" /dev/zero | tr '\0' 'x'; }
+
+# (a) The wall is announced at the END of a long transcript.
+{ _fe_pad 120000; printf '\nERROR: You have hit your usage limit. Try again at 6:10 PM.\n'; } >"$FBT/latewall.stderr"
+: >"$FBT/latewall.stdout"
+assert_eq "a wall announced late in a long transcript is eligible" \
+  "$(fbe latewall 1)" "account_limit"
+
+# (b) The same transcript with no wall text stays ineligible -- the tail window
+#     must not become a new way to say yes.
+{ _fe_pad 120000; printf '\nreview complete: no findings\n'; } >"$FBT/latequiet.stderr"
+: >"$FBT/latequiet.stdout"
+assert_eq "a long clean transcript is still NOT eligible" "$(fbe latequiet 1)" ""
+
+# (c) rc=0 with only a banner is a vacuous success, not a success. This is the
+#     shape codex produced five times running while the account was walled:
+#     version, workdir, model, prompt line, then nothing.
+printf 'OpenAI Codex v0.144.4\nworkdir: /tmp/w\nmodel: gpt-5.6-sol\nERROR: You have hit your usage limit.\n' >"$FBT/vac.stdout"
+: >"$FBT/vac.stderr"
+assert_eq "rc=0 with a banner-only output and a wall message is eligible" \
+  "$(fbe vac 0)" "account_limit"
+
+# (d) The rc=0 guard still holds for everything else. A vacuous run with no
+#     wall text is not eligible...
+printf 'OpenAI Codex v0.144.4\nworkdir: /tmp/w\n' >"$FBT/vacquiet.stdout"
+: >"$FBT/vacquiet.stderr"
+assert_eq "rc=0 with a banner-only output and NO wall is NOT eligible" \
+  "$(fbe vacquiet 0)" ""
+
+# (e) ...and neither is a real review that merely discusses one — long OR
+#     short. The size gate separates (c) from the long one; the verdict-marker
+#     check separates it from the short one (a 34-byte "LGTM. Handles HTTP 429
+#     correctly." was eligible before — cross-review of #113).
+printf 'LGTM. Handles HTTP 429 correctly.\n' >"$FBT/shortrev.stdout"
+: >"$FBT/shortrev.stderr"
+assert_eq "rc=0 with a SHORT real review mentioning a status code is NOT eligible" \
+  "$(fbe shortrev 0)" ""
+printf 'Reviewed 2 files. No issues; the usage limit banner is handled.\n' >"$FBT/shortrev2.stdout"
+: >"$FBT/shortrev2.stderr"
+assert_eq "rc=0 with a short 'no issues' review mentioning a usage limit is NOT eligible" \
+  "$(fbe shortrev2 0)" ""
+# ...in every verdict format the prompt asks for: a [P1] line, a severity
+# heading with the status code on the NEXT line, and a "Looks correct".
+printf '[P1] client.ts:12: unhandled HTTP 429 error\n' >"$FBT/shortp1.stdout"; : >"$FBT/shortp1.stderr"
+assert_eq "rc=0 with a short [P1] review mentioning HTTP 429 is NOT eligible" "$(fbe shortp1 0)" ""
+printf '## High\nIn retry.go: status=429 retry loop lacks backoff.\n' >"$FBT/shorthigh.stdout"; : >"$FBT/shorthigh.stderr"
+assert_eq "rc=0 with a short '## High' heading review mentioning status=429 is NOT eligible" "$(fbe shorthigh 0)" ""
+printf 'Looks correct. The 401 Unauthorized branch re-auths once.\n' >"$FBT/shortok.stdout"; : >"$FBT/shortok.stderr"
+assert_eq "rc=0 with a short 'Looks correct' review mentioning 401 Unauthorized is NOT eligible" "$(fbe shortok 0)" ""
+# ...while a vacuous wall whose wording merely CONTAINS a severity word as a
+# substring ("slow down", "allowed", "below") is still rescued.
+printf 'OpenAI Codex v0.144.4\nworkdir: /tmp/w\nERROR: Rate limit reached (HTTP 429). Please slow down; see details below.\n' >"$FBT/vacslow.stdout"; : >"$FBT/vacslow.stderr"
+assert_eq "rc=0 vacuous wall containing 'slow'/'below' is still eligible" "$(fbe vacslow 0)" "rate_limited"
+printf 'OpenAI Codex v0.144.4\nprompt: highlight the allowed paths\nERROR: You have hit your usage limit.\n' >"$FBT/vachigh.stdout"; : >"$FBT/vachigh.stderr"
+assert_eq "rc=0 vacuous wall whose echoed prompt contains 'highlight'/'allowed' is still eligible" "$(fbe vachigh 0)" "account_limit"
+{ _fe_pad 5000; printf '\nthe handler should surface the usage limit to the caller\n'; } >"$FBT/realrev.stdout"
+: >"$FBT/realrev.stderr"
+assert_eq "rc=0 with a REAL review mentioning a usage limit is NOT eligible" \
+  "$(fbe realrev 0)" ""
 
 # TOKEN ANCHORING -- second defect of this class on this matcher. The first
 # rewrite required only that an HTTP-ish prefix and the digits appear on the

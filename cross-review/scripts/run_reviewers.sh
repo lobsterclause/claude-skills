@@ -702,7 +702,23 @@ maybe_or_fallback() {
       [[ -f "$out/$name.primary-failed.$ext" ]] && mv -f "$out/$name.primary-failed.$ext" "$out/$name.$ext"
     done
     echo "WARN: $name: fallback could not run (rc=$frc) — primary failure preserved, lane drops out" >&2
-    echo "$rc"
+    # A vacuous rc=0 that was eligible but could not be rescued must not
+    # read as "ok" — not to the caller, and not in the restored meta.json that
+    # append_runlog.sh scores from: the lane reviewed nothing (cross-review
+    # pass 2 of #113).
+    if [[ "$rc" -eq 0 ]]; then
+      local drop_rc="${frc:-5}"
+      [[ "$drop_rc" -ne 0 ]] || drop_rc=5
+      if [[ -f "$out/$name.meta.json" ]] && command -v jq >/dev/null 2>&1; then
+        local stamped
+        stamped="$(jq --argjson ec "$drop_rc" --arg r "$reason" \
+          '. + {exit_code: $ec, failure_kind: "vacuous_success", fallback: {used: false, reason: $r, warning: "fallback could not run"}}' \
+          "$out/$name.meta.json" 2>/dev/null)" && [[ -n "$stamped" ]] && printf '%s\n' "$stamped" >"$out/$name.meta.json" || true
+      fi
+      echo "$drop_rc"
+    else
+      echo "$rc"
+    fi
     return
   fi
 
@@ -742,9 +758,11 @@ fallback_only() {
   export CROSS_REVIEW_ATTEMPT=1
   "$fn"
   local rc=$?
-  if [[ $rc -ne 0 ]]; then
-    rc="$(maybe_or_fallback "$name" "$rc")"
-  fi
+  # Unconditional: a vacuous rc=0 (banner only, wall in the text) is exactly
+  # what fallback_eligible.sh's rc=0 carve-out exists for, and gating this
+  # call on rc≠0 made that path unreachable in production (cross-review of
+  # #113). maybe_or_fallback echoes rc unchanged when the lane is not eligible.
+  rc="$(maybe_or_fallback "$name" "$rc")"
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
 }
@@ -786,9 +804,8 @@ retry_reviewer() {
     # retry would just consume it again.
     echo "$name: attempt 1 timed out (rc=$rc), not retrying — bump the timeout if this recurs" >&2
   fi
-  if [[ $rc -ne 0 ]]; then
-    rc="$(maybe_or_fallback "$name" "$rc")"
-  fi
+  # Unconditional for the same reason as fallback_only (cross-review of #113).
+  rc="$(maybe_or_fallback "$name" "$rc")"
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
 }
