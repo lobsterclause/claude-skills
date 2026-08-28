@@ -433,7 +433,10 @@ if $calibration_on; then
   # of #147). The window is the leaderboard's own recency bound; it is not
   # per-epoch — a seat that changed model inside the window is scored over
   # both, which the header documents.
-  calibration_events_tmp="$(mktemp)"
+  calibration_events_tmp="$(mktemp)" || { echo "leaderboard: mktemp failed for the calibration events" >&2; exit 1; }
+  # EXIT trap so an interrupt during severity_calibration.sh cannot leak the
+  # file (cross-review pass 2 of #147); removed eagerly below as well.
+  trap 'rm -f "$calibration_events_tmp"' EXIT
   printf '%s' "$window_events" | jq -c '.[]' >"$calibration_events_tmp" 2>/dev/null
   calibration_report="$(bash "$skill_dir/scripts/severity_calibration.sh" --events "$calibration_events_tmp" --json 2>/dev/null)"
   rm -f "$calibration_events_tmp"
