@@ -222,6 +222,31 @@
 # `--mode` (table/json/report) once passed -- draw weights (which read the
 # json score) follow the folded score. The default (no `--include-recall`)
 # output gets no new column and is unaffected.
+#
+# --calibration (#106): optional severity-calibration multiplier, off by
+# default. With it OFF every mode's output is byte-identical to today. With
+# it ON, severity_calibration.sh --json is shelled out to ONCE (same events
+# ledger the rest of this script already resolved, passed explicitly via
+# --events -- never per seat) and reduced to a per-seat
+# calibration_factor = clamp(1 - inflation, 0.5, 1.0), where inflation is
+# that seat's `inflation` field (a 2-decimal string, parsed with jq
+# `tonumber`). The factor only applies when the seat's `resolved` count from
+# that report is >= calibration_min_n (10 -- a separate, higher bar than
+# severity_calibration.sh's own --min-sample, which only gates its WARN
+# line); below that floor, or for a seat absent from the report entirely
+# (no proposed events), the factor is 1.0 (a no-op) and `applied` is false.
+# The factor multiplies the seat's VALUE axis ONLY -- composing
+# multiplicatively with the existing solo-discount factor above, since both
+# act on the same value axis and order doesn't matter -- leaving reliability
+# and survival, and the 45/35/20 blend weights, untouched. It is applied
+# only to a seat's CURRENT model epoch (previous epochs stay historical
+# reference, same as the epoch-blend feature above). Draw weights (which
+# read the json score) follow the calibrated score automatically.
+# `--mode json` gains, only when this flag is passed, a per-seat
+# `calibration: {factor, inflation, resolved, applied}` object (factor and
+# inflation as 2-decimal strings). `--mode table` gains a `cal` column.
+# `--mode report` prints a short "severity calibration applied" block
+# listing every seat with applied=true.
 
 set -uo pipefail
 
@@ -229,6 +254,7 @@ recent=40
 mode="table"
 profiles_arg=""
 include_recall=""
+calibration_on=false
 
 need_val() {
   if [[ "$2" -lt 2 ]]; then
@@ -243,6 +269,7 @@ while [[ $# -gt 0 ]]; do
     --mode)     need_val "$1" "$#"; mode="$2";         shift 2 ;;
     --profiles) need_val "$1" "$#"; profiles_arg="$2"; shift 2 ;;
     --include-recall) need_val "$1" "$#"; include_recall="$2"; shift 2 ;;
+    --calibration) calibration_on=true; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -389,6 +416,30 @@ recall_json="$(printf '%s' "$recall_events" | jq -c \
 recall_by_seat="$(jq -c 'reduce .[] as $r ({}; .[$r.reviewer] = $r.all.recall_raw)' <<<"$recall_json" 2>/dev/null)"
 [[ -n "$recall_by_seat" ]] || recall_by_seat="{}"
 
+# --calibration (#106) — see header comment. Called ONCE (never per seat).
+# calibration_min_n gates whether a seat's factor engages at all — below it,
+# the factor stays 1.0 and applied stays false, same as a seat absent from
+# severity_calibration.sh's report entirely.
+calibration_min_n=10
+calibration_map='{}'
+if $calibration_on; then
+  calibration_report="$(bash "$skill_dir/scripts/severity_calibration.sh" --events "$events_file" --json 2>/dev/null)"
+  [[ -n "$calibration_report" ]] || calibration_report="[]"
+  calibration_map="$(jq -c --argjson min_n "$calibration_min_n" '
+    reduce .[] as $s ({}; . + {($s.reviewer): (
+      ($s.inflation | tonumber) as $infl
+      | $s.resolved as $res
+      | if $res >= $min_n then
+          ((1 - $infl) as $raw
+           | (if $raw < 0.5 then 0.5 elif $raw > 1.0 then 1.0 else $raw end)) as $f
+          | {factor: $f, inflation: $infl, resolved: $res, applied: true}
+        else
+          {factor: 1.0, inflation: $infl, resolved: $res, applied: false}
+        end
+    )})' <<<"$calibration_report" 2>/dev/null)"
+  [[ -n "$calibration_map" ]] || calibration_map="{}"
+fi
+
 # Baseline seats (codex/kimi unless the profile file says otherwise) — a
 # finding corroborated by a baseline is the 0.7 credit tier.
 baselines='["codex","kimi"]'
@@ -477,7 +528,9 @@ score_reviewer() {
     --argjson solo_discount_factor "$solo_discount_factor" \
     --argjson epoch_rookie_min_n "$epoch_rookie_min_n" \
     --argjson fix_verified_bonus "$fix_verified_bonus" \
-    --argjson duplicate_merged_discount "$duplicate_merged_discount" '
+    --argjson duplicate_merged_discount "$duplicate_merged_discount" \
+    --argjson calibration_map "$calibration_map" \
+    --argjson calibration_on "$calibration_on" '
     # Fixed 2-decimal string formatter for the cost-per-kept fields (jq
     # numbers drop trailing zeros, so 0.1 would otherwise render "0.1" not
     # "0.10"). null in ("no kept findings" / "no cost data") -> em dash out,
@@ -530,7 +583,7 @@ score_reviewer() {
     # of this file) scoped to just this epoch own rows AND this epoch own
     # run_ids, so a finding (or its corroboration) from a retired model can
     # never leak into a new epoch credit.
-    | def score_epoch($rows):
+    | def score_epoch($rows; $cal_factor):
         ($rows | map(.rv)) as $rs
         | ($rows | map(.run_id) | map(select(. != null))) as $run_ids
         # Sleep-killed timeouts (2026-07-03): a timed_out sample whose
@@ -727,11 +780,11 @@ score_reviewer() {
     | (if $n == 0 then 50
        elif $ev_n > 0 then
          (100 * (0.45 * $rel
-                 + 0.35 * ($cw / $tw)
+                 + 0.35 * (($cw / $tw) * $cal_factor)
                  + 0.20 * (1 - ($dw / $tw)))) | round
        elif $findings > 0 then
          (100 * (0.45 * $rel
-                 + 0.35 * ($convergent / $findings)
+                 + 0.35 * (($convergent / $findings) * $cal_factor)
                  + 0.20 * (1 - ($dropped / $findings)))) | round
        elif ($scored | length) == 0 then
          (100 * $rel * $telemetry_mult) | round
@@ -753,7 +806,9 @@ score_reviewer() {
         score: $score, basis: $basis }
     ;
 
-    (score_epoch($cur_epoch.rows)) as $cur
+    (($calibration_map[$r] // {factor: 1, inflation: 0, resolved: 0, applied: false})) as $cal
+    | ($cal.factor) as $cal_factor
+    | (score_epoch($cur_epoch.rows; $cal_factor)) as $cur
     # Rookie-prior blend (#90) — see header comment. Only engages once this
     # seat has swapped models at least once; a single-epoch seat (every seat
     # before this feature) is left completely unblended.
@@ -765,9 +820,9 @@ score_reviewer() {
        else $cur.score end) as $final_score
     | (if $blend_w < 1 then ($cur.basis + "_blend") else $cur.basis end) as $final_basis
     | ($prev_epochs_raw
-       | map({model: .model, runs: (.rows | length), score: (score_epoch(.rows).score)})
+       | map({model: .model, runs: (.rows | length), score: (score_epoch(.rows; 1).score)})
        | reverse) as $previous_epochs
-    | { reviewer: $r,
+    | ({ reviewer: $r,
         provider: $provider,
         attempts: $cur.n,
         ok: $cur.ok,
@@ -795,6 +850,10 @@ score_reviewer() {
         epoch_runs: $epoch_runs,
         previous_epochs: $previous_epochs,
         score: $final_score }
+      + (if $calibration_on then
+           { calibration: { factor: fmt2($cal_factor), inflation: fmt2($cal.inflation),
+                             resolved: $cal.resolved, applied: $cal.applied } }
+         else {} end))
   '
 }
 
@@ -813,9 +872,9 @@ done
 
 print_table() {
   echo "── cross-review leaderboard (window: last $recent structured runs) ──"
-  printf '%s' "$rows" | jq -s -r '
+  printf '%s' "$rows" | jq -s -r --argjson calibration_on "$calibration_on" '
     sort_by(-.score) | to_entries[] |
-    "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)\(if (.value.score_basis | endswith("_blend")) then " (new-model rookie blend)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if (.value.sleep_excluded // 0) > 0 then " (sleep-excl ×\(.value.sleep_excluded))" else "" end)\(if (.value.score_basis | startswith("events")) then "  ·  ev: \(.value.ev_findings) findings, \(.value.ev_solo) solo, \(.value.ev_dropped) disproven\(if (.value.ev_unanchored // 0) > 0 then ", \(.value.ev_unanchored) unanchored" else "" end)" elif .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)\(if .value.model != null then "  ·  model \(.value.model)" else "" end)" +
+    "  #\(.key + 1)  \(.value.reviewer) [\(.value.provider)] — score \(.value.score)\(if .value.rookie then " (rookie prior)" else "" end)\(if (.value.score_basis | endswith("_blend")) then " (new-model rookie blend)" else "" end)  ·  runs \(.value.ok)/\(.value.attempts)\(if .value.quota > 0 then " (quota ×\(.value.quota))" else "" end)\(if (.value.sleep_excluded // 0) > 0 then " (sleep-excl ×\(.value.sleep_excluded))" else "" end)\(if (.value.score_basis | startswith("events")) then "  ·  ev: \(.value.ev_findings) findings, \(.value.ev_solo) solo, \(.value.ev_dropped) disproven\(if (.value.ev_unanchored // 0) > 0 then ", \(.value.ev_unanchored) unanchored" else "" end)" elif .value.findings > 0 then "  ·  findings \(.value.findings), convergent \(.value.convergent), disproven \(.value.dropped)" else "" end)  ·  p50 \(.value.p50_duration_s)s  ·  last: \(.value.latest_status)\(if .value.model != null then "  ·  model \(.value.model)" else "" end)\(if $calibration_on then "  ·  cal=\(.value.calibration.factor)" else "" end)" +
     (if (.value.previous_epochs | length) > 0 then
        ([.value.previous_epochs[] | "\n        ↳ (prior epoch) \(.model // "legacy") — \(.runs) runs, score \(.score)"] | join(""))
      else "" end)
@@ -831,6 +890,11 @@ print_table() {
   echo "   prior epochs print as indented reference lines, never fed into the draw."
   echo "   an under-sampled new epoch (<$epoch_rookie_min_n runs) blends toward the"
   echo "   rookie prior 50, weighted by epoch_runs/$epoch_rookie_min_n)"
+  if $calibration_on; then
+    echo "  (cal= is the severity-calibration multiplier on the value axis --"
+    echo "   clamp(1 - inflation, 0.5, 1.0), engaged only once a seat has"
+    echo "   $calibration_min_n+ resolved findings; 1.00 elsewhere)"
+  fi
 }
 
 # print_epoch_report — #90: the epoch boundary date for every seat that has
@@ -995,6 +1059,25 @@ for r in "${REVIEWERS[@]}"; do
   pricing_map="$(jq -c --arg r "$r" --argjson p "$(pricing_of "$r")" '. + {($r): $p}' <<<"$pricing_map")"
 done
 
+# print_calibration_report — #106: lists every seat whose severity-
+# calibration factor actually engaged (applied=true) this window. Only
+# called when --calibration is on.
+print_calibration_report() {
+  echo "── severity calibration applied (value axis, #106) ──"
+  local body
+  body="$(printf '%s' "$rows" | jq -s -r '
+    map(select(.calibration.applied == true)) |
+    sort_by(.reviewer) | .[] |
+    "  \(.reviewer) [\(.provider)] — factor \(.calibration.factor) (inflation \(.calibration.inflation), resolved \(.calibration.resolved))"
+  ')"
+  if [[ -z "$body" ]]; then
+    echo "  (no seat crossed the calibration_min_n floor this window)"
+  else
+    printf '%s\n' "$body"
+  fi
+  echo "──"
+}
+
 # --include-recall (#116): fold each seat's overall (all-bucket) recall into
 # its score; seats with no recall data are left unchanged. Applies to every
 # --mode once passed. Default (no flag) output is unaffected.
@@ -1024,6 +1107,10 @@ case "$mode" in
     print_recall_report
     echo
     print_cost_report
+    if $calibration_on; then
+      echo
+      print_calibration_report
+    fi
     ;;
   *)
     echo "unknown mode: $mode (use table|json|report)" >&2
