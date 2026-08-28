@@ -317,6 +317,51 @@ emit_warning() {
   '
 }
 
+# ── wrapper audit (#144) ─────────────────────────────────────────────────────
+# Which wrapper checkout -- this SKILL's own repo, as worktree.sh start
+# stamps it and append_runlog.sh copies it onto the entry -- did the
+# reviewing over the window, and was it safe to trust: reachable from
+# origin/master, and clean. A round launched from the shared symlinked
+# install can be sitting on an unpushed branch with a bug master doesn't
+# have; this is the surface that would have caught the 2026-08-27 incident
+# that motivated #144.
+#
+# Never fetches: ancestry is checked against whatever origin/master this
+# skill checkout already has on disk, same discipline the rest of this
+# script follows for git state.
+wrapper_entries=$(printf '%s\n' "$structured" | jq -c 'select((.wrapper_sha | type) == "string" and (.wrapper_sha | test("^[0-9a-f]{40}$|^[0-9a-f]{64}$")))')
+wrapper_n=$(printf '%s\n' "$wrapper_entries" | grep -c '^.' || true)
+
+wrapper_origin_master_known=0
+if git -C "$skill_dir" rev-parse --verify --quiet 'origin/master^{commit}' >/dev/null 2>&1; then
+  wrapper_origin_master_known=1
+fi
+
+wrapper_nonancestor_count=0
+wrapper_nonancestor_last_sha7=""
+wrapper_nonancestor_last_branch=""
+wrapper_dirty_count=0
+wrapper_dist_lines=""
+if [[ "$wrapper_n" -gt 0 ]]; then
+  # One jq pass for the whole window (not three forks per entry), and the sha
+  # is validated before it reaches git: a malformed row ({"wrapper_sha":
+  # "--all"}) must not become a git option or a phantom non-ancestor
+  # (cross-review of #148).
+  while IFS=$'\t' read -r w_sha w_branch w_dirty; do
+    [[ "$w_sha" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || continue
+    w_sha7="${w_sha:0:7}"
+    wrapper_dist_lines="${wrapper_dist_lines}${wrapper_dist_lines:+$'\n'}${w_sha7} ${w_branch} ${w_dirty}"
+    [[ "$w_dirty" == "true" ]] && wrapper_dirty_count=$((wrapper_dirty_count + 1))
+    if [[ "$wrapper_origin_master_known" -eq 1 ]]; then
+      if ! git -C "$skill_dir" merge-base --is-ancestor "$w_sha" origin/master 2>/dev/null; then
+        wrapper_nonancestor_count=$((wrapper_nonancestor_count + 1))
+        wrapper_nonancestor_last_sha7="$w_sha7"
+        wrapper_nonancestor_last_branch="$w_branch"
+      fi
+    fi
+  done < <(printf '%s\n' "$wrapper_entries" | jq -r '[(.wrapper_sha // ""), (.wrapper_branch // "?"), ((.wrapper_dirty // false) | tostring)] | @tsv')
+fi
+
 case "$mode" in
   warn)
     out=$(for stats in "${reviewer_stats[@]}"; do emit_warning "$stats"; done)
@@ -332,6 +377,19 @@ case "$mode" in
     roster_warn=$(roster_audit_out | grep '^WARN ' || true)
     if [[ -n "$roster_warn" ]]; then
       out="${out}${out:+$'\n'}$(printf '%s\n' "$roster_warn" | sed 's/^/  /')"
+    fi
+    # Wrapper audit (#144): only fires when the window actually has
+    # wrapper_sha data (older entries, or a caller not going through
+    # worktree.sh, simply have none).
+    if [[ "$wrapper_n" -gt 0 ]]; then
+      if [[ "$wrapper_origin_master_known" -eq 1 && "$wrapper_nonancestor_count" -gt 0 ]]; then
+        out="${out}${out:+$'\n'}  WARN: wrapper: $wrapper_nonancestor_count of last $wrapper_n rounds ran on a wrapper that is not an ancestor of origin/master ($wrapper_nonancestor_last_sha7, branch $wrapper_nonancestor_last_branch)"
+      elif [[ "$wrapper_origin_master_known" -eq 0 && "$quiet" -eq 0 ]]; then
+        echo "analyze_runlog: wrapper ancestry check skipped -- skill dir has no origin/master to compare against (never fetched)" >&2
+      fi
+      if [[ "$wrapper_dirty_count" -gt 0 ]]; then
+        out="${out}${out:+$'\n'}  WARN: wrapper: $wrapper_dirty_count of last $wrapper_n rounds ran on a DIRTY wrapper"
+      fi
     fi
     if [[ -n "$out" ]]; then
       echo "── cross-review pre-run check (last $n_entries runs) ──"
@@ -392,6 +450,23 @@ case "$mode" in
       "  run_id=\(.pct_run_id // "—")%  findings=\(.pct_findings // "—")%  roster_decision=\(.pct_roster_decision // "—")%",
       "  reviewer rows (\(.n_reviewer_rows)): model=\(.pct_model // "—")%  cost_usd=\(.pct_cost_usd // "—")%  context_access=\(.pct_context_access // "—")%"
     ' <<<"$completeness"
+    echo "──"
+
+    echo ""
+    echo "── wrapper audit (last $n_entries runs) ──"
+    if [[ "$wrapper_n" -eq 0 ]]; then
+      echo "  no wrapper_sha data in window"
+    else
+      echo "  distribution (sha7 → count):"
+      printf '%s\n' "$wrapper_dist_lines" | awk '{print $1}' | sort | uniq -c | sort -rn \
+        | awk '{printf "    %s → %s\n", $2, $1}'
+      echo "  dirty: $wrapper_dirty_count of $wrapper_n"
+      if [[ "$wrapper_origin_master_known" -eq 1 ]]; then
+        echo "  non-ancestor-of-origin/master: $wrapper_nonancestor_count of $wrapper_n"
+      else
+        echo "  NOTE: ancestry check skipped -- skill dir has no origin/master to compare against (never fetched)"
+      fi
+    fi
     echo "──"
 
     echo ""
