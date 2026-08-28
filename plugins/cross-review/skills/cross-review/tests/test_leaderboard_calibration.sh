@@ -307,6 +307,39 @@ assert_eq "calibration-applied block does NOT list qwen (below the floor)" \
   "$(grep -c 'qwen \[alibaba\] — factor' <<<"$REPORT_CALFLAG")" "0"
 
 echo
+# (h) the lower clamp: a seat whose every Critical is dropped has inflation
+# 1.00 and would get factor 0.00 without the clamp -- it must pin to 0.50
+# (cross-review of #147).
+echo "── (h) clamp: total inflation pins the factor to 0.50, not 0.00 ──"
+RUNLOG2="$T/runlog2.jsonl"; EVENTS2="$T/events2.jsonl"; : >"$RUNLOG2"; : >"$EVENTS2"
+for i in $(seq 1 12); do
+  printf '%s\n' "{\"ts\":\"2026-08-01T04:00:00Z\",\"run_id\":\"e$i\",\"reviewers\":{\"north\":{\"status\":\"ok\",\"exit_code\":0,\"duration_s\":10,\"output_bytes\":10,\"timeout_budget_s\":300}}}" >>"$RUNLOG2"
+  printf '%s\n' "{\"event\":\"proposed\",\"finding_id\":\"e-crit-$i\",\"run_id\":\"e$i\",\"reviewer\":\"north\",\"severity\":\"Critical\",\"all_sources\":[\"north\",\"minimax\"],\"ts\":\"2026-08-01T04:00:05Z\"}" >>"$EVENTS2"
+  printf '%s\n' "{\"event\":\"factcheck_dropped\",\"finding_id\":\"e-crit-$i\",\"run_id\":\"e$i\",\"ts\":\"2026-08-01T04:00:06Z\"}" >>"$EVENTS2"
+done
+CLAMP_JSON="$(CROSS_REVIEW_RUNLOG="$RUNLOG2" CROSS_REVIEW_FINDING_EVENTS="$EVENTS2" bash "$S/leaderboard.sh" --recent 200 --mode json --calibration 2>/dev/null)"
+assert_eq "north: inflation is 1.00" "$(jq -r '.[] | select(.reviewer=="north") | .calibration.inflation' <<<"$CLAMP_JSON")" "1.00"
+assert_eq "north: factor is clamped to 0.50" "$(jq -r '.[] | select(.reviewer=="north") | .calibration.factor' <<<"$CLAMP_JSON")" "0.50"
+assert_eq "north: applied" "$(jq -r '.[] | select(.reviewer=="north") | .calibration.applied' <<<"$CLAMP_JSON")" "true"
+
+# (i) the calibration input is the production WINDOW's events, not the whole
+# ledger: rows older than --recent carry a pile of dropped Criticals for
+# mimo; inside the window mimo is perfectly calibrated (cross-review of #147).
+echo "── (i) calibration is scored over the --recent window only ──"
+RUNLOG3="$T/runlog3.jsonl"; EVENTS3="$T/events3.jsonl"; : >"$RUNLOG3"; : >"$EVENTS3"
+for i in $(seq 1 12); do
+  printf '%s\n' "{\"ts\":\"2026-07-01T00:00:00Z\",\"run_id\":\"old$i\",\"reviewers\":{\"mimo\":{\"status\":\"ok\",\"exit_code\":0,\"duration_s\":10,\"output_bytes\":10,\"timeout_budget_s\":300}}}" >>"$RUNLOG3"
+  printf '%s\n' "{\"event\":\"proposed\",\"finding_id\":\"old-crit-$i\",\"run_id\":\"old$i\",\"reviewer\":\"mimo\",\"severity\":\"Critical\",\"all_sources\":[\"mimo\",\"minimax\"],\"ts\":\"2026-07-01T00:00:05Z\"}" >>"$EVENTS3"
+  printf '%s\n' "{\"event\":\"factcheck_dropped\",\"finding_id\":\"old-crit-$i\",\"run_id\":\"old$i\",\"ts\":\"2026-07-01T00:00:06Z\"}" >>"$EVENTS3"
+done
+cat "$RUNLOG" >>"$RUNLOG3"; cat "$EVENTS" >>"$EVENTS3"
+IN_WINDOW_N="$(wc -l <"$RUNLOG" | tr -d ' ')"
+WIN_JSON="$(CROSS_REVIEW_RUNLOG="$RUNLOG3" CROSS_REVIEW_FINDING_EVENTS="$EVENTS3" bash "$S/leaderboard.sh" --recent "$IN_WINDOW_N" --mode json --calibration 2>/dev/null)"
+ALL_JSON="$(CROSS_REVIEW_RUNLOG="$RUNLOG3" CROSS_REVIEW_FINDING_EVENTS="$EVENTS3" bash "$S/leaderboard.sh" --recent 200 --mode json --calibration 2>/dev/null)"
+assert_eq "mimo inside the window: the old dropped Criticals do not count (factor 1.00)" "$(jq -r '.[] | select(.reviewer=="mimo") | .calibration.factor' <<<"$WIN_JSON")" "1.00"
+assert_eq "mimo inside the window: resolved counts only the window's 12" "$(jq -r '.[] | select(.reviewer=="mimo") | .calibration.resolved' <<<"$WIN_JSON")" "12"
+assert_eq "mimo with the old rows inside the window: the factor drops" "$(jq -r '.[] | select(.reviewer=="mimo") | (.calibration.factor | tonumber) < 1' <<<"$ALL_JSON")" "true"
+
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]] || exit 1
 exit 0

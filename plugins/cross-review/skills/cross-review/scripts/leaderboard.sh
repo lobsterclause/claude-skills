@@ -240,7 +240,9 @@
 # act on the same value axis and order doesn't matter -- leaving reliability
 # and survival, and the 45/35/20 blend weights, untouched. It is applied
 # only to a seat's CURRENT model epoch (previous epochs stay historical
-# reference, same as the epoch-blend feature above). Draw weights (which
+# reference, same as the epoch-blend feature above) and its inflation is
+# measured over the production WINDOW's events only (the --recent rows,
+# synthetic rounds excluded), not the whole ledger. Draw weights (which
 # read the json score) follow the calibrated score automatically.
 # `--mode json` gains, only when this flag is passed, a per-seat
 # `calibration: {factor, inflation, resolved, applied}` object (factor and
@@ -423,11 +425,22 @@ recall_by_seat="$(jq -c 'reduce .[] as $r ({}; .[$r.reviewer] = $r.all.recall_ra
 calibration_min_n=10
 calibration_map='{}'
 if $calibration_on; then
-  calibration_report="$(bash "$skill_dir/scripts/severity_calibration.sh" --events "$events_file" --json 2>/dev/null)"
+  # Scored over the PRODUCTION WINDOW's events (window_events: the --recent
+  # rows' run_ids, synthetic rounds already excluded), not the whole ledger:
+  # severity_calibration.sh aggregates by reviewer name across whatever it is
+  # handed, so the full file would let a retired model's inflation penalise
+  # the seat's current model and would cost O(ledger) per run (cross-review
+  # of #147). The window is the leaderboard's own recency bound; it is not
+  # per-epoch — a seat that changed model inside the window is scored over
+  # both, which the header documents.
+  calibration_events_tmp="$(mktemp)"
+  printf '%s' "$window_events" | jq -c '.[]' >"$calibration_events_tmp" 2>/dev/null
+  calibration_report="$(bash "$skill_dir/scripts/severity_calibration.sh" --events "$calibration_events_tmp" --json 2>/dev/null)"
+  rm -f "$calibration_events_tmp"
   [[ -n "$calibration_report" ]] || calibration_report="[]"
   calibration_map="$(jq -c --argjson min_n "$calibration_min_n" '
     reduce .[] as $s ({}; . + {($s.reviewer): (
-      ($s.inflation | tonumber) as $infl
+      ($s.inflation | try tonumber catch 0) as $infl
       | $s.resolved as $res
       | if $res >= $min_n then
           ((1 - $infl) as $raw
