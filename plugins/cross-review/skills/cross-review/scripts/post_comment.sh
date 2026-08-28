@@ -287,8 +287,26 @@ case "$mode" in
     # than nothing: the gate's regex would reject it and the prose fallback
     # would then be the only stamp, which is the state this marker exists to
     # get out of.
+    #
+    # wrapper_sha (#144): which checkout of THIS skill did the reviewing, read
+    # straight from $run_dir/context.json when worktree.sh start recorded one.
+    # Appended as a trailing `wrapper=<sha>` token on the SAME marker line
+    # rather than changing its existing shape: CR_MARKER_RE in
+    # cross-review/ci/cross-review-currency.sh is
+    # '<!-- cross-review: sha=[0-9a-f]{40} ' (an unanchored, prefix-only
+    # match) and the sha-extraction sed is
+    # 's/.*<!-- cross-review: sha=([0-9a-f]{40}) .*/\1/p' (greedy `.*` after
+    # the captured sha) — both tolerate anything appended after "sha=<sha> ",
+    # so this token cannot break the currency gate. Omitted entirely when
+    # context.json has no wrapper_sha (older runs, or a caller that never
+    # went through worktree.sh) — never fabricated.
+    wrapper_sha=""
+    if [[ -f "$run_dir/context.json" ]] && command -v jq >/dev/null 2>&1; then
+      wrapper_sha="$(jq -r '.wrapper_sha // empty' "$run_dir/context.json" 2>/dev/null)"
+      [[ "$wrapper_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || wrapper_sha=""
+    fi
     marker=""
-    [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] && marker="<!-- cross-review: sha=${head_sha} pass=${pass} -->"
+    [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] && marker="<!-- cross-review: sha=${head_sha} pass=${pass}${wrapper_sha:+ wrapper=${wrapper_sha}} -->"
 
     {
       printf '## Cross-review — pass %s\n\n' "$pass"

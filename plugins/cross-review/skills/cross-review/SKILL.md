@@ -158,7 +158,7 @@ Reviewers shown a half-resolved state will hallucinate confidently about the bro
 
 If either warning fires, do **not** proceed silently. A skill that quietly sends sensitive content or bleeds tokens is worse than one that asks.
 
-`worktree.sh start` writes that JSON to `$run_dir/context.json` itself — you do not need to. It records `head_sha` (the commit the worktree is actually on, which is what a later stamp must carry), plus `base_sha`, `ref`, `id`, `repo`, and `started_at`. `cd` into `$worktree`; future steps use `$run_dir` for outputs and `$worktree` as cwd.
+`worktree.sh start` writes that JSON to `$run_dir/context.json` itself — you do not need to. It records `head_sha` (the commit the worktree is actually on, which is what a later stamp must carry), plus `base_sha`, `ref`, `id`, `repo`, and `started_at`. It also records `wrapper_sha`/`wrapper_branch`/`wrapper_dirty` — the commit, branch, and dirty state of THIS SKILL'S OWN checkout (not the target repo's worktree) at the moment the round started, so a review launched from the shared symlinked install (`~/.claude/skills/cross-review` → this repo's `cross-review/`) records which wrapper actually did the reviewing, whether or not it was pushed. `cd` into `$worktree`; future steps use `$run_dir` for outputs and `$worktree` as cwd.
 
 > This used to read "Save the JSON to `$run_dir/context.json`" — prose, which an agent can skip, and did. On 2026-08-11 six kindred-mama-ai PRs (#3214, #3252, #3264, #3269, #3276, #3280) had 68–676KB of real reviewer output on disk, no `context.json`, and no posted comment; nothing could tell them from PRs nobody reviewed. A run that never recorded its SHA cannot be reconciled afterwards at any price, so the script records it.
 
@@ -788,6 +788,8 @@ The script reads each `$run_dir/<reviewer>.meta.json` to fill in per-reviewer te
 Append once per pass (not once per multi-pass run). The runlog is JSONL: one line per pass, append-only, safe under concurrent splitstream rounds.
 
 Every appended entry carries a `schema_version`; see `docs/decisions/2026-08-27-cross-review-ledger-schema-version-policy.md` for when that number is allowed to bump and what a reader must do about it.
+
+`wrapper_sha`/`wrapper_dirty`/`wrapper_branch` need no flag either — the script copies them straight off `$run_dir/context.json` when `worktree.sh start` recorded them, so `analyze_runlog.sh --mode warn` can flag a round reviewed by a wrapper that is not on `origin/master` or was dirty at start time (#144).
 
 ## Reviewer-specific notes
 

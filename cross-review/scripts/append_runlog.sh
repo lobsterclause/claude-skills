@@ -513,6 +513,20 @@ if [[ -n "$phases_file" ]]; then
   fi
 fi
 
+# wrapper_sha / wrapper_dirty / wrapper_branch (#144): copied verbatim from
+# $run_dir/context.json when worktree.sh start stamped them there. Never
+# fabricated -- a context.json written before #144 (or by a caller that
+# never went through worktree.sh) simply has none of these keys, and the
+# entry below omits all three rather than guessing.
+wrapper_sha_val=""
+wrapper_dirty_val=""
+wrapper_branch_val=""
+if [[ -f "$run_dir/context.json" ]]; then
+  wrapper_sha_val="$(jq -r '.wrapper_sha // empty' "$run_dir/context.json" 2>/dev/null)"
+  wrapper_dirty_val="$(jq -r 'if has("wrapper_dirty") and .wrapper_dirty != null then (.wrapper_dirty | tostring) else empty end' "$run_dir/context.json" 2>/dev/null)"
+  wrapper_branch_val="$(jq -r '.wrapper_branch // empty' "$run_dir/context.json" 2>/dev/null)"
+fi
+
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 entry=$(jq -nc \
@@ -554,6 +568,9 @@ entry=$(jq -nc \
   --arg round_wall_s "$round_wall_s_val" \
   --argjson phases "$phases_json" \
   --argjson synthetic "$([[ "$synthetic" -eq 1 ]] && echo true || echo false)" \
+  --arg wrapper_sha "$wrapper_sha_val" \
+  --arg wrapper_dirty "$wrapper_dirty_val" \
+  --arg wrapper_branch "$wrapper_branch_val" \
   '{codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, glm: $glm,
     deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
     devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
@@ -586,7 +603,10 @@ entry=$(jq -nc \
   + (if $round_wall_s == "" then {} else {round_wall_s: ($round_wall_s | tonumber)} end)
   + (if $trailing == null then {} else {trailing_reviewer: $trailing} end)
   + (if $phases == null then {} else {phases: $phases} end)
-  + (if $synthetic then {synthetic: true} else {} end)')
+  + (if $synthetic then {synthetic: true} else {} end)
+  + (if $wrapper_sha == "" then {} else {wrapper_sha: $wrapper_sha} end)
+  + (if $wrapper_dirty == "" then {} else {wrapper_dirty: ($wrapper_dirty == "true")} end)
+  + (if $wrapper_branch == "" then {} else {wrapper_branch: $wrapper_branch} end)')
 
 # JSONL — one line, append-only. Wrap in flock to make it splitstream-safe:
 # POSIX guarantees write() atomicity below PIPE_BUF (4KB Linux, 512B macOS).
