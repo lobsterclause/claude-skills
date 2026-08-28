@@ -124,5 +124,19 @@
       "js",
       "jsx"
     ]
+  },
+  {
+    "id": "args_swap_pair",
+    "class": "args",
+    "description": "Swap the two bare-identifier arguments of a call, e.g. `combine(left, right)` -> `combine(right, left)`. A member-call receiver (`obj.combine(a, b)`) is fine, since the match only anchors on the identifier immediately before the opening paren. The replace re-anchors on the callee identifier, so an earlier bare pair on the same line (an arrow-function parameter list `(a, b) =>`) is left alone and the CALL is what gets swapped. Does NOT cover: nested calls (`f(g(a), b)`), string/numeric/other literals as an argument (`f(\"x\", y)`), more than two arguments, spread arguments, or a comma without exactly one following space (this repo's prettier style).",
+    "match": "[A-Za-z_][A-Za-z0-9_]*\\(([A-Za-z_][A-Za-z0-9_]*), ([A-Za-z_][A-Za-z0-9_]*)\\)",
+    "replace": "s/([A-Za-z_][A-Za-z0-9_]*)\\(([A-Za-z_][A-Za-z0-9_]*), ([A-Za-z_][A-Za-z0-9_]*)\\)/\\1(\\3, \\2)/",
+    "expected_severity": "High",
+    "languages": [
+      "ts",
+      "tsx",
+      "js",
+      "jsx"
+    ]
   }
 ]

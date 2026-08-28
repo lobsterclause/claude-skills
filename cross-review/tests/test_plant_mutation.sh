@@ -170,7 +170,7 @@ bash "$S/plant_mutation.sh" --repo "$REPO_C" --base "$C_BASE" --head "$C_HEAD" \
 if [[ -f "$OUT_C" ]]; then
   PICKED_OP="$(jq -r '.operator' "$OUT_C")"
   case "$PICKED_OP" in
-    nullish|bounds_lt_le) ok "unforced draw picks a real candidate op ($PICKED_OP)" ;;
+    nullish|bounds_lt_le|args_swap_pair) ok "unforced draw picks a real candidate op ($PICKED_OP)" ;;
     *) bad "unforced draw picks a real candidate op (got '$PICKED_OP')" ;;
   esac
 else
@@ -274,7 +274,89 @@ bash "$S/plant_mutation.sh" --repo "$REPO_H" --base "$H_BASE" --head "$H_HEAD" -
 assert_eq "leading-zero --seed is rejected (exit 1)" "$?" "1"
 assert_eq "leading-zero seed created no branch" "$(git -C "$REPO_H" branch --list 'mutation/*' | wc -l | tr -d ' ')" "0"
 
-echo
+# (i) args_swap_pair: matching/non-matching call shapes (#108).
+REPO_I="$T/repo-i"
+mk_repo_with "$REPO_I" \
+  'return combine(left, right);' \
+  'nested(f(a), b);' \
+  'f("x", y);'
+I_BASE="$(git -C "$REPO_I" rev-parse HEAD~1)"; I_HEAD="$(git -C "$REPO_I" rev-parse HEAD)"
+IDRY="$(bash "$S/plant_mutation.sh" --repo "$REPO_I" --base "$I_BASE" --head "$I_HEAD" --seed 1 --dry-run 2>&1)"
+assert_contains "flat two-identifier call is an args_swap_pair candidate" "$IDRY" "src/b.ts:2  operator=args_swap_pair"
+assert_not_contains "nested call is not an args_swap_pair candidate" "$IDRY" "src/b.ts:3  operator=args_swap_pair"
+assert_not_contains "call with a string literal arg is not an args_swap_pair candidate" "$IDRY" "src/b.ts:4  operator=args_swap_pair"
+
+OUT_I="$T/planted-i.json"
+bash "$S/plant_mutation.sh" --repo "$REPO_I" --base "$I_BASE" --head "$I_HEAD" \
+  --seed 1 --operator args_swap_pair --run-id mutation-i --out "$OUT_I" >/dev/null 2>&1
+assert_eq "args_swap_pair plants (exit 0)" "$?" "0"
+assert_eq "args_swap_pair swaps the two identifiers" "$(jq -r '.mutated_line' "$OUT_I")" "return combine(right, left);"
+assert_eq "planted.json .operator is args_swap_pair" "$(jq -r '.operator' "$OUT_I")" "args_swap_pair"
+assert_eq "planted.json .class is args" "$(jq -r '.class' "$OUT_I")" "args"
+# The replace re-anchors on the callee: a leading arrow-function parameter
+# list `(a, b) =>` on the same line must NOT be the pair that gets swapped
+# (cross-review of #145 — both seats).
+OP_REPLACE="$(jq -r '.[] | select(.id=="args_swap_pair") | .replace' "$SKILL_DIR/references/mutation_operators.json")"
+assert_eq "arrow-function parameter list is left alone; the call is swapped" \
+  "$(printf '%s\n' 'const cb = (a, b) => combine(left, right);' | sed -E "$OP_REPLACE")" \
+  'const cb = (a, b) => combine(right, left);'
+assert_eq "member-call receiver: the call is swapped" \
+  "$(printf '%s\n' 'obj.combine(left, right);' | sed -E "$OP_REPLACE")" \
+  'obj.combine(right, left);'
+assert_eq "a leading no-op pair before a real call is not a false no-op" \
+  "$(printf '%s\n' '(a, a) + call(x, y);' | sed -E "$OP_REPLACE")" \
+  '(a, a) + call(y, x);'
+REPO_I2="$T/repo-i2"
+mk_repo_with "$REPO_I2" \
+  'const cb = (a, b) => combine(left, right);' \
+  'obj.combine(left, right);'
+I2_BASE="$(git -C "$REPO_I2" rev-parse HEAD~1)"; I2_HEAD="$(git -C "$REPO_I2" rev-parse HEAD)"
+I2DRY="$(bash "$S/plant_mutation.sh" --repo "$REPO_I2" --base "$I2_BASE" --head "$I2_HEAD" --seed 1 --dry-run 2>&1)"
+assert_contains "arrow-function line is a candidate (its call site)" "$I2DRY" "src/b.ts:2  operator=args_swap_pair"
+assert_contains "member-call line is a candidate" "$I2DRY" "src/b.ts:3  operator=args_swap_pair"
+
+# (j) args_swap_pair no-op guard: the only two-identifier site is `f(a, a)`,
+#     which swaps to itself -- must be treated as ineligible, re-drawn among
+#     the (empty) remaining pool, and the plant must abort cleanly.
+REPO_J="$T/repo-j"
+mk_repo_with "$REPO_J" 'f(a, a);'
+J_BASE="$(git -C "$REPO_J" rev-parse HEAD~1)"; J_HEAD="$(git -C "$REPO_J" rev-parse HEAD)"
+bash "$S/plant_mutation.sh" --repo "$REPO_J" --base "$J_BASE" --head "$J_HEAD" \
+  --seed 1 --operator args_swap_pair --run-id mutation-j --out "$T/planted-j.json" \
+  >/dev/null 2>"$T/stderr-j.log"
+NOOP_ONLY_EXIT=$?
+assert_eq "args_swap_pair no-op-only site exits 2 (the no-candidate contract code)" "$NOOP_ONLY_EXIT" "2"
+assert_contains "no-op-only site names the cause" "$(cat "$T/stderr-j.log")" "no-op"
+assert_eq "no-op-only site: no planted.json written" "$([[ -f "$T/planted-j.json" ]] && echo yes || echo no)" "no"
+assert_eq "no-op-only site: file unchanged" "$(git -C "$REPO_J" show HEAD:src/b.ts | tail -1)" "f(a, a);"
+assert_eq "no-op-only site: tree clean" "$(git -C "$REPO_J" status --porcelain | wc -l | tr -d ' ')" "0"
+assert_eq "no-op-only site: no mutation branch created" "$(git -C "$REPO_J" branch --list 'mutation/*' | wc -l | tr -d ' ')" "0"
+
+# (k) mixed pool: one eligible args_swap_pair site among THREE no-op-only
+#     ones -- whatever order the seeded permutation yields (awk rand()
+#     streams differ between BSD awk, gawk and mawk, so no single seed can
+#     pin "no-op first"), the draw must skip every no-op and land on the
+#     real site. Run over several seeds so at least one permutation puts a
+#     no-op ahead of the real site on every awk.
+REPO_K="$T/repo-k"
+mk_repo_with "$REPO_K" \
+  'f(a, a);' \
+  'g(b, b);' \
+  'return combine(left, right);' \
+  'h(c, c);'
+K_BASE="$(git -C "$REPO_K" rev-parse HEAD~1)"; K_HEAD="$(git -C "$REPO_K" rev-parse HEAD)"
+K_OK=0
+for ks in 1 2 3 4 5 6; do
+  OUT_K="$T/planted-k-$ks.json"
+  bash "$S/plant_mutation.sh" --repo "$REPO_K" --base "$K_BASE" --head "$K_HEAD" \
+    --seed "$ks" --operator args_swap_pair --run-id "mutation-k-$ks" --out "$OUT_K" >/dev/null 2>&1 \
+    && [[ "$(jq -r '.line_range[0]' "$OUT_K")" == "4" ]] \
+    && [[ "$(jq -r '.mutated_line' "$OUT_K")" == "return combine(right, left);" ]] \
+    && K_OK=$((K_OK + 1))
+  git -C "$REPO_K" switch -q --detach "$K_HEAD" 2>/dev/null; git -C "$REPO_K" branch --list 'mutation/*' | xargs -n1 git -C "$REPO_K" branch -D -q 2>/dev/null
+done
+assert_eq "mixed pool: every seed skips all three no-ops and lands on the real site (6/6)" "$K_OK" "6"
+
 echo "── summary ──"
 echo "  PASS=$PASS FAIL=$FAIL"
 if [[ "$FAIL" -gt 0 ]]; then

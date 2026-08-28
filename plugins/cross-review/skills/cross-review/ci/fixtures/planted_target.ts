@@ -38,3 +38,11 @@ export function resolveUnder(root: string, name: string): string {
 export function guard(req: { auth(scope: string): boolean }): boolean {
   return req.auth("read");
 }
+
+function combine(left: string, right: string): string {
+  return left + right;
+}
+
+export function combineNames(left: string, right: string): string {
+  return combine(left, right);
+}
