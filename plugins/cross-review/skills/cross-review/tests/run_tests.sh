@@ -2583,6 +2583,14 @@ printf 'Reviewed 2 files. No issues; the usage limit banner is handled.\n' >"$FB
 : >"$FBT/shortrev2.stderr"
 assert_eq "rc=0 with a short 'no issues' review mentioning a usage limit is NOT eligible" \
   "$(fbe shortrev2 0)" ""
+# ...in every verdict format the prompt asks for: a [P1] line, a severity
+# heading with the status code on the NEXT line, and a "Looks correct".
+printf '[P1] client.ts:12: unhandled HTTP 429 error\n' >"$FBT/shortp1.stdout"; : >"$FBT/shortp1.stderr"
+assert_eq "rc=0 with a short [P1] review mentioning HTTP 429 is NOT eligible" "$(fbe shortp1 0)" ""
+printf '## High\nIn retry.go: status=429 retry loop lacks backoff.\n' >"$FBT/shorthigh.stdout"; : >"$FBT/shorthigh.stderr"
+assert_eq "rc=0 with a short '## High' heading review mentioning status=429 is NOT eligible" "$(fbe shorthigh 0)" ""
+printf 'Looks correct. The 401 Unauthorized branch re-auths once.\n' >"$FBT/shortok.stdout"; : >"$FBT/shortok.stderr"
+assert_eq "rc=0 with a short 'Looks correct' review mentioning 401 Unauthorized is NOT eligible" "$(fbe shortok 0)" ""
 { _fe_pad 5000; printf '\nthe handler should surface the usage limit to the caller\n'; } >"$FBT/realrev.stdout"
 : >"$FBT/realrev.stderr"
 assert_eq "rc=0 with a REAL review mentioning a usage limit is NOT eligible" \

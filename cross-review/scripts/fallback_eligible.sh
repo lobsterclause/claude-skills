@@ -53,7 +53,11 @@ if [[ "$rc" == "0" ]]; then
   # below (cross-review of #113, both seats). A run that produced a verdict or
   # findings REVIEWED something, whatever its length — it is never eligible.
   _fe_text="$(cat "$out/$name.stdout" "$out/$name.stderr" 2>/dev/null)"
-  if grep -qiE 'lgtm|looks good|no (findings|issues)|findings?:|reviewed [0-9]|\b(critical|high|medium|low)\b.*\b(severity|finding)|"findings"' <<<"$_fe_text"; then
+  # Same verdict vocabulary run_reviewers.sh's output_no_verdict uses (severity
+  # words alone, [P<n>] priorities, clean verdicts) — grep scans line by line,
+  # so a "## High" heading on its own line counts, and no \b (BSD grep -E).
+  # (cross-review pass 2 of #113, both seats.)
+  if grep -qiE 'critical|high|medium|low|no (significant |material )?(issues?|findings?|problems?|concerns?|regressions?)|looks (good|correct|fine)|lgtm|approved|\[P[0-9]\]|findings?:|reviewed [0-9]|"findings"' <<<"$_fe_text"; then
     exit 1
   fi
 fi

@@ -31,7 +31,10 @@ cat >"$T/bin/curl" <<SHIM
 cat "$T/canned.json"
 SHIM
 chmod +x "$T/bin/"*
-export PATH="$T/bin:$PATH"
+# The standard dirs are listed explicitly so run_reviewers.sh's own PATH
+# injection of /opt/homebrew/bin and /usr/local/bin cannot land ahead of the
+# shims (cross-review pass 2 of #113).
+export PATH="$T/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export OPENROUTER_API_KEY="sk-or-test-shim"
 export HOME="$T/home"; mkdir -p "$HOME"
 
@@ -82,6 +85,27 @@ assert_eq "no primary-failed artefact" \
   "$([[ -f "$T/o2/codex.primary-failed.stdout" ]] && echo yes || echo no)" "no"
 assert_eq "the review text is kept as the lane's output" \
   "$(grep -c 'LGTM' "$T/o2/codex.stdout")" "1"
+
+echo "── (c) codex exits 0 with a banner + wall but the fallback cannot run: the lane is NOT ok ──"
+cat >"$T/bin/codex" <<'SHIM'
+#!/bin/sh
+cat >/dev/null 2>&1 || true
+pad=$(printf '%0480d' 0 | tr 0 p)
+printf 'OpenAI Codex v0.144.4\nworkdir: /tmp/w\nmodel: gpt-5.6-sol\nprompt: %s\nERROR: You have hit your usage limit. Try again at 6:10 PM.\n' "$pad"
+exit 0
+SHIM
+chmod +x "$T/bin/codex"
+# No OpenRouter key anywhere: the fallback lane cannot run at all.
+( unset OPENROUTER_API_KEY; HOME="$T/home-nokey"; mkdir -p "$HOME"; export HOME
+  bash "$S/run_reviewers.sh" --base main --out "$T/o3" --reviewers codex --timeout 60 >"$T/o3.out" 2>"$T/o3.err" ) || true
+assert_eq "the drop-out WARN is printed" \
+  "$(grep -c 'fallback could not run' "$T/o3.err")" "1"
+assert_eq "the unrescued vacuous lane is reported failed, not ok" \
+  "$(grep -c '^codex: failed' "$T/o3.err")" "1"
+assert_eq "the restored meta.json does not say exit_code 0" \
+  "$(jq -r '.exit_code != 0' "$T/o3/codex.meta.json" 2>/dev/null)" "true"
+assert_eq "the restored meta.json names the failure" \
+  "$(jq -r '.failure_kind' "$T/o3/codex.meta.json" 2>/dev/null)" "vacuous_success"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"
