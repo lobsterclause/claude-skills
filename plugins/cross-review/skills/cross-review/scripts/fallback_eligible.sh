@@ -57,7 +57,11 @@ if [[ "$rc" == "0" ]]; then
   # words alone, [P<n>] priorities, clean verdicts) — grep scans line by line,
   # so a "## High" heading on its own line counts, and no \b (BSD grep -E).
   # (cross-review pass 2 of #113, both seats.)
-  if grep -qiE 'critical|high|medium|low|no (significant |material )?(issues?|findings?|problems?|concerns?|regressions?)|looks (good|correct|fine)|lgtm|approved|\[P[0-9]\]|findings?:|reviewed [0-9]|"findings"' <<<"$_fe_text"; then
+  # Severity words are boundary-anchored with POSIX classes (no \b): bare
+  # `low`/`high` matched "slow down", "allowed", "below", "highlight" inside
+  # wall messages and echoed prompts and blocked the rescue (pass 3, both
+  # seats).
+  if grep -qiE '(^|[^[:alnum:]])(critical|high|medium|low)([^[:alnum:]]|$)|no (significant |material )?(issues?|findings?|problems?|concerns?|regressions?)|looks (good|correct|fine)|lgtm|approved|\[P[0-9]\]|findings?:|reviewed [0-9]|"findings"' <<<"$_fe_text"; then
     exit 1
   fi
 fi

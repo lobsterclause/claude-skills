@@ -2591,6 +2591,12 @@ printf '## High\nIn retry.go: status=429 retry loop lacks backoff.\n' >"$FBT/sho
 assert_eq "rc=0 with a short '## High' heading review mentioning status=429 is NOT eligible" "$(fbe shorthigh 0)" ""
 printf 'Looks correct. The 401 Unauthorized branch re-auths once.\n' >"$FBT/shortok.stdout"; : >"$FBT/shortok.stderr"
 assert_eq "rc=0 with a short 'Looks correct' review mentioning 401 Unauthorized is NOT eligible" "$(fbe shortok 0)" ""
+# ...while a vacuous wall whose wording merely CONTAINS a severity word as a
+# substring ("slow down", "allowed", "below") is still rescued.
+printf 'OpenAI Codex v0.144.4\nworkdir: /tmp/w\nERROR: Rate limit reached (HTTP 429). Please slow down; see details below.\n' >"$FBT/vacslow.stdout"; : >"$FBT/vacslow.stderr"
+assert_eq "rc=0 vacuous wall containing 'slow'/'below' is still eligible" "$(fbe vacslow 0)" "rate_limited"
+printf 'OpenAI Codex v0.144.4\nprompt: highlight the allowed paths\nERROR: You have hit your usage limit.\n' >"$FBT/vachigh.stdout"; : >"$FBT/vachigh.stderr"
+assert_eq "rc=0 vacuous wall whose echoed prompt contains 'highlight'/'allowed' is still eligible" "$(fbe vachigh 0)" "account_limit"
 { _fe_pad 5000; printf '\nthe handler should surface the usage limit to the caller\n'; } >"$FBT/realrev.stdout"
 : >"$FBT/realrev.stderr"
 assert_eq "rc=0 with a REAL review mentioning a usage limit is NOT eligible" \

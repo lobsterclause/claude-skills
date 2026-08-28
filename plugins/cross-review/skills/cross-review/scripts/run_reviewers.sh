@@ -713,7 +713,7 @@ maybe_or_fallback() {
         local stamped
         stamped="$(jq --argjson ec "$drop_rc" --arg r "$reason" \
           '. + {exit_code: $ec, failure_kind: "vacuous_success", fallback: {used: false, reason: $r, warning: "fallback could not run"}}' \
-          "$out/$name.meta.json" 2>/dev/null)" && [[ -n "$stamped" ]] && printf '%s\n' "$stamped" >"$out/$name.meta.json"
+          "$out/$name.meta.json" 2>/dev/null)" && [[ -n "$stamped" ]] && printf '%s\n' "$stamped" >"$out/$name.meta.json" || true
       fi
       echo "$drop_rc"
     else
