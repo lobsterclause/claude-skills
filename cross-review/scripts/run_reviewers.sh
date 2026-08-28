@@ -742,9 +742,11 @@ fallback_only() {
   export CROSS_REVIEW_ATTEMPT=1
   "$fn"
   local rc=$?
-  if [[ $rc -ne 0 ]]; then
-    rc="$(maybe_or_fallback "$name" "$rc")"
-  fi
+  # Unconditional: a vacuous rc=0 (banner only, wall in the text) is exactly
+  # what fallback_eligible.sh's rc=0 carve-out exists for, and gating this
+  # call on rc≠0 made that path unreachable in production (cross-review of
+  # #113). maybe_or_fallback echoes rc unchanged when the lane is not eligible.
+  rc="$(maybe_or_fallback "$name" "$rc")"
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
 }
@@ -786,9 +788,8 @@ retry_reviewer() {
     # retry would just consume it again.
     echo "$name: attempt 1 timed out (rc=$rc), not retrying — bump the timeout if this recurs" >&2
   fi
-  if [[ $rc -ne 0 ]]; then
-    rc="$(maybe_or_fallback "$name" "$rc")"
-  fi
+  # Unconditional for the same reason as fallback_only (cross-review of #113).
+  rc="$(maybe_or_fallback "$name" "$rc")"
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
 }

@@ -2509,7 +2509,7 @@ assert_eq "an account wall is eligible"        "$(fbe kimi 75)"  "account_limit"
 # out treats as eligible, so reusing it would assert the opposite of the intent.
 # What "a success is never eligible" means is that a lane which actually
 # REVIEWED something is never eligible -- so the fixture is a review.
-printf 'Reviewed 3 files. No findings. The retry path in client.ts is correct.\n' >"$FBT/kimiok.stdout"
+printf 'Reviewed 3 files. No findings. The 429 retry path in client.ts is correct.\n' >"$FBT/kimiok.stdout"
 : >"$FBT/kimiok.stderr"
 assert_eq "a success is never eligible"        "$(fbe kimiok 0)" ""
 # A timeout must never fall back: the budget was already spent.
@@ -2571,8 +2571,18 @@ printf 'OpenAI Codex v0.144.4\nworkdir: /tmp/w\n' >"$FBT/vacquiet.stdout"
 assert_eq "rc=0 with a banner-only output and NO wall is NOT eligible" \
   "$(fbe vacquiet 0)" ""
 
-# (e) ...and neither is a real review that merely discusses one. The size gate
-#     is what separates (c) from this.
+# (e) ...and neither is a real review that merely discusses one — long OR
+#     short. The size gate separates (c) from the long one; the verdict-marker
+#     check separates it from the short one (a 34-byte "LGTM. Handles HTTP 429
+#     correctly." was eligible before — cross-review of #113).
+printf 'LGTM. Handles HTTP 429 correctly.\n' >"$FBT/shortrev.stdout"
+: >"$FBT/shortrev.stderr"
+assert_eq "rc=0 with a SHORT real review mentioning a status code is NOT eligible" \
+  "$(fbe shortrev 0)" ""
+printf 'Reviewed 2 files. No issues; the usage limit banner is handled.\n' >"$FBT/shortrev2.stdout"
+: >"$FBT/shortrev2.stderr"
+assert_eq "rc=0 with a short 'no issues' review mentioning a usage limit is NOT eligible" \
+  "$(fbe shortrev2 0)" ""
 { _fe_pad 5000; printf '\nthe handler should surface the usage limit to the caller\n'; } >"$FBT/realrev.stdout"
 : >"$FBT/realrev.stderr"
 assert_eq "rc=0 with a REAL review mentioning a usage limit is NOT eligible" \

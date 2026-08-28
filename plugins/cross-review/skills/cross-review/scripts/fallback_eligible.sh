@@ -45,9 +45,17 @@ VACUOUS_MAX_BYTES=1024
 if [[ "$rc" == "0" ]]; then
   _fe_bytes=0
   for _fe_f in "$out/$name.stdout" "$out/$name.stderr"; do
-    [[ -f "$_fe_f" ]] && _fe_bytes=$(( _fe_bytes + $(wc -c <"$_fe_f") ))
+    [[ -f "$_fe_f" ]] && _fe_bytes=$(( _fe_bytes + $(wc -c <"$_fe_f" 2>/dev/null || echo 0) ))
   done
   (( _fe_bytes < VACUOUS_MAX_BYTES )) || exit 1
+  # Size alone cannot tell a banner from a SHORT real review: "LGTM. Handles
+  # HTTP 429 correctly." is 34 bytes, rc=0, and matches the rate-limit pattern
+  # below (cross-review of #113, both seats). A run that produced a verdict or
+  # findings REVIEWED something, whatever its length — it is never eligible.
+  _fe_text="$(cat "$out/$name.stdout" "$out/$name.stderr" 2>/dev/null)"
+  if grep -qiE 'lgtm|looks good|no (findings|issues)|findings?:|reviewed [0-9]|\b(critical|high|medium|low)\b.*\b(severity|finding)|"findings"' <<<"$_fe_text"; then
+    exit 1
+  fi
 fi
 
 # A timeout is never eligible: the budget was spent, and re-spending it on
