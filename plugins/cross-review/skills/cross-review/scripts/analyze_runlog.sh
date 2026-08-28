@@ -329,7 +329,7 @@ emit_warning() {
 # Never fetches: ancestry is checked against whatever origin/master this
 # skill checkout already has on disk, same discipline the rest of this
 # script follows for git state.
-wrapper_entries=$(printf '%s\n' "$structured" | jq -c 'select(.wrapper_sha != null and .wrapper_sha != "")')
+wrapper_entries=$(printf '%s\n' "$structured" | jq -c 'select((.wrapper_sha | type) == "string" and (.wrapper_sha | test("^[0-9a-f]{40}$|^[0-9a-f]{64}$")))')
 wrapper_n=$(printf '%s\n' "$wrapper_entries" | grep -c '^.' || true)
 
 wrapper_origin_master_known=0
@@ -343,12 +343,12 @@ wrapper_nonancestor_last_branch=""
 wrapper_dirty_count=0
 wrapper_dist_lines=""
 if [[ "$wrapper_n" -gt 0 ]]; then
-  while IFS= read -r w_entry; do
-    [[ -n "$w_entry" ]] || continue
-    w_sha=$(jq -r '.wrapper_sha // empty' <<<"$w_entry")
-    w_branch=$(jq -r '.wrapper_branch // "?"' <<<"$w_entry")
-    w_dirty=$(jq -r '.wrapper_dirty // false' <<<"$w_entry")
-    [[ -n "$w_sha" ]] || continue
+  # One jq pass for the whole window (not three forks per entry), and the sha
+  # is validated before it reaches git: a malformed row ({"wrapper_sha":
+  # "--all"}) must not become a git option or a phantom non-ancestor
+  # (cross-review of #148).
+  while IFS=$'\t' read -r w_sha w_branch w_dirty; do
+    [[ "$w_sha" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || continue
     w_sha7="${w_sha:0:7}"
     wrapper_dist_lines="${wrapper_dist_lines}${wrapper_dist_lines:+$'\n'}${w_sha7} ${w_branch} ${w_dirty}"
     [[ "$w_dirty" == "true" ]] && wrapper_dirty_count=$((wrapper_dirty_count + 1))
@@ -359,7 +359,7 @@ if [[ "$wrapper_n" -gt 0 ]]; then
         wrapper_nonancestor_last_branch="$w_branch"
       fi
     fi
-  done < <(printf '%s\n' "$wrapper_entries")
+  done < <(printf '%s\n' "$wrapper_entries" | jq -r '[(.wrapper_sha // ""), (.wrapper_branch // "?"), ((.wrapper_dirty // false) | tostring)] | @tsv')
 fi
 
 case "$mode" in

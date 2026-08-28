@@ -297,7 +297,10 @@ case "$cmd" in
     wrapper_sha_json="null"
     wrapper_branch_json="null"
     wrapper_dirty_json="null"
-    if [[ -n "$skill_git_dir" ]] && git -C "$skill_git_dir" rev-parse --show-toplevel >/dev/null 2>&1; then
+    # The skill must be TRACKED by that repository, not merely sit inside one:
+    # a zip-extracted skill under a tracked ~/.dotfiles would otherwise record
+    # the dotfiles' HEAD as the wrapper and read as dirty (cross-review of #148).
+    if [[ -n "$skill_git_dir" ]] && git -C "$skill_git_dir" ls-files --error-unmatch scripts/worktree.sh >/dev/null 2>&1; then
       _wrapper_sha="$(git -C "$skill_git_dir" rev-parse HEAD 2>/dev/null || true)"
       if [[ "$_wrapper_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
         wrapper_sha_json="\"$_wrapper_sha\""

@@ -147,6 +147,18 @@ OUT_D="$(cd "$TARGET" && CROSS_REVIEW_WORKTREE_ROOT="$WT_ROOT" CROSS_REVIEW_RUN_
   bash "$NOGIT_SKILL/scripts/worktree.sh" start --ref HEAD --id wrap-d --base HEAD 2>"$T/wt-d.err")"
 assert_eq "worktree.sh start: non-git skill dir -> wrapper_sha is JSON null" \
   "$(jq -r '.wrapper_sha' <<<"$OUT_D")" "null"
+# A skill dir that merely sits UNTRACKED inside someone else's repo is not a
+# wrapper checkout either (#148 pass 1: a zip-extracted skill under a tracked
+# ~/.dotfiles must not report the dotfiles' HEAD, nor read as dirty).
+NEST="$T/nest"; mkdir -p "$NEST"; git -C "$NEST" init -q -b main
+git -C "$NEST" -c user.email=t@t -c user.name=t commit -q --allow-empty -m outer
+mkdir -p "$NEST/skill/scripts"; cp "$S/worktree.sh" "$NEST/skill/scripts/"
+OUT_E="$(cd "$TARGET" && CROSS_REVIEW_WORKTREE_ROOT="$WT_ROOT" CROSS_REVIEW_RUN_ROOT="$RUN_ROOT" \
+  bash "$NEST/skill/scripts/worktree.sh" start --ref HEAD --id wrap-e --base HEAD 2>"$T/wt-e.err")"
+assert_eq "worktree.sh start: untracked skill dir inside another repo -> wrapper_sha is JSON null" \
+  "$(jq -r '.wrapper_sha' <<<"$OUT_E")" "null"
+assert_eq "worktree.sh start: untracked skill dir inside another repo -> wrapper_dirty is JSON null" \
+  "$(jq -r '.wrapper_dirty' <<<"$OUT_E")" "null"
 assert_eq "worktree.sh start: non-git skill dir -> wrapper_dirty is JSON null" \
   "$(jq -r '.wrapper_dirty' <<<"$OUT_D")" "null"
 assert_eq "worktree.sh start: non-git skill dir -> wrapper_branch is JSON null" \
@@ -214,6 +226,12 @@ assert_contains "analyze_runlog warn: non-ancestor WARN names the branch" \
   "$WARN_OUT" "branch feature-unpushed"
 assert_contains "analyze_runlog warn: dirty-wrapper WARN names the count and window" \
   "$WARN_OUT" "wrapper: 1 of last 3 rounds ran on a DIRTY wrapper"
+# A malformed wrapper_sha never reaches git and never counts (#148 pass 1).
+BAD_LOG="$T/bad-log.jsonl"
+{ cat "$WARN_LOG"; mk_entry "--all" "evil" false 4; } >"$BAD_LOG"
+BAD_OUT="$(CROSS_REVIEW_RUNLOG="$BAD_LOG" bash "$SKILL/scripts/analyze_runlog.sh" --recent 10 --mode warn 2>&1)"
+assert_contains "analyze_runlog warn: a malformed wrapper_sha is skipped, counts unchanged" \
+  "$BAD_OUT" "wrapper: 2 of last 3 rounds ran on a wrapper that is not an ancestor of origin/master"
 
 echo "── analyze_runlog.sh --mode warn: all-ancestor, all-clean wrapper window is silent (#144) ──"
 CLEAN_LOG="$T/clean-log.jsonl"
@@ -240,7 +258,16 @@ cat >"$T/bin/gh" <<'SH'
 #!/bin/bash
 case "$1 $2" in
   "auth status") exit 0 ;;
-  "pr view") printf '{"headRefOid":"%s","state":"OPEN"}\n' "${CR_TEST_HEAD_SHA:-}" ; exit 0 ;;
+  "pr view")
+      case "$*" in
+        *comments*)
+            jqexpr=""; prev=""
+            for a in "$@"; do [ "$prev" = "--jq" ] && jqexpr="$a"; prev="$a"; done
+            if [ -n "$jqexpr" ]; then printf '%s' "${CR_TEST_COMMENTS:-{\"comments\":[]\}}" | jq -r "$jqexpr"
+            else printf '%s\n' "${CR_TEST_COMMENTS:-{\"comments\":[]\}}"; fi ;;
+        *) printf '{"headRefOid":"%s","state":"OPEN"}\n' "${CR_TEST_HEAD_SHA:-}" ;;
+      esac
+      exit 0 ;;
   "pr comment")
       while [ $# -gt 0 ]; do
         if [ "$1" = "--body-file" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
@@ -266,6 +293,15 @@ assert_contains "post_comment.sh: marker still carries sha=<40hex> pass=<n> (byt
   "$(cat "$CAPTURE")" "<!-- cross-review: sha=${HEAD_SHA_40} pass=1"
 assert_contains "post_comment.sh: marker line carries the wrapper sha" \
   "$(cat "$CAPTURE")" "wrapper=${SKILL_ANCESTOR_SHA}"
+
+echo "── post_comment.sh: the next pass is derived from a wrapper-bearing marker (#148 pass 1) ──"
+CAPTURE3="$T/pc-capture3.md"; : >"$CAPTURE3"
+PRIOR_COMMENTS="$(jq -nc --arg m "<!-- cross-review: sha=${HEAD_SHA_40} pass=1 wrapper=${SKILL_ANCESTOR_SHA} -->" '{comments:[{body:("## Cross-review — pass 1\n" + $m)}]}')"
+PATH="$T/bin:$PATH" CR_TEST_HEAD_SHA="$HEAD_SHA_40" CR_TEST_CAPTURE="$CAPTURE3" CR_TEST_COMMENTS="$PRIOR_COMMENTS" \
+  bash "$SKILL/scripts/post_comment.sh" --pr 1 --mode summary --findings "$PC_FIND" \
+  --head-sha "$HEAD_SHA_40" >/dev/null 2>"$T/pc3.err"
+assert_contains "post_comment.sh: a prior wrapper-bearing pass=1 marker yields pass=2" \
+  "$(cat "$CAPTURE3")" "<!-- cross-review: sha=${HEAD_SHA_40} pass=2 wrapper="
 
 echo "── post_comment.sh --mode summary: no context.json wrapper_sha -> marker unchanged, no wrapper token ──"
 PC_RUN2="$T/pc-run2"; mkdir -p "$PC_RUN2"

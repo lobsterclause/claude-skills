@@ -165,8 +165,11 @@ fi
 # must never cost the user a posted review.
 if [[ "$mode" == "summary" && "$pass_explicit" -eq 0 && -n "$pr" ]] &&
   command -v jq >/dev/null 2>&1; then
+  # The capture tolerates trailing tokens after pass=<n> (the #144
+  # `wrapper=<sha>` token) — without that, every wrapper-bearing marker was
+  # invisible here and each new round posted as pass=1 (cross-review of #148).
   prior="$(gh pr view "$pr" ${gh_repo[@]+"${gh_repo[@]}"} --json comments \
-    --jq '[.comments[].body | capture("<!-- cross-review: sha=[0-9a-f]{40} pass=(?<n>[0-9]+) -->").n | tonumber] | max // 0' \
+    --jq '[.comments[].body | capture("<!-- cross-review: sha=[0-9a-f]{40} pass=(?<n>[0-9]+)( [^>]*)? -->").n | tonumber] | max // 0' \
     2>/dev/null || true)"
   if [[ "$prior" =~ ^[0-9]+$ ]]; then
     pass="$((prior + 1))"
@@ -250,8 +253,6 @@ case "$mode" in
     # warned about above and rides on the prose stamp, which the gate still
     # accepts. Emitting a short sha here would produce a marker the gate's
     # regex rejects, which is worse than not emitting one.
-    marker=""
-    [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] && marker="<!-- cross-review: sha=${head_sha} pass=${pass} -->"
     staleness=""
     if command -v jq >/dev/null 2>&1; then
       pr_meta="$(gh pr view "$pr" ${gh_repo[@]+"${gh_repo[@]}"} --json headRefOid,state 2>/dev/null || true)"
