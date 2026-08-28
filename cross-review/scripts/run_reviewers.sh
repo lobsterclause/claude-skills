@@ -1278,18 +1278,29 @@ run_openrouter_reviewer() {
   # --name-only (which drops a rename's source path).
   doc_file_list="$(git diff --name-status "$base"...HEAD 2>/dev/null || true)"
   doc_note="$(doc_narrative_note "$doc_file_list")"
+  # PROMPT ORDER IS A CACHE DECISION. Every host that prompt-caches does so
+  # on the exact request prefix, so the stable text goes first and anything
+  # that changes between rounds goes AFTER the diff: the --stat summary
+  # changes with every fix, and with it the truncation/doc notes. Before
+  # 2026-08-28 the summary sat between the instructions and the diff, so the
+  # cacheable prefix was the ~700-token header and nothing else — round 2
+  # of a review re-paid the whole diff on every model (measured: first-turn
+  # cached_tokens 0 on GPT-5.6, 256–800 on Kimi/Grok, across 40 runs).
+  # Now round 2 shares the prefix with round 1 up to the first hunk the
+  # fixes touched. The JSON suffix stays LAST on purpose — it is the output
+  # contract and weaker models follow the most recent instruction.
   local full_prompt
   full_prompt="$review_prompt
 
-$tools_intro ${context_intro}${truncation_note}${doc_note}
-
-Changed files (diff --stat against $base):
-$diff_summary
+$tools_intro ${context_intro}
 
 $context_label
 $context_tag_open
 $diff_full
 $context_tag_close${files_block}
+
+Changed files (diff --stat against $base):
+$diff_summary${truncation_note}${doc_note}
 
 $json_findings_suffix"
 
@@ -1441,6 +1452,7 @@ $json_findings_suffix"
   # is visible in telemetry instead of only on a billing dashboard. Null
   # (older entries, failed calls, providers that omit usage) degrades to 0.
   local cost_json="null" tokp_json="null" tokc_json="null"
+  local tokcached_json="null" tokcw_json="null" provider_json="null"
   if [[ -s "$resp_file" ]]; then
     # jq type check instead of a permissive bash regex (nemotron, PR #28
     # pass 1): anything non-numeric — strings, objects, corrupt provider
@@ -1449,6 +1461,14 @@ $json_findings_suffix"
     cost_json="$(jq -r '.usage.cost | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
     tokp_json="$(jq -r '.usage.prompt_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
     tokc_json="$(jq -r '.usage.completion_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+    # Prompt-cache hit/write counters (usage.prompt_tokens_details, the
+    # OpenRouter-normalised shape every host reports; absent → null) and the
+    # upstream host that answered. These are what "is caching working" is
+    # measured from — before 2026-08-28 the numbers sat in every response
+    # file and nothing recorded them (analysis had to jq the raw dir by hand).
+    tokcached_json="$(jq -r '.usage.prompt_tokens_details.cached_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+    tokcw_json="$(jq -r '.usage.prompt_tokens_details.cache_write_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+    provider_json="$(jq -c '.provider | if type=="string" then . else null end' "$resp_file" 2>/dev/null || echo null)"
     # A response file that is non-empty but holds NO JSON value — the
     # whitespace keepalives a streaming provider sends before curl's 600s
     # timeout fires — makes jq print NOTHING and exit 0, so `|| echo null`
@@ -1456,9 +1476,12 @@ $json_findings_suffix"
     # Every consumer then fails to parse the one sample the leaderboard most
     # needs (a timeout). Observed twice 2026-08-26 (deepseek, nemotron); #74.
     cost_json="${cost_json:-null}"; tokp_json="${tokp_json:-null}"; tokc_json="${tokc_json:-null}"
+    tokcached_json="${tokcached_json:-null}"; tokcw_json="${tokcw_json:-null}"; provider_json="${provider_json:-null}"
   fi
   if [[ "$tl_used" == true ]]; then
     cost_json="${TL_COST:-null}"; tokp_json="${TL_TOKP:-null}"; tokc_json="${TL_TOKC:-null}"
+    tokcached_json="${TL_TOKCACHED:-null}"; tokcw_json="${TL_TOKCW:-null}"
+    provider_json="$(jq -n --arg p "${TL_PROVIDER:-null}" 'if $p == "null" or $p == "" then null else $p end')"
   fi
   # A retried attempt overwrites meta — but attempt 1's spend was real money
   # (a charged response classified degenerate/no-verdict still billed).
@@ -1474,6 +1497,29 @@ $json_findings_suffix"
         cost_json="$(awk -v a="$cost_json" -v b="$prior_cost" 'BEGIN{printf "%.6f", a + b}')"
       fi
     fi
+    # The token counters accumulate the same way, or a retried run's
+    # cache-hit rate is computed from the second prompt alone — which is
+    # exactly the one most likely to have hit the cache attempt 1 wrote
+    # (codex P2, cache-telemetry PR). Integer sums; null + null stays null.
+    local _k _prior _cur
+    for _k in tokens_prompt tokens_completion tokens_cached tokens_cache_write; do
+      _prior="$(jq -r --arg k "$_k" '.[$k] | if type=="number" then tostring else "null" end' "$out/${slug}.meta.json" 2>/dev/null || echo null)"
+      _prior="${_prior:-null}"
+      [[ "$_prior" == "null" ]] && continue
+      case "$_k" in
+        tokens_prompt)      _cur="$tokp_json" ;;
+        tokens_completion)  _cur="$tokc_json" ;;
+        tokens_cached)      _cur="$tokcached_json" ;;
+        tokens_cache_write) _cur="$tokcw_json" ;;
+      esac
+      if [[ "$_cur" == "null" ]]; then _cur="$_prior"; else _cur=$(( ${_cur%%.*} + ${_prior%%.*} )); fi
+      case "$_k" in
+        tokens_prompt)      tokp_json="$_cur" ;;
+        tokens_completion)  tokc_json="$_cur" ;;
+        tokens_cached)      tokcached_json="$_cur" ;;
+        tokens_cache_write) tokcw_json="$_cur" ;;
+      esac
+    done
   fi
   # tool_policy {mode, basis} is what tool_policy.sh decided and why;
   # tool_stats is what the loop actually did. Both are the learner's input
@@ -1494,8 +1540,9 @@ $json_findings_suffix"
   if [[ "$context_access" == file_context || ( "$tl_mode" != off && "$tool_context" == files && "$context_mode" == files ) ]]; then
     ctx_n="$context_files_included"; ctx_o="$context_files_omitted"
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "tool_policy": %s, "tool_stats": %s}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s, "tokens_cached": %s, "tokens_cache_write": %s, "upstream_provider": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "tool_policy": %s, "tool_stats": %s}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$cli" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" \
+    "$tokcached_json" "$tokcw_json" "$provider_json" \
     "$context_access" "$ctx_n" "$ctx_o" "$tool_policy_json" "$tool_stats_json" >"$out/${slug}.meta.json"
   return "$rc"
 }
@@ -1653,15 +1700,17 @@ run_agy_reviewer() {
     context_tag_close="</diff>"
     context_intro="The full diff is included above."
   fi
+  # Stable text first, per-round text after the diff — Gemini's implicit
+  # cache is prefix-based too (same reasoning as run_openrouter_reviewer).
   full_prompt="$review_prompt
-
-Changed files (diff --stat against $base):
-$diff_summary
 
 $context_label
 $context_tag_open
 $diff_full
 $context_tag_close
+
+Changed files (diff --stat against $base):
+$diff_summary
 
 $context_intro HARD CONSTRAINT: you are running headless with no interactive permission prompt, so ANY shell/terminal command you attempt that is not pre-approved is auto-denied and immediately terminates your run with zero output — the whole review is lost. Do NOT run git, jq, printf, echo, or any other shell command, not even to orient yourself or to validate your own output, and do NOT go looking for the repository — it is already mounted in your workspace at $repo_root. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools (read/view/search-file) only — those are a different permission category and are not gated this way. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
 
@@ -1978,17 +2027,19 @@ run_kimi() {
   doc_file_list="$(git diff --name-status "$base"...HEAD 2>/dev/null || true)"
   doc_note="$(doc_narrative_note "$doc_file_list")"
   local full_prompt
+  # Stable text first, per-round text after the diff — same cache reasoning
+  # as run_openrouter_reviewer's prompt block.
   full_prompt="$review_prompt
 
-Do NOT use any file-reading or shell tools. ${context_intro}${truncation_note}${doc_note}
-
-Changed files (diff --stat against $base):
-$diff_summary
+Do NOT use any file-reading or shell tools. ${context_intro}
 
 $context_label
 $context_tag_open
 $diff_full
 $context_tag_close${files_block}
+
+Changed files (diff --stat against $base):
+$diff_summary${truncation_note}${doc_note}
 
 Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
 

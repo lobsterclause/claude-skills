@@ -56,6 +56,8 @@ TL_CALL_CAP_BYTES="${CROSS_REVIEW_TOOL_CALL_CAP_BYTES:-40000}"
 TL_READ_MAX_LINES="${CROSS_REVIEW_TOOL_READ_MAX_LINES:-400}"
 TL_SEARCH_MAX_LINES="${CROSS_REVIEW_TOOL_SEARCH_MAX_LINES:-200}"
 TL_LIST_MAX_LINES="${CROSS_REVIEW_TOOL_LIST_MAX_LINES:-500}"
+# CROSS_REVIEW_TL_PIN_PROVIDER=0 disables the per-loop upstream pin (see the
+# request builder in tool_loop_run) — a debugging knob, not a tuning one.
 TL_CHECK_TIMEOUT_S="${CROSS_REVIEW_CHECK_TIMEOUT_S:-300}"
 TL_CHECK_TAIL_BYTES="${CROSS_REVIEW_CHECK_TAIL_BYTES:-20000}"
 
@@ -291,6 +293,55 @@ tl_calls_json() {
         -c '{read_file:$r, search:$s, list_files:$l, run_check:$c, unknown:$u}'
 }
 
+# tl_provider_slug <display name> — the OpenRouter provider slug for the
+# `provider` display name a chat completion reports ("Ambient" → ambient,
+# "Google" → google-vertex, "Sakana AI" → sakana). Names do NOT lowercase
+# into slugs reliably (5 of 103 differ, 2026-08-28), so this reads the live
+# /api/v1/providers table: CROSS_REVIEW_OR_PROVIDERS_FILE (tests/fixtures)
+# else ~/.cross-review/cache/or_providers.json, refreshed when older than
+# 24h with a bounded unauthenticated GET. Prints nothing when unresolvable —
+# the caller then simply does not pin.
+tl_provider_slug() {
+  local name="$1" f="${CROSS_REVIEW_OR_PROVIDERS_FILE:-}"
+  [[ -n "$name" ]] || return 0
+  if [[ -z "$f" ]]; then
+    f="$HOME/.cross-review/cache/or_providers.json"
+    if [[ ! -s "$f" || -n "$(find "$f" -mmin +1440 2>/dev/null)" ]]; then
+      mkdir -p "$(dirname "$f")" 2>/dev/null
+      # Negative-cache a FAILED refresh in a marker file rather than a shell
+      # variable. A failed fetch writes no catalog, so TL_PROVIDER_PIN stays
+      # empty and the caller's `-z` guard is true again next turn — up to 9
+      # turns paying `curl --max-time 10` each, ~90s of the lane's budget, for
+      # an optimization that is optional by construction (codex+grok P2).
+      # It must be a FILE: the real caller is pin_slug="$(tl_provider_slug …)",
+      # so anything assigned here dies with the command-substitution subshell —
+      # the first attempt at this fix used a variable and its test called the
+      # function directly, so it passed while production stayed broken
+      # (codex+deepseek P2, pass 3). A file also spans the concurrent seats,
+      # which share $HOME and would otherwise each re-pay the same dead fetch.
+      # 60m TTL: the cost of holding the marker is a lost pin, not a lost review.
+      if [[ -z "$(find "$f.fetch-failed" -mmin -60 2>/dev/null)" ]]; then
+        # mktemp, not "$f.tmp.$$": the seats run as background subshells of one
+        # run_reviewers.sh, and $$ is the PARENT's pid in every one of them, so
+        # concurrent cold-cache refreshes would all write, validate, mv and rm
+        # the same path and could leave no cache at all (codex P2, this PR).
+        local tmp
+        tmp="$(mktemp "$f.tmp.XXXXXX" 2>/dev/null)" || tmp=""
+        if [[ -n "$tmp" ]] && curl -sS --max-time 10 "https://openrouter.ai/api/v1/providers" >"$tmp" 2>/dev/null \
+           && jq -e '.data | type == "array"' "$tmp" >/dev/null 2>&1; then
+          mv "$tmp" "$f"
+          rm -f "$f.fetch-failed"
+        else
+          [[ -n "$tmp" ]] && rm -f "$tmp"
+          : >"$f.fetch-failed" 2>/dev/null
+        fi
+      fi
+    fi
+  fi
+  [[ -s "$f" ]] || return 0
+  jq -r --arg n "$name" '.data[]? | select(.name == $n) | .slug // empty' "$f" 2>/dev/null | head -n 1
+}
+
 # tl_post <cli> <key> <body_file> <resp_file> <stderr_file> <max_time> —
 # one chat-completions call. Same secret hygiene as the single-shot lane:
 # the bearer token reaches curl on stdin (never argv, never disk).
@@ -345,6 +396,8 @@ tl_num() { jq -r "$1 | if type==\"number\" then tostring else \"0\" end" "$2" 2>
 # the wall budget runs out, or the API errors. Sets:
 #   TL_RC          0 ok | 1 api error | 124 timeout | 5 empty final content
 #   TL_COST TL_TOKP TL_TOKC   summed over every turn (null when nothing returned)
+#   TL_TOKCACHED TL_TOKCW     prompt-cache hit / write tokens, summed likewise
+#   TL_PROVIDER    upstream host that answered the last turn ("null" if unknown)
 #   TL_STEPS       assistant turns that carried tool calls
 #   TL_TURNS       total API calls made
 #   TL_BUDGET_EXHAUSTED TL_READ_BYTES TL_CHECK_RAN TL_CHECK_RC (see above)
@@ -360,6 +413,7 @@ tool_loop_run() {
   TL_READ_BYTES=0; TL_BUDGET_EXHAUSTED=false; TL_CHECK_RAN=false; TL_CHECK_RC="null"
   TL_C_READ=0; TL_C_SEARCH=0; TL_C_LIST=0; TL_C_CHECK=0; TL_C_UNKNOWN=0
   TL_RC=0; TL_COST="null"; TL_TOKP="null"; TL_TOKC="null"; TL_STEPS=0; TL_TURNS=0
+  TL_TOKCACHED="null"; TL_TOKCW="null"; TL_PROVIDER="null"; TL_PROVIDER_PIN=""
   TL_RF_DROPPED=false; TL_API_ERROR=""; TL_FAILURE_KIND=""
   local check_avail=false
   [[ "$mode" == "check" ]] && tl_resolve_check_cmd "$root" >/dev/null 2>&1 && check_avail=true
@@ -370,7 +424,7 @@ tool_loop_run() {
   jq -n --rawfile p "$prompt_file" '[{role:"user", content:$p}]' >"$msgs"
   local start now elapsed remaining
   start=$(date +%s)
-  local cost_sum=0 tokp_sum=0 tokc_sum=0 any_usage=false
+  local cost_sum=0 tokp_sum=0 tokc_sum=0 tokcached_sum=0 tokcw_sum=0 any_usage=false any_cache=false
   local turn=0 final_content="" force_final=false
   while :; do
     turn=$((turn + 1)); TL_TURNS=$turn
@@ -381,11 +435,18 @@ tool_loop_run() {
     [[ "$TL_RF_DROPPED" == true ]] && rf_arg="null"
     local extra='{}'
     [[ "$force_final" == true ]] && extra='{"tool_choice":"none"}'
+    # provider pin (OpenRouter only): once turn 1 has answered, every later
+    # turn asks for the SAME upstream first. Prompt caches live per host —
+    # a mid-loop re-route (kimi k2.7: Ambient → Inceptron on turn 4, PR #117
+    # 2026-08-27) threw away a 52k-token cached prefix and made that one
+    # turn cost 4× the previous. allow_fallbacks stays true: a dead host
+    # must not kill the review, it just loses the cache.
     jq -n --arg m "$model" --slurpfile msgs "$msgs" --argjson tools "$tools" --argjson rf "$rf_arg" \
-          --argjson extra "$extra" --arg cli "$cli" \
+          --argjson extra "$extra" --arg cli "$cli" --arg pin "$TL_PROVIDER_PIN" \
       '{model:$m, messages:$msgs[0], tools:$tools, stream:false}
        + (if $cli == "openrouter" then {usage:{include:true}} else {} end)
        + (if $rf == null then {} else {response_format:$rf} end)
+       + (if $pin == "" then {} else {provider:{order:[$pin], allow_fallbacks:true}} end)
        + $extra' >"$body"
     cp "$body" "$outd/${slug}.request.json"
     tl_post "$cli" "$key" "$body" "$resp" "$err" "$remaining" "$endpoint"
@@ -419,6 +480,35 @@ tool_loop_run() {
       cost_sum="$(jq -n --argjson a "$cost_sum" --argjson b "$(tl_num .usage.cost "$resp")" '$a + $b')"
       tokp_sum=$((tokp_sum + $(tl_num .usage.prompt_tokens "$resp" | cut -d. -f1)))
       tokc_sum=$((tokc_sum + $(tl_num .usage.completion_tokens "$resp" | cut -d. -f1)))
+      # Prompt-cache counters (OpenRouter normalises every host to
+      # prompt_tokens_details.{cached_tokens,cache_write_tokens}; hosts that
+      # do not cache report 0, Moonshot-direct omits the object → 0).
+      # any_cache gates publishing: a host that omits the object (Moonshot
+      # direct) must stay null → excluded from the hit-rate denominator, not
+      # a measured 0% sample (codex P2, this PR).
+      local t_cached t_cw
+      jq -e '.usage.prompt_tokens_details | type == "object"' "$resp" >/dev/null 2>&1 && any_cache=true
+      t_cached="$(tl_num .usage.prompt_tokens_details.cached_tokens "$resp" | cut -d. -f1)"
+      t_cw="$(tl_num .usage.prompt_tokens_details.cache_write_tokens "$resp" | cut -d. -f1)"
+      tokcached_sum=$((tokcached_sum + t_cached)); tokcw_sum=$((tokcw_sum + t_cw))
+      echo "$slug: turn $turn provider=$(jq -r '.provider // "?"' "$resp" 2>/dev/null) prompt_tokens=$(tl_num .usage.prompt_tokens "$resp" | cut -d. -f1) cached=$t_cached" >>"$err"
+    fi
+    # Which upstream answered. The last one wins for meta.json; the FIRST one
+    # becomes the pin for the rest of this loop (see the request builder).
+    local turn_provider
+    turn_provider="$(jq -r '.provider // empty' "$resp" 2>/dev/null)"
+    if [[ -n "$turn_provider" ]]; then
+      TL_PROVIDER="$turn_provider"
+      if [[ "$cli" == "openrouter" && -z "$TL_PROVIDER_PIN" && "${CROSS_REVIEW_TL_PIN_PROVIDER:-1}" != "0" ]]; then
+        local pin_slug
+        pin_slug="$(tl_provider_slug "$turn_provider")"
+        if [[ -n "$pin_slug" ]]; then
+          TL_PROVIDER_PIN="$pin_slug"
+          echo "$slug: pinning later turns to upstream '$turn_provider' (provider.order=[$pin_slug]) to keep its prompt cache" >>"$err"
+        else
+          echo "$slug: upstream '$turn_provider' has no known OpenRouter slug — not pinning (cache may be lost on re-route)" >>"$err"
+        fi
+      fi
     fi
     local ncalls
     ncalls="$(jq -r '.choices[0].message.tool_calls | if type=="array" then length else 0 end' "$resp" 2>/dev/null || echo 0)"
@@ -461,7 +551,10 @@ tool_loop_run() {
     fi
   done
   rm -f "$msgs.assistant" "$msgs.tmp" "$outd/${slug}.tool.result.txt"
-  if [[ "$any_usage" == true ]]; then TL_COST="$cost_sum"; TL_TOKP="$tokp_sum"; TL_TOKC="$tokc_sum"; fi
+  if [[ "$any_usage" == true ]]; then
+    TL_COST="$cost_sum"; TL_TOKP="$tokp_sum"; TL_TOKC="$tokc_sum"
+    if [[ "$any_cache" == true ]]; then TL_TOKCACHED="$tokcached_sum"; TL_TOKCW="$tokcw_sum"; fi
+  fi
   if [[ $TL_RC -eq 0 ]]; then
     printf '%s' "$final_content" >"$outd/${slug}.stdout"
     [[ -n "$final_content" ]] || TL_RC=5

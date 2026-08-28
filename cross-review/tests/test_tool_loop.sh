@@ -42,6 +42,8 @@ export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"; : >"$CROSS_REVIEW_FINDING_
 #   rf400    — first request WITH response_format 400s; retried request without it succeeds
 #   bill402  — every request 402s (OpenRouter "Insufficient credits" shape)
 #   err400   — every request 400s with a tools complaint (survives the rf-drop retry)
+#   nocache  — normal flow, but usage carries NO prompt_tokens_details (the
+#              Moonshot-direct shape: a host that reports no cache counters)
 cat >"$HOME/.local/bin/curl" <<'SHIM'
 #!/bin/sh
 cat >/dev/null   # the --config stdin (bearer header)
@@ -69,7 +71,7 @@ if [ "${SHIM_MODE:-default}" = "rf400" ] && [ "$has_rf" = "true" ]; then
   printf '%s' '{"error":{"message":"response_format json_object is not supported with tools","code":400}}'
   exit 0
 fi
-final='{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"findings\":[{\"severity\":\"Low\",\"file\":\"src/a.txt\",\"line\":2,\"snippet\":\"beta\",\"claim\":\"verified via tools\",\"suggested_fix\":\"\"}]}"}}],"usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.002}}'
+final='{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"findings\":[{\"severity\":\"Low\",\"file\":\"src/a.txt\",\"line\":2,\"snippet\":\"beta\",\"claim\":\"verified via tools\",\"suggested_fix\":\"\"}]}"}}],"usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.002,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":0}},"provider":"Shimco"}'
 calls='{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[
   {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/a.txt\"}"}},
   {"id":"c2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"../outside.txt\"}"}},
@@ -77,16 +79,22 @@ calls='{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","
   {"id":"c4","type":"function","function":{"name":"search","arguments":"{\"pattern\":\"HUNK_NEIGHBOUR\",\"path_glob\":\"src/**/*.txt\"}"}},
   {"id":"c5","type":"function","function":{"name":"run_check","arguments":"{}"}},
   {"id":"c6","type":"function","function":{"name":"list_files","arguments":"{\"dir\":\"src\"}"}}
-]}}],"usage":{"prompt_tokens":50,"completion_tokens":30,"cost":0.001}}'
+]}}],"usage":{"prompt_tokens":50,"completion_tokens":30,"cost":0.001,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":50}},"provider":"Shimco"}'
 one='{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"cx","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/a.txt\",\"start_line\":1,\"end_line\":2}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"cost":0.0005}}'
 case "${SHIM_MODE:-default}" in
   always) if [ "$tool_choice" = "none" ]; then printf '%s' "$final"; else printf '%s' "$one"; fi ;;
+  nocache) if [ "$have_tool_msgs" = "0" ]; then printf '%s' "$calls" | jq -c 'del(.usage.prompt_tokens_details)'; else printf '%s' "$final" | jq -c 'del(.usage.prompt_tokens_details)'; fi ;;
   *)      if [ "$have_tool_msgs" = "0" ]; then printf '%s' "$calls"; else printf '%s' "$final"; fi ;;
 esac
 exit 0
 SHIM
 chmod +x "$HOME/.local/bin/curl"
 export SHIM_LOG_DIR="$T/shim"
+# Provider display-name → slug table the pin resolves against (never the live
+# /api/v1/providers here — curl is the shim). "Nameless Host" has no slug on
+# purpose: the loop must then decline to pin rather than send a bad order.
+printf '{"data":[{"name":"Shimco","slug":"shimco"},{"name":"Nameless Host","slug":""}]}' >"$T/or_providers.json"
+export CROSS_REVIEW_OR_PROVIDERS_FILE="$T/or_providers.json"
 
 # ── fixture repo ─────────────────────────────────────────────────────────────
 REPO="$T/repo"; mkdir -p "$REPO/src"
@@ -126,6 +134,19 @@ assert_eq "check_ran=false in read mode"       "$(jq -r .tool_stats.check_ran "$
 assert_eq "cost summed over both turns"        "$(jq -r .cost_usd "$META")" "0.003"
 assert_eq "prompt tokens summed"               "$(jq -r .tokens_prompt "$META")" "150"
 assert_eq "completion tokens summed"           "$(jq -r .tokens_completion "$META")" "50"
+assert_eq "cached tokens summed over both turns" "$(jq -r .tokens_cached "$META")" "40"
+assert_eq "cache-write tokens summed"           "$(jq -r .tokens_cache_write "$META")" "50"
+assert_eq "upstream provider recorded"          "$(jq -r .upstream_provider "$META")" "Shimco"
+assert_eq "turn 1 carries no provider pin"      "$(jq -r '.provider // "none"' "$T/o1/glm.turn.1.request.json")" "none"
+assert_eq "turn 2 pins turn 1's upstream"       "$(jq -c '.provider' "$T/o1/glm.turn.2.request.json")" '{"order":["shimco"],"allow_fallbacks":true}'
+assert_contains "pin is logged"                 "$(cat "$T/o1/glm.stderr")" "pinning later turns to upstream 'Shimco'"
+# Prompt order: the per-round --stat summary must sit AFTER the diff so the
+# cacheable prefix is header + diff, not header alone.
+P1="$(jq -r '.messages[0].content' "$T/o1/glm.turn.1.request.json")"
+[[ "${P1%%Changed files (diff --stat*}" == *"</diff>"* ]] && ok "diff --stat summary comes after the diff" || bad "diff --stat summary precedes the diff"
+L_STAT="$(printf '%s\n' "$P1" | grep -n 'Changed files (diff --stat' | head -1 | cut -d: -f1)"
+L_JSON="$(printf '%s\n' "$P1" | grep -n 'Output nothing but the single JSON object' | head -1 | cut -d: -f1)"
+[[ -n "$L_STAT" && -n "$L_JSON" && "$L_JSON" -gt "$L_STAT" ]] && ok "JSON suffix stays last (line $L_JSON > stat line $L_STAT)" || bad "JSON suffix not after the summary (stat=$L_STAT json=$L_JSON)"
 assert_contains "final content lands in stdout" "$(cat "$T/o1/glm.stdout")" "verified via tools"
 [[ -f "$T/o1/glm.turn.1.request.json" && -f "$T/o1/glm.turn.2.request.json" ]] && ok "per-turn request files kept for audit" || bad "per-turn request files missing"
 assert_eq "request.json points at the LAST turn" "$(jq -r '[.messages[] | select(.role == "tool")] | length' "$T/o1/glm.request.json")" "6"
@@ -194,6 +215,16 @@ run_lane "$T/o6" CROSS_REVIEW_TOOL_MODE=read CROSS_REVIEW_TOOL_READ_BUDGET_BYTES
 MSGS2="$T/o6/glm.turn.2.request.json"
 assert_eq "budget_exhausted=true"            "$(jq -r .tool_stats.budget_exhausted "$T/o6/glm.meta.json")" "true"
 assert_contains "first read is served and flagged" "$(tool_result c1)" "read budget exhausted"
+
+echo "── a host that reports no cache counters stays null, not a measured 0% ──"
+# Moonshot-direct omits usage.prompt_tokens_details entirely. Summing it as 0
+# would enter the run in analyze_runlog's hit-rate denominator as a real 0%
+# sample, dragging every seat's average toward zero (codex P2, this PR).
+run_lane "$T/o6c" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=nocache --
+assert_eq "no cache counters reported → tokens_cached null" "$(jq -r .tokens_cached "$T/o6c/glm.meta.json")" "null"
+assert_eq "…and tokens_cache_write null too"                "$(jq -r .tokens_cache_write "$T/o6c/glm.meta.json")" "null"
+assert_eq "cost/tokens still recorded"                      "$(jq -r .tokens_prompt "$T/o6c/glm.meta.json")" "150"
+assert_eq "provider still recorded"                         "$(jq -r .upstream_provider "$T/o6c/glm.meta.json")" "Shimco"
 
 echo "── response_format rejected alongside tools → dropped and retried ──"
 run_lane "$T/o7" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=rf400 --
@@ -282,6 +313,48 @@ assert_eq "429 → provider_rate_limited"       "$(tl_classify_api_error "$T/e1.
 assert_eq "balance message → provider_billing" "$(tl_classify_api_error "$T/e2.json")" "provider_billing"
 assert_eq "401 → provider_auth"                "$(tl_classify_api_error "$T/e3.json")" "provider_auth"
 assert_eq "anything else → provider_error"     "$(tl_classify_api_error "$T/e4.json")" "provider_error"
+
+# ── a dead provider catalog is fetched once, not once per turn ──
+# The production caller is pin_slug="$(tl_provider_slug …)" — a command
+# substitution — so the "already tried" state must survive a subshell. Every
+# call below uses that exact shape; a shell-variable guard passes a direct
+# call and still re-fetches here.
+mkdir -p "$T/curlshim"
+cat >"$T/curlshim/curl" <<'SH'
+#!/bin/bash
+echo call >>"$CURL_CALLS"
+[[ -n "${CURL_BODY:-}" ]] || exit 7
+cat "$CURL_BODY"
+SH
+chmod +x "$T/curlshim/curl"
+
+mkdir -p "$T/home_dead"
+(
+  export CURL_CALLS="$T/curl.dead"; : >"$CURL_CALLS"
+  export HOME="$T/home_dead"; export PATH="$T/curlshim:$PATH"
+  unset CROSS_REVIEW_OR_PROVIDERS_FILE
+  a="$(tl_provider_slug "Ambient")"; b="$(tl_provider_slug "Ambient")"
+  c="$(tl_provider_slug "Inceptron")"
+)
+assert_eq "a dead provider catalog is fetched once, not once per turn" \
+  "$(wc -l <"$T/curl.dead" | tr -d ' ')" "1"
+
+# …and the success path still caches, resolves, and is not re-fetched.
+mkdir -p "$T/home_ok"
+printf '{"data":[{"name":"Ambient","slug":"ambient"}]}' >"$T/providers_body.json"
+(
+  export CURL_CALLS="$T/curl.ok"; : >"$CURL_CALLS"
+  export CURL_BODY="$T/providers_body.json"
+  export HOME="$T/home_ok"; export PATH="$T/curlshim:$PATH"
+  unset CROSS_REVIEW_OR_PROVIDERS_FILE
+  printf '%s\n' "$(tl_provider_slug "Ambient")" >"$T/slug1"
+  printf '%s\n' "$(tl_provider_slug "Ambient")" >"$T/slug2"
+)
+assert_eq "a live catalog resolves the display name to its slug" "$(cat "$T/slug1")" "ambient"
+assert_eq "a fresh cache is reused, not re-fetched"              "$(wc -l <"$T/curl.ok" | tr -d ' ')" "1"
+assert_eq "the second call still resolves off the cache"         "$(cat "$T/slug2")" "ambient"
+assert_eq "a successful refresh leaves no failure marker" \
+  "$([[ -e "$T/home_ok/.cross-review/cache/or_providers.json.fetch-failed" ]] && echo yes || echo no)" "no"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

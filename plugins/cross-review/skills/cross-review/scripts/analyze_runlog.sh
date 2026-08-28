@@ -125,6 +125,12 @@ analyze_reviewer() {
     | (if $dn == 0 then 0 else $durs[($dn / 2 | floor)] end) as $p50
     | (if $dn == 0 then 0 else $durs[($dn * 0.95 | floor) | (if . >= $dn then $dn - 1 else . end)] end) as $p95
     | ($attempts | map(.timeout_budget_s // 0) | max // 0) as $cur_to
+    # Prompt-cache hit rate: cached / prompt tokens over the attempts that
+    # report both (rows before 2026-08-28 carry neither → excluded, not 0).
+    # This is the number "are we maximizing caching" is answered from.
+    | ($attempts | map(select((.tokens_prompt | type) == "number" and (.tokens_cached | type) == "number"))) as $cachable
+    | ($cachable | map(.tokens_prompt) | add // 0) as $cache_prompt
+    | ($cachable | map(.tokens_cached) | add // 0) as $cache_hit
     | {
         reviewer: $r,
         total: $total,
@@ -147,7 +153,9 @@ analyze_reviewer() {
         empty_rate:   (if $total == 0 then null else (($empty * 100) / $total | floor) end),
         p50_duration_s: $p50,
         p95_duration_s: $p95,
-        current_timeout_budget_s: $cur_to
+        current_timeout_budget_s: $cur_to,
+        cache_samples: ($cachable | length),
+        cache_hit_pct: (if $cache_prompt == 0 then null else ($cache_hit * 100 / $cache_prompt | floor) end)
       }
   '
 }
@@ -254,7 +262,7 @@ case "$mode" in
       echo "$stats" | jq -r '
         if .total == 0 then "  \(.reviewer): no data in window"
         else
-          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  fallback=\(.fallback // 0)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  quota=\(.quota // 0)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s\(if (.sleep_suspect // 0) > 0 then "  sleep_suspect=\(.sleep_suspect)" else "" end)"
+          "  \(.reviewer): reliability=\(.reliability // "—")%  ok=\(.ok)/\(.total)  fallback=\(.fallback // 0)  timed_out=\(.timed_out)  empty=\(.empty)  failed=\(.failed)  quota=\(.quota // 0)  p50=\(.p50_duration_s)s  p95=\(.p95_duration_s)s  budget=\(.current_timeout_budget_s)s\(if (.sleep_suspect // 0) > 0 then "  sleep_suspect=\(.sleep_suspect)" else "" end)\(if .cache_hit_pct != null then "  cache_hit=\(.cache_hit_pct)% (\(.cache_samples) runs)" else "" end)"
         end'
     done
     echo ""
