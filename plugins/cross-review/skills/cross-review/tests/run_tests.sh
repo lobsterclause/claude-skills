@@ -709,7 +709,7 @@ fbclass "control: no fallback object, rc=0 with output → ok" \
 fbclass "control: no fallback object, rc=1 → failed" \
   '{"exit_code":1,"duration_s":2,"timed_out":false,"output_bytes":0}' "failed"
 
-echo "── analyze_runlog.sh knows the `fallback` status it is fed ──"
+echo '── analyze_runlog.sh knows the `fallback` status it is fed ──'
 # [pin: 2026-08-22 — PR #66 taught append_runlog.sh to emit status "fallback"
 # for a first-party lane rescued over OpenRouter, but analyze_runlog.sh bucketed
 # only ok/timed_out/empty/failed/quota. A rescued attempt therefore landed in
