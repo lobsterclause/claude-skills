@@ -345,12 +345,15 @@ case "$mode" in
       [[ "$wrapper_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || wrapper_sha=""
     fi
     marker=""
+    # Field order is `sha= pass= [wrapper=] [base=] [digest=]`: the
+    # `sha=<40> pass=<n>` prefix is byte-stable (pinned by #148's
+    # test_wrapper_sha and CR_MARKER_RE); every parser (read_stamp.sh,
+    # post_comment's pass capture, the currency CI) matches fields by name.
     if [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
-      marker="<!-- cross-review: sha=${head_sha}"
-      [[ -n "$base_sha" ]] && marker+=" base=${base_sha}"
-      marker+=" pass=${pass}"
-      [[ -n "$digest" ]] && marker+=" digest=${digest}"
+      marker="<!-- cross-review: sha=${head_sha} pass=${pass}"
       [[ -n "$wrapper_sha" ]] && marker+=" wrapper=${wrapper_sha}"
+      [[ -n "$base_sha" ]] && marker+=" base=${base_sha}"
+      [[ -n "$digest" ]] && marker+=" digest=${digest}"
       marker+=" -->"
     fi
 

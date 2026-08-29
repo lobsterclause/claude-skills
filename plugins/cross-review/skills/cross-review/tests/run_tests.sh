@@ -815,7 +815,7 @@ assert_eq "control: dead ids with a wrong digest do NOT pass" \
 assert_eq "an empty range needs no coverage" \
   "$(rcv "$C3" "$C3" '[]' | jq -r .covered)" "true"
 
-echo "── analyze_runlog.sh knows the `fallback` status it is fed ──"
+echo '── analyze_runlog.sh knows the `fallback` status it is fed ──'
 # [pin: 2026-08-22 — PR #66 taught append_runlog.sh to emit status "fallback"
 # for a first-party lane rescued over OpenRouter, but analyze_runlog.sh bucketed
 # only ok/timed_out/empty/failed/quota. A rescued attempt therefore landed in
