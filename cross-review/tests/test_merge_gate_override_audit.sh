@@ -28,6 +28,7 @@ bad() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 assert_eq() {
   if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (got: '$2' want: '$3')"; fi
 }
+assert_not_contains() { if [[ "$2" != *"$3"* ]]; then ok "$1"; else bad "$1 (unexpectedly found '$3')"; fi; }
 assert_contains() {
   if [[ "$2" == *"$3"* ]]; then ok "$1"; else bad "$1 (no '$3' in output)"; fi
 }
@@ -60,6 +61,13 @@ mg_hook() {
     printf '{"tool_input":{"command":%s}}' "$(jq -Rn --arg c "$1" '$c')" \
     | bash "$MG_HOOK" 2>/dev/null ) \
     | jq -r '.hookSpecificOutput.permissionDecision // "PASS"' 2>/dev/null
+}
+# mg_rc <command> [env-prefix...] → the hook's EXIT CODE, so a crash is not
+# read as PASS (kimi L, PR #55 review). Extra args are `env` arguments.
+mg_rc() {
+  local c="$1"; shift
+  ( cd "$REPO" && printf '{"tool_input":{"command":%s}}' "$(jq -Rn --arg c "$c" '$c')" \
+    | env "$@" bash "$MG_HOOK" >/dev/null 2>&1 ); echo $?
 }
 
 echo "── override still passes the merge through unchanged ──"
@@ -124,6 +132,41 @@ BAD_DECISION="$(
   | jq -r '.hookSpecificOutput.permissionDecision // "PASS"' 2>/dev/null
 )"
 assert_eq "override still passes even when the log write fails" "$BAD_DECISION" "PASS"
+
+echo "── PR #55 review: per-invocation records, redaction, forms, no-HOME ──"
+: >"$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 11 --repo acme/a && CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 22 -R acme/b' >/dev/null
+assert_eq "a compound command logs one entry per overridden merge" "$(wc -l <"$AUDIT_LOG" | tr -d ' ')" "2"
+assert_eq "…first entry has its own pr/repo"  "$(jq -r 'select(.pr=="11") | .repo' "$AUDIT_LOG")" "acme/a"
+assert_eq "…second entry has its own pr/repo" "$(jq -r 'select(.pr=="22") | .repo' "$AUDIT_LOG")" "acme/b"
+: >"$AUDIT_LOG"
+mg_hook 'export DEPLOY_SECRET=hunter2; GH_TOKEN=ghp_abc123 CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 33 --token=ghp_xyz789' >/dev/null
+line="$(cat "$AUDIT_LOG")"
+assert_not_contains "unrelated segment never reaches the log" "$line" "hunter2"
+assert_not_contains "GH_TOKEN value redacted"                  "$line" "ghp_abc123"
+assert_not_contains "--token value redacted"                   "$line" "ghp_xyz789"
+assert_contains     "…the invocation itself is kept"           "$(jq -r .command "$AUDIT_LOG")" "gh pr merge 33"
+assert_contains     "…with the redaction marker"               "$(jq -r .command "$AUDIT_LOG")" "<redacted>"
+: >"$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge --repo "acme/other" 123 --squash' >/dev/null
+assert_eq "PR number after flags is found"      "$(jq -r .pr "$AUDIT_LOG")" "123"
+assert_eq "quoted --repo value is unquoted"     "$(jq -r .repo "$AUDIT_LOG")" "acme/other"
+assert_eq "head_sha is empty when the merge targets another repo" "$(jq -r .head_sha "$AUDIT_LOG")" ""
+: >"$AUDIT_LOG"
+mg_hook 'GH_REPO=acme/env CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 55' >/dev/null
+assert_eq "GH_REPO assignment is honoured as the repo" "$(jq -r .repo "$AUDIT_LOG")" "acme/env"
+: >"$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh api -X PUT -H "Authorization: token ghp_hdr999" repos/acme/w/pulls/77/merge' >/dev/null
+assert_eq "gh api merge form: pr"   "$(jq -r .pr "$AUDIT_LOG")" "77"
+assert_eq "gh api merge form: repo" "$(jq -r .repo "$AUDIT_LOG")" "acme/w"
+assert_not_contains "Authorization header value redacted" "$(cat "$AUDIT_LOG")" "ghp_hdr999"
+rm -f "$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 66' >/dev/null
+assert_eq "merge in the cwd repo records the cwd HEAD" "$(jq -r .head_sha "$AUDIT_LOG")" "$(git -C "$REPO" rev-parse HEAD)"
+perm="$(stat -f %Lp "$AUDIT_LOG" 2>/dev/null || stat -c %a "$AUDIT_LOG" 2>/dev/null)"
+assert_eq "audit log is created 0600 (umask 077)" "$perm" "600"
+assert_eq "unset HOME + no audit path: the hook still runs (rc 0)" "$(mg_rc 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 88' -u HOME -u CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG)" "0"
+assert_eq "unset HOME: a plain merge is still checked, not crashed (rc 0)" "$(mg_rc 'gh pr merge 89' -u HOME -u CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG)" "0"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

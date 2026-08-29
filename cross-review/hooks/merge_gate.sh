@@ -140,31 +140,54 @@ OVERRIDE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*CROSS_REVIEW_MERGE_OVERRIDE=1[[:s
 # CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG mirrors CROSS_REVIEW_RUNLOG elsewhere
 # in this skill: production never sets it, fixture tests point it at a scratch
 # path instead of the user's real home directory.
-AUDIT_LOG="${CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG:-$HOME/.claude/skills/cross-review/merge_override_audit.jsonl}"
+# Resolved inside the function, under set +e: with `set -u` an unset HOME
+# at top level aborted the WHOLE hook — every merge check, override or not
+# (codex, PR #55 review). No explicit path and no HOME → no log, no crash.
 log_override_audit() {
   (
     set +e
+    umask 077   # the log carries command lines; never world-readable
+    local_log="${CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG:-}"
+    if [[ -z "$local_log" ]]; then
+      [[ -n "${HOME:-}" ]] || exit 0
+      local_log="$HOME/.claude/skills/cross-review/merge_override_audit.jsonl"
+    fi
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-    repo="$(printf '%s' "$cmd_only" | grep -oE -- '(-R|--repo)[= ][^ ;&|)]+' 2>/dev/null | head -n1 | sed -E 's/^(-R|--repo)[= ]//')"
-    if [[ -z "$repo" ]]; then
-      repo="$(printf '%s' "$cmd_only" | grep -oE 'repos/[^/ ]+/[^/ ]+/pulls/[0-9]+/merge' 2>/dev/null | head -n1 | sed -E 's#repos/([^/ ]+/[^/ ]+)/pulls/.*#\1#')"
-    fi
-    if [[ -z "$repo" ]]; then
-      repo="$(git remote get-url origin 2>/dev/null | sed -E 's#^git@github\.com:##; s#^https://github\.com/##; s#\.git$##')"
-    fi
-    pr="$(printf '%s' "$cmd_only" | grep -oE 'pulls/[0-9]+/merge' 2>/dev/null | head -n1 | grep -oE '[0-9]+')"
-    if [[ -z "$pr" ]]; then
-      pr="$(printf '%s' "$cmd_only" | grep -oE 'gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+[0-9]+' 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"
-    fi
-    head_sha="$(git rev-parse HEAD 2>/dev/null)"
     who="${USER:-$(whoami 2>/dev/null)}"
-    entry="$(jq -nc \
-      --arg ts "$ts" --arg repo "$repo" --arg pr "$pr" \
-      --arg head_sha "$head_sha" --arg command "$cmd" --arg user "$who" \
-      '{ts:$ts, repo:$repo, pr:$pr, head_sha:$head_sha, command:$command, user:$user}' 2>/dev/null)"
-    [[ -n "$entry" ]] || exit 0
-    mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null
-    printf '%s\n' "$entry" >>"$AUDIT_LOG" 2>/dev/null
+    cwd_repo="$(git remote get-url origin 2>/dev/null | sed -E 's#^git@github\.com:##; s#^https://github\.com/##; s#\.git$##')"
+    cwd_sha="$(git rev-parse HEAD 2>/dev/null)"
+    # One entry PER overridden merge invocation, parsed from its own segment:
+    # a compound command used to yield one record with the first -R/--repo
+    # and first PR number found anywhere in the line (codex, kimi, PR #55).
+    printf '%s\n' "$cmd_only" | tr ';&|()' '\n\n\n\n\n' | while IFS= read -r seg; do
+      printf '%s' "$seg" | grep -qE '(^|[[:space:]])CROSS_REVIEW_MERGE_OVERRIDE=1[[:space:]]+gh[[:space:]]+(pr[[:space:]]+merge|api)([[:space:]]|$)' || continue
+      inv="$(printf '%s' "$seg" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+      # What is logged is the merge invocation with credential-shaped values
+      # redacted: FOO_TOKEN=/…SECRET=/…PASSWORD=/…KEY= assignments, --token,
+      # and Authorization headers. Only this segment is recorded — an
+      # unrelated command in the same compound line never reaches the log.
+      red="$(printf '%s' "$inv" | sed -E \
+        's/(^|[^A-Za-z0-9_])([A-Za-z_]*(TOKEN|SECRET|PASSWORD|PASSWD|_KEY|APIKEY))=[^[:space:]]+/\1\2=<redacted>/g; s/(--token)[= ][^[:space:]]+/\1 <redacted>/g; s/(Authorization:[[:space:]]*)[^"'"'"']+/\1<redacted>/g')"
+      repo="$(printf '%s' "$inv" | grep -oE -- '(-R|--repo)[= ]["'"'"']?[^ "'"'"']+' 2>/dev/null | head -n1 | sed -E 's/^(-R|--repo)[= ]["'"'"']?//')"
+      [[ -z "$repo" ]] && repo="$(printf '%s' "$inv" | grep -oE 'repos/[^/ ]+/[^/ ]+/pulls/[0-9]+/merge' 2>/dev/null | head -n1 | sed -E 's#repos/([^/ ]+/[^/ ]+)/pulls/.*#\1#')"
+      [[ -z "$repo" ]] && repo="$(printf '%s' "$inv" | grep -oE '(^|[[:space:]])GH_REPO=[^[:space:]]+' 2>/dev/null | head -n1 | sed -E 's/^[[:space:]]*GH_REPO=//')"
+      [[ -z "$repo" ]] && repo="${GH_REPO:-}"
+      [[ -z "$repo" ]] && repo="$cwd_repo"
+      pr="$(printf '%s' "$inv" | grep -oE 'pulls/[0-9]+/merge' 2>/dev/null | head -n1 | grep -oE '[0-9]+')"
+      # `gh pr merge [flags] <number> [flags]`: the first bare numeric token
+      # after `merge`, wherever the flags sit (kimi, PR #55).
+      [[ -z "$pr" ]] && pr="$(printf '%s' "$inv" | awk '{ for (i = 1; i <= NF; i++) if ($i == "merge") { for (j = i + 1; j <= NF; j++) if ($j ~ /^[0-9]+$/) { print $j; exit } } }' 2>/dev/null)"
+      # HEAD of the cwd is only the merged head when the merge targets the
+      # cwd repo; for -R/GH_REPO elsewhere it would be a wrong sha (kimi).
+      head_sha=""; [[ "$repo" == "$cwd_repo" ]] && head_sha="$cwd_sha"
+      entry="$(jq -nc \
+        --arg ts "$ts" --arg repo "$repo" --arg pr "$pr" \
+        --arg head_sha "$head_sha" --arg command "$red" --arg user "$who" \
+        '{ts:$ts, repo:$repo, pr:$pr, head_sha:$head_sha, command:$command, user:$user}' 2>/dev/null)"
+      [[ -n "$entry" ]] || continue
+      mkdir -p "$(dirname "$local_log")" 2>/dev/null
+      printf '%s\n' "$entry" >>"$local_log" 2>/dev/null
+    done
   ) || true
 }
 
