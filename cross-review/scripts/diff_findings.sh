@@ -174,7 +174,9 @@ fi
 normalize_kept() {
   local f="$1"
   jq -c '
-    (if type=="array" then . else (.findings // []) end)
+    (if type=="array" then .
+     elif type=="object" and (.findings|type)=="array" then .findings
+     else error("not a findings JSON: expected an array or {findings:[...]}") end)
     | .[]
     | select((.factcheck.verdict // "keep") != "drop")
     | select((.id | type) == "string" and .id != "")
@@ -230,6 +232,13 @@ else
   run_ids_ordered="$tmp_dir/run_ids.txt"
   jq -r '.run_id // empty' "$events_ok" | awk '!seen[$0]++' > "$run_ids_ordered"
 
+  # A ledger with bytes but no usable run in OUR namespace (all malformed,
+  # all another project's, or run_id-less) is as empty as a missing one and
+  # gets the same treatment (codex, #85 pass 2).
+  if [[ ! -s "$run_ids_ordered" && "$allow_empty_prev" != 1 ]]; then
+    echo "diff_findings: ledger has no usable run for project '$project': $ledger — pass --prev, or --allow-empty-prev for a genuine first round" >&2
+    exit 1
+  fi
   prev_run_id=""; prev_source="ledger"
   if grep -qxF -- "$run_id" "$run_ids_ordered" 2>/dev/null; then
     prev_run_id="$(awk -v cur="$run_id" '
@@ -374,7 +383,7 @@ if [[ -n "$out" ]]; then
   # Atomic, and a failed write is a failure — not a success with no file.
   out_tmp="$(mktemp "$(dirname "$out")/.diff_findings.XXXXXX" 2>/dev/null)" \
     && printf '%s\n' "$rendered" > "$out_tmp" && mv "$out_tmp" "$out" \
-    || { echo "diff_findings: cannot write --out $out" >&2; rm -f "${out_tmp:-}"; exit 1; }
+    || { echo "diff_findings: cannot write --out $out" >&2; [[ -n "${out_tmp:-}" ]] && rm -f -- "$out_tmp"; exit 1; }
 else
   printf '%s\n' "$rendered"
 fi
