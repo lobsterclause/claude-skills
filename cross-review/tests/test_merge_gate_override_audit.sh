@@ -163,7 +163,7 @@ assert_not_contains "Authorization header value redacted" "$(cat "$AUDIT_LOG")" 
 rm -f "$AUDIT_LOG"
 mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 66' >/dev/null
 assert_eq "merge in the cwd repo records the cwd HEAD" "$(jq -r .head_sha "$AUDIT_LOG")" "$(git -C "$REPO" rev-parse HEAD)"
-perm="$(stat -f %Lp "$AUDIT_LOG" 2>/dev/null || stat -c %a "$AUDIT_LOG" 2>/dev/null)"
+perm="$(stat -c %a "$AUDIT_LOG" 2>/dev/null || stat -f %Lp "$AUDIT_LOG" 2>/dev/null)"
 assert_eq "audit log is created 0600 (umask 077)" "$perm" "600"
 assert_eq "unset HOME + no audit path: the hook still runs (rc 0)" "$(mg_rc 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 88' -u HOME -u CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG)" "0"
 assert_eq "unset HOME: a plain merge is still checked, not crashed (rc 0)" "$(mg_rc 'gh pr merge 89' -u HOME -u CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG)" "0"
@@ -195,7 +195,7 @@ mg_hook 'GH_REPO="acme/quoted" CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 57' >/d
 assert_eq "quoted GH_REPO is unquoted"                    "$(jq -r .repo "$AUDIT_LOG")" "acme/quoted"
 rm -f "$AUDIT_LOG"; ( umask 022; : >"$AUDIT_LOG" ); chmod 644 "$AUDIT_LOG"
 mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 58' >/dev/null
-perm2="$(stat -f %Lp "$AUDIT_LOG" 2>/dev/null || stat -c %a "$AUDIT_LOG" 2>/dev/null)"
+perm2="$(stat -c %a "$AUDIT_LOG" 2>/dev/null || stat -f %Lp "$AUDIT_LOG" 2>/dev/null)"
 assert_eq "a pre-existing 0644 log is tightened to 0600 on append" "$perm2" "600"
 : >"$AUDIT_LOG"
 mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 61 && gh pr merge 62' >/dev/null
