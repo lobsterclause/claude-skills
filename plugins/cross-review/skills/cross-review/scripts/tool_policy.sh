@@ -53,7 +53,8 @@
 #   3. learned                                 → basis "learned"
 #   4. no ledger data at all                   → basis "default" (tool_policy.default_mode)
 # A requested `check` with no entrypoint degrades to `read`, basis suffixed
-# ":no_check_entrypoint".
+# ":no_check_entrypoint"; with an entrypoint but no operator trust (see the
+# gate below), ":check_not_trusted".
 #
 # Constants live in reviewer_profiles.json `_synthesis_rules.tool_policy`
 # (single source of truth; defaults below only cover an older profile file).
@@ -185,7 +186,7 @@ decide_one() {
        elif $N == 0 then {mode: $c.default_mode, basis: "default"}
        else {mode: $learned, basis: "learned"} end) as $d
     | (if $d.mode == "check" and ($check_available | not)
-       then {mode: "read", basis: ($d.basis + ":no_check_entrypoint")} else $d end) as $d
+       then {mode: "read", basis: ($d.basis + (if $check_entrypoint then ":check_not_trusted" else ":no_check_entrypoint" end))} else $d end) as $d
     | { reviewer: $r, mode: $d.mode, basis: $d.basis, check_available: $check_available, check_entrypoint: $check_entrypoint, check_trusted: $check_trusted,
         window_runs: $N, excluded_runs: $excluded, arms: $stats,
         max_steps: ($pin.max_steps // null),

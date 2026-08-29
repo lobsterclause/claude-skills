@@ -259,6 +259,21 @@ assert_contains     "search still returns ordinary files" "$SRCH" "src/a.txt:"
 assert_not_contains "search drops hits inside .env"        "$SRCH" ".env:"
 assert_not_contains "…so the secret never leaves"          "$SRCH" "should-never-be-read"
 assert_contains     "search refuses a secret path_glob"    "$( . "$S/lib_tool_loop.sh"; tl_search "$REPO" "." ".env" )" "secret-path policy"
+# Pass 2 (codex P1/P2): a ':' in the filename defeated the output filter,
+# and 200+ protected hits ate the result cap before the filter ran.
+SREPO="$T/srepo"; mkdir -p "$SREPO/src"
+( cd "$SREPO" && git init -q && git config user.email t@t && git config user.name t
+  printf 'SECRETCOLON=1\n' >'foo:.env'
+  for i in $(seq 1 250); do echo "xsecret line $i"; done >.env
+  printf 'alpha x\n' >src/a.txt
+  git add -A && git commit -qm s )
+SRCH2="$( . "$S/lib_tool_loop.sh"; tl_search "$SREPO" "SECRETCOLON|alpha" )"
+assert_contains     "colon-path repo: ordinary hit returned"      "$SRCH2" "src/a.txt:"
+assert_not_contains "colon-path repo: foo:.env never returned"    "$SRCH2" "SECRETCOLON"
+SRCH3="$( . "$S/lib_tool_loop.sh"; tl_search "$SREPO" "x" )"
+assert_contains     "250 protected hits no longer starve the cap" "$SRCH3" "src/a.txt:"
+assert_not_contains "…and none of them leak"                      "$SRCH3" "xsecret"
+assert_eq "search over only protected files → no matches" "$( . "$S/lib_tool_loop.sh"; tl_search "$SREPO" "SECRETCOLON" "foo*" )" "no matches"
 
 echo "── read_file caps in bytes, not characters (codex P2, PR #154) ──"
 UREPO="$T/urepo"; mkdir -p "$UREPO"
@@ -268,15 +283,45 @@ UOUT="$( CROSS_REVIEW_TOOL_CALL_CAP_BYTES=50 bash -c '. "$1/lib_tool_loop.sh"; t
 assert_contains "82-byte body is cut at the 50-byte cap" "$UOUT" "[truncated at 50 bytes]"
 assert_contains "read_bytes counts the capped bytes"     "$UOUT" "READ_BYTES=50"
 if printf '%s' "$UOUT" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then ok "cut body is still valid UTF-8"; else bad "cut body is still valid UTF-8 (invalid UTF-8)"; fi
+# Pass 2: an odd cap splits a 2-byte char; the budget pays for what was kept (kimi).
+UOUT2="$( CROSS_REVIEW_TOOL_CALL_CAP_BYTES=51 bash -c '. "$1/lib_tool_loop.sh"; tl_read_file "$2" u.txt 1 1; printf "\nREAD_BYTES=%s" "$TL_READ_BYTES"' _ "$S" "$UREPO" )"
+assert_contains "odd cap: marker says 51"                   "$UOUT2" "[truncated at 51 bytes]"
+assert_contains "odd cap: split byte dropped → 50 charged"  "$UOUT2" "READ_BYTES=50"
+# Pass 2 (codex P2): a body past the pipe buffer used to be emitted TWICE
+# under pipefail (printf's SIGPIPE tripped the old || fallback).
+( cd "$UREPO" && python3 -c "print('\n'.join('L%04d ' % i + 'y' * 400 for i in range(400)))" >big.txt && git add -A && git commit -qm big )
+BOUT="$( bash -c 'set -o pipefail; . "$1/lib_tool_loop.sh"; tl_read_file "$2" big.txt 1 400; printf "\nREAD_BYTES=%s" "$TL_READ_BYTES"' _ "$S" "$UREPO" )"
+assert_eq "160 KB body: exactly one truncation marker" "$(printf '%s' "$BOUT" | grep -c '\[truncated at 40000 bytes\]')" "1"
+assert_eq "160 KB body: output stays near the cap"      "$(( $(printf '%s' "$BOUT" | wc -c) < 40200 ))" "1"
+assert_contains "160 KB body: budget charged the cap"   "$BOUT" "READ_BYTES=40000"
 
 echo "── run_check is bounded by the lane's remaining budget (codex P2, PR #154) ──"
 CK="$T/ck"; mkdir -p "$CK"
 _t0=$(date +%s)
-CKR="$( CROSS_REVIEW_CHECK_CMD='sleep 40' TL_DEADLINE=$(( _t0 + 12 )) bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; TL_DEADLINE=$3; tl_run_check "$2" "$4" >/dev/null; cat "$4/check.result.json"' _ "$S" "$REPO" "$(( _t0 + 12 ))" "$CK" )"
+CKT="$( CROSS_REVIEW_CHECK_CMD='sleep 40' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; TL_DEADLINE=$3; tl_run_check "$2" "$4"' _ "$S" "$REPO" "$(( _t0 + 12 ))" "$CK" )"
 _t1=$(date +%s)
+CKR="$(cat "$CK"/check.result.partial.*.json 2>/dev/null)"
 assert_eq "check timed out under the lane budget" "$(jq -r .timed_out <<<"$CKR")" "true"
 assert_eq "timeout_s clamped to the 5 s floor (12 s left - 10 s margin)" "$(jq -r .timeout_s <<<"$CKR")" "5"
 if (( _t1 - _t0 < 30 )); then ok "returned well before the 40 s command would have"; else bad "returned well before the 40 s command (took $((_t1 - _t0))s)"; fi
+# Pass 2 (codex P2): a budget-forced timeout is lane-private, never the round's verdict.
+assert_eq "clamped timeout is marked partial"            "$(jq -r .partial <<<"$CKR")" "true"
+assert_contains "…and the model is told so"               "$CKT" "not a verdict on the suite"
+[[ ! -f "$CK/check.result.json" ]] && ok "no round-wide check.result.json was written" || bad "round-wide result cached from a clamped timeout"
+[[ ! -d "$CK/check.lock" ]] && ok "lock released for the next seat" || bad "lock still held after a partial run"
+CKR2="$( CROSS_REVIEW_CHECK_CMD='echo FULL_RUN' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; tl_run_check "$2" "$3" >/dev/null; cat "$3/check.result.json"' _ "$S" "$REPO" "$CK" )"
+assert_eq "next seat with budget runs the real check"    "$(jq -r .rc <<<"$CKR2")" "0"
+assert_eq "…and that one is cached round-wide"           "$(jq -r .partial <<<"$CKR2")" "false"
+# Pass 2 (kimi High): a waiter with a small budget still waits for the holder's run.
+CKW="$T/ckw"; mkdir -p "$CKW"
+( CROSS_REVIEW_CHECK_CMD='sleep 4; echo HOLDER_DONE' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; tl_run_check "$2" "$3" >/dev/null' _ "$S" "$REPO" "$CKW" ) &
+sleep 1
+_w0=$(date +%s)
+WOUT="$( CROSS_REVIEW_CHECK_CMD='sleep 4; echo HOLDER_DONE' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; TL_DEADLINE=$(( $(date +%s) + 30 )); tl_run_check "$2" "$3"' _ "$S" "$REPO" "$CKW" )"
+wait
+assert_contains "waiter received the holder's cached result" "$WOUT" "HOLDER_DONE"
+assert_contains "…with the holder's exit code"                "$WOUT" "exit code: 0"
+if (( $(date +%s) - _w0 < 20 )); then ok "waiter returned as soon as the holder finished"; else bad "waiter overwaited"; fi
 
 echo "── a snapshot seat stays single-shot ──"
 mkdir -p "$T/snap"; printf 'SNAPSHOT_BODY\n' >"$T/snap/snapshot-glm.md"

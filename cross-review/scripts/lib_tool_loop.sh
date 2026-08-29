@@ -67,6 +67,31 @@ TL_CHECK_TAIL_BYTES="${CROSS_REVIEW_CHECK_TAIL_BYTES:-20000}"
 TL_SECRET_PATH_PATTERN='\.env($|\.|/)|\.envrc|credentials|[Ss]ecret|\.pem$|\.key$|\.p12$|\.pfx$|id_rsa|id_ed25519|\.keystore|\.jks'
 TL_SECRET_CONTENT_PATTERN='AKIA[0-9A-Z]{16}|[Ss][Kk]-[A-Za-z0-9_-]{20,}|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]]*[:=][[:space:]]*['"'"'"][A-Za-z0-9/+=_-]{16,}['"'"'"]'
 
+# tl_trim_split_utf8 <string> — prints the string minus a trailing multibyte
+# sequence a byte cut left incomplete. Call under LC_ALL=C (bash substrings
+# are bytes there). Pure bash on purpose: macOS iconv -c prints the good
+# prefix but exits non-zero on an incomplete tail, which turned a `||`
+# fallback into a second copy of the slice (#154 pass 2 → 101 bytes charged
+# for a 51-byte cap). Lead bytes: 110xxxxx needs 1 continuation, 1110xxxx 2,
+# 11110xxx 3; a complete sequence at the very end is kept.
+tl_trim_split_utf8() {
+  local s="$1" n k=0 b need=0
+  n=${#s}
+  while (( k < 3 && n - k > 0 )); do
+    b=$(printf '%d' "'${s:$((n - k - 1)):1}")
+    (( b >= 128 && b < 192 )) || break
+    k=$((k + 1))
+  done
+  (( n - k > 0 )) || { printf '%s' "$s"; return; }
+  b=$(printf '%d' "'${s:$((n - k - 1)):1}")
+  if   (( b >= 240 )); then need=3
+  elif (( b >= 224 )); then need=2
+  elif (( b >= 192 )); then need=1
+  fi
+  if (( b >= 192 && k < need )); then s="${s:0:$((n - k - 1))}"; fi
+  printf '%s' "$s"
+}
+
 # tl_resolve_check_cmd <repo_root> — prints the repo's declared verify
 # command, or returns 1 when the repo declares none. Order matches the
 # global CLAUDE.md verify ladder. Only the REPO (or the operator, via env)
@@ -175,8 +200,14 @@ tl_read_file() {
   # iconv -c drop the partial sequence a byte cut can leave at the end.
   local bytes; bytes="$(printf '%s' "$body" | wc -c | tr -d ' ')"
   if (( bytes > TL_CALL_CAP_BYTES )); then
-    body="$(printf '%s' "$body" | head -c "$TL_CALL_CAP_BYTES" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null || printf '%s' "$body" | head -c "$TL_CALL_CAP_BYTES")"$'\n'"[truncated at $TL_CALL_CAP_BYTES bytes]"
-    bytes=$TL_CALL_CAP_BYTES
+    # Cut in the C locale, where bash substrings count bytes — no printf|head
+    # pipe, because under pipefail printf's SIGPIPE made the old `||`
+    # fallback emit the slice a second time (codex P2, #154 pass 2). iconv -c
+    # drops a split trailing sequence; re-measure so the budget pays for what
+    # was actually kept (kimi, same pass).
+    body="$(LC_ALL=C; tl_trim_split_utf8 "${body:0:$TL_CALL_CAP_BYTES}")"
+    bytes="$(printf '%s' "$body" | wc -c | tr -d ' ')"
+    body="$body"$'\n'"[truncated at $TL_CALL_CAP_BYTES bytes]"
   fi
   TL_READ_BYTES=$((TL_READ_BYTES + bytes))
   (( TL_READ_BYTES >= TL_READ_BUDGET_BYTES )) && TL_BUDGET_EXHAUSTED=true
@@ -209,13 +240,19 @@ tl_search() {
       spec=(-- "$glob")
     fi
   fi
-  local outp rc
-  outp="$(git -C "$root" grep -n -I -E --no-color -e "$pat" ${spec[@]+"${spec[@]}"} 2>&1 | head -n "$TL_SEARCH_MAX_LINES" | cut -c1-400 \
-          | sed -E "s/$TL_SECRET_CONTENT_PATTERN/[REDACTED]/g")"; rc=$?
-  # read_file refuses secret paths; git grep would hand their lines straight
-  # back. Same policy on the way out: drop every hit whose path matches.
-  # (ENVIRON, not -v: awk -v unescapes the pattern's backslashes.)
-  outp="$(printf '%s\n' "$outp" | PAT="$TL_SECRET_PATH_PATTERN" awk -F: 'NF && $1 !~ ENVIRON["PAT"]')"
+  # Protected paths never reach git grep at all. Filtering grep's output
+  # split on ':' failed twice on pass 2 of #154: a filename can contain ':'
+  # (foo:.env came back as path "foo"), and 200 protected hits ate the whole
+  # head cap before the filter ran. So the file list is built first —
+  # ls-files, NUL-delimited, minus the secret-path pattern — and handed to
+  # grep as literal pathspecs. An empty list is "no matches", not "grep
+  # everything" (xargs with no input runs the command bare on GNU).
+  local outp files_n
+  files_n="$(git -C "$root" ls-files -z ${spec[@]+"${spec[@]}"} 2>/dev/null | LC_ALL=C grep -zvcE "$TL_SECRET_PATH_PATTERN" || true)"
+  [[ "$files_n" =~ ^[0-9]+$ && "$files_n" -gt 0 ]] || { printf 'no matches'; return; }
+  outp="$(git -C "$root" ls-files -z ${spec[@]+"${spec[@]}"} 2>/dev/null | LC_ALL=C grep -zvE "$TL_SECRET_PATH_PATTERN" \
+          | xargs -0 git --literal-pathspecs -C "$root" grep -n -I -E --no-color -e "$pat" -- 2>&1 \
+          | head -n "$TL_SEARCH_MAX_LINES" | cut -c1-400 | sed -E "s/$TL_SECRET_CONTENT_PATTERN/[REDACTED]/g")"
   if [[ -z "$outp" ]]; then printf 'no matches'; return; fi
   local n; n="$(printf '%s\n' "$outp" | wc -l | tr -d ' ')"
   printf '%s' "$outp"
@@ -237,7 +274,7 @@ tl_list_files() {
   printf '%s' "$outp"
 }
 
-# tl_run_check <repo_root> <out_dir> — runs (or reuses) the round's single
+# tl_run_check <repo_root> <out_dir> [<depth>] — runs (or reuses) the round's single
 # verify run. Concurrency: lanes are parallel background jobs; the first one
 # to mkdir the lock runs it, the others wait for the result file.
 tl_run_check() {
@@ -249,18 +286,18 @@ tl_run_check() {
   fi
   # The check gets the smaller of its own timeout and what is left of the
   # lane: a 60 s lane must not run a 300 s check (codex P2, PR #154).
-  local check_budget="$TL_CHECK_TIMEOUT_S"
+  local check_budget="$TL_CHECK_TIMEOUT_S" clamped=false
   if [[ "${TL_DEADLINE:-}" =~ ^[0-9]+$ ]]; then
     local _rem=$(( TL_DEADLINE - $(date +%s) - 10 ))
     (( _rem < 5 )) && _rem=5
-    (( _rem < check_budget )) && check_budget=$_rem
+    (( _rem < check_budget )) && { check_budget=$_rem; clamped=true; }
   fi
   if [[ ! -f "$result" ]]; then
     if mkdir "$lock" 2>/dev/null; then
       local t0 t1 rc=0 timed_out=false
       t0=$(date +%s)
       if [[ -n "${TIMEOUT_BIN:-}" ]]; then
-        ( cd "$root" && "$TIMEOUT_BIN" -k 10 "$check_budget" bash -c "$cmd" ) >"$raw" 2>&1 || rc=$?
+        ( cd "$root" && "$TIMEOUT_BIN" -k 5 "$check_budget" bash -c "$cmd" ) >"$raw" 2>&1 || rc=$?
       elif declare -F run_with_timeout >/dev/null; then
         ( cd "$root" && run_with_timeout "$check_budget" bash -c "$cmd" ) >"$raw" 2>&1 || rc=$?
       else
@@ -270,17 +307,41 @@ tl_run_check() {
       [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out=true
       local tail_txt
       tail_txt="$(tail -c "$TL_CHECK_TAIL_BYTES" "$raw" 2>/dev/null | LC_ALL=C tr -d '\000' | sed -E "s/$TL_SECRET_CONTENT_PATTERN/[REDACTED]/g")"
-      jq -n --arg cmd "$cmd" --argjson rc "$rc" --argjson dur "$((t1 - t0))" --argjson to "$timed_out" --argjson ts "$check_budget" --arg tail "$tail_txt" \
-        '{cmd:$cmd, rc:$rc, duration_s:$dur, timed_out:$to, timeout_s:$ts, output_tail:$tail}' >"$result.tmp" && mv "$result.tmp" "$result"
+      local partial=false
+      [[ "$timed_out" == true && "$clamped" == true ]] && partial=true
+      jq -n --arg cmd "$cmd" --argjson rc "$rc" --argjson dur "$((t1 - t0))" --argjson to "$timed_out" --argjson ts "$check_budget" --argjson partial "$partial" --arg tail "$tail_txt" \
+        '{cmd:$cmd, rc:$rc, duration_s:$dur, timed_out:$to, timeout_s:$ts, partial:$partial, output_tail:$tail}' >"$result.tmp"
+      if [[ "$partial" == true ]]; then
+        # A timeout forced by THIS lane's short remaining budget says nothing
+        # about the suite; caching it would deny every later seat a real run
+        # (codex P2, #154 pass 2). Keep it lane-private and free the lock.
+        mv "$result.tmp" "$outd/check.result.partial.$$.json"
+        result="$outd/check.result.partial.$$.json"; rmdir "$lock" 2>/dev/null || true
+      else
+        mv "$result.tmp" "$result"
+      fi
     else
-      local waited=0
-      while [[ ! -f "$result" ]] && (( waited < check_budget + 30 )); do sleep 2; waited=$((waited + 2)); done
+      # Wait for the HOLDER's run, bounded by the holder's ceiling and by this
+      # lane's own deadline — not by this lane's check_budget, which can be far
+      # shorter than the run already in progress (kimi High, #154 pass 2).
+      local waited=0 wait_cap=$((TL_CHECK_TIMEOUT_S + 30))
+      if [[ "${TL_DEADLINE:-}" =~ ^[0-9]+$ ]]; then
+        local _wr=$(( TL_DEADLINE - $(date +%s) - 5 ))
+        (( _wr < wait_cap )) && wait_cap=$_wr
+        (( wait_cap < 2 )) && wait_cap=2
+      fi
+      while [[ ! -f "$result" && -d "$lock" ]] && (( waited < wait_cap )); do sleep 2; waited=$((waited + 2)); done
+      if [[ ! -f "$result" && ! -d "$lock" && "${3:-0}" == "0" ]]; then
+        # The holder gave the lock back without a round result (its partial
+        # timeout above): this lane has budget of its own — run it once.
+        tl_run_check "$root" "$outd" 1; return
+      fi
       [[ -f "$result" ]] || { printf 'error: the verify run started by another reviewer has not finished — treat runtime claims as unverified'; return; }
     fi
   fi
   TL_CHECK_RAN=true
   TL_CHECK_RC="$(jq -r '.rc' "$result")"
-  jq -r '"verify command: \(.cmd)\nexit code: \(.rc) (\(if .rc == 0 then "PASS" else "FAIL" end))\(if .timed_out then " — TIMED OUT" else "" end)\nduration: \(.duration_s)s\n--- output (tail) ---\n\(.output_tail)"' "$result"
+  jq -r '"verify command: \(.cmd)\nexit code: \(.rc) (\(if .rc == 0 then "PASS" else "FAIL" end))\(if .timed_out then " — TIMED OUT" else "" end)\(if .partial then " after only \(.timeout_s)s — cut short by this lane\u0027s remaining budget, not a verdict on the suite" else "" end)\nduration: \(.duration_s)s\n--- output (tail) ---\n\(.output_tail)"' "$result"
 }
 
 # tl_exec <name> <args_json> <repo_root> <out_dir> — dispatch one tool call.
