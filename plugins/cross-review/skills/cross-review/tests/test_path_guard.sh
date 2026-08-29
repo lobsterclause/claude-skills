@@ -129,7 +129,7 @@ assert_eq "alias 22 → v22.22.2, not v22.1.0" "$RESOLVED" "$FAKE_NVM/versions/n
 
 echo "── run_reviewers.sh propagates the selector's fail-closed instead of substituting a fleet (codex+glm, PR #68) ──"
 RR_REPO="$T/rr-repo"; mkdir -p "$RR_REPO"
-( cd "$RR_REPO" && { git init -q -b master 2>/dev/null || git init -q; } && git config user.email t@t && git config user.name t && printf 'a\n' >f && git add f && git commit -qm i && git checkout -qb feat && printf 'b\n' >>f && git commit -qam c ) >/dev/null 2>&1
+( cd "$RR_REPO" && git init -q && git symbolic-ref HEAD refs/heads/master && git config user.email t@t && git config user.name t && printf 'a\n' >f && git add f && git commit -qm i && git checkout -qb feat && printf 'b\n' >>f && git commit -qam c ) >/dev/null 2>&1
 RR_ERR="$T/rr.err"
 ( cd "$RR_REPO" && env -i HOME="$T" NVM_DIR="$T/empty" PATH="$JQ_DIR:/usr/bin:/bin" OPENROUTER_API_KEY=sk-or-test-shim \
     /bin/bash "$S/run_reviewers.sh" --base master --out "$T/rr-out" >/dev/null 2>"$RR_ERR" ); rr_rc=$?

@@ -1145,8 +1145,20 @@ cr_agents_inject() {
   local root; root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   local f="$root/AGENTS.md" lock="$root/.AGENTS.md.cross-review.lock"
   if [[ -L "$f" ]]; then echo "codex: AGENTS.md is a symlink — not injecting the environment note" >&2; return 0; fi
-  if ! mkdir "$lock" 2>/dev/null; then echo "codex: another cross-review run holds AGENTS.md — not injecting the environment note" >&2; return 0; fi
+  if ! mkdir "$lock" 2>/dev/null; then
+    # Same stale-lock reclaim as _agy_gate_lock: a run killed with SIGKILL
+    # leaves the dir behind and every later run would skip the note for good
+    # (kimi + minimax, #68 pass 3). Rename-then-delete so two reclaimers
+    # cannot remove each other's fresh lock.
+    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]] && mv "$lock" "$lock.stale.$$" 2>/dev/null; then
+      rm -rf "$lock.stale.$$" 2>/dev/null || true
+    fi
+    if ! mkdir "$lock" 2>/dev/null; then echo "codex: another cross-review run holds AGENTS.md — not injecting the environment note" >&2; return 0; fi
+  fi
   CR_AGENTS_LOCK="$lock"
+  # Re-checked under the lock: the entry could have become a symlink between
+  # the first test and mkdir (spark, #68 pass 3).
+  if [[ -L "$f" ]]; then echo "codex: AGENTS.md is a symlink — not injecting the environment note" >&2; rmdir "$lock" 2>/dev/null; CR_AGENTS_LOCK=""; return 0; fi
   if [[ -e "$f" ]]; then
     local bak
     if bak="$(mktemp "$root/.AGENTS.md.cross-review.XXXXXX" 2>/dev/null)" && cp -p "$f" "$bak" 2>/dev/null && cmp -s "$f" "$bak"; then
@@ -1159,15 +1171,25 @@ cr_agents_inject() {
   else
     CR_AGENTS_CREATED=1
   fi
+  # State is complete BEFORE the write: a partial append that fails must
+  # still be undone (a created file removed, a backup restored) — codex +
+  # spark, #68 pass 3.
+  CR_AGENTS_MD="$f"
   if ! printf '\n\n## cross-review environment note\n\n%s\n' "$NO_DEPS_NOTE" >>"$f" 2>/dev/null; then
-    echo "codex: could not write AGENTS.md — leaving it untouched" >&2
+    echo "codex: could not write AGENTS.md — restoring it" >&2
     cr_agents_restore; return 0
   fi
-  CR_AGENTS_MD="$f"
 }
 cr_agents_restore() {
   if [[ -n "$CR_AGENTS_BAK" ]]; then
-    mv -f "$CR_AGENTS_BAK" "${CR_AGENTS_MD:-${CR_AGENTS_BAK%/.AGENTS.md.cross-review.*}/AGENTS.md}" 2>/dev/null
+    local _tgt="${CR_AGENTS_MD:-${CR_AGENTS_BAK%/.AGENTS.md.cross-review.*}/AGENTS.md}"
+    # A restore that fails is loud and leaves the backup where the user can
+    # find it (codex + minimax, #68 pass 3): mv, then cp -p, then WARN.
+    if ! mv -f "$CR_AGENTS_BAK" "$_tgt" 2>/dev/null; then
+      if cp -p "$CR_AGENTS_BAK" "$_tgt" 2>/dev/null; then rm -f "$CR_AGENTS_BAK"
+      else echo "WARN: could not restore $_tgt — your original is at $CR_AGENTS_BAK" >&2
+      fi
+    fi
   elif [[ "$CR_AGENTS_CREATED" == 1 && -n "$CR_AGENTS_MD" ]]; then
     rm -f "$CR_AGENTS_MD"
   fi
@@ -1204,13 +1226,9 @@ run_codex() {
   # would break silently the moment the CLI default moved. `cli_model` pins it
   # here, and a test asserts it agrees with or_fallback.model. (glm, PR #66.)
   # `codex exec review --base` never sees $review_prompt, so the no-deps note
-  # above did not reach the ONE lane it was written for (four seats converged
-  # on this, PR #68 review). codex reads the project's AGENTS.md as standing
-  # instructions: put the note there for the duration of the run and restore
-  # it afterwards. cr_agents_inject/cr_agents_restore below; the restore is
-  # also wired into the EXIT/INT/TERM trap (pass 2: three seats).
-  cr_agents_inject
-  local codex_model codex_model_args=()
+  # reaches codex through AGENTS.md — injected by the PARENT before this
+  # function is dispatched (see the codex case in the dispatch loop) and
+  # restored by the parent's trap; nothing here may touch it.
   local codex_model codex_model_args=()
   codex_model="$(profile_get codex cli_model)"
   if [[ -n "$codex_model" ]]; then
@@ -1223,7 +1241,6 @@ run_codex() {
     ${codex_cfg[@]+"${codex_cfg[@]}"} \
     >"$out/codex.stdout" 2>&1
   rc=$?
-  cr_agents_restore
   end=$(date +%s)
   local timed_out="false"
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
@@ -2563,6 +2580,12 @@ for r in "${requested[@]}"; do
     codex)
       if command -v codex >/dev/null 2>&1; then
         [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        # The no-deps note rides in AGENTS.md for codex (see cr_agents_inject).
+        # Injected HERE, in the parent: run_codex runs as a background job, and
+        # state set in that subshell is invisible to the parent's EXIT/INT/TERM
+        # trap — a killed parent left the note behind (codex+kimi+spark, #68
+        # pass 3). Restored by cleanup_run at exit.
+        cr_agents_inject
         fallback_only run_codex codex &
         pids+=($!)
         ran+=("codex")
