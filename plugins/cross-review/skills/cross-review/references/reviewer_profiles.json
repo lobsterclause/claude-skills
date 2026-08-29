@@ -46,6 +46,7 @@
     "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.7 Flash (High)\"` — must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones — weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing — quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. FALLBACK POLICY REVISED 2026-08-22 (supersedes the 2026-07-01 no-fallback rule): on an ACCOUNT wall (quota/auth/suspension) or an agy panic this lap is re-run over OpenRouter against the same Gemini model, loudly — see or_fallback above. It is recorded as status \"fallback\", never \"ok\", so the leaderboard still down-weights the sick lane. On any other failure the lap still drops out and rotation covers the gap. MODEL BUMPED 2026-08-22: Gemini 3.5 Flash (High) → 3.7 Flash (High). agy had been listing 3.6 and 3.7 Flash for weeks while this seat stayed pinned to 3.5 — detection never noticed because detect_reviewers.sh only greps the models list for a 3.1 Pro entry, and the 6h agy_models.txt cache hid the rest. No draw_boost: a Flash point-release is the same seat, not a new identity (contrast deepseek/nemotron in #59, which changed tier and model outright)."
   },
   "gemini-pro": {
+    "draw_boost": 2.5,
     "or_fallback": {
       "enabled": true,
       "model": "google/gemini-3.1-pro-preview"
@@ -65,7 +66,7 @@
     "synthesis_weight": 1.0,
     "pricing": null,
     "specialization": "deep reasoning, multi-step logic, architectural and semantic-drift findings the Flash lap misses. Slower and more expensive than antigravity (Flash). Deep lap of the Gemini fleet. Rotation-pool member (not a baseline).",
-    "notes": "Same `agy` CLI as antigravity, just pinned to `--model \"Gemini 3.1 Pro (High)\"`. Previously routed through the standalone `gemini` CLI (-m gemini-3.1-pro-preview); migrated to agy in the 2026-06-18 sunset since agy now hosts Gemini 3.1 Pro and exposes --model. Pro is a preview tier — surface model-availability errors to the user, don't auto-retry. NOTE: antigravity + gemini-pro are the SAME provider (Google) — their agreement is NOT independent the way codex/kimi convergence is; treat Flash+Pro overlap as one provider's vote, not two. Pro triggers agy's SIGSEGV panic (RunCommandHandler nil-deref, agy ≤1.0.15) far more than Flash — it roams files/commands harder; exit 2 + ~20-45s + empty output = the panic, not your diff. Quota semantics: same as antigravity (check failure_kind). FALLBACK POLICY REVISED 2026-08-22: an ACCOUNT wall or an agy panic re-runs this lap over OpenRouter against the same Pro model (see or_fallback); any other failure still drops the lap. Recorded as status \"fallback\", never \"ok\"."
+    "notes": "DRAW_BOOST 2.5 SET 2026-08-27: best precision in the fleet outside the codex baseline — 152 findings over 157 seats at a 10% fact-check drop rate, free, and ~3x antigravity's per-seat yield (1.1 vs 0.4 findings/run). It was being drawn far below what that record earns. Deliberately a heavy boost and NOT a third baseline: baselines sit on the fail-closed path in select_roster.sh and this is a preview-tier model, so it must be allowed to vanish without blocking a round. Shared-Google-quota risk checked and is not real in the data: 1 quota_exhausted event across 592 combined agy seats (gemini-pro + antigravity), plus the OpenRouter fallback added 2026-08-22. Same `agy` CLI as antigravity, just pinned to `--model \"Gemini 3.1 Pro (High)\"`. Previously routed through the standalone `gemini` CLI (-m gemini-3.1-pro-preview); migrated to agy in the 2026-06-18 sunset since agy now hosts Gemini 3.1 Pro and exposes --model. Pro is a preview tier — surface model-availability errors to the user, don't auto-retry. NOTE: antigravity + gemini-pro are the SAME provider (Google) — their agreement is NOT independent the way codex/kimi convergence is; treat Flash+Pro overlap as one provider's vote, not two. Pro triggers agy's SIGSEGV panic (RunCommandHandler nil-deref, agy ≤1.0.15) far more than Flash — it roams files/commands harder; exit 2 + ~20-45s + empty output = the panic, not your diff. Quota semantics: same as antigravity (check failure_kind). FALLBACK POLICY REVISED 2026-08-22: an ACCOUNT wall or an agy panic re-runs this lap over OpenRouter against the same Pro model (see or_fallback); any other failure still drops the lap. Recorded as status \"fallback\", never \"ok\"."
   },
   "kimi": {
     "or_fallback": {
@@ -210,7 +211,7 @@
     "timeout_s": 600,
     "provider": "alibaba",
     "cli": "openrouter",
-    "model": "qwen/qwen3-coder-next",
+    "model": "qwen/qwen3.8-27b",
     "retry_policy": "retry_on_transient",
     "prompt_style": "diff_only_no_tools",
     "severity_priors": {
@@ -221,16 +222,19 @@
     },
     "synthesis_weight": 0.75,
     "draw_boost": 0.2,
-    "pricing": { "prompt_per_m": 0.11, "completion_per_m": 0.80 },
+    "pricing": {
+      "completion_per_m": 2.55,
+      "prompt_per_m": 0.42
+    },
     "specialization": "single-turn diff reasoning; independent provider vote (Alibaba). Rotation-pool member.",
     "bench_note": "2026-08-03: benched — 4/5 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
-    "notes": "Qwen3 Coder Next via OpenRouter ($0.11/M in, $0.80/M out; code-specialized MoE). Added 2026-07-02 filling fugu's seat, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Alibaba), routed through OpenRouter (US) — surface both for security-sensitive repos."
+    "notes": "RE-PINNED 2026-08-27: qwen/qwen3-coder-next -> qwen/qwen3.8-27b ($0.42/M in, $2.55/M out, released 2026-08-14). 3.8-flash was the first choice on price but 429'd on 2 of 3 live probes on 2026-08-27 — it shipped 2026-08-26 and Alibaba's capacity for it is thin; a 429 just drops the seat out of the round, which is the failure this re-pin exists to avoid. 3.8-27b has two weeks of soak, served clean via Chutes, and the extra cost is noise at this seat's volume (lifetime spend $0.29 over 117 seats). The coder-next pin dated 2026-02-04 and was ~6 months stale — the whole Qwen 3.8 family shipped past it. This seat carried the fleet's second-worst fact-check drop rate (52% across 181 findings / 117 seats) and that number was measured on a model two generations behind, so it is a stale-pin result, not a verdict on the seat. Kept rather than benched because it is the cheapest and fastest breadth lane we have ($0.29 lifetime spend, 10s p50). draw_boost stays 0.2 while 3.8 earns its own record; if the drop rate does not fall, bench it on THAT evidence. Qwen3 Coder Next via OpenRouter ($0.11/M in, $0.80/M out; code-specialized MoE). Added 2026-07-02 filling fugu's seat, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Alibaba), routed through OpenRouter (US) — surface both for security-sensitive repos."
   },
   "devstral": {
     "timeout_s": 600,
     "provider": "mistral",
     "cli": "openrouter",
-    "model": "mistralai/mistral-large-2512",
+    "model": "mistralai/devstral-2512",
     "retry_policy": "retry_on_transient",
     "prompt_style": "diff_only_no_tools",
     "severity_priors": {
@@ -241,10 +245,13 @@
     },
     "synthesis_weight": 0.75,
     "draw_boost": 0.2,
-    "pricing": { "prompt_per_m": 0.50, "completion_per_m": 1.50 },
+    "pricing": {
+      "completion_per_m": 2.00,
+      "prompt_per_m": 0.40
+    },
     "specialization": "single-turn diff reasoning; independent provider vote (Mistral). Rotation-pool member.",
     "bench_note": "2026-08-03: benched — 2/2 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
-    "notes": "Devstral 2 via OpenRouter ($0.40/M in, $2/M out; Mistral's agentic-coding model). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. France-origin provider (Mistral), routed through OpenRouter (US). Repointed 2026-08-03: mistralai/devstral-2512 was delisted from OpenRouter and Mistral has no current Devstral route; this seat exists for lab diversity (France), so it now rides mistral-large-2512, 262k context, $0.50/$1.50 per M."
+    "notes": "RE-PINNED 2026-08-27: mistralai/mistral-large-2512 -> mistralai/devstral-2512. The old pin dated 2025-12-01 (~9 months stale) and did not even match this seat's name — the seat is called devstral while pointing at mistral-large. 69% fact-check drop rate over 16 seats on that pin. Re-pinned to the code-specialised Mistral the seat was always meant to be. draw_boost stays 0.2 pending a fresh record. Devstral 2 via OpenRouter ($0.40/M in, $2/M out; Mistral's agentic-coding model). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. France-origin provider (Mistral), routed through OpenRouter (US). Repointed 2026-08-03: mistralai/devstral-2512 was delisted from OpenRouter and Mistral has no current Devstral route; this seat exists for lab diversity (France), so it now rides mistral-large-2512, 262k context, $0.50/$1.50 per M."
   },
   "laguna": {
     "timeout_s": 600,
@@ -305,6 +312,7 @@
     "notes": "Cohere North Mini Code (:free tier) via OpenRouter. Added 2026-07-01, rookie. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid \u2014 check the route's terms for security-sensitive repos. Canada-origin provider (Cohere). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets \u2014 see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data \u2014 re-evaluate after clean rounds."
   },
   "nemotron": {
+    "bench_note": "2026-08-27: BENCHED (draw_boost 0) — judged on its CURRENT model only (nvidia/nemotron-3.5-lightning, pinned 2026-08-14; the 3-ultra record before it belongs to a different model and does not carry). 19 seats, 10 findings, 8 of them fact-check-disproven = an 80% drop rate, worst in the fleet by a wide margin (next worst qwen at 52%, fleet median ~25%). This is not a quiet seat, it is a noisy one: every round it is drawn it costs adjudication effort to refute claims, at a p50 of 160s. The 2026-08-14 model swap was its fair second chance and it came back WORSE than the 3-ultra seat it replaced (34%). Benched at 0 rather than the usual 0.2 because the 0.2 cohort are throttle cases and this is a retirement; kept in POOL and fully wired so the seat-wiring invariant holds and the bench is one field to reverse.",
     "timeout_s": 600,
     "provider": "nvidia",
     "cli": "openrouter",
@@ -318,7 +326,7 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.75,
-    "draw_boost": 2.5,
+    "draw_boost": 0,
     "pricing": { "prompt_per_m": 0.00, "completion_per_m": 0.00 },
     "specialization": "single-turn diff reasoning, fast tier, 1M context; independent provider vote (NVIDIA). Rotation-pool member. FREE tier \u2014 zero marginal cost.",
     "notes": "NVIDIA Nemotron 3.5 Lightning (:free tier, 1M ctx) via OpenRouter. Added 2026-07-01 as Nemotron 3 Ultra 550B; **swapped to 3.5 Lightning 2026-08-14** (released 2026-08-11) \u2014 the Ultra seat sat at score 25 on 1-of-3 reliability, and that record is sleep-contaminated (below) rather than a clean capability signal, so a same-vendor, same-price (free) refresh is the cheapest way to get a clean read. Treat the seat as a rookie again: pre-2026-08-14 rows are a different model. The leaderboard keys on seat name, not model, so rookie-again had to be made real rather than asserted — draw_boost 2.5 added 2026-08-14 to offset the inherited score-25 weight; retire it after ~10 sampled runs, same as seed/grok. Free-tier caveat: OpenRouter free routes can be rate-limited or have data-retention terms that differ from paid \u2014 check the route's terms for security-sensitive repos. US-origin provider (NVIDIA). 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets \u2014 see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data \u2014 re-evaluate after clean rounds."
