@@ -3106,7 +3106,8 @@ if [[ -n "$REPO_ROOT" && -d "$COPY_A" && -d "$COPY_B" ]]; then
   # runlog.jsonl / finding_events.jsonl are runtime state, not source: the
   # installed skill is a symlink to COPY_A, so its history lands there and
   # would otherwise read as drift on every run (2026-08-03).
-  if diff -r --exclude 'runlog.jsonl*' --exclude 'finding_events.jsonl' --exclude 'iteration-1' --exclude '*.bak*' --exclude '.DS_Store' "$COPY_A" "$COPY_B" >/dev/null 2>&1; then
+  # state/ joined them 2026-08-29: check_repeat_pass.sh records last-base there.
+  if diff -r --exclude 'runlog.jsonl*' --exclude 'finding_events.jsonl' --exclude 'state' --exclude 'iteration-1' --exclude '*.bak*' --exclude '.DS_Store' "$COPY_A" "$COPY_B" >/dev/null 2>&1; then
     ok "root copy ≡ plugin copy"
   else
     bad "root copy and plugin copy have drifted — sync before merging"

@@ -481,6 +481,38 @@ if git diff --quiet "$base"...HEAD; then
   exit 0
 fi
 
+# Repeat-pass guard. A pass >= 2 that reuses the previous pass's base re-reads
+# every line already reviewed (SKILL.md's re-review loop asks for the previous
+# pass's HEAD instead). That rule was prose and was ignored on 29% of August's
+# multi-pass rounds — 162,929 diff lines re-read. check_repeat_pass.sh makes it
+# binding, and prints the base the caller should have used.
+#
+# Placed AFTER the empty-diff short-circuit so a no-op round neither blocks nor
+# records, and BEFORE any reviewer is dispatched so nothing is spent. It fails
+# OPEN by design: a missing or unreadable state record allows the round.
+_guard="$(cd "$(dirname "$0")" && pwd)/check_repeat_pass.sh"
+_base_sha="$(git rev-parse --verify --quiet "$base^{commit}" 2>/dev/null || echo "")"
+_head_sha="$(git rev-parse --verify --quiet HEAD 2>/dev/null || echo "")"
+if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
+  # Capture the status DIRECTLY. Inside `if ! cmd; then`, `$?` is the negated
+  # result (0), not the guard's exit code — which silently turned every block
+  # into a "guard returned 0 — continuing" and dispatched the round anyway.
+  # Caught by the integration test in tests/test_repeat_pass_guard.sh.
+  bash "$_guard" --base-sha "$_base_sha" --head-sha "$_head_sha"
+  _grc=$?
+  if [[ "$_grc" -ne 0 ]]; then
+    # 3 = blocked. Any other non-zero is a guard malfunction (usage error,
+    # unreadable state) and must NOT cost the caller a round — fail open.
+    if [[ "$_grc" -eq 3 ]]; then
+      printf '{"skipped": true, "reason": "repeat_pass_same_base", "base": "%s"}\n' "$base" > "$out/run.meta.json"
+      exit 3
+    fi
+    echo "check_repeat_pass: guard returned $_grc — continuing (fail open)" >&2
+  fi
+  # Record only once we are committed to dispatching this round.
+  bash "$_guard" --record --base-sha "$_base_sha" --head-sha "$_head_sha" || true
+fi
+
 # Whole-file context for the text-only lanes (--context-mode files). Built
 # ONCE here, before dispatch, because every text-only seat gets the identical
 # block and the lanes run as parallel background jobs. Lanes `cat` the file;
