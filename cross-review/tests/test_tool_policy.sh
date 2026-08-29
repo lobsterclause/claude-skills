@@ -41,7 +41,7 @@ cat >"$PROF" <<'EOF'
   "codex":  { "cli": null,         "provider": "openai" }
 }
 EOF
-export CROSS_REVIEW_PROFILES="$PROF"
+export CROSS_REVIEW_PROFILES_FILE="$PROF"
 export CROSS_REVIEW_RUNLOG="$T/runlog.jsonl"
 export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"
 NOCHECK="$T/nocheck"; mkdir -p "$NOCHECK"
@@ -92,13 +92,13 @@ D="$(CROSS_REVIEW_TOOL_CHECK_TRUST=1 decide glm)"
 assert_eq "trust without an entrypoint still no check arm" "$(jq -r '.arms | has("check")' <<<"$D")" "false"
 # The degrade reason must say which gate closed (codex P3, #154 pass 2).
 PROFC="$T/profiles_checkdefault.json"; jq '._synthesis_rules.tool_policy.default_mode = "check"' "$PROF" >"$PROFC"
-D="$(CROSS_REVIEW_PROFILES="$PROFC" decide glm "$T/withcheck")"
+D="$(CROSS_REVIEW_PROFILES_FILE="$PROFC" decide glm "$T/withcheck")"
 assert_eq "default check + entrypoint, untrusted → read" "$(jq -r .mode <<<"$D")" "read"
 assert_eq "…basis names the trust gate"                   "$(jq -r .basis <<<"$D")" "default:check_not_trusted"
-D="$(CROSS_REVIEW_PROFILES="$PROFC" decide glm)"
+D="$(CROSS_REVIEW_PROFILES_FILE="$PROFC" decide glm)"
 assert_eq "default check, no entrypoint → read"           "$(jq -r .mode <<<"$D")" "read"
 assert_eq "…basis names the missing entrypoint"           "$(jq -r .basis <<<"$D")" "default:no_check_entrypoint"
-D="$(CROSS_REVIEW_PROFILES="$PROFC" CROSS_REVIEW_TOOL_CHECK_TRUST=1 decide glm "$T/withcheck")"
+D="$(CROSS_REVIEW_PROFILES_FILE="$PROFC" CROSS_REVIEW_TOOL_CHECK_TRUST=1 decide glm "$T/withcheck")"
 assert_eq "default check + entrypoint + trust → check"    "$(jq -r '[.mode,.basis] | join("/")' <<<"$D")" "check/default"
 D="$(CROSS_REVIEW_TOOL_MODE=check decide glm)"
 assert_eq "requested check without entrypoint → read" "$(jq -r .mode <<<"$D")" "read"
