@@ -1087,6 +1087,15 @@ if [[ -f "$json_suffix_file" ]]; then
   json_findings_suffix="$(cat "$json_suffix_file")"
 fi
 
+# codex_output_has_verdict_marker <file> — true when the transcript carries a
+# review verdict/severity marker (fallback_eligible.sh's vocabulary) once the
+# startup banner's metadata lines are removed. Used by the quota gate above.
+CODEX_VACUOUS_MAX_BYTES=1024
+codex_output_has_verdict_marker() {
+  grep -viE '^(reasoning (effort|summaries)|model|provider|approval|sandbox|workdir|session id):' "$1" 2>/dev/null \
+    | grep -qiE '(^|[^[:alnum:]])(critical|high|medium|low)([^[:alnum:]]|$)|no (significant |material )?(issues?|findings?|problems?|concerns?|regressions?)|looks (good|correct|fine)|lgtm|approved|\[P[0-9]\]|findings?:|reviewed [0-9]|"findings"'
+}
+
 run_codex() {
   local start end rc
   start=$(date +%s)
@@ -1143,10 +1152,13 @@ run_codex() {
   # must never self-classify (glm High + codex M, PR #61 review). A wall is
   # a failed run or a near-empty one.
   # rc=0 arm aligned with fallback_eligible.sh: a wall can carry codex's
-  # startup banner (measured 485-564 B), so the cut is VACUOUS_MAX_BYTES
-  # (1024) AND no verdict/severity marker — a real review is never this
-  # short without one (codex + kimi + antigravity, #61 pass 2).
-  if { [[ $rc -ne 0 ]] || { [[ "$bytes" -lt 1024 ]] && ! grep -qiE '(^|[^[:alnum:]])(critical|high|medium|low)([^[:alnum:]]|$)|no (significant |material )?(issues?|findings?|problems?|concerns?|regressions?)|looks (good|correct|fine)|lgtm|approved|\[P[0-9]\]|findings?:|"findings"' "$out/codex.stdout" 2>/dev/null; }; } \
+  # startup banner (measured 485-564 B), so the cut is CODEX_VACUOUS_MAX_BYTES
+  # (1024, = fallback_eligible's VACUOUS_MAX_BYTES) AND no verdict/severity
+  # marker — a real review is never this short without one (codex + kimi +
+  # antigravity, #61 pass 2). The banner's own `reasoning effort: high` line
+  # is metadata, not a verdict: it is dropped before the marker scan (codex,
+  # #61 pass 3). Vocabulary is fallback_eligible's, `reviewed [0-9]` included.
+  if { [[ $rc -ne 0 ]] || { [[ "$bytes" -lt "$CODEX_VACUOUS_MAX_BYTES" ]] && ! codex_output_has_verdict_marker "$out/codex.stdout"; }; } \
      && grep -qiE "hit your usage limit|purchase more credits|usage limit reached" "$out/codex.stdout" 2>/dev/null; then
     local reset_eta
     reset_eta="$(grep -oiE "try again at [^.]*" "$out/codex.stdout" 2>/dev/null | head -1)"
