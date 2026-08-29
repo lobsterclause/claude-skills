@@ -42,7 +42,13 @@ derive_project() {
     if [[ "$remote_url" == *"://"* ]]; then
       : # already an authority-style URL, host/path split below
     else
-      host="${host/:/\/}"
+      # Replacement side unescaped on purpose: bash 3.2 (macOS /bin/bash)
+      # keeps a literal backslash from `\/`, so an ssh remote became
+      # github.com\/owner/repo and an ssh clone got a DIFFERENT project
+      # namespace than an https clone of the same repo — splitting that
+      # repo's ledger history in two on macOS. bash 4+ was unaffected,
+      # which is why only the 3.2 hosts saw it (#160).
+      host="${host/://}"
     fi
     host="${host%/}"
     host="${host%.git}"
