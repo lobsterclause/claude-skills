@@ -130,7 +130,7 @@ done
 # version token (/2, /1.1), the plural is allowed, and the delimiter after
 # "account" is MANDATORY. The trailing ([^0-9]|$) guard is what still rejects
 # "4290ms elapsed" and "http 4031 bytes" -- keep it when touching this.
-if grep -Eqi 'usage limit|insufficient balance|(^|[^[:alnum:]])accounts?[^[:alnum:]].{0,40}suspend|exceeded_current_quota|quota exceeded' <<<"$blob"; then
+if grep -Eqi 'usage limit|purchase more credits|insufficient balance|(^|[^[:alnum:]])accounts?[^[:alnum:]].{0,40}suspend|exceeded_current_quota|quota exceeded' <<<"$blob"; then
   echo "account_limit"; exit 0
 fi
 if grep -Eqi '(error code|http(/[0-9.]+)?|status( code)?)[^[:alnum:]]+429([^0-9]|$)|429 too many requests' <<<"$blob"; then

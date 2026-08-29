@@ -47,8 +47,11 @@ assert_contains "stderr says the baseline dropped out" "$(cat "$T/o1.log")" "usa
 echo "── wall printed with rc=0 is still a failure ──"
 codex_shim 0 "Please purchase more credits to continue."
 run "$T/o2"
-assert_eq "failure_kind quota_exhausted"     "$(jq -r .failure_kind "$T/o2/codex.meta.json")" "quota_exhausted"
-assert_eq "rc=0 remapped to 3"               "$(jq -r .exit_code "$T/o2/codex.meta.json")" "3"
+# With rc=0 the vacuous-success path (#113) owns the classification: no
+# OpenRouter key here, so the lane is dropped as a failure, never "ok".
+assert_eq "rc=0 wall is not an ok lane"        "$(jq -r '.exit_code != 0' "$T/o2/codex.meta.json")" "true"
+assert_eq "…failure_kind is set"               "$(jq -r '.failure_kind != null' "$T/o2/codex.meta.json")" "true"
+[[ -f "$T/o2/codex.quota_exhausted" ]] && ok "sentinel still written for an rc=0 wall" || bad "sentinel missing for an rc=0 wall"
 assert_contains "ETA absent → 'not reported'" "$(cat "$T/o2/codex.quota_exhausted")" "reset time not reported"
 
 echo "── an ordinary rc=1 is NOT a quota wall ──"

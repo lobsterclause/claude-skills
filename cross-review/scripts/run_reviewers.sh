@@ -1141,7 +1141,10 @@ run_codex() {
     printf '%s\n' "${reset_eta:-reset time not reported}" >"$out/codex.quota_exhausted"
     echo "codex: usage limit reached — baseline drops out of this round (${reset_eta:-reset time not reported})" >&2
     fk_json='"quota_exhausted"'
-    [[ $rc -eq 0 ]] && rc=3
+    # No rc remap: rc=3 is agy's quota signal and fallback_eligible.sh treats
+    # it as agy-only (#113), so remapping here silently disqualified codex
+    # from its OpenRouter rescue. A wall printed with rc=0 is left to the
+    # vacuous-success path, which turns it into a failure or a fallback.
   elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/codex.stdout"; then
     echo "codex: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
