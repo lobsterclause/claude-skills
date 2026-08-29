@@ -801,8 +801,9 @@ assert_eq "a gap in the middle is NOT covered" \
   "$(rcv "$C0" "$C3" "$GAP" | jq -r .covered)" "false"
 assert_eq "and the uncovered commits are named" \
   "$(rcv "$C0" "$C3" "$GAP" | jq -r '.uncovered | length')" "2"
+# rev-list is newest-first; look for the entry rather than pinning an index.
 assert_contains "…one entry per commit, subject intact (no word splitting/globbing)" \
-  "$(rcv "$C0" "$C3" "$GAP" | jq -r '.uncovered[0]')" "commit 1: update f.txt *"
+  "$(rcv "$C0" "$C3" "$GAP" | jq -r '.uncovered[]' | grep -F 'commit 1: update f.txt *')" "commit 1: update f.txt *"
 assert_eq "no records at all is not covered" \
   "$(rcv "$C0" "$C3" '[]' | jq -r .covered)" "false"
 # A head-only (legacy) stamp asserts ONE commit and nothing behind it. Treating
@@ -2012,16 +2013,23 @@ MG_CLEAR="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\"
 
 assert_eq "hook denies a stale merge" \
   "$(mg_hook "$MG_STALE" 'gh pr merge 3207 --squash --auto')" "deny"
+# A clear record still needs --match-head-commit (the hook's TOCTOU rule).
 assert_eq "marker current, prose stale → the marker clears the merge" \
-  "$(mg_hook "$MG_MARKER_WINS_PASS" 'gh pr merge 3207')" "PASS"
+  "$(mg_hook "$MG_MARKER_WINS_PASS" "gh pr merge 3207 --match-head-commit $HEAD40")" "PASS"
 assert_eq "marker stale, prose current → the marker denies the merge" \
   "$(mg_hook "$MG_MARKER_WINS_DENY" 'gh pr merge 3207')" "deny"
 assert_eq "a marker-only record at the current head clears" \
-  "$(mg_hook "$MG_MARKER_ONLY_PASS" 'gh pr merge 3207')" "PASS"
+  "$(mg_hook "$MG_MARKER_ONLY_PASS" "gh pr merge 3207 --match-head-commit $HEAD40")" "PASS"
 assert_eq "a marker-only record at an old head denies" \
   "$(mg_hook "$MG_MARKER_ONLY_DENY" 'gh pr merge 3207')" "deny"
 assert_eq "the newest marker-only record wins over an older prose one" \
-  "$(mg_hook "$MG_OLD_PROSE_THEN_NEW_MARKER" 'gh pr merge 3207')" "PASS"
+  "$(mg_hook "$MG_OLD_PROSE_THEN_NEW_MARKER" "gh pr merge 3207 --match-head-commit $HEAD40")" "PASS"
+# An unterminated marker prefix is not a record (codex, #67 pass 3): it must
+# not mask a valid current review that precedes it.
+MARKER_BROKEN="## Cross-review — pass 3\n<!-- cross-review: sha=b813773500000000000000000000000000000000 pass=3\nno closing tag"
+MG_BROKEN_AFTER_GOOD="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_ONLY_NEW\"},{\"body\":\"$MARKER_BROKEN\"}]}"
+assert_eq "an unterminated marker after a current record does not mask it" \
+  "$(mg_hook "$MG_BROKEN_AFTER_GOOD" "gh pr merge 3207 --match-head-commit $HEAD40")" "PASS"
 # A merge reviewed at head is no longer waved through unconditionally: it must
 # also bind itself to that commit. See the TOCTOU block further down for why.
 assert_eq "control: hook allows a merge reviewed at head AND bound to it" \

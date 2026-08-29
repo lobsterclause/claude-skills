@@ -146,7 +146,7 @@ fi
 # read_stamp.sh) or the prose. Requiring the prose here skipped marker-only
 # records and could pick an older prose-bearing comment over the newest
 # marker-bearing one (codex + antigravity, #67 pass 2).
-STAMP_RE='(<!-- cross-review: sha=[0-9a-f]{40}|Reviewed `[0-9a-f]{7,40}`)'
+STAMP_RE='(<!-- cross-review: sha=[0-9a-f]{40}[^>]*-->|Reviewed `[0-9a-f]{7,40}`)'
 review_body="$(printf '%s' "$comments_json" \
   | jq -r --arg re "$STAMP_RE" \
       '[.[] | .body | select(startswith("## Cross-review")) | select(test($re))] | last // ""' \
