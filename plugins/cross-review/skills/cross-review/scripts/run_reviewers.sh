@@ -1129,6 +1129,52 @@ if [[ -f "$json_suffix_file" ]]; then
   json_findings_suffix="$(cat "$json_suffix_file")"
 fi
 
+# ── AGENTS.md carrier for the no-deps note (codex lane) ──────────────────────
+# State is script-global so the EXIT/INT/TERM trap can undo it: a signal
+# during the codex run used to leave the note in the user's file for good
+# (minimax + spark + codex, #68 pass 2). Rules: the file is the REPO ROOT's
+# (kimi + spark); a symlink is never followed (codex); nothing is appended
+# until a backup is verified — a failed mktemp/cp left the note permanently
+# or restored an EMPTY file (kimi Critical, minimax, spark); the backup lives
+# beside the file with `cp -p` so mode/ownership survive the round trip
+# (codex); a lock dir keeps two overlapping runs from restoring each other's
+# state (codex).
+CR_AGENTS_MD=""; CR_AGENTS_BAK=""; CR_AGENTS_CREATED=0; CR_AGENTS_LOCK=""
+cr_agents_inject() {
+  [[ -n "${NO_DEPS_NOTE:-}" ]] || return 0
+  local root; root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  local f="$root/AGENTS.md" lock="$root/.AGENTS.md.cross-review.lock"
+  if [[ -L "$f" ]]; then echo "codex: AGENTS.md is a symlink — not injecting the environment note" >&2; return 0; fi
+  if ! mkdir "$lock" 2>/dev/null; then echo "codex: another cross-review run holds AGENTS.md — not injecting the environment note" >&2; return 0; fi
+  CR_AGENTS_LOCK="$lock"
+  if [[ -e "$f" ]]; then
+    local bak
+    if bak="$(mktemp "$root/.AGENTS.md.cross-review.XXXXXX" 2>/dev/null)" && cp -p "$f" "$bak" 2>/dev/null && cmp -s "$f" "$bak"; then
+      CR_AGENTS_BAK="$bak"
+    else
+      [[ -n "${bak:-}" ]] && rm -f "$bak"
+      echo "codex: could not back up AGENTS.md — not injecting the environment note" >&2
+      rmdir "$lock" 2>/dev/null; CR_AGENTS_LOCK=""; return 0
+    fi
+  else
+    CR_AGENTS_CREATED=1
+  fi
+  if ! printf '\n\n## cross-review environment note\n\n%s\n' "$NO_DEPS_NOTE" >>"$f" 2>/dev/null; then
+    echo "codex: could not write AGENTS.md — leaving it untouched" >&2
+    cr_agents_restore; return 0
+  fi
+  CR_AGENTS_MD="$f"
+}
+cr_agents_restore() {
+  if [[ -n "$CR_AGENTS_BAK" ]]; then
+    mv -f "$CR_AGENTS_BAK" "${CR_AGENTS_MD:-${CR_AGENTS_BAK%/.AGENTS.md.cross-review.*}/AGENTS.md}" 2>/dev/null
+  elif [[ "$CR_AGENTS_CREATED" == 1 && -n "$CR_AGENTS_MD" ]]; then
+    rm -f "$CR_AGENTS_MD"
+  fi
+  [[ -n "$CR_AGENTS_LOCK" ]] && rmdir "$CR_AGENTS_LOCK" 2>/dev/null
+  CR_AGENTS_MD=""; CR_AGENTS_BAK=""; CR_AGENTS_CREATED=0; CR_AGENTS_LOCK=""
+}
+
 run_codex() {
   local start end rc
   start=$(date +%s)
@@ -1160,17 +1206,11 @@ run_codex() {
   # `codex exec review --base` never sees $review_prompt, so the no-deps note
   # above did not reach the ONE lane it was written for (four seats converged
   # on this, PR #68 review). codex reads the project's AGENTS.md as standing
-  # instructions: put the note there for the duration of the run — appended
-  # to an existing file, created otherwise — and restore it afterwards.
-  local agents_md="AGENTS.md" agents_bak="" agents_created=0
-  if [[ -n "${NO_DEPS_NOTE:-}" ]]; then
-    if [[ -f "$agents_md" ]]; then
-      agents_bak="$(mktemp "${TMPDIR:-/tmp}/cr-agents.XXXXXX")" && cp "$agents_md" "$agents_bak"
-    else
-      agents_created=1
-    fi
-    printf '\n\n## cross-review environment note\n\n%s\n' "$NO_DEPS_NOTE" >>"$agents_md"
-  fi
+  # instructions: put the note there for the duration of the run and restore
+  # it afterwards. cr_agents_inject/cr_agents_restore below; the restore is
+  # also wired into the EXIT/INT/TERM trap (pass 2: three seats).
+  cr_agents_inject
+  local codex_model codex_model_args=()
   local codex_model codex_model_args=()
   codex_model="$(profile_get codex cli_model)"
   if [[ -n "$codex_model" ]]; then
@@ -1183,8 +1223,7 @@ run_codex() {
     ${codex_cfg[@]+"${codex_cfg[@]}"} \
     >"$out/codex.stdout" 2>&1
   rc=$?
-  # Put AGENTS.md back exactly as it was (or remove the one we created).
-  if [[ -n "$agents_bak" ]]; then mv -f "$agents_bak" "$agents_md"; elif [[ "$agents_created" == 1 ]]; then rm -f "$agents_md"; fi
+  cr_agents_restore
   end=$(date +%s)
   local timed_out="false"
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
@@ -2468,6 +2507,7 @@ remove_agy_shell_gate() {
 cleanup_run() {
   cleanup_pids
   remove_agy_shell_gate
+  cr_agents_restore
 }
 trap cleanup_run EXIT INT TERM
 

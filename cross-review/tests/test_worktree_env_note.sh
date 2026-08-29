@@ -77,7 +77,7 @@ bash "$S/run_reviewers.sh" --base main --out "$T/no_deps" --reviewers glm >/dev/
 cat >"$T/bin/codex" <<'CSHIM'
 #!/bin/sh
 cat >/dev/null 2>&1 || true
-if [ -f AGENTS.md ]; then printf 'AGENTS_SEEN: '; cat AGENTS.md; else printf 'AGENTS_ABSENT\n'; fi
+R=$(git rev-parse --show-toplevel 2>/dev/null || pwd); if [ -f "$R/AGENTS.md" ]; then printf 'AGENTS_SEEN: '; cat "$R/AGENTS.md"; else printf 'AGENTS_ABSENT\n'; fi
 printf '\ncodex\n[P3] nothing\n'
 CSHIM
 chmod +x "$T/bin/codex"
@@ -90,6 +90,22 @@ rm -f AGENTS.md
 bash "$S/run_reviewers.sh" --base main --out "$T/no_deps_codex2" --reviewers codex >/dev/null 2>&1 || true
 assert_contains "no AGENTS.md before → note still delivered" "$(cat "$T/no_deps_codex2/codex.stdout")" "AGENTS_SEEN"
 [[ ! -f AGENTS.md ]] && ok "…and the created AGENTS.md is removed afterwards" || bad "created AGENTS.md left behind"
+# Pass 2 (#68): mode survives the round trip; a symlink is never followed;
+# the note lands in the ROOT's AGENTS.md even from a subdirectory.
+printf '# project rules\n' >AGENTS.md; chmod 644 AGENTS.md
+bash "$S/run_reviewers.sh" --base main --out "$T/no_deps_codex3" --reviewers codex >/dev/null 2>&1 || true
+assert_eq "AGENTS.md keeps its mode (0644) after the round trip" "$(stat -f %Lp AGENTS.md 2>/dev/null || stat -c %a AGENTS.md)" "644"
+assert_eq "…and its content"                                   "$(cat AGENTS.md)" "# project rules"
+[[ ! -e .AGENTS.md.cross-review.lock ]] && ok "lock released" || bad "lock left behind"
+rm -f AGENTS.md; printf 'TARGET\n' >"$T/target.md"; ln -s "$T/target.md" AGENTS.md
+bash "$S/run_reviewers.sh" --base main --out "$T/no_deps_codex4" --reviewers codex >"$T/symlink.log" 2>&1 || true
+assert_eq "a symlinked AGENTS.md is never written through" "$(cat "$T/target.md")" "TARGET"
+[[ -L AGENTS.md ]] && ok "…and the symlink itself is left in place" || bad "symlink replaced"
+assert_contains "…with a WARN"                                "$(cat "$T/symlink.log")" "symlink"
+rm -f AGENTS.md
+mkdir -p sub && ( cd sub && bash "$S/run_reviewers.sh" --base main --out "$T/no_deps_codex5" --reviewers codex >/dev/null 2>&1 || true )
+assert_contains "invoked from a subdirectory, the root AGENTS.md carries the note" "$(cat "$T/no_deps_codex5/codex.stdout")" "AGENTS_SEEN"
+[[ ! -f sub/AGENTS.md && ! -f AGENTS.md ]] && ok "…and nothing is left in either directory" || bad "stray AGENTS.md after subdir run"
 PROMPT_NO="$(jq -r '.messages[0].content' "$T/no_deps/glm.request.json" 2>/dev/null)"
 assert_contains "a prompt was actually captured" "$PROMPT_NO" "code review of the changes"
 assert_contains "prompt carries the no-deps environment note" "$PROMPT_NO" "$NOTE"
