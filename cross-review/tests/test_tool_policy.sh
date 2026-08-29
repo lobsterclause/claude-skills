@@ -41,7 +41,7 @@ cat >"$PROF" <<'EOF'
   "codex":  { "cli": null,         "provider": "openai" }
 }
 EOF
-export CROSS_REVIEW_PROFILES="$PROF"
+export CROSS_REVIEW_PROFILES_FILE="$PROF"
 export CROSS_REVIEW_RUNLOG="$T/runlog.jsonl"
 export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"
 NOCHECK="$T/nocheck"; mkdir -p "$NOCHECK"
