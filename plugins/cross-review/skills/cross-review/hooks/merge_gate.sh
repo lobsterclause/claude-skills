@@ -146,10 +146,11 @@ OVERRIDE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*CROSS_REVIEW_MERGE_OVERRIDE=1[[:s
 # would have split inside a quoted argument (codex+kimi, #55 pass 2).
 split_segments() {
   printf '%s\n' "$1" | awk '
-    { s = $0; out = ""; q = ""
+    { s = $0; out = ""; q = ""; prev = ""
       for (i = 1; i <= length(s); i++) {
         c = substr(s, i, 1)
-        if (q != "") { if (c == q) q = ""; out = out c; continue }
+        if (q != "") { if (c == q && prev != "\\") q = ""; out = out c; prev = c; continue }
+        prev = c
         if (c == "\"" || c == "\047") { q = c; out = out c; continue }
         if (c ~ /[;&|()]/) { print out; out = ""; continue }
         out = out c
@@ -165,7 +166,7 @@ OVERRIDE_SEG_RE='(^|[[:space:]])CROSS_REVIEW_MERGE_OVERRIDE=1[[:space:]]+gh[[:sp
 # kimi, antigravity convergent).
 read -r -d '' REDACT_SED <<'SEDEOF' || true
 s/(^|[^A-Za-z0-9_])([A-Za-z_]*([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|_[Kk][Ee][Yy]|[Aa][Pp][Ii][Kk][Ee][Yy]))=("[^"]*"|'[^']*'|[^[:space:]]+)/\1\2=<redacted>/g
-s/(--token)[= ]("[^"]*"|'[^']*'|[^[:space:]]+)/\1 <redacted>/g
+s/(--token)[=[:space:]]("[^"]*"|'[^']*'|[^[:space:]]+)/\1 <redacted>/g
 s/([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*)(\\"[^"]*\\"|[^"']+)/\1<redacted>/g
 SEDEOF
 
@@ -190,6 +191,7 @@ log_override_audit() {
     # and first PR number found anywhere in the line (codex, kimi, PR #55).
     split_segments "$cmd_only" | while IFS= read -r seg; do
       printf '%s' "$seg" | grep -qE "$OVERRIDE_SEG_RE" || continue
+      printf '%s' "$seg" | grep -qE "$MERGE_SEG_RE" || continue   # a non-merge gh api call is not an override to record
       inv="$(printf '%s' "$seg" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
       red="$(printf '%s' "$inv" | sed -E "$REDACT_SED")"
       repo="$(printf '%s' "$inv" | grep -oE -- '(-R|--repo)[= ]["'"'"']?[^ "'"'"']+' 2>/dev/null | head -n1 | sed -E 's/^(-R|--repo)[= ]["'"'"']?//')"
@@ -209,7 +211,8 @@ log_override_audit() {
             for (j = i + 1; j <= NF; j++) {
               if ($j in v) { j++; continue }
               if ($j ~ /^-/) continue
-              if ($j ~ /^[0-9]+$/) { print $j; exit } } } }' 2>/dev/null)"
+              tok = $j; gsub(/^["\047]|["\047]$/, "", tok)
+              if (tok ~ /^[0-9]+$/) { print tok; exit } } } }' 2>/dev/null)"
       # HEAD of the cwd is only the merged head when the merge targets the
       # cwd repo; for -R/GH_REPO elsewhere it would be a wrong sha (kimi).
       head_sha=""; [[ "$repo" == "$cwd_repo" ]] && head_sha="$cwd_sha"
@@ -219,10 +222,15 @@ log_override_audit() {
         '{ts:$ts, repo:$repo, pr:$pr, head_sha:$head_sha, command:$command, user:$user}' 2>/dev/null)"
       [[ -n "$entry" ]] || continue
       mkdir -p "$(dirname "$local_log")" 2>/dev/null
+      # umask only shapes NEW files: a log created 0644 by an older hook must
+      # be tightened BEFORE the line lands in it, not after (codex+kimi pass
+      # 2, ordering per kimi pass 3). A symlink or someone else's file is
+      # never written.
+      if [[ -e "$local_log" ]]; then
+        [[ -f "$local_log" && ! -L "$local_log" && -O "$local_log" ]] || continue
+        chmod 600 "$local_log" 2>/dev/null || continue
+      fi
       printf '%s\n' "$entry" >>"$local_log" 2>/dev/null
-      # umask only shapes NEW files: a log created 0644 by an older hook stays
-      # readable while sensitive lines are appended (codex+kimi, pass 2).
-      [[ -f "$local_log" && ! -L "$local_log" && -O "$local_log" ]] && chmod 600 "$local_log" 2>/dev/null
     done
   ) || true
 }
@@ -236,7 +244,10 @@ log_override_audit() {
 n_merge=0; n_override=0
 while IFS= read -r seg; do
   printf '%s' "$seg" | grep -qE "$MERGE_SEG_RE" && n_merge=$((n_merge + 1))
-  printf '%s' "$seg" | grep -qE "$OVERRIDE_SEG_RE" && n_override=$((n_override + 1))
+  # An override counts only on a segment that IS a merge: `OVERRIDE=1 gh api
+  # user && gh pr merge 3207` used to score 1 == 1 and pass (codex +
+  # antigravity, #55 pass 3).
+  printf '%s' "$seg" | grep -qE "$OVERRIDE_SEG_RE" && printf '%s' "$seg" | grep -qE "$MERGE_SEG_RE" && n_override=$((n_override + 1))
 done < <(split_segments "$cmd_only")
 if (( n_override > 0 )); then
   log_override_audit

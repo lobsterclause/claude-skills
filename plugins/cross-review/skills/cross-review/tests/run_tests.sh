@@ -1932,6 +1932,8 @@ assert_eq "two spaces do not bypass the gate" \
 # still gated (antigravity High, #55 pass 2).
 assert_eq "mixed override + plain merge in one line is still gated" \
   "$(mg_hook "$MG_STALE" 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 3207 && gh pr merge 3207')" "deny"
+assert_eq "a decoy overridden gh api call does not pass the plain merge (codex+antigravity, #55 pass 3)" \
+  "$(mg_hook "$MG_STALE" 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh api user && gh pr merge 3207')" "deny"
 assert_eq "…while an all-overridden compound passes" \
   "$(mg_hook "$MG_STALE" 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 3207 && CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 3207')" "PASS"
 

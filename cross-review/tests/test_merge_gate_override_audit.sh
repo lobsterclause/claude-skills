@@ -200,6 +200,12 @@ assert_eq "a pre-existing 0644 log is tightened to 0600 on append" "$perm2" "600
 : >"$AUDIT_LOG"
 mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 61 && gh pr merge 62' >/dev/null
 assert_eq "mixed compound: only the overridden merge is logged" "$(jq -r .pr "$AUDIT_LOG")" "61"
+: >"$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh api user && gh pr merge 63' >/dev/null
+assert_eq "a decoy overridden gh api call logs nothing (it is not a merge)" "$(wc -c <"$AUDIT_LOG" | tr -d ' ')" "0"
+: >"$AUDIT_LOG"
+mg_hook "CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge --token$(printf '\t')ghp_tab777 64" >/dev/null
+assert_not_contains "--token separated by a tab is redacted" "$(cat "$AUDIT_LOG")" "ghp_tab777"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"
