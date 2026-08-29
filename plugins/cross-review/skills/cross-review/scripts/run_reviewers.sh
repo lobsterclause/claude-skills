@@ -169,8 +169,9 @@
 # Chat lanes carry `tool_policy` {mode, basis} (what tool_policy.sh decided
 # and why: override | pinned | learned | default) and `tool_stats` {mode,
 # steps, turns, calls{read_file,search,list_files,run_check,unknown},
-# read_bytes, budget_exhausted, check_ran, check_rc, rf_dropped} — the
-# learner's own input next round, and analyze_runlog's split-by-arm.
+# read_bytes, budget_exhausted, check_ran, check_rc, rf_dropped, wall_forced,
+# turn_max_s, wall_scaled} — the learner's own input next round, and
+# analyze_runlog's split-by-arm.
 #
 # Exit codes:
 #   0 — at least one reviewer succeeded, OR run was skipped intentionally (empty diff)
