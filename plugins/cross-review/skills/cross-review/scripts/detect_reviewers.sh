@@ -30,40 +30,14 @@
 
 set -euo pipefail
 
-# Same PATH guard as run_reviewers.sh / select_roster.sh: without it, `has agy`
-# succeeds via the direct ~/.local/bin fallback below but the bare `agy models`
-# probe fails (127) and gemini-pro false-negatives — detection disagreeing with
-# execution. codex+fugu convergent finding, PR #18 pass 1.
-if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-  PATH="$HOME/.local/bin:$PATH"
-fi
-
-# Same class of bug, second location. codex and kimi are npm-global CLIs, and
-# nvm installs those under $NVM_DIR/versions/node/<version>/bin — a directory
-# that is NOT on $PATH for non-interactive shells, because nvm is a shell
-# function sourced from .zshrc and it never runs here. This bit us for real:
-# `codex` fell off $PATH and NINE consecutive review rounds ran without their
-# fixed baseline while reporting healthy (2026-08-14, kindred-mama-ai).
-nvm_bin=""
-_nvm_root="${NVM_DIR:-$HOME/.nvm}"
-if [[ -d "$_nvm_root/versions/node" ]]; then
-  # alias/default may hold a bare major ("22") or a full version ("v22.22.2").
-  _nvm_default="$(cat "$_nvm_root/alias/default" 2>/dev/null || true)"
-  if [[ -n "$_nvm_default" ]]; then
-    for _d in "$_nvm_root/versions/node/${_nvm_default}/bin" \
-              "$_nvm_root/versions/node/v${_nvm_default}".*/bin; do
-      if [[ -d "$_d" ]]; then nvm_bin="$_d"; break; fi
-    done
-  fi
-  if [[ -z "$nvm_bin" ]]; then
-    # No usable default alias — fall back to the highest installed version.
-    _d="$(ls -d "$_nvm_root"/versions/node/*/bin 2>/dev/null | sort -V | tail -1 || true)"
-    if [[ -n "$_d" ]]; then nvm_bin="$_d"; fi
-  fi
-fi
-if [[ -n "$nvm_bin" && ":$PATH:" != *":$nvm_bin:"* ]]; then
-  PATH="$nvm_bin:$PATH"
-fi
+# PATH fixups for ~/.local/bin (agy) and the nvm bin dir (codex, kimi) live in
+# lib_path.sh so detection, selection and execution cannot drift apart. They
+# did drift: this script resolved nvm and the other two did not, so it reported
+# codex available while select_roster.sh dropped it from every roster. See
+# lib_path.sh for the incident.
+# shellcheck source=lib_path.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_path.sh"
+nvm_bin="$CROSS_REVIEW_NVM_BIN"
 
 has() {
   command -v "$1" >/dev/null 2>&1 && return 0

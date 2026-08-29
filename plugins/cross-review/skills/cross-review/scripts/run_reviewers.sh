@@ -248,13 +248,14 @@ model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
                         devstral laguna kat north nemotron spark seed grok
                         longcat inkling kimi27 kimi3)
 
-# Antigravity installs `agy` to $HOME/.local/bin. That directory isn't always
-# on $PATH for non-interactive shells (notably bash invocations from other
-# tools). Surface it ourselves so `command -v agy` and a bare `agy` both
-# resolve without requiring the user to edit their shell rc.
-if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-  PATH="$HOME/.local/bin:$PATH"
-fi
+# Shared with detect_reviewers.sh and select_roster.sh: ~/.local/bin for agy,
+# plus the nvm bin dir for the codex and kimi npm globals. This file used to
+# carry only the ~/.local/bin half, so a round dispatched to codex or kimi from
+# a non-interactive shell could not execute them at all -- the EXECUTION half of
+# the same drift that made select_roster.sh drop them from the draw. See
+# lib_path.sh.
+# shellcheck source=lib_path.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_path.sh"
 
 need_val() {
   local flag="$1"
@@ -305,8 +306,23 @@ esac
 # it is). Missing/failed selector → classic fixed fleet.
 if [[ -z "$reviewers" ]]; then
   selector="$(cd "$(dirname "$0")" && pwd)/select_roster.sh"
-  if [[ -x "$selector" ]] && reviewers="$(bash "$selector")" && [[ -n "$reviewers" ]]; then
-    echo "roster (select_roster.sh): $reviewers" >&2
+  if [[ -x "$selector" ]]; then
+    # The selector's fail-closed exit (3: a baseline is not installed) is a
+    # verdict, not an outage. Treating every nonzero as "selector unavailable"
+    # substituted the fixed fleet, skipped the missing baselines at dispatch,
+    # and ran the exact baseline-less round the guard exists to stop (codex +
+    # glm convergent, PR #68 review).
+    sel_rc=0; reviewers="$(bash "$selector")" || sel_rc=$?
+    if [[ $sel_rc -eq 3 ]]; then
+      echo "run_reviewers: select_roster.sh refused the round (baseline missing) — not substituting a roster. Fix PATH or set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 for a deliberate degraded run." >&2
+      exit 1
+    fi
+    if [[ $sel_rc -eq 0 && -n "$reviewers" ]]; then
+      echo "roster (select_roster.sh): $reviewers" >&2
+    else
+      reviewers="codex,antigravity,gemini-pro,kimi,glm"
+      echo "roster: selector failed (rc=$sel_rc) — using fixed fallback fleet: $reviewers" >&2
+    fi
   else
     reviewers="codex,antigravity,gemini-pro,kimi,glm"
     echo "roster: selector unavailable — using fixed fallback fleet: $reviewers" >&2
@@ -1159,6 +1175,36 @@ else
   review_prompt="$default_prompt"
 fi
 
+# Review worktrees are `git worktree add` checkouts with no install step, so a
+# JS repo here has no node_modules. Agentic reviewers do not know that and will
+# try to run the suite -- reasonably, since "do the tests pass" is a good
+# question. It just cannot be answered here.
+#
+# Measured 2026-08-26 (kindred-mama-ai #3582, a two-file test diff): codex spent
+# its entire 600s budget chasing an unresolvable module, emitted 194KB of
+# transcript and ZERO verdict markers, and the round lost both baselines. The
+# retry at 1500s produced a verdict in 694s -- most of it still spent on the
+# same dead end.
+#
+# Appended after the prompt is resolved so a custom --prompt-file gets it too,
+# and gated on the condition actually holding: claiming deps are missing when
+# they are installed would be its own bad instruction.
+# Anchored to the repo root, not the cwd (kimi + glm); Yarn PnP zero-install
+# repos have usable deps without node_modules (.pnp.cjs) and are exempt
+# (codex); the note claims only what was checked (glm).
+NO_DEPS_NOTE=""
+_nd_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [[ -f "$_nd_root/package.json" && ! -d "$_nd_root/node_modules" && ! -f "$_nd_root/.pnp.cjs" && ! -f "$_nd_root/.pnp.js" ]]; then
+  NO_DEPS_NOTE="ENVIRONMENT: dependencies are NOT installed in this checkout \
+(package.json is present, node_modules is absent). Do not run tests, builds, \
+linters or typecheckers: they fail on missing modules, and that failure tells \
+you nothing about the diff. Review by reading the code."
+  review_prompt="$review_prompt
+
+$NO_DEPS_NOTE"
+fi
+unset _nd_root
+
 # json_findings_suffix: schema-mandate text appended ONLY in the curl lane
 # (run_openrouter_reviewer — the OpenRouter pool plus direct-Moonshot seats
 # like kimi27/kimi3). Those reviewers have no downstream tool loop of their
@@ -1173,6 +1219,74 @@ json_findings_suffix=""
 if [[ -f "$json_suffix_file" ]]; then
   json_findings_suffix="$(cat "$json_suffix_file")"
 fi
+
+# ── AGENTS.md carrier for the no-deps note (codex lane) ──────────────────────
+# State is script-global so the EXIT/INT/TERM trap can undo it: a signal
+# during the codex run used to leave the note in the user's file for good
+# (minimax + spark + codex, #68 pass 2). Rules: the file is the REPO ROOT's
+# (kimi + spark); a symlink is never followed (codex); nothing is appended
+# until a backup is verified — a failed mktemp/cp left the note permanently
+# or restored an EMPTY file (kimi Critical, minimax, spark); the backup lives
+# beside the file with `cp -p` so mode/ownership survive the round trip
+# (codex); a lock dir keeps two overlapping runs from restoring each other's
+# state (codex).
+CR_AGENTS_MD=""; CR_AGENTS_BAK=""; CR_AGENTS_CREATED=0; CR_AGENTS_LOCK=""
+cr_agents_inject() {
+  [[ -n "${NO_DEPS_NOTE:-}" ]] || return 0
+  local root; root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  local f="$root/AGENTS.md" lock="$root/.AGENTS.md.cross-review.lock"
+  if [[ -L "$f" ]]; then echo "codex: AGENTS.md is a symlink — not injecting the environment note" >&2; return 0; fi
+  if ! mkdir "$lock" 2>/dev/null; then
+    # Same stale-lock reclaim as _agy_gate_lock: a run killed with SIGKILL
+    # leaves the dir behind and every later run would skip the note for good
+    # (kimi + minimax, #68 pass 3). Rename-then-delete so two reclaimers
+    # cannot remove each other's fresh lock.
+    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]] && mv "$lock" "$lock.stale.$$" 2>/dev/null; then
+      rm -rf "$lock.stale.$$" 2>/dev/null || true
+    fi
+    if ! mkdir "$lock" 2>/dev/null; then echo "codex: another cross-review run holds AGENTS.md — not injecting the environment note" >&2; return 0; fi
+  fi
+  CR_AGENTS_LOCK="$lock"
+  # Re-checked under the lock: the entry could have become a symlink between
+  # the first test and mkdir (spark, #68 pass 3).
+  if [[ -L "$f" ]]; then echo "codex: AGENTS.md is a symlink — not injecting the environment note" >&2; rmdir "$lock" 2>/dev/null; CR_AGENTS_LOCK=""; return 0; fi
+  if [[ -e "$f" ]]; then
+    local bak
+    if bak="$(mktemp "$root/.AGENTS.md.cross-review.XXXXXX" 2>/dev/null)" && cp -p "$f" "$bak" 2>/dev/null && cmp -s "$f" "$bak"; then
+      CR_AGENTS_BAK="$bak"
+    else
+      [[ -n "${bak:-}" ]] && rm -f "$bak"
+      echo "codex: could not back up AGENTS.md — not injecting the environment note" >&2
+      rmdir "$lock" 2>/dev/null; CR_AGENTS_LOCK=""; return 0
+    fi
+  else
+    CR_AGENTS_CREATED=1
+  fi
+  # State is complete BEFORE the write: a partial append that fails must
+  # still be undone (a created file removed, a backup restored) — codex +
+  # spark, #68 pass 3.
+  CR_AGENTS_MD="$f"
+  if ! printf '\n\n## cross-review environment note\n\n%s\n' "$NO_DEPS_NOTE" >>"$f" 2>/dev/null; then
+    echo "codex: could not write AGENTS.md — restoring it" >&2
+    cr_agents_restore; return 0
+  fi
+}
+cr_agents_restore() {
+  if [[ -n "$CR_AGENTS_BAK" ]]; then
+    local _tgt="${CR_AGENTS_MD:-${CR_AGENTS_BAK%/.AGENTS.md.cross-review.*}/AGENTS.md}"
+    # A restore that fails is loud and leaves the backup where the user can
+    # find it (codex + minimax, #68 pass 3): mv, then cp -p, then WARN.
+    if ! mv -f "$CR_AGENTS_BAK" "$_tgt" 2>/dev/null; then
+      if cp -p "$CR_AGENTS_BAK" "$_tgt" 2>/dev/null; then rm -f "$CR_AGENTS_BAK"
+      else echo "WARN: could not restore $_tgt — your original is at $CR_AGENTS_BAK" >&2
+      fi
+    fi
+  elif [[ "$CR_AGENTS_CREATED" == 1 && -n "$CR_AGENTS_MD" ]]; then
+    rm -f "$CR_AGENTS_MD"
+  fi
+  [[ -n "$CR_AGENTS_LOCK" ]] && rmdir "$CR_AGENTS_LOCK" 2>/dev/null
+  CR_AGENTS_MD=""; CR_AGENTS_BAK=""; CR_AGENTS_CREATED=0; CR_AGENTS_LOCK=""
+}
 
 run_codex() {
   local start end rc
@@ -1202,6 +1316,10 @@ run_codex() {
   # "the fallback re-runs the SAME model" guarantee an unverified guess that
   # would break silently the moment the CLI default moved. `cli_model` pins it
   # here, and a test asserts it agrees with or_fallback.model. (glm, PR #66.)
+  # `codex exec review --base` never sees $review_prompt, so the no-deps note
+  # reaches codex through AGENTS.md — injected by the PARENT before this
+  # function is dispatched (see the codex case in the dispatch loop) and
+  # restored by the parent's trap; nothing here may touch it.
   local codex_model codex_model_args=()
   codex_model="$(profile_get codex cli_model)"
   if [[ -n "$codex_model" ]]; then
@@ -2521,6 +2639,7 @@ remove_agy_shell_gate() {
 cleanup_run() {
   cleanup_pids
   remove_agy_shell_gate
+  cr_agents_restore
 }
 trap cleanup_run EXIT INT TERM
 
@@ -2576,6 +2695,12 @@ for r in "${requested[@]}"; do
     codex)
       if command -v codex >/dev/null 2>&1; then
         [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        # The no-deps note rides in AGENTS.md for codex (see cr_agents_inject).
+        # Injected HERE, in the parent: run_codex runs as a background job, and
+        # state set in that subshell is invisible to the parent's EXIT/INT/TERM
+        # trap — a killed parent left the note behind (codex+kimi+spark, #68
+        # pass 3). Restored by cleanup_run at exit.
+        cr_agents_inject
         fallback_only run_codex codex &
         pids+=($!)
         ran+=("codex")
