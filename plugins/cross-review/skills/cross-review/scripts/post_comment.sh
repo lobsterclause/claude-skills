@@ -91,6 +91,16 @@ run_dir="$(dirname "$findings")"
 if [[ -z "$base_sha" && -f "$run_dir/context.json" ]] && command -v jq >/dev/null 2>&1; then
   base_sha="$(jq -r '.base_sha // ""' "$run_dir/context.json" 2>/dev/null || true)"
 fi
+# base must be a full sha BEFORE the digest is derived from it, or the marker
+# ends up with digest= and no base= (kimi, PR #67 review); an abbreviated base
+# is expanded first, like head_sha. An explicit --digest is validated too
+# (spark): a malformed one would look authoritative and verify nothing.
+if [[ -n "$base_sha" && ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] && command -v git >/dev/null 2>&1; then
+  base_sha="$(git rev-parse --verify -q "$base_sha^{commit}" 2>/dev/null || true)"
+fi
+[[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || base_sha=""
+[[ -z "$digest" || "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "post_comment: ignoring malformed --digest" >&2; digest=""; }
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
 if [[ -z "$digest" && -n "$base_sha" && -n "$head_sha" ]] && command -v git >/dev/null 2>&1; then
   # Content, not commit ids: a rebase rewrites every sha while changing nothing
   # a reviewer read. Digesting the diff is what lets a record survive one.
@@ -98,7 +108,7 @@ if [[ -z "$digest" && -n "$base_sha" && -n "$head_sha" ]] && command -v git >/de
   # the reviewers were actually shown.
   if git rev-parse --verify -q "$base_sha^{commit}" >/dev/null 2>&1 \
      && git rev-parse --verify -q "$head_sha^{commit}" >/dev/null 2>&1; then
-    digest="$(git diff "$base_sha" "$head_sha" 2>/dev/null | shasum -a 256 2>/dev/null | cut -d" " -f1)"
+    digest="$(git diff "$base_sha" "$head_sha" 2>/dev/null | sha256 2>/dev/null | cut -d" " -f1)"
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || digest=""
   fi
 fi

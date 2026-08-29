@@ -36,6 +36,8 @@ emit() { jq -cn --argjson c "$1" --arg r "$2" --argjson u "${3:-[]}" \
   '{covered:$c, reason:$r, uncovered:$u, covered_by:$n, method:$m}'; exit 0; }
 
 resolves() { git rev-parse --verify -q "$1^{commit}" >/dev/null 2>&1; }
+# sha256 of stdin, portable: GNU coreutils sha256sum or perl shasum (macOS).
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
 
 # --- 1. Digest equality: the rebase-proof path -------------------------------
 # A rebase rewrites every sha while changing nothing a reviewer read, so
@@ -44,7 +46,7 @@ resolves() { git rev-parse --verify -q "$1^{commit}" >/dev/null 2>&1; }
 # whatever the ids say. Checked FIRST: it is both cheaper and strictly more
 # truthful than id matching.
 if resolves "$base" && resolves "$head"; then
-  cur_digest="$(git diff "$base" "$head" 2>/dev/null | shasum -a 256 2>/dev/null | cut -d' ' -f1)"
+  cur_digest="$(git diff "$base" "$head" 2>/dev/null | sha256 2>/dev/null | cut -d' ' -f1)"
   if [[ "$cur_digest" =~ ^[0-9a-f]{64}$ ]]; then
     if jq -e --arg d "$cur_digest" 'any(.[]; .digest == $d)' <<<"$records" >/dev/null 2>&1; then
       emit true "a record digests the identical diff (survives a rebase)" '[]' 1 "digest"
@@ -61,12 +63,17 @@ if ! resolves "$base" || ! resolves "$head"; then
   emit false "cannot resolve $base..$head locally (fetch the branch, or the history was rewritten)" '[]' 0 "none"
 fi
 
-mapfile -t pr_commits < <(git rev-list "$base..$head" 2>/dev/null)
+# bash 3.2 (stock macOS /bin/bash) has no mapfile and no associative arrays;
+# merge_preflight.sh swallows a parse error as "coverage unavailable", so the
+# whole union path was silently dead there (kimi High + codex, PR #67 review).
+# Commit sets are newline-delimited strings; membership is grep -qxF.
+pr_commits=()
+while IFS= read -r c; do [[ -n "$c" ]] && pr_commits+=("$c"); done < <(git rev-list "$base..$head" 2>/dev/null)
 if [[ ${#pr_commits[@]} -eq 0 ]]; then
   emit true "no commits between base and head — nothing to cover" '[]' 0 "commits"
 fi
 
-declare -A covered=()
+covered=$'\n'
 used=0
 while IFS= read -r rec; do
   [[ -z "$rec" ]] && continue
@@ -78,25 +85,25 @@ while IFS= read -r rec; do
   # legacy stamp as covering everything behind it would silently bless the
   # entire history on the strength of a single point.
   if [[ -z "$r_base" ]]; then
-    [[ -n "$r_head" ]] && resolves "$r_head" && { covered["$(git rev-parse "$r_head")"]=1; used=$((used+1)); }
+    [[ -n "$r_head" ]] && resolves "$r_head" && { covered+="$(git rev-parse "$r_head")"$'\n'; used=$((used+1)); }
     continue
   fi
   resolves "$r_base" && resolves "$r_head" || continue
   any=0
-  while IFS= read -r c; do [[ -n "$c" ]] && covered["$c"]=1 && any=1; done \
+  while IFS= read -r c; do [[ -n "$c" ]] && covered+="$c"$'\n' && any=1; done \
     < <(git rev-list "$r_base..$r_head" 2>/dev/null)
   [[ "$any" -eq 1 ]] && used=$((used+1))
 done < <(jq -c '.[]' <<<"$records" 2>/dev/null)
 
 uncovered=()
 for c in "${pr_commits[@]}"; do
-  [[ -n "${covered[$c]:-}" ]] || uncovered+=("$c $(git log -1 --format=%s "$c" 2>/dev/null | cut -c1-60)")
+  printf '%s' "$covered" | grep -qxF -- "$c" || uncovered+=("$c $(git log -1 --format=%s "$c" 2>/dev/null | cut -c1-60)")
 done
 
 if [[ ${#uncovered[@]} -eq 0 ]]; then
   emit true "all ${#pr_commits[@]} commit(s) covered by $used record(s)" '[]' "$used" "commits"
 fi
 
-u_json="$(printf '%s\n' "${uncovered[@]}" | jq -R . | jq -s .)"
+u_json="$(printf '%s\n' ${uncovered[@]+"${uncovered[@]}"} | jq -R . | jq -s .)"
 emit false "${#uncovered[@]} of ${#pr_commits[@]} commit(s) not covered by any review record" \
   "$u_json" "$used" "commits"

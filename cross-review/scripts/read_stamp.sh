@@ -39,10 +39,15 @@ esac
 
 # The marker is authoritative. Anchored on the full 40-char form: an abbreviated
 # sha in a marker is not a marker this repo wrote.
-m_sha="$(sed -nE 's/.*<!-- cross-review: sha=([0-9a-f]{40})[^>]*-->.*/\1/p' <<<"$body" | head -1)"
-m_base="$(sed -nE 's/.*<!-- cross-review:[^>]*[[:space:]]base=([0-9a-f]{40})[^>]*-->.*/\1/p' <<<"$body" | head -1)"
-m_pass="$(sed -nE 's/.*<!-- cross-review:[^>]*[[:space:]]pass=([0-9]+)[^>]*-->.*/\1/p' <<<"$body" | head -1)"
-m_dig="$(sed -nE 's/.*<!-- cross-review:[^>]*[[:space:]]digest=([0-9a-f]{64})[^>]*-->.*/\1/p' <<<"$body" | head -1)"
+# Exactly ONE marker is extracted first, then its fields are read from that
+# marker alone: reading each field from the whole body let the sha of the
+# record's own marker combine with the base= or digest= of a marker quoted
+# inside its findings (codex, PR #67 review).
+marker="$(grep -oE '<!-- cross-review: sha=[0-9a-f]{40}[^>]*-->' <<<"$body" 2>/dev/null | head -1)"
+m_sha="$(sed -nE 's/.*sha=([0-9a-f]{40}).*/\1/p' <<<"$marker" | head -1)"
+m_base="$(sed -nE 's/.*[[:space:]]base=([0-9a-f]{40}).*/\1/p' <<<"$marker" | head -1)"
+m_pass="$(sed -nE 's/.*[[:space:]]pass=([0-9]+).*/\1/p' <<<"$marker" | head -1)"
+m_dig="$(sed -nE 's/.*[[:space:]]digest=([0-9a-f]{64}).*/\1/p' <<<"$marker" | head -1)"
 
 # Prose fallback. Deliberately NOT `Reviewed at` -- see post_comment.sh: four
 # hand-written records used that phrasing and a working gate read them as

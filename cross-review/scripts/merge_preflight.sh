@@ -159,8 +159,17 @@ if [[ -z "$review_body" ]]; then
   emit unreviewed 0 "no cross-review record on PR #$pr — nothing to contradict the merge."
 fi
 
+# ONE parser for the stamp (read_stamp.sh): the marker is authoritative and the
+# prose is the fallback. Reading the prose here while currency/coverage read
+# the marker let a record corrected in the marker alone clear on a superseded
+# prose sha (codex High + spark, PR #67 review).
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+reviewed_sha=""
+if [[ -x "$here/read_stamp.sh" ]]; then
+  reviewed_sha="$(printf '%s' "$review_body" | bash "$here/read_stamp.sh" --body-stdin 2>/dev/null | jq -r '.sha // ""' 2>/dev/null || true)"
+fi
 # post_comment.sh prints the SHA abbreviated to 9 chars: Reviewed `abc123def`.
-reviewed_sha="$(printf '%s' "$review_body" \
+[[ -n "$reviewed_sha" ]] || reviewed_sha="$(printf '%s' "$review_body" \
   | sed -nE 's/.*Reviewed `([0-9a-f]{7,40})`.*/\1/p' | head -1)"
 
 # Compare on the stamp's own width. The stamp is abbreviated; headRefOid is not.
@@ -184,7 +193,6 @@ fi
 # Strictly additive. Point equality above still clears exactly what it always
 # cleared; this runs only where the gate previously said `stale` outright, and
 # falls through to that same verdict when coverage is genuinely incomplete.
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -x "$here/read_stamp.sh" && -x "$here/range_coverage.sh" ]] && command -v git >/dev/null 2>&1; then
   # EVERY stamped record, not just the newest -- the union is the whole point.
   records="[]"

@@ -761,6 +761,15 @@ Reviewed \`deadbeef1\`."
 assert_eq "on disagreement the marker wins"      "$(rs "$DISAGREE" .sha)" "$SHA40"
 DIS_ERR="$(printf '%s' "$DISAGREE" | bash "$RS" --body-stdin 2>&1 >/dev/null)"
 assert_contains "a self-contradicting record warns" "$DIS_ERR" "disagrees with prose"
+# Fields come from ONE marker: a marker quoted in the findings must not lend
+# its base=/digest= to the record's own marker (codex, PR #67 review).
+TWO="## Cross-review
+<!-- cross-review: sha=$SHA40 pass=1 -->
+Quoted from another PR: <!-- cross-review: sha=$BASE40 base=$BASE40 pass=7 digest=$DIG64 -->"
+assert_eq "two markers: sha comes from the first"   "$(rs "$TWO" .sha)"    "$SHA40"
+assert_eq "two markers: no base borrowed"            "$(rs "$TWO" .base)"   ""
+assert_eq "two markers: no digest borrowed"          "$(rs "$TWO" .digest)" ""
+assert_eq "two markers: pass from the first"         "$(rs "$TWO" .pass)"   "1"
 
 echo "── range_coverage.sh: the union of records, not one point ──"
 # [pin: 2026-08-22 — point-equality gating made the merge gate a treadmill.
@@ -814,6 +823,13 @@ assert_eq "control: dead ids with a wrong digest do NOT pass" \
   "$(rcv "$C0" "$C3" "$DEADBAD" | jq -r .covered)" "false"
 assert_eq "an empty range needs no coverage" \
   "$(rcv "$C3" "$C3" '[]' | jq -r .covered)" "true"
+# Stock macOS /bin/bash is 3.2: no mapfile, no associative arrays. The union
+# path must work there or the gate silently degrades to "stale" (kimi High).
+if [[ -x /bin/bash ]]; then
+  rcv32() { (cd "$GR" && /bin/bash "$RCV" --base "$1" --head "$2" --records "$3") 2>/dev/null; }
+  assert_eq "under /bin/bash ($(/bin/bash -c 'echo ${BASH_VERSION%%(*}')): union covers" "$(rcv32 "$C0" "$C3" "$UNION" | jq -r .covered)" "true"
+  assert_eq "under /bin/bash: a gap is still caught, 2 uncovered" "$(rcv32 "$C0" "$C3" "$GAP" | jq -r '.uncovered | length')" "2"
+fi
 
 echo '── analyze_runlog.sh knows the `fallback` status it is fed ──'
 # [pin: 2026-08-22 — PR #66 taught append_runlog.sh to emit status "fallback"
@@ -1927,6 +1943,11 @@ mg_status() { printf '%s' "$MG_OUT" | jq -r '.status // ""' 2>/dev/null; }
 HEAD40='399df23d4d5945162d0c5ed623484d608337165d'
 REVIEWED_OLD='## Cross-review — pass 1\n\n_Automated review by codex + kimi. Reviewed `b81377350`. See below._'
 REVIEWED_NEW='## Cross-review — pass 2\n\n_Automated review by codex. Reviewed `399df23d4`. See below._'
+# Marker and prose disagree: the MARKER decides (one parser — codex High, #67).
+MARKER_NEW_PROSE_OLD="## Cross-review — pass 2\n<!-- cross-review: sha=$HEAD40 pass=2 -->\n_Reviewed \`b81377350\`._"
+MARKER_OLD_PROSE_NEW="## Cross-review — pass 2\n<!-- cross-review: sha=b813773500000000000000000000000000000000 pass=2 -->\n_Reviewed \`399df23d4\`._"
+MG_MARKER_WINS_PASS="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_NEW_PROSE_OLD\"}]}"
+MG_MARKER_WINS_DENY="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_OLD_PROSE_NEW\"}]}"
 
 # 1. The whole point: a record bound to a different commit blocks the merge.
 mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_OLD\"}]}" --pr 3207
@@ -1983,6 +2004,10 @@ MG_CLEAR="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\"
 
 assert_eq "hook denies a stale merge" \
   "$(mg_hook "$MG_STALE" 'gh pr merge 3207 --squash --auto')" "deny"
+assert_eq "marker current, prose stale → the marker clears the merge" \
+  "$(mg_hook "$MG_MARKER_WINS_PASS" 'gh pr merge 3207')" "PASS"
+assert_eq "marker stale, prose current → the marker denies the merge" \
+  "$(mg_hook "$MG_MARKER_WINS_DENY" 'gh pr merge 3207')" "deny"
 # A merge reviewed at head is no longer waved through unconditionally: it must
 # also bind itself to that commit. See the TOCTOU block further down for why.
 assert_eq "control: hook allows a merge reviewed at head AND bound to it" \
