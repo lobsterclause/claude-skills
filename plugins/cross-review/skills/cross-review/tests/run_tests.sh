@@ -1928,6 +1928,12 @@ mg_lookup() {
 #    space skipped the gate entirely — before the whitespace-flexible regex ran.
 assert_eq "two spaces do not bypass the gate" \
   "$(mg_hook "$MG_STALE" 'gh  pr merge 3207')" "deny"
+# The override is per segment: a line that also carries a plain merge is
+# still gated (antigravity High, #55 pass 2).
+assert_eq "mixed override + plain merge in one line is still gated" \
+  "$(mg_hook "$MG_STALE" 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 3207 && gh pr merge 3207')" "deny"
+assert_eq "…while an all-overridden compound passes" \
+  "$(mg_hook "$MG_STALE" 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 3207 && CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 3207')" "PASS"
 
 # 2. [antigravity] Per-line stripping left earlier lines in the token scan, so a
 #    number anywhere above the merge was read as the PR. Both directions are

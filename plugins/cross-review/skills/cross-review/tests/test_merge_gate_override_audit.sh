@@ -168,6 +168,39 @@ assert_eq "audit log is created 0600 (umask 077)" "$perm" "600"
 assert_eq "unset HOME + no audit path: the hook still runs (rc 0)" "$(mg_rc 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 88' -u HOME -u CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG)" "0"
 assert_eq "unset HOME: a plain merge is still checked, not crashed (rc 0)" "$(mg_rc 'gh pr merge 89' -u HOME -u CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG)" "0"
 
+echo "── PR #55 pass 2: quoted/lowercase credentials, numeric flag values, quoted separators, existing perms, mixed compound ──"
+: >"$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh api -X PUT -H "authorization: Bearer ghp_low111" repos/acme/w/pulls/78/merge' >/dev/null
+assert_not_contains "lowercase authorization header redacted" "$(cat "$AUDIT_LOG")" "ghp_low111"
+: >"$AUDIT_LOG"
+mg_hook 'GH_TOKEN="two words here" gh_token=ghp_lc222 CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 34 --token "quoted tok 333"' >/dev/null
+line="$(cat "$AUDIT_LOG")"
+assert_not_contains "quoted assignment redacted whole"  "$line" "two words"
+assert_not_contains "lowercase token= redacted"          "$line" "ghp_lc222"
+assert_not_contains "quoted --token redacted whole"      "$line" "quoted tok"
+: >"$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge --body 2025 --subject "fix; urgent (now)" 123 --repo acme/other' >/dev/null
+assert_eq "numeric flag value is not the PR"             "$(jq -r .pr "$AUDIT_LOG")" "123"
+assert_eq "one entry despite ';' and '(' inside quotes"  "$(wc -l <"$AUDIT_LOG" | tr -d ' ')" "1"
+# scrub() drops quoted strings from cmd_only before anything else sees them,
+# so the quoted subject is absent by design — what matters is that it did
+# not split the invocation and the merge itself is recorded.
+assert_contains "the invocation is recorded around the scrubbed flag" "$(jq -r .command "$AUDIT_LOG")" "--body 2025"
+assert_not_contains "…and the quoted text itself never lands in the log" "$(jq -r .command "$AUDIT_LOG")" "urgent"
+: >"$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge --repo 123 456' >/dev/null
+assert_eq "--repo value consumed before the PR is chosen" "$(jq -r .pr "$AUDIT_LOG")" "456"
+: >"$AUDIT_LOG"
+mg_hook 'GH_REPO="acme/quoted" CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 57' >/dev/null
+assert_eq "quoted GH_REPO is unquoted"                    "$(jq -r .repo "$AUDIT_LOG")" "acme/quoted"
+rm -f "$AUDIT_LOG"; ( umask 022; : >"$AUDIT_LOG" ); chmod 644 "$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 58' >/dev/null
+perm2="$(stat -f %Lp "$AUDIT_LOG" 2>/dev/null || stat -c %a "$AUDIT_LOG" 2>/dev/null)"
+assert_eq "a pre-existing 0644 log is tightened to 0600 on append" "$perm2" "600"
+: >"$AUDIT_LOG"
+mg_hook 'CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 61 && gh pr merge 62' >/dev/null
+assert_eq "mixed compound: only the overridden merge is logged" "$(jq -r .pr "$AUDIT_LOG")" "61"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

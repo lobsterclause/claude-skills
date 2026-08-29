@@ -140,6 +140,35 @@ OVERRIDE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*CROSS_REVIEW_MERGE_OVERRIDE=1[[:s
 # CROSS_REVIEW_MERGE_OVERRIDE_AUDIT_LOG mirrors CROSS_REVIEW_RUNLOG elsewhere
 # in this skill: production never sets it, fixture tests point it at a scratch
 # path instead of the user's real home directory.
+# split_segments <command> — one shell segment per line, splitting on
+# ; & | ( ) OUTSIDE quotes. scrub() has already removed quoted strings from
+# cmd_only, so this is belt-and-braces for anything that survives it; `tr`
+# would have split inside a quoted argument (codex+kimi, #55 pass 2).
+split_segments() {
+  printf '%s\n' "$1" | awk '
+    { s = $0; out = ""; q = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q != "") { if (c == q) q = ""; out = out c; continue }
+        if (c == "\"" || c == "\047") { q = c; out = out c; continue }
+        if (c ~ /[;&|()]/) { print out; out = ""; continue }
+        out = out c
+      }
+      print out }'
+}
+MERGE_SEG_RE='gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)|gh[[:space:]]+api[[:space:]].*pulls/[0-9]+/merge'
+OVERRIDE_SEG_RE='(^|[[:space:]])CROSS_REVIEW_MERGE_OVERRIDE=1[[:space:]]+gh[[:space:]]+(pr[[:space:]]+merge|api)([[:space:]]|$)'
+
+# Redaction, as a sed -E program. Case-insensitive via bracket classes (BSD
+# sed has no I flag); a quoted value is consumed whole, so `GH_TOKEN="two
+# words"` and `authorization: bearer …` no longer leak (#55 pass 2: codex,
+# kimi, antigravity convergent).
+read -r -d '' REDACT_SED <<'SEDEOF' || true
+s/(^|[^A-Za-z0-9_])([A-Za-z_]*([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|_[Kk][Ee][Yy]|[Aa][Pp][Ii][Kk][Ee][Yy]))=("[^"]*"|'[^']*'|[^[:space:]]+)/\1\2=<redacted>/g
+s/(--token)[= ]("[^"]*"|'[^']*'|[^[:space:]]+)/\1 <redacted>/g
+s/([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*)(\\"[^"]*\\"|[^"']+)/\1<redacted>/g
+SEDEOF
+
 # Resolved inside the function, under set +e: with `set -u` an unset HOME
 # at top level aborted the WHOLE hook — every merge check, override or not
 # (codex, PR #55 review). No explicit path and no HOME → no log, no crash.
@@ -159,24 +188,28 @@ log_override_audit() {
     # One entry PER overridden merge invocation, parsed from its own segment:
     # a compound command used to yield one record with the first -R/--repo
     # and first PR number found anywhere in the line (codex, kimi, PR #55).
-    printf '%s\n' "$cmd_only" | tr ';&|()' '\n\n\n\n\n' | while IFS= read -r seg; do
-      printf '%s' "$seg" | grep -qE '(^|[[:space:]])CROSS_REVIEW_MERGE_OVERRIDE=1[[:space:]]+gh[[:space:]]+(pr[[:space:]]+merge|api)([[:space:]]|$)' || continue
+    split_segments "$cmd_only" | while IFS= read -r seg; do
+      printf '%s' "$seg" | grep -qE "$OVERRIDE_SEG_RE" || continue
       inv="$(printf '%s' "$seg" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-      # What is logged is the merge invocation with credential-shaped values
-      # redacted: FOO_TOKEN=/…SECRET=/…PASSWORD=/…KEY= assignments, --token,
-      # and Authorization headers. Only this segment is recorded — an
-      # unrelated command in the same compound line never reaches the log.
-      red="$(printf '%s' "$inv" | sed -E \
-        's/(^|[^A-Za-z0-9_])([A-Za-z_]*(TOKEN|SECRET|PASSWORD|PASSWD|_KEY|APIKEY))=[^[:space:]]+/\1\2=<redacted>/g; s/(--token)[= ][^[:space:]]+/\1 <redacted>/g; s/(Authorization:[[:space:]]*)[^"'"'"']+/\1<redacted>/g')"
+      red="$(printf '%s' "$inv" | sed -E "$REDACT_SED")"
       repo="$(printf '%s' "$inv" | grep -oE -- '(-R|--repo)[= ]["'"'"']?[^ "'"'"']+' 2>/dev/null | head -n1 | sed -E 's/^(-R|--repo)[= ]["'"'"']?//')"
       [[ -z "$repo" ]] && repo="$(printf '%s' "$inv" | grep -oE 'repos/[^/ ]+/[^/ ]+/pulls/[0-9]+/merge' 2>/dev/null | head -n1 | sed -E 's#repos/([^/ ]+/[^/ ]+)/pulls/.*#\1#')"
-      [[ -z "$repo" ]] && repo="$(printf '%s' "$inv" | grep -oE '(^|[[:space:]])GH_REPO=[^[:space:]]+' 2>/dev/null | head -n1 | sed -E 's/^[[:space:]]*GH_REPO=//')"
+      [[ -z "$repo" ]] && repo="$(printf '%s' "$inv" | grep -oE '(^|[[:space:]])GH_REPO=["'"'"']?[^ "'"'"']+' 2>/dev/null | head -n1 | sed -E 's/^[[:space:]]*GH_REPO=["'"'"']?//')"
       [[ -z "$repo" ]] && repo="${GH_REPO:-}"
       [[ -z "$repo" ]] && repo="$cwd_repo"
       pr="$(printf '%s' "$inv" | grep -oE 'pulls/[0-9]+/merge' 2>/dev/null | head -n1 | grep -oE '[0-9]+')"
       # `gh pr merge [flags] <number> [flags]`: the first bare numeric token
-      # after `merge`, wherever the flags sit (kimi, PR #55).
-      [[ -z "$pr" ]] && pr="$(printf '%s' "$inv" | awk '{ for (i = 1; i <= NF; i++) if ($i == "merge") { for (j = i + 1; j <= NF; j++) if ($j ~ /^[0-9]+$/) { print $j; exit } } }' 2>/dev/null)"
+      # after `merge` that is not the VALUE of a value-taking flag — `--body
+      # 2025 123` is PR 123 (codex+kimi, #55 pass 2). Flags with values match
+      # parse_invocation below; `--flag=value` carries its value inline.
+      [[ -z "$pr" ]] && pr="$(printf '%s' "$inv" | awk '
+        BEGIN { v["-b"]=1; v["--body"]=1; v["-F"]=1; v["--body-file"]=1; v["-t"]=1; v["--subject"]=1
+                v["-A"]=1; v["--author-email"]=1; v["-R"]=1; v["--repo"]=1; v["--match-head-commit"]=1 }
+        { for (i = 1; i <= NF; i++) if ($i == "merge") {
+            for (j = i + 1; j <= NF; j++) {
+              if ($j in v) { j++; continue }
+              if ($j ~ /^-/) continue
+              if ($j ~ /^[0-9]+$/) { print $j; exit } } } }' 2>/dev/null)"
       # HEAD of the cwd is only the merged head when the merge targets the
       # cwd repo; for -R/GH_REPO elsewhere it would be a wrong sha (kimi).
       head_sha=""; [[ "$repo" == "$cwd_repo" ]] && head_sha="$cwd_sha"
@@ -187,13 +220,27 @@ log_override_audit() {
       [[ -n "$entry" ]] || continue
       mkdir -p "$(dirname "$local_log")" 2>/dev/null
       printf '%s\n' "$entry" >>"$local_log" 2>/dev/null
+      # umask only shapes NEW files: a log created 0644 by an older hook stays
+      # readable while sensitive lines are appended (codex+kimi, pass 2).
+      [[ -f "$local_log" && ! -L "$local_log" && -O "$local_log" ]] && chmod 600 "$local_log" 2>/dev/null
     done
   ) || true
 }
 
-if printf '%s' "$cmd_only" | grep -qE "$OVERRIDE_RE"; then
+# The override is honoured per SEGMENT, and only when EVERY merge in the
+# command carries it. A top-level match used to `pass` the whole line, so
+# `CROSS_REVIEW_MERGE_OVERRIDE=1 gh pr merge 1 && gh pr merge 2` skipped the
+# gate for PR 2 (antigravity High, #55 pass 2). A mixed line is logged for
+# its overridden merges and then falls through to the normal per-invocation
+# gate, which checks all of them — the safe direction.
+n_merge=0; n_override=0
+while IFS= read -r seg; do
+  printf '%s' "$seg" | grep -qE "$MERGE_SEG_RE" && n_merge=$((n_merge + 1))
+  printf '%s' "$seg" | grep -qE "$OVERRIDE_SEG_RE" && n_override=$((n_override + 1))
+done < <(split_segments "$cmd_only")
+if (( n_override > 0 )); then
   log_override_audit
-  pass
+  (( n_override == n_merge )) && pass
 fi
 
 dequote() {
