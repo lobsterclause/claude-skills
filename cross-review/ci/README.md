@@ -54,6 +54,7 @@ SKILL=~/.claude/skills/cross-review          # or wherever the skill lives
 cp "$SKILL"/ci/cross-review-currency.sh       scripts/
 cp "$SKILL"/ci/test-cross-review-currency.sh  scripts/
 cp "$SKILL"/ci/cross-review-currency.yml      .github/workflows/
+cp "$SKILL"/scripts/emit_sarif.sh              scripts/   # only if you enable the sarif job (CR_EMIT_SARIF)
 bash scripts/test-cross-review-currency.sh    # expect 176 passed, 0 failed
 ```
 
