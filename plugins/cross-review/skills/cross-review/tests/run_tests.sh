@@ -3099,22 +3099,34 @@ done
 echo "── dual-copy identity (repo context only) ──"
 
 # [pin: mimo pass-4 — the two in-repo copies must never drift again]
+# The comparison itself lives in check_dual_copy.sh, which the CI workflow
+# also calls: one exclude list, not two that can drift apart (2026-08-29).
 REPO_ROOT="$(cd "$SKILL_DIR/.." 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
-COPY_A="$REPO_ROOT/cross-review"
-COPY_B="$REPO_ROOT/plugins/cross-review/skills/cross-review"
-if [[ -n "$REPO_ROOT" && -d "$COPY_A" && -d "$COPY_B" ]]; then
-  # runlog.jsonl / finding_events.jsonl are runtime state, not source: the
-  # installed skill is a symlink to COPY_A, so its history lands there and
-  # would otherwise read as drift on every run (2026-08-03).
-  # state/ joined them 2026-08-29: check_repeat_pass.sh records last-base there.
-  if diff -r --exclude 'runlog.jsonl*' --exclude 'finding_events.jsonl' --exclude 'state' --exclude 'iteration-1' --exclude '*.bak*' --exclude '.DS_Store' "$COPY_A" "$COPY_B" >/dev/null 2>&1; then
-    ok "root copy ≡ plugin copy"
-  else
-    bad "root copy and plugin copy have drifted — sync before merging"
-  fi
+bash "$SKILL_DIR/tests/check_dual_copy.sh" "$REPO_ROOT"
+DC_RC=$?
+if [[ "$DC_RC" -eq 0 ]]; then
+  ok "root copy ≡ plugin copy"
+elif [[ "$DC_RC" -eq 1 ]]; then
+  bad "root copy and plugin copy have drifted — sync before merging"
 else
   echo "  skip dual-copy identity (not in the skills repo)"
 fi
+
+# The shared check's three exits are the contract the CI workflow switches on,
+# so pin them here rather than trusting the workflow to be read correctly.
+DC_SH="$SKILL_DIR/tests/check_dual_copy.sh"
+dc_rc() { bash "$DC_SH" "$1" >/dev/null 2>&1; echo $?; }
+DC_TMP="$(mktemp -d)"
+mkdir -p "$DC_TMP/cross-review" "$DC_TMP/plugins/cross-review/skills/cross-review"
+echo a > "$DC_TMP/cross-review/f.txt"
+echo b > "$DC_TMP/plugins/cross-review/skills/cross-review/f.txt"
+assert_eq "dual-copy: drifted copies exit 1" "$(dc_rc "$DC_TMP")" "1"
+echo a > "$DC_TMP/plugins/cross-review/skills/cross-review/f.txt"
+assert_eq "dual-copy: identical copies exit 0" "$(dc_rc "$DC_TMP")" "0"
+mkdir -p "$DC_TMP/cross-review/state"; echo x > "$DC_TMP/cross-review/state/last_base.json"
+assert_eq "dual-copy: runtime state/ is not drift" "$(dc_rc "$DC_TMP")" "0"
+assert_eq "dual-copy: no copies to compare exits 2, not 0" "$(dc_rc "$DC_TMP/nope")" "2"
+rm -rf "$DC_TMP"
 
 echo "── ci/ merge gate (delegated harness) ──"
 
