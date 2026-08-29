@@ -47,6 +47,7 @@ export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"; : >"$CROSS_REVIEW_FINDING_
 cat >"$HOME/.local/bin/curl" <<'SHIM'
 #!/bin/sh
 cat >/dev/null   # the --config stdin (bearer header)
+[ -n "${SHIM_SLEEP:-}" ] && sleep "$SHIM_SLEEP"   # a slow provider (wall-budget tests)
 body=""
 prev=""
 for a in "$@"; do
@@ -209,6 +210,41 @@ assert_eq "three turns (2 tool turns + forced final)" "$(jq -r .tool_stats.turns
 assert_eq "final request sets tool_choice=none" "$(jq -r '.tool_choice // ""' "$T/o5/glm.turn.3.request.json")" "none"
 assert_contains "budget message injected" "$(jq -r '.messages[-1].content' "$T/o5/glm.turn.3.request.json")" "Tool budget exhausted"
 assert_contains "final content still captured" "$(cat "$T/o5/glm.stdout")" "verified via tools"
+
+echo "── wall budget: scaled by prompt size × turns for a tool-armed lane (#159) ──"
+# glm's profile timeout is 900 s; no --timeout here, so the lane may scale.
+# wall_kb_per_s=1 makes even this tiny fixture prompt count.
+( cd "$REPO" && env CROSS_REVIEW_TOOL_MODE=read CROSS_REVIEW_TOOL_WALL_KB_PER_S=1 bash "$S/run_reviewers.sh" --base main --out "$T/o5w" --reviewers glm >"$T/o5w.log" 2>&1 )
+META="$T/o5w/glm.meta.json"
+PB="$(jq -r '.messages[0].content | length' "$T/o5w/glm.turn.1.request.json")"
+WANT=$(( 900 + 9 * (PB / 1024) ))
+assert_eq "budget grew with the prompt (${PB}B × 9 turns)" "$(jq -r .timeout_budget_s "$META")" "$WANT"
+assert_eq "tool_stats.wall_scaled=true"       "$(jq -r .tool_stats.wall_scaled "$META")" "true"
+assert_contains "scaling is logged like kimi's" "$(cat "$T/o5w.log")" "turns — budget scaled 900s → ${WANT}s"
+( cd "$REPO" && env CROSS_REVIEW_TOOL_MODE=read CROSS_REVIEW_TOOL_WALL_KB_PER_S=1 CROSS_REVIEW_TOOL_WALL_CAP_S=905 bash "$S/run_reviewers.sh" --base main --out "$T/o5c" --reviewers glm >"$T/o5c.log" 2>&1 )
+assert_eq "wall_cap_s caps the scaled budget" "$(jq -r .timeout_budget_s "$T/o5c/glm.meta.json")" "905"
+assert_eq "explicit --timeout-glm is honoured verbatim" "$(jq -r .timeout_budget_s "$T/o5/glm.meta.json")" "60"
+assert_eq "…and reports wall_scaled=false"    "$(jq -r .tool_stats.wall_scaled "$T/o5/glm.meta.json")" "false"
+( cd "$REPO" && env CROSS_REVIEW_TOOL_MODE=read CROSS_REVIEW_TOOL_WALL_KB_PER_S=1 bash "$S/run_reviewers.sh" --base main --out "$T/o5g" --reviewers glm --timeout 60 >"$T/o5g.log" 2>&1 )
+assert_eq "explicit global --timeout is honoured verbatim" "$(jq -r .timeout_budget_s "$T/o5g/glm.meta.json")" "60"
+
+echo "── wall budget: the loop forces its answer when another tool turn will not fit (#159) ──"
+# 20 s lane, 6 s per turn, a model that always wants another tool call. After
+# turn 1 (~6 s, ~14 s left) two more such turns do not fit, so turn 2 must be
+# the forced answer — not a tool turn whose successor dies at the deadline
+# with nothing to show. (The lane stays above the loop's own 10 s floor.)
+( cd "$REPO" && env CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=always SHIM_SLEEP=6 bash "$S/run_reviewers.sh" --base main --out "$T/o5t" --reviewers glm --timeout-glm 20 >"$T/o5t.log" 2>&1 )
+META="$T/o5t/glm.meta.json"
+assert_eq "lane succeeded instead of timing out" "$(jq -r .exit_code "$META")" "0"
+assert_eq "timed_out=false"                     "$(jq -r .timed_out "$META")" "false"
+assert_eq "tool_stats.wall_forced=true"         "$(jq -r .tool_stats.wall_forced "$META")" "true"
+assert_eq "one tool step, then the answer"      "$(jq -r '"\(.tool_stats.steps)/\(.tool_stats.turns)"' "$META")" "1/2"
+[[ "$(jq -r .tool_stats.turn_max_s "$META")" -ge 6 ]] && ok "turn_max_s records the slow turn" || bad "turn_max_s=$(jq -r .tool_stats.turn_max_s "$META"), want ≥6"
+assert_eq "final request sets tool_choice=none" "$(jq -r '.tool_choice // ""' "$T/o5t/glm.turn.2.request.json")" "none"
+assert_contains "time-budget message injected"  "$(jq -r '.messages[-1].content' "$T/o5t/glm.turn.2.request.json")" "Time budget nearly exhausted"
+assert_contains "stop is logged"                "$(cat "$T/o5t/glm.stderr")" "wall budget cannot fit another tool turn"
+assert_contains "final content still captured"  "$(cat "$T/o5t/glm.stdout")" "verified via tools"
+assert_eq "a fast loop never wall-forces"       "$(jq -r .tool_stats.wall_forced "$T/o5/glm.meta.json")" "false"
 
 echo "── read budget: exhausted reads are refused, not served ──"
 run_lane "$T/o6" CROSS_REVIEW_TOOL_MODE=read CROSS_REVIEW_TOOL_READ_BUDGET_BYTES=10 --
