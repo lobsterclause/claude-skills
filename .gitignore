@@ -8,4 +8,6 @@ __pycache__/
 cross-review/runlog.jsonl
 cross-review/finding_events.jsonl
 cross-review/iteration-*/
+cross-review/state/
+cross-review/merge_override_audit.jsonl
 **/*.bak-*
