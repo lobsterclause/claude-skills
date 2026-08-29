@@ -118,7 +118,9 @@
 # defaults): CROSS_REVIEW_TOOL_MAX_STEPS, CROSS_REVIEW_TOOL_READ_BUDGET_BYTES,
 # CROSS_REVIEW_TOOL_CALL_CAP_BYTES, CROSS_REVIEW_CHECK_TIMEOUT_S,
 # CROSS_REVIEW_TOOL_CONTEXT=files|diff (keep or drop the whole-file paste when
-# tools are on; default files — tools add on top).
+# tools are on; default files — tools add on top), CROSS_REVIEW_TOOL_WALL_KB_PER_S
+# / CROSS_REVIEW_TOOL_WALL_CAP_S (a tool-armed lane's wall budget grows with
+# prompt size × turns unless --timeout/--timeout-<seat> is explicit, #159).
 #
 # Writes:
 #   <out>/codex.stdout         — codex review (stderr merged)
@@ -167,8 +169,9 @@
 # Chat lanes carry `tool_policy` {mode, basis} (what tool_policy.sh decided
 # and why: override | pinned | learned | default) and `tool_stats` {mode,
 # steps, turns, calls{read_file,search,list_files,run_check,unknown},
-# read_bytes, budget_exhausted, check_ran, check_rc, rf_dropped} — the
-# learner's own input next round, and analyze_runlog's split-by-arm.
+# read_bytes, budget_exhausted, check_ran, check_rc, rf_dropped, wall_forced,
+# turn_max_s, wall_scaled} — the learner's own input next round, and
+# analyze_runlog's split-by-arm.
 #
 # Exit codes:
 #   0 — at least one reviewer succeeded, OR run was skipped intentionally (empty diff)
@@ -371,6 +374,8 @@ _tp_default CROSS_REVIEW_TOOL_READ_BUDGET_BYTES  read_budget_bytes
 _tp_default CROSS_REVIEW_TOOL_CALL_CAP_BYTES     call_cap_bytes
 _tp_default CROSS_REVIEW_CHECK_TIMEOUT_S         check_timeout_s
 _tp_default CROSS_REVIEW_TOOL_CONTEXT            tool_context
+_tp_default CROSS_REVIEW_TOOL_WALL_KB_PER_S       wall_kb_per_s
+_tp_default CROSS_REVIEW_TOOL_WALL_CAP_S          wall_cap_s
 # shellcheck source=lib_tool_loop.sh
 source "$(dirname "$0")/lib_tool_loop.sh"
 tool_context="${CROSS_REVIEW_TOOL_CONTEXT:-files}"
@@ -1501,6 +1506,29 @@ $json_findings_suffix"
     # Found by the PR #99 cross-review round, 2026-08-27.
     local rf_json='{"type":"json_object"}'
     [[ "${rf_args[2]:-}" == "null" ]] && rf_json="null"
+    # Wall budget for a tool-armed lane (#159). The seat's timeout_s is a
+    # single-shot number; the loop makes up to max_steps+1 calls and each one
+    # re-sends the whole prefix, so on a big prompt the flat budget runs out
+    # with steps to spare (deepseek on #154 pass 1: 299 KB prompt, 9 turns,
+    # 600 s, no output) and the learner demotes the arm for the wrong reason.
+    # Same shape as the kimi rule: add per-turn time proportional to prompt
+    # size, cap it, and honour an explicit --timeout / --timeout-<seat> verbatim
+    # (a smoke run or CI hard cap must win). Profile _synthesis_rules.tool_policy
+    # holds the numbers: wall_kb_per_s (prompt KB per extra second per turn,
+    # default 4 ≈ 1 s per ~1k tokens) and wall_cap_s.
+    local tl_wall_scaled=false _seat_flag="timeout_${slug//-/_}"
+    if [[ -z "$timeout_s" && -z "${!_seat_flag:-}" ]]; then
+      local _pb _kbps="${CROSS_REVIEW_TOOL_WALL_KB_PER_S:-4}" _cap="${CROSS_REVIEW_TOOL_WALL_CAP_S:-3000}" _scaled
+      _pb="$(wc -c <"$prompt_tmp" | tr -d ' ')"
+      [[ "$_kbps" =~ ^[0-9]+$ && "$_kbps" -gt 0 ]] || _kbps=4
+      [[ "$_cap" =~ ^[0-9]+$ ]] || _cap=3000
+      _scaled=$(( timeout_budget + (TL_MAX_STEPS + 1) * (_pb / 1024 / _kbps) ))
+      (( _scaled > _cap )) && _scaled=$_cap
+      if (( _scaled > timeout_budget )); then
+        echo "$slug: $(( _pb / 1024 )) KB prompt × $(( TL_MAX_STEPS + 1 )) turns — budget scaled ${timeout_budget}s → ${_scaled}s" >&2
+        timeout_budget=$_scaled; tl_wall_scaled=true
+      fi
+    fi
     tool_loop_run "$slug" "$model" "$cli" "$endpoint" "$key" "$timeout_budget" \
       "$prompt_tmp" "$rf_json" "$tl_mode" "$out" "$repo_root_tl"
     rc=$?
@@ -1668,7 +1696,8 @@ $json_findings_suffix"
     tool_stats_json="$(jq -n -c --arg m "$tl_mode" --argjson steps "${TL_STEPS:-0}" --argjson turns "${TL_TURNS:-0}" \
       --argjson calls "$(tl_calls_json)" --argjson rb "${TL_READ_BYTES:-0}" --argjson be "${TL_BUDGET_EXHAUSTED:-false}" \
       --argjson cr "${TL_CHECK_RAN:-false}" --argjson crc "${TL_CHECK_RC:-null}" --argjson rfd "${TL_RF_DROPPED:-false}" \
-      '{mode:$m, steps:$steps, turns:$turns, calls:$calls, read_bytes:$rb, budget_exhausted:$be, check_ran:$cr, check_rc:$crc, rf_dropped:$rfd}')"
+      --argjson wf "${TL_WALL_FORCED:-false}" --argjson tmax "${TL_TURN_MAX_S:-0}" --argjson wsc "${tl_wall_scaled:-false}" \
+      '{mode:$m, steps:$steps, turns:$turns, calls:$calls, read_bytes:$rb, budget_exhausted:$be, check_ran:$cr, check_rc:$crc, rf_dropped:$rfd, wall_forced:$wf, turn_max_s:$tmax, wall_scaled:$wsc}')"
   else
     tool_stats_json='{"mode":"off"}'
   fi
