@@ -20,10 +20,11 @@
 #   ] }
 #
 # Mapping:
-#   - anchor.resolved == true  -> physicalLocation.region from
+#   - anchor.resolved == true AND anchor.side == "new" -> physicalLocation.region from
 #     anchor.start_line/anchor.end_line.
-#   - anchor.resolved == true but anchor.side == "old" (a deleted line) ->
-#     file-level result too: the line number belongs to the base, not the head.
+#   - anchor.resolved == true but anchor.side != "new" ("old" = a deleted line,
+#     or missing = legacy/malformed input) -> file-level result too: the line
+#     number belongs to the base, or to nothing that can be trusted.
 #   - anchor.resolved != true, or the "anchor" key is absent entirely -> a
 #     file-level result: an artifactLocation with NO region key. Never a
 #     guessed line.
