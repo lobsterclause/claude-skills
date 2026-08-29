@@ -82,9 +82,12 @@ command -v jq >/dev/null 2>&1 || { echo "select_roster: jq required" >&2; exit 1
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 
-if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-  PATH="$HOME/.local/bin:$PATH"
-fi
+# Shared with detect_reviewers.sh and run_reviewers.sh. This file used to carry
+# only the ~/.local/bin half, so `command -v codex` below missed an nvm-installed
+# npm global and dropped the baseline from every draw while detect_reviewers.sh
+# reported it available. See lib_path.sh.
+# shellcheck source=lib_path.sh
+. "$script_dir/lib_path.sh"
 
 has_openrouter() {
   command -v curl >/dev/null 2>&1 || return 1
@@ -101,6 +104,29 @@ BASELINES=()
 missing_baselines=()
 if command -v codex >/dev/null 2>&1; then BASELINES+=(codex); else missing_baselines+=(codex); fi
 if command -v kimi  >/dev/null 2>&1; then BASELINES+=(kimi);  else missing_baselines+=(kimi);  fi
+
+# Fail closed, exactly as detect_reviewers.sh does. A missing baseline used to
+# be a stderr WARN plus a silently raised rotation count, which produces a
+# normal-looking four-seat roster with no codex in it -- a missing verifier and
+# a passing verification are indistinguishable from the outside, which is the
+# whole reason detect_reviewers.sh exits 1 here. This script is a second entry
+# point into the same decision and must answer the same way.
+#
+# Same escape hatch, same name: set it at the call site for a deliberate
+# degraded run, never as a wrapper default.
+if [[ ${#missing_baselines[@]} -gt 0 ]]; then
+  if [[ "${CROSS_REVIEW_ALLOW_MISSING_BASELINE:-0}" == "1" ]]; then
+    echo "select_roster: WARN baseline(s) not installed: ${missing_baselines[*]} (allowed via CROSS_REVIEW_ALLOW_MISSING_BASELINE)" >&2
+  else
+    echo "select_roster: baseline(s) not installed: ${missing_baselines[*]}" >&2
+    echo "  Do not run a round without them. Usually PATH, not a missing install:" >&2
+    echo "  codex and kimi are npm globals under the nvm bin dir, and nvm is a" >&2
+    echo "  shell function that never runs in a non-interactive shell." >&2
+    echo "  Check 'command -v codex'; set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1" >&2
+    echo "  only for a deliberate degraded spot check." >&2
+    exit 3   # dedicated: run_reviewers.sh must not read this as "selector unavailable"
+  fi
+fi
 
 POOL=()
 if command -v agy >/dev/null 2>&1; then
@@ -187,7 +213,11 @@ lb_json="$(bash "$script_dir/leaderboard.sh" --mode json 2>/dev/null || echo '[]
 # to make a deliberately-seated reviewer (kimi27, 2026-07-03) come up
 # frequently while it earns leaderboard data; retire boosts once real scores
 # accumulate.
-profile_file="$script_dir/../references/reviewer_profiles.json"
+# CROSS_REVIEW_PROFILES_FILE overrides the profile path for fixture tests only,
+# same contract as CROSS_REVIEW_RUNLOG and CROSS_REVIEW_FINDING_EVENTS. It
+# exists so the draw_boost semantics (0 = never drawn, garbage = default 1)
+# can be pinned against a synthetic profile instead of mutating the real one.
+profile_file="${CROSS_REVIEW_PROFILES_FILE:-$script_dir/../references/reviewer_profiles.json}"
 draw_boost_of() {
   [[ -f "$profile_file" ]] || { echo 1; return; }
   jq -r --arg r "$1" '.[$r].draw_boost // 1' "$profile_file" 2>/dev/null || echo 1
@@ -238,8 +268,19 @@ draw_picks() {
     attempts = $3 + 0
     latest = $4
     cost = (NF >= 6 ? $6 + 0 : 0)
-    boost = (NF >= 7 ? $7 + 0 : 1)
-    if (boost <= 0) boost = 1
+    # draw_boost: 0 is a LEGITIMATE value meaning "never draw this seat" — a
+    # retired seat that stays fully wired (see the nemotron bench_note). The
+    # previous guard was `if (boost <= 0) boost = 1`, which silently gave a
+    # seat pinned to 0 FULL weight — the exact opposite of what the profile
+    # says, and undetectable except by counting draws over many rounds.
+    # Garbage still must default to 1, because `$7 + 0` coerces a typo like
+    # "abc" to 0 and would otherwise bench a seat by accident. So validate the
+    # SHAPE first and only then coerce: a well-formed non-negative decimal is
+    # taken at face value (0 included); anything else — negative, non-numeric,
+    # empty — is garbage and falls back to 1.
+    boost_raw = (NF >= 7 ? $7 : "1")
+    if (boost_raw !~ /^[0-9]+(\.[0-9]+)?$/) boost_raw = "1"
+    boost = boost_raw + 0
     # exploit * explore / latency / cost * boost — latency and COST shape the
     # draw, never the synthesis-time weighting of findings. The cost divisor is
     # the fugu lesson made structural (PR #20: $4.74/call, 94.9% of a week'"'"'s OR

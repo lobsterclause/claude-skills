@@ -487,6 +487,9 @@ tl_num() { jq -r "$1 | if type==\"number\" then tostring else \"0\" end" "$2" 2>
 #   TL_STEPS       assistant turns that carried tool calls
 #   TL_TURNS       total API calls made
 #   TL_BUDGET_EXHAUSTED TL_READ_BYTES TL_CHECK_RAN TL_CHECK_RC (see above)
+#   TL_WALL_FORCED true when the loop ended the conversation early because the
+#                  wall budget could not fit another tool turn (#159)
+#   TL_TURN_MAX_S  the slowest API turn, seconds (0 when none completed)
 #   TL_RF_DROPPED  true when response_format had to be dropped for this model
 #   TL_API_ERROR   the provider's error message, if any
 #   TL_FAILURE_KIND  provider_billing | provider_rate_limited | provider_auth |
@@ -501,6 +504,7 @@ tool_loop_run() {
   TL_RC=0; TL_COST="null"; TL_TOKP="null"; TL_TOKC="null"; TL_STEPS=0; TL_TURNS=0
   TL_TOKCACHED="null"; TL_TOKCW="null"; TL_PROVIDER="null"; TL_PROVIDER_PIN=""
   TL_RF_DROPPED=false; TL_API_ERROR=""; TL_FAILURE_KIND=""
+  TL_WALL_FORCED=false; TL_TURN_MAX_S=0
   local check_avail=false
   [[ "$mode" == "check" ]] && tl_resolve_check_cmd "$root" >/dev/null 2>&1 && check_avail=true
   local tools; tools="$(tl_tool_defs "$mode" "$check_avail")"
@@ -536,8 +540,11 @@ tool_loop_run() {
        + (if $pin == "" then {} else {provider:{order:[$pin], allow_fallbacks:true}} end)
        + $extra' >"$body"
     cp "$body" "$outd/${slug}.request.json"
+    local turn_t0; turn_t0=$(date +%s)
     tl_post "$cli" "$key" "$body" "$resp" "$err" "$remaining" "$endpoint"
     local rc=$?
+    local turn_s=$(( $(date +%s) - turn_t0 ))
+    (( turn_s > TL_TURN_MAX_S )) && TL_TURN_MAX_S=$turn_s
     cp "$resp" "$outd/${slug}.response.json" 2>/dev/null || true
     if [[ $rc -ne 0 ]]; then
       # curl itself failed: timeout stays a timeout; anything else never
@@ -634,9 +641,28 @@ tool_loop_run() {
       jq -c --arg id "$id" --arg name "$name" --arg c "$result" '. + [{role:"tool", tool_call_id:$id, name:$name, content:$c}]' "$msgs" >"$msgs.tmp" && mv "$msgs.tmp" "$msgs"
       i=$((i + 1))
     done
+    # One clock read for the wall check below: two reads straddling a second
+    # boundary could pass the >= 10 guard and fail the < bound, or vice
+    # versa (codex Low, PR #162 pass 2).
+    local wall_left=$(( budget - ($(date +%s) - start) ))
     if (( TL_STEPS >= TL_MAX_STEPS )); then
       force_final=true
       jq -c '. + [{role:"user", content:"Tool budget exhausted. Do not call any more tools. Answer now with your findings in the required JSON shape, based on what you have already seen; mark anything you could not verify as unverified."}]' "$msgs" >"$msgs.tmp" && mv "$msgs.tmp" "$msgs"
+    elif (( wall_left >= 10 && wall_left < 2 * TL_TURN_MAX_S + 10 )); then
+      # Wall-aware stop (#159): every turn re-sends the whole prefix, so a
+      # turn costs about what the slowest one did. If two more of those do
+      # not fit (one tool turn + the answer), spend what is left on the
+      # answer now instead of on a tool call whose reply would be cut off at
+      # the lane deadline with nothing to show for it (deepseek on #154:
+      # 9 turns in a 600 s lane, steps to spare, zero output). The learner
+      # sees this as an ok run with wall_forced=true, not as a timeout. The
+      # >= 10 guard matches the floor at the top of the loop: under it the
+      # next iteration is a 124 regardless, and stamping wall_forced on a
+      # timed-out run would say "answered" about a lane that did not (kimi
+      # Low, PR #162 pass 1).
+      force_final=true; TL_WALL_FORCED=true
+      echo "$slug: wall budget cannot fit another tool turn (slowest ${TL_TURN_MAX_S}s, ${wall_left}s left) — forcing the final answer after $TL_STEPS step(s)" >>"$err"
+      jq -c '. + [{role:"user", content:"Time budget nearly exhausted. Do not call any more tools. Answer now with your findings in the required JSON shape, based on what you have already seen; mark anything you could not verify as unverified."}]' "$msgs" >"$msgs.tmp" && mv "$msgs.tmp" "$msgs"
     fi
   done
   rm -f "$msgs.assistant" "$msgs.tmp" "$outd/${slug}.tool.result.txt"

@@ -270,13 +270,19 @@ for ((pi = 1; pi <= PERF_N; pi++)); do
   printf '{"event":"proposed","ts":"2026-08-01T00:00:%02dZ","finding_id":"f-%d","run_id":"run-%d","schema_version":1}\n' "$((pi % 60))" "$pi" "$pi" >>"$PERF_EVENTS"
 done
 
+TMP_PIN_TEXT="$T/pin_text.txt"   # inside $T so the EXIT trap cleans it up
 # Expected output PINNED from the pre-#132 script (origin/master before
 # #139, generated 2026-08-27 on this exact fixture) -- not re-derived from
 # `git show HEAD:` at test time, which becomes a tautology the moment the
 # refactor merges and fails outright without history (cross-review of #137).
 # It also spares the ~60s-per-invocation run of the old per-line-fork script.
 # Paths never appear in the output, so no normalization is needed.
-PIN_TEXT=$(cat <<'PINNED'
+# NOT `PIN_TEXT=$(cat <<'PINNED' ... )`: bash 3.2 (macOS /bin/bash) fails to
+# parse a quoted heredoc nested inside a command substitution when the body
+# contains single quotes ("unexpected EOF while looking for matching `''"),
+# so the whole suite died at parse time on 3.2 hosts (#160). A plain heredoc
+# to a file, read back, is equivalent and parses everywhere.
+cat >"$TMP_PIN_TEXT" <<'PINNED'
 ERROR runlog:10 malformed
 ERROR runlog:500 malformed
 ERROR runlog:990 malformed
@@ -292,7 +298,7 @@ WARN  events: 6 event(s) with a run_id absent from runlog (orphan run_id):
 runlog: 1000 lines, 3 malformed, 0 missing ts, 2 legacy no-ts, 1 above-current schema_version, schema_version: 1=994, 99=1, missing=2
 events: 1000 lines, 0 malformed, 0 unknown event(s), 6 orphan run_id(s), 0 above-current schema_version, schema_version: 1=1000
 PINNED
-)
+PIN_TEXT="$(cat "$TMP_PIN_TEXT")"
 PIN_JSON='{"runlog":{"lines":1000,"malformed":3,"missing_ts":0,"legacy_no_ts":2,"future_version":1,"future_version_examples":[99],"current_schema_version":1,"schema_version":{"1":994,"99":1,"missing":2}},"events":{"lines":1000,"malformed":0,"unknown_event":0,"unknown_event_examples":[],"orphan_run_id":6,"orphan_run_id_examples":["run-10","run-20","run-30","run-500","run-980"],"future_version":0,"future_version_examples":[],"current_schema_version":1,"schema_version":{"1":1000}},"errors":3,"warns":9}'
 NEW_TEXT="$(CROSS_REVIEW_WRITERS_DIR="$S" bash "$S/validate_ledgers.sh" --runlog "$PERF_RUNLOG" --events "$PERF_EVENTS" 2>&1)"
 assert_eq "single-pass text output matches the pre-#132 script byte-for-byte on a $PERF_N-line fixture" "$NEW_TEXT" "$PIN_TEXT"

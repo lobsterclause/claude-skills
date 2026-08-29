@@ -118,7 +118,9 @@
 # defaults): CROSS_REVIEW_TOOL_MAX_STEPS, CROSS_REVIEW_TOOL_READ_BUDGET_BYTES,
 # CROSS_REVIEW_TOOL_CALL_CAP_BYTES, CROSS_REVIEW_CHECK_TIMEOUT_S,
 # CROSS_REVIEW_TOOL_CONTEXT=files|diff (keep or drop the whole-file paste when
-# tools are on; default files — tools add on top).
+# tools are on; default files — tools add on top), CROSS_REVIEW_TOOL_WALL_KB_PER_S
+# / CROSS_REVIEW_TOOL_WALL_CAP_S (a tool-armed lane's wall budget grows with
+# prompt size × turns unless --timeout/--timeout-<seat> is explicit, #159).
 #
 # Writes:
 #   <out>/codex.stdout         — codex review (stderr merged)
@@ -142,15 +144,15 @@
 #                                request/response/meta shape as the OR pool,
 #                                different endpoint — see run_openrouter_reviewer)
 #   <out>/agy.quota_exhausted  — sentinel: agy hit the shared Individual quota
-#   <out>/codex.quota_exhausted — sentinel: codex hit its usage cap; carries the
-#                                 reset ETA from the wall message (#61). Spares
-#                                 retries; unlike agy, codex may still be
-#                                 rescued via or_fallback, else it drops out.
 #                                this run (contains the reset ETA). Spares
 #                                retries and any lap that starts AFTER detection
 #                                (~5s in); the concurrent sibling usually burns
 #                                its own doomed call first (2s stagger). No
 #                                fallback — the lap drops out of the round.
+#   <out>/codex.quota_exhausted — sentinel: codex hit its usage cap; carries the
+#                                 reset ETA from the wall message (#61). Spares
+#                                 retries; unlike agy, codex may still be
+#                                 rescued via or_fallback, else it drops out.
 #   <out>/run.meta.json        — overall run metadata (skipped reason, etc.)
 #
 # meta.json extras: agy laps carry `failure_kind` (quota_exhausted | agy_panic |
@@ -171,8 +173,9 @@
 # Chat lanes carry `tool_policy` {mode, basis} (what tool_policy.sh decided
 # and why: override | pinned | learned | default) and `tool_stats` {mode,
 # steps, turns, calls{read_file,search,list_files,run_check,unknown},
-# read_bytes, budget_exhausted, check_ran, check_rc, rf_dropped} — the
-# learner's own input next round, and analyze_runlog's split-by-arm.
+# read_bytes, budget_exhausted, check_ran, check_rc, rf_dropped, wall_forced,
+# turn_max_s, wall_scaled} — the learner's own input next round, and
+# analyze_runlog's split-by-arm.
 #
 # Exit codes:
 #   0 — at least one reviewer succeeded, OR run was skipped intentionally (empty diff)
@@ -249,13 +252,14 @@ model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
                         devstral laguna kat north nemotron spark seed grok
                         longcat inkling kimi27 kimi3)
 
-# Antigravity installs `agy` to $HOME/.local/bin. That directory isn't always
-# on $PATH for non-interactive shells (notably bash invocations from other
-# tools). Surface it ourselves so `command -v agy` and a bare `agy` both
-# resolve without requiring the user to edit their shell rc.
-if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-  PATH="$HOME/.local/bin:$PATH"
-fi
+# Shared with detect_reviewers.sh and select_roster.sh: ~/.local/bin for agy,
+# plus the nvm bin dir for the codex and kimi npm globals. This file used to
+# carry only the ~/.local/bin half, so a round dispatched to codex or kimi from
+# a non-interactive shell could not execute them at all -- the EXECUTION half of
+# the same drift that made select_roster.sh drop them from the draw. See
+# lib_path.sh.
+# shellcheck source=lib_path.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_path.sh"
 
 need_val() {
   local flag="$1"
@@ -306,8 +310,23 @@ esac
 # it is). Missing/failed selector → classic fixed fleet.
 if [[ -z "$reviewers" ]]; then
   selector="$(cd "$(dirname "$0")" && pwd)/select_roster.sh"
-  if [[ -x "$selector" ]] && reviewers="$(bash "$selector")" && [[ -n "$reviewers" ]]; then
-    echo "roster (select_roster.sh): $reviewers" >&2
+  if [[ -x "$selector" ]]; then
+    # The selector's fail-closed exit (3: a baseline is not installed) is a
+    # verdict, not an outage. Treating every nonzero as "selector unavailable"
+    # substituted the fixed fleet, skipped the missing baselines at dispatch,
+    # and ran the exact baseline-less round the guard exists to stop (codex +
+    # glm convergent, PR #68 review).
+    sel_rc=0; reviewers="$(bash "$selector")" || sel_rc=$?
+    if [[ $sel_rc -eq 3 ]]; then
+      echo "run_reviewers: select_roster.sh refused the round (baseline missing) — not substituting a roster. Fix PATH or set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 for a deliberate degraded run." >&2
+      exit 1
+    fi
+    if [[ $sel_rc -eq 0 && -n "$reviewers" ]]; then
+      echo "roster (select_roster.sh): $reviewers" >&2
+    else
+      reviewers="codex,antigravity,gemini-pro,kimi,glm"
+      echo "roster: selector failed (rc=$sel_rc) — using fixed fallback fleet: $reviewers" >&2
+    fi
   else
     reviewers="codex,antigravity,gemini-pro,kimi,glm"
     echo "roster: selector unavailable — using fixed fallback fleet: $reviewers" >&2
@@ -375,6 +394,8 @@ _tp_default CROSS_REVIEW_TOOL_READ_BUDGET_BYTES  read_budget_bytes
 _tp_default CROSS_REVIEW_TOOL_CALL_CAP_BYTES     call_cap_bytes
 _tp_default CROSS_REVIEW_CHECK_TIMEOUT_S         check_timeout_s
 _tp_default CROSS_REVIEW_TOOL_CONTEXT            tool_context
+_tp_default CROSS_REVIEW_TOOL_WALL_KB_PER_S       wall_kb_per_s
+_tp_default CROSS_REVIEW_TOOL_WALL_CAP_S          wall_cap_s
 # shellcheck source=lib_tool_loop.sh
 source "$(dirname "$0")/lib_tool_loop.sh"
 tool_context="${CROSS_REVIEW_TOOL_CONTEXT:-files}"
@@ -1042,6 +1063,82 @@ snapshot_for() {
   return 1
 }
 
+# build_review_background — assembles the short PR/issue/commit-log context
+# block substituted into {{BACKGROUND}} in review_prompt.txt, so reviewers can
+# check the "semantic drift" question (does the change do what it claims?)
+# against something concrete instead of the diff alone (issue #75).
+#
+# Sourcing order:
+#   1. `gh pr view --json title,body` for the current branch, plus the issue
+#      it closes/fixes/resolves if one is linked in the title or body.
+#   2. Fallback: `git log` subjects for <base>..HEAD (the common case for
+#      local-branch runs of this skill, where there is no open PR yet).
+#   3. Fallback: a harmless static sentence — never an empty string.
+#
+# MUST fail open in every failure mode: no `gh` binary, no network, `gh`
+# non-zero, no PR, empty body. A background lookup must never fail a review
+# round, so every gh/git call here is guarded with `|| true` / `2>/dev/null`
+# and this function never propagates a nonzero exit under `set -uo pipefail`.
+#
+# Cap: 4000 bytes (documented here; far below the 100KB argv-truncation guard
+# further down), elided at the last newline before the cap so we never cut
+# mid-sentence.
+build_review_background() {
+  local cap=4000
+  local text=""
+  local gh_timeout=()
+  [[ -n "${TIMEOUT_BIN:-}" ]] && gh_timeout=("$TIMEOUT_BIN" 10)
+
+  if command -v gh >/dev/null 2>&1; then
+    local pr_json title body issue_num issue_json
+    pr_json="$("${gh_timeout[@]}" gh pr view --json title,body 2>/dev/null)" || pr_json=""
+    if [[ -n "$pr_json" ]] && command -v jq >/dev/null 2>&1; then
+      title="$(printf '%s' "$pr_json" | jq -r '.title // ""' 2>/dev/null || true)"
+      body="$(printf '%s' "$pr_json" | jq -r '.body // ""' 2>/dev/null || true)"
+      if [[ -n "$title" || -n "$body" ]]; then
+        text="PR title: $title"$'\n\n'"PR description:"$'\n'"$body"
+        # Best-effort linked-issue lookup: "closes/fixes/resolves #NN" in the
+        # title or body. Never fatal if this finds nothing or gh fails.
+        issue_num="$(printf '%s\n%s' "$title" "$body" \
+          | grep -Eio '(clos|fix|resolv)(e[sd]?|ing)?[[:space:]]+#[0-9]+' \
+          | grep -Eo '[0-9]+' | head -1 || true)"
+        if [[ -n "$issue_num" ]]; then
+          issue_json="$("${gh_timeout[@]}" gh issue view "$issue_num" --json title,body 2>/dev/null)" || issue_json=""
+          if [[ -n "$issue_json" ]]; then
+            local ititle ibody
+            ititle="$(printf '%s' "$issue_json" | jq -r '.title // ""' 2>/dev/null || true)"
+            ibody="$(printf '%s' "$issue_json" | jq -r '.body // ""' 2>/dev/null || true)"
+            if [[ -n "$ititle" || -n "$ibody" ]]; then
+              text="$text"$'\n\n'"Linked issue #$issue_num: $ititle"$'\n'"$ibody"
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  if [[ -z "$text" ]]; then
+    local log
+    log="$(git log --pretty=format:'- %s' "$base"..HEAD 2>/dev/null | head -n 50 || true)"
+    [[ -n "$log" ]] && text="Commit messages on this branch (no PR found):"$'\n'"$log"
+  fi
+
+  [[ -z "$text" ]] && text="No PR, issue, or commit-log context is available for this change."
+
+  # Defuse a literal placeholder in untrusted PR/issue text so it can never
+  # re-open the substitution point (same class of guard as the </diff> defuse
+  # further down in run_kimi).
+  text="${text//\{\{BACKGROUND\}\}/[BACKGROUND]}"
+
+  if [[ "${#text}" -gt "$cap" ]]; then
+    text="${text:0:$cap}"
+    [[ "$text" == *$'\n'* ]] && text="${text%$'\n'*}"
+    text="$text"$'\n'"[... background truncated at ${cap} bytes]"
+  fi
+
+  printf '%s' "$text"
+}
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompt_file="$script_dir/../references/review_prompt.txt"
 
@@ -1067,10 +1164,50 @@ Rank findings as Critical / High / Medium / Low. Skip pure style nits."
 
 if [[ -f "$prompt_file" ]]; then
   review_prompt="$(cat "$prompt_file")"
+  # bash >= 5.2 enables `patsub_replacement`, under which a bare `&` in a
+  # ${x//pat/rep} replacement expands to the MATCHED text. The background
+  # block is attacker-adjacent free text (a PR title, an issue body): a PR
+  # called "R&D support" would substitute the placeholder back into itself
+  # and ship a literal {{BACKGROUND}} to every reviewer, on bash 5.2 only.
+  # Same defence as the file-context attribute escaping above; harmless
+  # (unknown option) on older bash. Covers {{BASE}} too — a branch name may
+  # legally contain '&'.
+  shopt -u patsub_replacement 2>/dev/null || true
   review_prompt="${review_prompt//\{\{BASE\}\}/$base}"
+  review_prompt="${review_prompt//\{\{BACKGROUND\}\}/$(build_review_background)}"
 else
   review_prompt="$default_prompt"
 fi
+
+# Review worktrees are `git worktree add` checkouts with no install step, so a
+# JS repo here has no node_modules. Agentic reviewers do not know that and will
+# try to run the suite -- reasonably, since "do the tests pass" is a good
+# question. It just cannot be answered here.
+#
+# Measured 2026-08-26 (kindred-mama-ai #3582, a two-file test diff): codex spent
+# its entire 600s budget chasing an unresolvable module, emitted 194KB of
+# transcript and ZERO verdict markers, and the round lost both baselines. The
+# retry at 1500s produced a verdict in 694s -- most of it still spent on the
+# same dead end.
+#
+# Appended after the prompt is resolved so a custom --prompt-file gets it too,
+# and gated on the condition actually holding: claiming deps are missing when
+# they are installed would be its own bad instruction.
+# Anchored to the repo root, not the cwd (kimi + glm); Yarn PnP zero-install
+# repos have usable deps without node_modules (.pnp.cjs) and are exempt
+# (codex); the note claims only what was checked (glm).
+NO_DEPS_NOTE=""
+_nd_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [[ -f "$_nd_root/package.json" && ! -d "$_nd_root/node_modules" && ! -f "$_nd_root/.pnp.cjs" && ! -f "$_nd_root/.pnp.js" ]]; then
+  NO_DEPS_NOTE="ENVIRONMENT: dependencies are NOT installed in this checkout \
+(package.json is present, node_modules is absent). Do not run tests, builds, \
+linters or typecheckers: they fail on missing modules, and that failure tells \
+you nothing about the diff. Review by reading the code."
+  review_prompt="$review_prompt
+
+$NO_DEPS_NOTE"
+fi
+unset _nd_root
 
 # json_findings_suffix: schema-mandate text appended ONLY in the curl lane
 # (run_openrouter_reviewer — the OpenRouter pool plus direct-Moonshot seats
@@ -1094,6 +1231,74 @@ CODEX_VACUOUS_MAX_BYTES=1024
 codex_output_has_verdict_marker() {
   grep -viE '^(reasoning (effort|summaries)|model|provider|approval|sandbox|workdir|session id):' "$1" 2>/dev/null \
     | grep -qiE '(^|[^[:alnum:]])(critical|high|medium|low)([^[:alnum:]]|$)|no (significant |material )?(issues?|findings?|problems?|concerns?|regressions?)|looks (good|correct|fine)|lgtm|approved|\[P[0-9]\]|findings?:|reviewed [0-9]|"findings"'
+}
+
+# ── AGENTS.md carrier for the no-deps note (codex lane) ──────────────────────
+# State is script-global so the EXIT/INT/TERM trap can undo it: a signal
+# during the codex run used to leave the note in the user's file for good
+# (minimax + spark + codex, #68 pass 2). Rules: the file is the REPO ROOT's
+# (kimi + spark); a symlink is never followed (codex); nothing is appended
+# until a backup is verified — a failed mktemp/cp left the note permanently
+# or restored an EMPTY file (kimi Critical, minimax, spark); the backup lives
+# beside the file with `cp -p` so mode/ownership survive the round trip
+# (codex); a lock dir keeps two overlapping runs from restoring each other's
+# state (codex).
+CR_AGENTS_MD=""; CR_AGENTS_BAK=""; CR_AGENTS_CREATED=0; CR_AGENTS_LOCK=""
+cr_agents_inject() {
+  [[ -n "${NO_DEPS_NOTE:-}" ]] || return 0
+  local root; root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  local f="$root/AGENTS.md" lock="$root/.AGENTS.md.cross-review.lock"
+  if [[ -L "$f" ]]; then echo "codex: AGENTS.md is a symlink — not injecting the environment note" >&2; return 0; fi
+  if ! mkdir "$lock" 2>/dev/null; then
+    # Same stale-lock reclaim as _agy_gate_lock: a run killed with SIGKILL
+    # leaves the dir behind and every later run would skip the note for good
+    # (kimi + minimax, #68 pass 3). Rename-then-delete so two reclaimers
+    # cannot remove each other's fresh lock.
+    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]] && mv "$lock" "$lock.stale.$$" 2>/dev/null; then
+      rm -rf "$lock.stale.$$" 2>/dev/null || true
+    fi
+    if ! mkdir "$lock" 2>/dev/null; then echo "codex: another cross-review run holds AGENTS.md — not injecting the environment note" >&2; return 0; fi
+  fi
+  CR_AGENTS_LOCK="$lock"
+  # Re-checked under the lock: the entry could have become a symlink between
+  # the first test and mkdir (spark, #68 pass 3).
+  if [[ -L "$f" ]]; then echo "codex: AGENTS.md is a symlink — not injecting the environment note" >&2; rmdir "$lock" 2>/dev/null; CR_AGENTS_LOCK=""; return 0; fi
+  if [[ -e "$f" ]]; then
+    local bak
+    if bak="$(mktemp "$root/.AGENTS.md.cross-review.XXXXXX" 2>/dev/null)" && cp -p "$f" "$bak" 2>/dev/null && cmp -s "$f" "$bak"; then
+      CR_AGENTS_BAK="$bak"
+    else
+      [[ -n "${bak:-}" ]] && rm -f "$bak"
+      echo "codex: could not back up AGENTS.md — not injecting the environment note" >&2
+      rmdir "$lock" 2>/dev/null; CR_AGENTS_LOCK=""; return 0
+    fi
+  else
+    CR_AGENTS_CREATED=1
+  fi
+  # State is complete BEFORE the write: a partial append that fails must
+  # still be undone (a created file removed, a backup restored) — codex +
+  # spark, #68 pass 3.
+  CR_AGENTS_MD="$f"
+  if ! printf '\n\n## cross-review environment note\n\n%s\n' "$NO_DEPS_NOTE" >>"$f" 2>/dev/null; then
+    echo "codex: could not write AGENTS.md — restoring it" >&2
+    cr_agents_restore; return 0
+  fi
+}
+cr_agents_restore() {
+  if [[ -n "$CR_AGENTS_BAK" ]]; then
+    local _tgt="${CR_AGENTS_MD:-${CR_AGENTS_BAK%/.AGENTS.md.cross-review.*}/AGENTS.md}"
+    # A restore that fails is loud and leaves the backup where the user can
+    # find it (codex + minimax, #68 pass 3): mv, then cp -p, then WARN.
+    if ! mv -f "$CR_AGENTS_BAK" "$_tgt" 2>/dev/null; then
+      if cp -p "$CR_AGENTS_BAK" "$_tgt" 2>/dev/null; then rm -f "$CR_AGENTS_BAK"
+      else echo "WARN: could not restore $_tgt — your original is at $CR_AGENTS_BAK" >&2
+      fi
+    fi
+  elif [[ "$CR_AGENTS_CREATED" == 1 && -n "$CR_AGENTS_MD" ]]; then
+    rm -f "$CR_AGENTS_MD"
+  fi
+  [[ -n "$CR_AGENTS_LOCK" ]] && rmdir "$CR_AGENTS_LOCK" 2>/dev/null
+  CR_AGENTS_MD=""; CR_AGENTS_BAK=""; CR_AGENTS_CREATED=0; CR_AGENTS_LOCK=""
 }
 
 run_codex() {
@@ -1124,6 +1329,10 @@ run_codex() {
   # "the fallback re-runs the SAME model" guarantee an unverified guess that
   # would break silently the moment the CLI default moved. `cli_model` pins it
   # here, and a test asserts it agrees with or_fallback.model. (glm, PR #66.)
+  # `codex exec review --base` never sees $review_prompt, so the no-deps note
+  # reaches codex through AGENTS.md — injected by the PARENT before this
+  # function is dispatched (see the codex case in the dispatch loop) and
+  # restored by the parent's trap; nothing here may touch it.
   local codex_model codex_model_args=()
   codex_model="$(profile_get codex cli_model)"
   if [[ -n "$codex_model" ]]; then
@@ -1457,6 +1666,29 @@ $json_findings_suffix"
     # Found by the PR #99 cross-review round, 2026-08-27.
     local rf_json='{"type":"json_object"}'
     [[ "${rf_args[2]:-}" == "null" ]] && rf_json="null"
+    # Wall budget for a tool-armed lane (#159). The seat's timeout_s is a
+    # single-shot number; the loop makes up to max_steps+1 calls and each one
+    # re-sends the whole prefix, so on a big prompt the flat budget runs out
+    # with steps to spare (deepseek on #154 pass 1: 299 KB prompt, 9 turns,
+    # 600 s, no output) and the learner demotes the arm for the wrong reason.
+    # Same shape as the kimi rule: add per-turn time proportional to prompt
+    # size, cap it, and honour an explicit --timeout / --timeout-<seat> verbatim
+    # (a smoke run or CI hard cap must win). Profile _synthesis_rules.tool_policy
+    # holds the numbers: wall_kb_per_s (prompt KB per extra second per turn,
+    # default 4 ≈ 1 s per ~1k tokens) and wall_cap_s.
+    local tl_wall_scaled=false _seat_flag="timeout_${slug//-/_}"
+    if [[ -z "$timeout_s" && -z "${!_seat_flag:-}" ]]; then
+      local _pb _kbps="${CROSS_REVIEW_TOOL_WALL_KB_PER_S:-4}" _cap="${CROSS_REVIEW_TOOL_WALL_CAP_S:-3000}" _scaled
+      _pb="$(wc -c <"$prompt_tmp" | tr -d ' ')"
+      [[ "$_kbps" =~ ^[0-9]+$ && "$_kbps" -gt 0 ]] || _kbps=4
+      [[ "$_cap" =~ ^[0-9]+$ ]] || _cap=3000
+      _scaled=$(( timeout_budget + (TL_MAX_STEPS + 1) * (_pb / 1024 / _kbps) ))
+      (( _scaled > _cap )) && _scaled=$_cap
+      if (( _scaled > timeout_budget )); then
+        echo "$slug: $(( _pb / 1024 )) KB prompt × $(( TL_MAX_STEPS + 1 )) turns — budget scaled ${timeout_budget}s → ${_scaled}s" >&2
+        timeout_budget=$_scaled; tl_wall_scaled=true
+      fi
+    fi
     tool_loop_run "$slug" "$model" "$cli" "$endpoint" "$key" "$timeout_budget" \
       "$prompt_tmp" "$rf_json" "$tl_mode" "$out" "$repo_root_tl"
     rc=$?
@@ -1624,7 +1856,8 @@ $json_findings_suffix"
     tool_stats_json="$(jq -n -c --arg m "$tl_mode" --argjson steps "${TL_STEPS:-0}" --argjson turns "${TL_TURNS:-0}" \
       --argjson calls "$(tl_calls_json)" --argjson rb "${TL_READ_BYTES:-0}" --argjson be "${TL_BUDGET_EXHAUSTED:-false}" \
       --argjson cr "${TL_CHECK_RAN:-false}" --argjson crc "${TL_CHECK_RC:-null}" --argjson rfd "${TL_RF_DROPPED:-false}" \
-      '{mode:$m, steps:$steps, turns:$turns, calls:$calls, read_bytes:$rb, budget_exhausted:$be, check_ran:$cr, check_rc:$crc, rf_dropped:$rfd}')"
+      --argjson wf "${TL_WALL_FORCED:-false}" --argjson tmax "${TL_TURN_MAX_S:-0}" --argjson wsc "${tl_wall_scaled:-false}" \
+      '{mode:$m, steps:$steps, turns:$turns, calls:$calls, read_bytes:$rb, budget_exhausted:$be, check_ran:$cr, check_rc:$crc, rf_dropped:$rfd, wall_forced:$wf, turn_max_s:$tmax, wall_scaled:$wsc}')"
   else
     tool_stats_json='{"mode":"off"}'
   fi
@@ -2448,6 +2681,7 @@ remove_agy_shell_gate() {
 cleanup_run() {
   cleanup_pids
   remove_agy_shell_gate
+  cr_agents_restore
 }
 trap cleanup_run EXIT INT TERM
 
@@ -2503,6 +2737,12 @@ for r in "${requested[@]}"; do
     codex)
       if command -v codex >/dev/null 2>&1; then
         [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        # The no-deps note rides in AGENTS.md for codex (see cr_agents_inject).
+        # Injected HERE, in the parent: run_codex runs as a background job, and
+        # state set in that subshell is invisible to the parent's EXIT/INT/TERM
+        # trap — a killed parent left the note behind (codex+kimi+spark, #68
+        # pass 3). Restored by cleanup_run at exit.
+        cr_agents_inject
         fallback_only run_codex codex &
         pids+=($!)
         ran+=("codex")
