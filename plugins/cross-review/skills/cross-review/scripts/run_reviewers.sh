@@ -1139,6 +1139,15 @@ Rank findings as Critical / High / Medium / Low. Skip pure style nits."
 
 if [[ -f "$prompt_file" ]]; then
   review_prompt="$(cat "$prompt_file")"
+  # bash >= 5.2 enables `patsub_replacement`, under which a bare `&` in a
+  # ${x//pat/rep} replacement expands to the MATCHED text. The background
+  # block is attacker-adjacent free text (a PR title, an issue body): a PR
+  # called "R&D support" would substitute the placeholder back into itself
+  # and ship a literal {{BACKGROUND}} to every reviewer, on bash 5.2 only.
+  # Same defence as the file-context attribute escaping above; harmless
+  # (unknown option) on older bash. Covers {{BASE}} too — a branch name may
+  # legally contain '&'.
+  shopt -u patsub_replacement 2>/dev/null || true
   review_prompt="${review_prompt//\{\{BASE\}\}/$base}"
   review_prompt="${review_prompt//\{\{BACKGROUND\}\}/$(build_review_background)}"
 else

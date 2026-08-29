@@ -98,6 +98,40 @@ else
   bad "kimi shim never captured a prompt when gh was absent"
 fi
 
+echo "── an '&' in the PR title/body survives substitution (bash 5.2 patsub_replacement) ──"
+# Regression: `${x//pat/rep}` treats a bare `&` in the replacement as the
+# MATCHED TEXT when patsub_replacement is on (bash >= 5.2, the ubuntu CI
+# runner). A PR called "R&D support" then substituted {{BACKGROUND}} back
+# into itself, shipping the literal placeholder to every reviewer while
+# passing on macOS bash 3.2. Caught by the cross-review round on #87.
+cat >"$T/bin/gh" <<'SHIM'
+#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '{"title":"R&D support for widgets","body":"Adds Q&A plumbing so the widget path can answer & log."}\n'
+  exit 0
+fi
+exit 1
+SHIM
+chmod +x "$T/bin/gh"
+# Both context modes, deliberately: the whole-file block (--context-mode
+# files, the default) happens to turn patsub_replacement off for its own
+# attribute escaping, which MASKS this bug on the default path. Only the
+# diff path is exposed — so a single-mode test would go green against the
+# unfixed script.
+for _amp_mode in files diff; do
+  rm -f "$CAPTURE"
+  CROSS_REVIEW_CONTEXT_MODE="$_amp_mode" \
+    bash "$S/run_reviewers.sh" --base main --out "$T/o_amp_$_amp_mode" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1
+  if [[ -f "$CAPTURE" ]]; then
+    CAPTURED="$(cat "$CAPTURE")"
+    assert_not_contains "[$_amp_mode] no literal {{BACKGROUND}} leaks when the title contains '&'" "$CAPTURED" "{{BACKGROUND}}"
+    assert_contains "[$_amp_mode] the '&' in the title reaches the reviewer verbatim" "$CAPTURED" "R&D support for widgets"
+    assert_contains "[$_amp_mode] the '&' in the body reaches the reviewer verbatim" "$CAPTURED" "answer & log"
+  else
+    bad "[$_amp_mode] kimi shim never captured a prompt for the '&' case"
+  fi
+done
+
 echo "── oversized PR body is truncated to the documented cap, at a line boundary ──"
 BIGBODY="$(for i in $(seq 1 2000); do printf 'line %d of a very long rationale that keeps going and going\n' "$i"; done)"
 cat >"$T/bin/gh" <<SHIM
