@@ -143,7 +143,9 @@
 #                                different endpoint — see run_openrouter_reviewer)
 #   <out>/agy.quota_exhausted  — sentinel: agy hit the shared Individual quota
 #   <out>/codex.quota_exhausted — sentinel: codex hit its usage cap; carries the
-#                                 reset ETA from the wall message (#61)
+#                                 reset ETA from the wall message (#61). Spares
+#                                 retries; unlike agy, codex may still be
+#                                 rescued via or_fallback, else it drops out.
 #                                this run (contains the reset ETA). Spares
 #                                retries and any lap that starts AFTER detection
 #                                (~5s in); the concurrent sibling usually burns
@@ -1140,8 +1142,12 @@ run_codex() {
   # >=512B) that merely QUOTES these phrases — this repo's own diffs do —
   # must never self-classify (glm High + codex M, PR #61 review). A wall is
   # a failed run or a near-empty one.
-  if { [[ $rc -ne 0 ]] || [[ "$bytes" -lt 512 ]]; } && grep -qiE "hit your usage limit|purchase more credits|usage limit reached" \
-       "$out/codex.stdout" 2>/dev/null; then
+  # rc=0 arm aligned with fallback_eligible.sh: a wall can carry codex's
+  # startup banner (measured 485-564 B), so the cut is VACUOUS_MAX_BYTES
+  # (1024) AND no verdict/severity marker — a real review is never this
+  # short without one (codex + kimi + antigravity, #61 pass 2).
+  if { [[ $rc -ne 0 ]] || { [[ "$bytes" -lt 1024 ]] && ! grep -qiE '(^|[^[:alnum:]])(critical|high|medium|low)([^[:alnum:]]|$)|no (significant |material )?(issues?|findings?|problems?|concerns?|regressions?)|looks (good|correct|fine)|lgtm|approved|\[P[0-9]\]|findings?:|"findings"' "$out/codex.stdout" 2>/dev/null; }; } \
+     && grep -qiE "hit your usage limit|purchase more credits|usage limit reached" "$out/codex.stdout" 2>/dev/null; then
     local reset_eta
     reset_eta="$(grep -oiE "try again at [^.]*" "$out/codex.stdout" 2>/dev/null | head -1)"
     printf '%s\n' "${reset_eta:-reset time not reported}" >"$out/codex.quota_exhausted"

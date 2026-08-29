@@ -37,7 +37,7 @@ REPO="$T/repo"; mkdir -p "$REPO"
   printf 'a\nb\n' >f.txt && git commit -qam change ) >/dev/null 2>&1
 
 codex_shim() {  # codex_shim <rc> <stdout text> — plain sh, no bash-isms (kimi)
-  { printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\ncat <<'"'"'MSG'"'"'\n'; printf '%s\n' "$2"; printf 'MSG\nexit %s\n' "$1"; } >"$T/bin/codex"; chmod +x "$T/bin/codex"
+  { printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\ncat <<'"'"'CODEX_SHIM_EOF_7f3a'"'"'\n'; printf '%s\n' "$2"; printf 'CODEX_SHIM_EOF_7f3a\nexit %s\n' "$1"; } >"$T/bin/codex"; chmod +x "$T/bin/codex"
 }
 run() { ( cd "$REPO" && bash "$S/run_reviewers.sh" --base master --out "$1" --reviewers codex >"$1.log" 2>&1 ); }
 
@@ -67,6 +67,16 @@ run "$T/o4"
 assert_eq "real review quoting the phrases stays rc 0"   "$(jq -r .exit_code "$T/o4/codex.meta.json")" "0"
 assert_eq "…and is not stamped quota_exhausted"          "$(jq -r '.failure_kind == "quota_exhausted"' "$T/o4/codex.meta.json")" "false"
 [[ ! -f "$T/o4/codex.quota_exhausted" ]] && ok "…no sentinel for a real review" || bad "sentinel written for a real review"
+[[ ! -f "$T/o4/codex.fallback.warning" ]] && ok "…and it was never offered the fallback (kimi)" || bad "healthy rc=0 was offered a fallback"
+
+echo "── rc=0 wall UNDER a 600 B startup banner is still a wall (antigravity High, #61 p2) ──"
+banner="$(printf 'OpenAI Codex v0.144.4\n--------\nworkdir: /tmp/x\nmodel: gpt-5.6-sol\nprovider: openai\napproval: never\nsandbox: workspace-write\nreasoning effort: xhigh\n--------\nuser\nchanges against master\n%s\n' "$(printf 'p%.0s' {1..420})")"
+codex_shim 0 "$banner
+ERROR: You've hit your usage limit. Upgrade to Pro or try again at Aug 29th, 2026 1:26 AM."
+run "$T/o5"
+assert_eq "banner+wall rc=0 (>512 B) → quota_exhausted"  "$(jq -r .failure_kind "$T/o5/codex.meta.json")" "quota_exhausted"
+assert_eq "…not an ok lane"                              "$(jq -r '.exit_code != 0' "$T/o5/codex.meta.json")" "true"
+assert_contains "…sentinel carries the ETA"              "$(cat "$T/o5/codex.quota_exhausted" 2>/dev/null)" "1:26 AM"
 
 echo "── an ordinary rc=1 is NOT a quota wall ──"
 codex_shim 1 "error: something unrelated broke"
