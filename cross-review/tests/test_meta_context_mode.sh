@@ -56,6 +56,12 @@ export MOONSHOT_API_KEY="sk-ms-test-shim"
 # both live under $HOME/.cross-review — never touch the real one.
 export HOME="$T/home"
 mkdir -p "$HOME"
+# The tool loop (feat/cross-review-tool-loop) arms text-only seats with
+# read/check tools under its default "auto" policy, which makes their
+# context_access tool_read/tool_check instead of file_context/diff_only.
+# Cases (a)-(f) pin the PASTE contract, so the loop is held off here; case
+# (g) below covers the armed shape on its own.
+export CROSS_REVIEW_TOOL_MODE=off
 
 # ── temp git repo with a one-file diff as the review target ────────────────
 REPO="$T/repo"; mkdir -p "$REPO"; cd "$REPO"
@@ -137,7 +143,11 @@ echo "── (e) additive only: every pre-existing meta key survives, plus conte
 # feat/cr-meta-context-mode base commit). Any key missing here is a
 # regression; context_mode must be the only addition.
 CODEX_KEYS_BEFORE='["attempt","context_access","duration_s","exit_code","failure_kind","output_bytes","timed_out","timeout_budget_s","wall_over_budget"]'
-OR_KEYS_BEFORE='["attempt","cli","context_access","context_files","context_files_omitted","cost_usd","duration_s","exit_code","failure_kind","model","output_bytes","timed_out","timeout_budget_s","tokens_completion","tokens_prompt","total_diff_lines","truncated","wall_over_budget"]'
+# OR rows also carry tokens_cached/tokens_cache_write/upstream_provider and
+# tool_policy/tool_stats since feat/cross-review-tool-loop (prompt-caching
+# telemetry + the learned tool arms); those pre-date context_mode on that
+# branch, so they belong in the "before" set.
+OR_KEYS_BEFORE='["attempt","cli","context_access","context_files","context_files_omitted","cost_usd","duration_s","exit_code","failure_kind","model","output_bytes","timed_out","timeout_budget_s","tokens_cache_write","tokens_cached","tokens_completion","tokens_prompt","tool_policy","tool_stats","total_diff_lines","truncated","upstream_provider","wall_over_budget"]'
 KIMI_KEYS_BEFORE='["attempt","context_access","context_files","context_files_omitted","diff_line_cap","duration_s","exit_code","failure_kind","output_bytes","timed_out","timeout_budget_s","total_diff_lines","truncated","wall_over_budget"]'
 AGY_KEYS_BEFORE='["attempt","cli","context_access","duration_s","exit_code","failure_kind","model","model_resolved","output_bytes","quota_resets_in","timed_out","timeout_budget_s","wall_over_budget"]'
 
@@ -183,6 +193,28 @@ assert_eq "no_model_configured + snapshot present -> context_mode files" \
 unset CROSS_REVIEW_PROFILES_FILE
 assert_eq "live reviewer_profiles.json still has glm.model" \
   "$(jq -r '.glm.model != null' "$S/../references/reviewer_profiles.json")" "true"
+
+echo "── (g) tool loop armed (read): glm context_access tool_read -> context_mode tools ──"
+# Same table as append_runlog.sh / leaderboard.sh: a seat that could read
+# files through the loop is a "tools" row, whatever was pasted.
+canned_or_response
+CROSS_REVIEW_TOOL_MODE=read bash "$S/run_reviewers.sh" --base main --out "$T/o9" \
+  --reviewers glm --context-mode files >/dev/null 2>&1 || true
+assert_eq "armed glm context_access == tool_read" \
+  "$(jq -r '.context_access' "$T/o9/glm.meta.json")" "tool_read"
+assert_eq "armed glm context_mode == tools" \
+  "$(jq -r '.context_mode' "$T/o9/glm.meta.json")" "tools"
+rm -f "$T/bin/curl"
+
+echo "── (h) tool loop armed (check): context_access tool_check -> context_mode tools (#155) ──"
+canned_or_response
+CROSS_REVIEW_TOOL_MODE=check CROSS_REVIEW_CHECK_CMD=true bash "$S/run_reviewers.sh" --base main --out "$T/o10" \
+  --reviewers glm --context-mode files >/dev/null 2>&1 || true
+assert_eq "armed glm context_access == tool_check" \
+  "$(jq -r '.context_access' "$T/o10/glm.meta.json")" "tool_check"
+assert_eq "armed glm context_mode == tools" \
+  "$(jq -r '.context_mode' "$T/o10/glm.meta.json")" "tools"
+rm -f "$T/bin/curl"
 
 echo ""
 echo "══ $PASS passed, $FAIL failed ══"

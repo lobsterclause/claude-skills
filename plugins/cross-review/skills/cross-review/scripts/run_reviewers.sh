@@ -53,6 +53,7 @@
 #                    [--timeout-glm <sec>]
 #                    [--snapshot-dir <dir>]
 #                    [--context-mode files|diff]
+#                    [--tool-mode auto|off|read|check]
 #
 # No --reviewers → select_roster.sh chooses the round's roster (codex + kimi
 # baselines, ≥3 total, leaderboard-weighted rotation picks). Explicit
@@ -100,6 +101,25 @@
 # codex (agentic, own diffing) and the agy laps (workspace mounted) are
 # unaffected — they can already read files.
 #
+# --tool-mode auto|off|read|check (default: auto; env CROSS_REVIEW_TOOL_MODE):
+# the wrapper-owned TOOL LOOP for the chat-completions lanes (the OpenRouter
+# pool, kimi27/kimi3, and any first-party lane rescued over OpenRouter) —
+# scripts/lib_tool_loop.sh. `read` gives the seat read_file / search /
+# list_files, executed HERE with path, size and secret guards; `check` adds
+# run_check, which runs the repository's OWN declared verify entrypoint
+# (CROSS_REVIEW_CHECK_CMD → .claude/verify.sh → package.json "verify" →
+# Makefile verify/check) once per round, cached across seats — the model can
+# ask for it, never say what it is. `off` is the pre-2026-08-27 single shot.
+# `auto` asks scripts/tool_policy.sh, which learns the arm PER SEAT from the
+# runlog + finding-events ledgers (UCB over reward = precision proxy +
+# reliability − cost; see its header) — every decision is stamped into
+# meta.json so the next round sees it. A seat's profile `tools.mode` pins
+# it. Tunables (env, profile `_synthesis_rules.tool_policy` supplies the
+# defaults): CROSS_REVIEW_TOOL_MAX_STEPS, CROSS_REVIEW_TOOL_READ_BUDGET_BYTES,
+# CROSS_REVIEW_TOOL_CALL_CAP_BYTES, CROSS_REVIEW_CHECK_TIMEOUT_S,
+# CROSS_REVIEW_TOOL_CONTEXT=files|diff (keep or drop the whole-file paste when
+# tools are on; default files — tools add on top).
+#
 # Writes:
 #   <out>/codex.stdout         — codex review (stderr merged)
 #   <out>/codex.meta.json      — {exit_code, duration_s}
@@ -138,10 +158,17 @@
 #   file_context   — text-only lane, diff + whole changed files (default)
 #   snapshot       — text-only lane, a --snapshot-dir file replaced the diff
 #   diff_only      — text-only lane, the hunk and nothing else
+#   tool_read      — chat lane ran the tool loop with file tools (--tool-mode)
+#   tool_check     — chat lane ran the tool loop with file tools + run_check
 # score_findings.sh --meta-dir reads this to weight convergence by what the
 # agreeing seats could see (issue #70); analyze_runlog/leaderboard can split
 # precision by it. Text-only lanes also carry `context_files` (count
 # embedded) and `context_files_omitted` (count dropped by the byte budget).
+# Chat lanes carry `tool_policy` {mode, basis} (what tool_policy.sh decided
+# and why: override | pinned | learned | default) and `tool_stats` {mode,
+# steps, turns, calls{read_file,search,list_files,run_check,unknown},
+# read_bytes, budget_exhausted, check_ran, check_rc, rf_dropped} — the
+# learner's own input next round, and analyze_runlog's split-by-arm.
 #
 # Exit codes:
 #   0 — at least one reviewer succeeded, OR run was skipped intentionally (empty diff)
@@ -177,6 +204,10 @@ snapshot_dir=""
 # header note. `files` by default; `diff` restores hunk-only prompts.
 context_mode="${CROSS_REVIEW_CONTEXT_MODE:-files}"
 context_budget_bytes="${CROSS_REVIEW_CONTEXT_BUDGET_BYTES:-300000}"
+# Tool arm for the chat lanes — see the --tool-mode note above. Resolved to
+# an exported CROSS_REVIEW_TOOL_MODE so tool_policy.sh (a child process per
+# seat) sees the same override the flag set.
+tool_mode="${CROSS_REVIEW_TOOL_MODE:-auto}"
 # Empty default: resolved after arg parsing. If --reviewers is not passed,
 # select_roster.sh picks the round's roster (codex+kimi baselines + weighted
 # rotation picks); if the selector is missing, fall back to the fixed classic
@@ -244,6 +275,7 @@ while [[ $# -gt 0 ]]; do
     --timeout-glm)        need_val --timeout-glm        "$#"; timeout_glm="$2";        shift 2 ;;
     --snapshot-dir)       need_val --snapshot-dir       "$#"; snapshot_dir="$2";       shift 2 ;;
     --context-mode)       need_val --context-mode       "$#"; context_mode="$2";       shift 2 ;;
+    --tool-mode)          need_val --tool-mode          "$#"; tool_mode="$2";          shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -255,6 +287,10 @@ fi
 case "$context_mode" in
   files|diff) ;;
   *) echo "--context-mode must be 'files' or 'diff' (got '$context_mode')" >&2; exit 2 ;;
+esac
+case "$tool_mode" in
+  auto|off|read|check) export CROSS_REVIEW_TOOL_MODE="$tool_mode" ;;
+  *) echo "--tool-mode must be auto, off, read or check (got '$tool_mode')" >&2; exit 2 ;;
 esac
 case "$context_budget_bytes" in
   ''|*[!0-9]*) echo "CROSS_REVIEW_CONTEXT_BUDGET_BYTES must be a non-negative integer (got '$context_budget_bytes')" >&2; exit 2 ;;
@@ -318,6 +354,27 @@ profile_flag() {
        then (.[$r][$k] | tostring) else $d end' "$profile_file" 2>/dev/null \
     || echo "$dflt"
 }
+
+# Tool-loop tunables: the profile's _synthesis_rules.tool_policy supplies the
+# defaults, the environment overrides per run, lib_tool_loop.sh reads the
+# resolved environment when sourced. One source of truth for the numbers.
+_tp_default() {  # _tp_default <ENV_NAME> <profile-key>
+  [[ -n "${!1:-}" ]] && return 0
+  local v
+  v="$(jq -r --arg k "$2" '((._synthesis_rules // {}).tool_policy // {})[$k] // empty' "$profile_file" 2>/dev/null)"
+  [[ -n "$v" ]] && export "$1=$v"
+  return 0
+}
+_tp_default CROSS_REVIEW_TOOL_MAX_STEPS          max_steps
+_tp_default CROSS_REVIEW_TOOL_MAX_CALLS_PER_TURN max_calls_per_turn
+_tp_default CROSS_REVIEW_TOOL_READ_BUDGET_BYTES  read_budget_bytes
+_tp_default CROSS_REVIEW_TOOL_CALL_CAP_BYTES     call_cap_bytes
+_tp_default CROSS_REVIEW_CHECK_TIMEOUT_S         check_timeout_s
+_tp_default CROSS_REVIEW_TOOL_CONTEXT            tool_context
+# shellcheck source=lib_tool_loop.sh
+source "$(dirname "$0")/lib_tool_loop.sh"
+tool_context="${CROSS_REVIEW_TOOL_CONTEXT:-files}"
+case "$tool_context" in files|diff) ;; *) echo "CROSS_REVIEW_TOOL_CONTEXT must be files|diff (got '$tool_context')" >&2; exit 2 ;; esac
 
 # Resolve every model string from the profile — the single source of truth (see
 # the note at the top of this file). A reviewer whose profile has no `.model`
@@ -492,8 +549,13 @@ if [[ "$context_mode" == "files" ]]; then
     # Defuse BOTH closing tags inside untrusted file content — </file> ends
     # one entry, </files> ends the whole block — same prompt-injection guard
     # as </diff> and </snapshot> (codex + kimi, PR #71 pass 1).
-    _ctx_blob="${_ctx_blob//<\/file>/< \/file>}"
-    _ctx_blob="${_ctx_blob//<\/files>/< \/files>}"
+    # The replacement side is NOT escaped: bash 3.2 (macOS /bin/bash) keeps
+    # a literal backslash from `< \/file>`, rendering `< \/file>` — still
+    # defused, but test_file_context's expectations then depend on which
+    # bash is first on PATH (2 fails on 3.2, green on brew bash 5). Same for
+    # the </diff> and </snapshot> sites below.
+    _ctx_blob="${_ctx_blob//<\/file>/< /file>}"
+    _ctx_blob="${_ctx_blob//<\/files>/< /files>}"
     # $(...) strips the trailing newline the format string adds; write it
     # back with exactly one — no blank line between entries (kimi, pass 2).
     _ctx_entry="$(printf '<file path="%s">\n%s\n</file>' "$_ctx_path_attr" "$_ctx_blob")"$'\n'
@@ -937,7 +999,7 @@ wall_over_budget() {
 # dispatch time instead of inferred later.
 context_mode_json() {
   case "$1" in
-    agent|workspace_read|tool_read) printf '"tools"' ;;
+    agent|workspace_read|tool_read|tool_check) printf '"tools"' ;;
     file_context|snapshot)          printf '"files"' ;;
     *)                               printf '"diff"' ;;
   esac
@@ -1198,7 +1260,7 @@ run_openrouter_reviewer() {
   if [[ "$using_snapshot" == true ]]; then
     # Defuse a literal closing tag inside untrusted snapshot content (same
     # prompt-injection guard as the raw-diff </diff> defuse below).
-    diff_full="${diff_full//<\/snapshot>/< \/snapshot>}"
+    diff_full="${diff_full//<\/snapshot>/< /snapshot>}"
     context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
     context_tag_open="<snapshot>"
     context_tag_close="</snapshot>"
@@ -1206,7 +1268,7 @@ run_openrouter_reviewer() {
   else
     # Defuse a literal </diff> inside untrusted patch content (same
     # prompt-injection guard as run_kimi).
-    diff_full="${diff_full//<\/diff>/< \/diff>}"
+    diff_full="${diff_full//<\/diff>/< /diff>}"
     context_label="Full diff:"
     context_tag_open="<diff>"
     context_tag_close="</diff>"
@@ -1225,6 +1287,42 @@ run_openrouter_reviewer() {
     files_block="$(context_files_block)"
     context_access="file_context"
   fi
+  # Tool arm for this seat (lib_tool_loop.sh / tool_policy.sh — see the
+  # --tool-mode note in the header). Decided per seat, per round, from the
+  # ledgers; the decision and its basis are stamped into meta.json below so
+  # the learner sees its own history next round. A snapshot seat stays
+  # single-shot: the snapshot IS its whole view by contract.
+  local repo_root_tl tool_decision tl_mode="off" tl_basis="snapshot"
+  repo_root_tl="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  if [[ "$using_snapshot" != true ]]; then
+    tool_decision="$(bash "$(dirname "$0")/tool_policy.sh" --reviewer "$slug" --repo-root "$repo_root_tl" 2>>"$out/${slug}.stderr")" || tool_decision=""
+    if [[ -n "$tool_decision" ]] && jq -e . <<<"$tool_decision" >/dev/null 2>&1; then
+      tl_mode="$(jq -r '.mode // "off"' <<<"$tool_decision")"
+      tl_basis="$(jq -r '.basis // "unknown"' <<<"$tool_decision")"
+      local _ms _rb
+      _ms="$(jq -r '.max_steps // empty' <<<"$tool_decision")"; [[ "$_ms" =~ ^[0-9]+$ ]] && TL_MAX_STEPS="$_ms"
+      _rb="$(jq -r '.read_budget_bytes // empty' <<<"$tool_decision")"; [[ "$_rb" =~ ^[0-9]+$ ]] && TL_READ_BUDGET_BYTES="$_rb"
+    else
+      tl_basis="policy_error"
+      echo "$slug: tool_policy.sh failed — running single-shot (off)" >>"$out/${slug}.stderr"
+    fi
+    case "$tl_mode" in off|read|check) ;; *) tl_mode="off"; tl_basis="policy_error" ;; esac
+  fi
+  local tools_intro="You have no file-reading or shell tools."
+  if [[ "$tl_mode" != "off" ]]; then
+    context_access="tool_$tl_mode"
+    if [[ "$tool_context" == "diff" ]]; then
+      # The intro above promised whole files after the diff; they are not
+      # coming. Say so, or the model skips the reads this mode exists for.
+      files_block=""
+      context_intro="Base your review on the diff below. The changed files are NOT pasted — read the surrounding code with your tools before relying on anything outside a hunk."
+    fi
+    tools_intro="You have tools: read_file (a range of any tracked file, post-change), search (git grep -E across the repo) and list_files. Before reporting anything that depends on code outside a hunk — an unhandled case, a missing check, a caller you assume exists, a portability claim — READ the surrounding code or SEARCH for it and cite what you found; if the code already handles it, do not report it. Keep tool use focused: a few targeted reads beat reading every file. Your tool budget is limited; when it runs out, answer with what you have and mark unverified claims as such."
+    if [[ "$tl_mode" == "check" ]]; then
+      tools_intro="$tools_intro You also have run_check, which runs this repository's own verification entrypoint once (cached for the round): call it at most once, only when a finding turns on runtime behaviour (\"this breaks the tests\", \"this fails to compile\"), and report what it actually printed."
+    fi
+    echo "$slug: tool loop on (mode=$tl_mode, basis=$tl_basis, max_steps=$TL_MAX_STEPS, read_budget=${TL_READ_BUDGET_BYTES}B, context=$tool_context)" >&2
+  fi
   local doc_note doc_file_list
   # Uncapped, rename-clean, and source-path-preserving by construction — see
   # doc_narrative_risk's comment for why --name-status, not the capped/
@@ -1232,18 +1330,29 @@ run_openrouter_reviewer() {
   # --name-only (which drops a rename's source path).
   doc_file_list="$(git diff --name-status "$base"...HEAD 2>/dev/null || true)"
   doc_note="$(doc_narrative_note "$doc_file_list")"
+  # PROMPT ORDER IS A CACHE DECISION. Every host that prompt-caches does so
+  # on the exact request prefix, so the stable text goes first and anything
+  # that changes between rounds goes AFTER the diff: the --stat summary
+  # changes with every fix, and with it the truncation/doc notes. Before
+  # 2026-08-28 the summary sat between the instructions and the diff, so the
+  # cacheable prefix was the ~700-token header and nothing else — round 2
+  # of a review re-paid the whole diff on every model (measured: first-turn
+  # cached_tokens 0 on GPT-5.6, 256–800 on Kimi/Grok, across 40 runs).
+  # Now round 2 shares the prefix with round 1 up to the first hunk the
+  # fixes touched. The JSON suffix stays LAST on purpose — it is the output
+  # contract and weaker models follow the most recent instruction.
   local full_prompt
   full_prompt="$review_prompt
 
-You have no file-reading or shell tools. ${context_intro}${truncation_note}${doc_note}
-
-Changed files (diff --stat against $base):
-$diff_summary
+$tools_intro ${context_intro}
 
 $context_label
 $context_tag_open
 $diff_full
 $context_tag_close${files_block}
+
+Changed files (diff --stat against $base):
+$diff_summary${truncation_note}${doc_note}
 
 $json_findings_suffix"
 
@@ -1290,6 +1399,29 @@ $json_findings_suffix"
     rf_args=(--argjson rf '{"type":"json_object"}')
     echo "WARN: $slug: supports_json_object is '$want_json' (expected true/false) — treating as true" >&2
   fi
+  local resp_file="$out/${slug}.response.json"
+  local tl_used=false api_failure_kind=""
+  if [[ "$tl_mode" != "off" ]]; then
+    # ── tool loop (lib_tool_loop.sh) ── multi-turn; the library owns the
+    # request/response files per turn and leaves <slug>.request.json /
+    # <slug>.response.json pointing at the last turn. Usage is summed over
+    # every turn into TL_COST/TL_TOKP/TL_TOKC — the last response alone would
+    # under-bill the seat on the leaderboard.
+    # rf_args is (--argjson rf <value>): the value is index 2, not 1. Reading
+    # index 1 compared the literal name "rf" against "null", never matched,
+    # and shipped response_format to every tool-loop seat — including seed,
+    # whose profile opts out and which OpenRouter 400s on it. The single-shot
+    # branch below was never affected (it passes the array to jq whole).
+    # Found by the PR #99 cross-review round, 2026-08-27.
+    local rf_json='{"type":"json_object"}'
+    [[ "${rf_args[2]:-}" == "null" ]] && rf_json="null"
+    tool_loop_run "$slug" "$model" "$cli" "$endpoint" "$key" "$timeout_budget" \
+      "$prompt_tmp" "$rf_json" "$tl_mode" "$out" "$repo_root_tl"
+    rc=$?
+    tl_used=true
+    api_failure_kind="${TL_FAILURE_KIND:-}"
+    rm -f "$prompt_tmp"
+  else
   if [[ "$cli" == "openrouter" ]]; then
     jq -n --rawfile p "$prompt_tmp" --arg m "$model" "${rf_args[@]}" \
       '{model: $m, messages: [{role: "user", content: $p}], stream: false,
@@ -1302,7 +1434,6 @@ $json_findings_suffix"
   fi
   rm -f "$prompt_tmp"
 
-  local resp_file="$out/${slug}.response.json"
   # The Authorization header reaches curl on STDIN — never argv, never disk.
   #
   # Not argv: that is world-visible via `ps` for the duration of the call, same
@@ -1331,16 +1462,22 @@ $json_findings_suffix"
   # curl exits 28 on --max-time; normalize to 124 so meta.timed_out and the
   # retry policy treat it exactly like a coreutils timeout.
   [[ $rc -eq 28 ]] && rc=124
+  # Same classification as the tool loop (lib_tool_loop.sh
+  # tl_classify_api_error): the learner must not read a billing outage as
+  # the off arm failing either.
+  [[ $rc -ne 0 && $rc -ne 124 ]] && api_failure_kind="transport_error"
   if [[ $rc -eq 0 ]]; then
     local api_error
     api_error="$(jq -r '.error.message // empty' "$resp_file" 2>/dev/null)"
     if [[ -n "$api_error" ]]; then
       echo "$slug: $cli API error: $api_error" >>"$out/${slug}.stderr"
+      api_failure_kind="$(tl_classify_api_error "$resp_file")"
       rc=1
     else
       jq -r '.choices[0].message.content // empty' "$resp_file" >"$out/${slug}.stdout" 2>>"$out/${slug}.stderr" || rc=1
     fi
   fi
+  fi  # tool loop / single shot
   end=$(date +%s)
   local timed_out="false"
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
@@ -1358,6 +1495,8 @@ $json_findings_suffix"
     echo "$slug: output is preamble-only (<512B, no severity or clean-verdict marker) — classifying as failed" >&2
     fk_json='"no_verdict_output"'
     rc=5
+  elif [[ $rc -ne 0 && "$timed_out" == false && -n "$api_failure_kind" ]]; then
+    fk_json="\"$api_failure_kind\""
   fi
   # Cost accounting (fugu lesson, PR #20): usage:{include:true} makes OR
   # return authoritative per-call cost; recording it in meta → runlog lets
@@ -1365,6 +1504,7 @@ $json_findings_suffix"
   # is visible in telemetry instead of only on a billing dashboard. Null
   # (older entries, failed calls, providers that omit usage) degrades to 0.
   local cost_json="null" tokp_json="null" tokc_json="null"
+  local tokcached_json="null" tokcw_json="null" provider_json="null"
   if [[ -s "$resp_file" ]]; then
     # jq type check instead of a permissive bash regex (nemotron, PR #28
     # pass 1): anything non-numeric — strings, objects, corrupt provider
@@ -1373,6 +1513,14 @@ $json_findings_suffix"
     cost_json="$(jq -r '.usage.cost | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
     tokp_json="$(jq -r '.usage.prompt_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
     tokc_json="$(jq -r '.usage.completion_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+    # Prompt-cache hit/write counters (usage.prompt_tokens_details, the
+    # OpenRouter-normalised shape every host reports; absent → null) and the
+    # upstream host that answered. These are what "is caching working" is
+    # measured from — before 2026-08-28 the numbers sat in every response
+    # file and nothing recorded them (analysis had to jq the raw dir by hand).
+    tokcached_json="$(jq -r '.usage.prompt_tokens_details.cached_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+    tokcw_json="$(jq -r '.usage.prompt_tokens_details.cache_write_tokens | if type=="number" then tostring else "null" end' "$resp_file" 2>/dev/null || echo null)"
+    provider_json="$(jq -c '.provider | if type=="string" then . else null end' "$resp_file" 2>/dev/null || echo null)"
     # A response file that is non-empty but holds NO JSON value — the
     # whitespace keepalives a streaming provider sends before curl's 600s
     # timeout fires — makes jq print NOTHING and exit 0, so `|| echo null`
@@ -1380,6 +1528,12 @@ $json_findings_suffix"
     # Every consumer then fails to parse the one sample the leaderboard most
     # needs (a timeout). Observed twice 2026-08-26 (deepseek, nemotron); #74.
     cost_json="${cost_json:-null}"; tokp_json="${tokp_json:-null}"; tokc_json="${tokc_json:-null}"
+    tokcached_json="${tokcached_json:-null}"; tokcw_json="${tokcw_json:-null}"; provider_json="${provider_json:-null}"
+  fi
+  if [[ "$tl_used" == true ]]; then
+    cost_json="${TL_COST:-null}"; tokp_json="${TL_TOKP:-null}"; tokc_json="${TL_TOKC:-null}"
+    tokcached_json="${TL_TOKCACHED:-null}"; tokcw_json="${TL_TOKCW:-null}"
+    provider_json="$(jq -n --arg p "${TL_PROVIDER:-null}" 'if $p == "null" or $p == "" then null else $p end')"
   fi
   # A retried attempt overwrites meta — but attempt 1's spend was real money
   # (a charged response classified degenerate/no-verdict still billed).
@@ -1395,11 +1549,53 @@ $json_findings_suffix"
         cost_json="$(awk -v a="$cost_json" -v b="$prior_cost" 'BEGIN{printf "%.6f", a + b}')"
       fi
     fi
+    # The token counters accumulate the same way, or a retried run's
+    # cache-hit rate is computed from the second prompt alone — which is
+    # exactly the one most likely to have hit the cache attempt 1 wrote
+    # (codex P2, cache-telemetry PR). Integer sums; null + null stays null.
+    local _k _prior _cur
+    for _k in tokens_prompt tokens_completion tokens_cached tokens_cache_write; do
+      _prior="$(jq -r --arg k "$_k" '.[$k] | if type=="number" then tostring else "null" end' "$out/${slug}.meta.json" 2>/dev/null || echo null)"
+      _prior="${_prior:-null}"
+      [[ "$_prior" == "null" ]] && continue
+      case "$_k" in
+        tokens_prompt)      _cur="$tokp_json" ;;
+        tokens_completion)  _cur="$tokc_json" ;;
+        tokens_cached)      _cur="$tokcached_json" ;;
+        tokens_cache_write) _cur="$tokcw_json" ;;
+      esac
+      if [[ "$_cur" == "null" ]]; then _cur="$_prior"; else _cur=$(( ${_cur%%.*} + ${_prior%%.*} )); fi
+      case "$_k" in
+        tokens_prompt)      tokp_json="$_cur" ;;
+        tokens_completion)  tokc_json="$_cur" ;;
+        tokens_cached)      tokcached_json="$_cur" ;;
+        tokens_cache_write) tokcw_json="$_cur" ;;
+      esac
+    done
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "context_mode": %s}\n' \
+  # tool_policy {mode, basis} is what tool_policy.sh decided and why;
+  # tool_stats is what the loop actually did. Both are the learner's input
+  # next round (an "off" run is an explicit off-arm sample, not a gap).
+  local tool_stats_json tool_policy_json
+  tool_policy_json="$(jq -n -c --arg m "$tl_mode" --arg b "$tl_basis" '{mode:$m, basis:$b}')"
+  if [[ "$tl_used" == true ]]; then
+    tool_stats_json="$(jq -n -c --arg m "$tl_mode" --argjson steps "${TL_STEPS:-0}" --argjson turns "${TL_TURNS:-0}" \
+      --argjson calls "$(tl_calls_json)" --argjson rb "${TL_READ_BYTES:-0}" --argjson be "${TL_BUDGET_EXHAUSTED:-false}" \
+      --argjson cr "${TL_CHECK_RAN:-false}" --argjson crc "${TL_CHECK_RC:-null}" --argjson rfd "${TL_RF_DROPPED:-false}" \
+      '{mode:$m, steps:$steps, turns:$turns, calls:$calls, read_bytes:$rb, budget_exhausted:$be, check_ran:$cr, check_rc:$crc, rf_dropped:$rfd}')"
+  else
+    tool_stats_json='{"mode":"off"}'
+  fi
+  # The whole-file paste count only applies when the paste happened: in
+  # CROSS_REVIEW_TOOL_CONTEXT=diff the tool arms drop it.
+  local ctx_n=0 ctx_o=0
+  if [[ "$context_access" == file_context || ( "$tl_mode" != off && "$tool_context" == files && "$context_mode" == files ) ]]; then
+    ctx_n="$context_files_included"; ctx_o="$context_files_omitted"
+  fi
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s, "tokens_cached": %s, "tokens_cache_write": %s, "upstream_provider": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "tool_policy": %s, "tool_stats": %s, "context_mode": %s}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$cli" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" \
-    "$context_access" "$([[ "$context_access" == file_context ]] && echo "$context_files_included" || echo 0)" "$([[ "$context_access" == file_context ]] && echo "$context_files_omitted" || echo 0)" \
-    "$(context_mode_json "$context_access")" >"$out/${slug}.meta.json"
+    "$tokcached_json" "$tokcw_json" "$provider_json" \
+    "$context_access" "$ctx_n" "$ctx_o" "$tool_policy_json" "$tool_stats_json" "$(context_mode_json "$context_access")" >"$out/${slug}.meta.json"
   return "$rc"
 }
 
@@ -1528,7 +1724,7 @@ run_agy_reviewer() {
     diff_full="$(cat "$snapshot_path" 2>/dev/null || true)"
     # Defuse a literal closing tag inside untrusted snapshot content — same
     # guard as run_kimi/run_openrouter_reviewer.
-    diff_full="${diff_full//<\/snapshot>/< \/snapshot>}"
+    diff_full="${diff_full//<\/snapshot>/< /snapshot>}"
     context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
     context_tag_open="<snapshot>"
     context_tag_close="</snapshot>"
@@ -1550,21 +1746,23 @@ run_agy_reviewer() {
     diff_full="$(git diff --unified=50 "$base"...HEAD 2>/dev/null || true)"
     # Defuse a literal </diff> inside untrusted patch content — same guard as
     # run_kimi/run_openrouter_reviewer.
-    diff_full="${diff_full//<\/diff>/< \/diff>}"
+    diff_full="${diff_full//<\/diff>/< /diff>}"
     context_label="Full diff (unified context, against $base):"
     context_tag_open="<diff>"
     context_tag_close="</diff>"
     context_intro="The full diff is included above."
   fi
+  # Stable text first, per-round text after the diff — Gemini's implicit
+  # cache is prefix-based too (same reasoning as run_openrouter_reviewer).
   full_prompt="$review_prompt
-
-Changed files (diff --stat against $base):
-$diff_summary
 
 $context_label
 $context_tag_open
 $diff_full
 $context_tag_close
+
+Changed files (diff --stat against $base):
+$diff_summary
 
 $context_intro HARD CONSTRAINT: you are running headless with no interactive permission prompt, so ANY shell/terminal command you attempt that is not pre-approved is auto-denied and immediately terminates your run with zero output — the whole review is lost. Do NOT run git, jq, printf, echo, or any other shell command, not even to orient yourself or to validate your own output, and do NOT go looking for the repository — it is already mounted in your workspace at $repo_root. If you need broader context (surrounding code, imports, related logic outside the diff hunks), use your file-reading tools (read/view/search-file) only — those are a different permission category and are not gated this way. Do NOT edit, write, or commit any files — this is a read-only review. Return your findings as prose, organized by severity."
 
@@ -1846,7 +2044,7 @@ run_kimi() {
     # Defuse a literal closing tag inside untrusted snapshot content so it
     # can't close the fence early and inject instructions — same guard as
     # the raw-diff </diff> defuse below (prompt-injection "inj").
-    diff_full="${diff_full//<\/snapshot>/< \/snapshot>}"
+    diff_full="${diff_full//<\/snapshot>/< /snapshot>}"
     context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
     context_tag_open="<snapshot>"
     context_tag_close="</snapshot>"
@@ -1854,7 +2052,7 @@ run_kimi() {
   else
     # Defuse a literal </diff> inside untrusted patch content so a malicious
     # diff can't close the fence early and inject instructions.
-    diff_full="${diff_full//<\/diff>/< \/diff>}"
+    diff_full="${diff_full//<\/diff>/< /diff>}"
     context_label="Full diff:"
     context_tag_open="<diff>"
     context_tag_close="</diff>"
@@ -1881,17 +2079,19 @@ run_kimi() {
   doc_file_list="$(git diff --name-status "$base"...HEAD 2>/dev/null || true)"
   doc_note="$(doc_narrative_note "$doc_file_list")"
   local full_prompt
+  # Stable text first, per-round text after the diff — same cache reasoning
+  # as run_openrouter_reviewer's prompt block.
   full_prompt="$review_prompt
 
-Do NOT use any file-reading or shell tools. ${context_intro}${truncation_note}${doc_note}
-
-Changed files (diff --stat against $base):
-$diff_summary
+Do NOT use any file-reading or shell tools. ${context_intro}
 
 $context_label
 $context_tag_open
 $diff_full
 $context_tag_close${files_block}
+
+Changed files (diff --stat against $base):
+$diff_summary${truncation_note}${doc_note}
 
 Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
 

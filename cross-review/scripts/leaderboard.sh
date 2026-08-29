@@ -189,7 +189,7 @@
 # rate/drop-rate table broken down by `.reviewers[$r].context_mode`
 # (diff|files|tools) for any seat with >=5 rows in at least two of those
 # buckets over the window. A row with no context_mode but a context_access
-# is mapped: agent/workspace_read/tool_read -> tools, file_context/snapshot
+# is mapped: agent/workspace_read/tool_read/tool_check -> tools, file_context/snapshot
 # -> files, diff_only -> diff; anything else -> unknown, excluded from the
 # buckets entirely.
 #
@@ -945,7 +945,7 @@ print_context_mode_report() {
       if (rv.context_mode // null) != null then rv.context_mode
       else
         (rv.context_access // null) as $ca
-        | if ($ca == "agent" or $ca == "workspace_read" or $ca == "tool_read") then "tools"
+        | if ($ca == "agent" or $ca == "workspace_read" or $ca == "tool_read" or $ca == "tool_check") then "tools"
           elif ($ca == "file_context" or $ca == "snapshot") then "files"
           elif ($ca == "diff_only") then "diff"
           else "unknown" end

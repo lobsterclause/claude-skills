@@ -3,7 +3,10 @@
   "_pricing_note": "pricing.{prompt_per_m,completion_per_m} (USD per million tokens) is a 2026-08-27 snapshot from public list prices, used by leaderboard.sh (#92) to ESTIMATE cost_usd on rows the provider does not bill for (tokens_prompt/tokens_completion present, no cost_usd). Values pulled from the corresponding seat's `notes` field where a price was already documented there; null where no price was known with reasonable confidence (deepseek, mimo, minimax, kimi27, kimi3 — no confirmed current list price on hand) or where the seat is a CLI lane with no token counts at all (codex, antigravity, gemini-pro, kimi). Refreshing these against the live OpenRouter catalog belongs to validate_or_models.sh, not this field.",
   "_doc": "Per-reviewer behavioral profile. Read by run_reviewers.sh (timeout, retry, model), the SKILL.md synthesis step (severity_priors, synthesis_weight), and analyze_runlog.sh (suggests edits to this file). Tune values here, not in scattered defaults. Edit notes/specialization freely; numeric tuning is best driven by analyze_runlog.sh suggestions over real runs. NOTE: antigravity and gemini-pro are BOTH served by Google's `agy` (Antigravity) CLI as of the 2026-06-18 Gemini-CLI sunset \u2014 the only difference is the --model value. The `model` field here MUST be the exact display-name string `agy models` prints (e.g. \"Gemini 3.1 Pro (High)\"); agy silently falls back to its default (Flash) on an unrecognized model string instead of erroring.",
   "codex": {
-    "or_fallback": { "enabled": true, "model": "openai/gpt-5.6-sol" },
+    "or_fallback": {
+      "enabled": true,
+      "model": "openai/gpt-5.6-sol"
+    },
     "cli_model": "gpt-5.6-sol",
     "timeout_s": 900,
     "provider": "openai",
@@ -21,7 +24,10 @@
     "notes": "Reliable in observed runs (4/4 most rounds). Treat solo P1 as near-certain real. Output sometimes truncates on very long sessions \u2014 surface the truncation in the runlog rather than retrying. timeout_s 300 \u2192 900 on 2026-08-14, per Gabriel: the 300s budget was set on a 'fast-or-fail' read that no longer holds. On a 268-line, 18-file diff codex burned the full 300s producing 224KB of context-gathering log and no review at all \u2014 it is agentic, so it explores the repo before writing anything, and the budget cut it off mid-exploration. A timeout that lands before the reviewer has said one word is not a tuning signal, it is a lost baseline seat."
   },
   "antigravity": {
-    "or_fallback": { "enabled": true, "model": "google/gemini-3.7-flash" },
+    "or_fallback": {
+      "enabled": true,
+      "model": "google/gemini-3.7-flash"
+    },
     "timeout_s": 600,
     "provider": "google",
     "cli": "agy",
@@ -37,10 +43,13 @@
     "synthesis_weight": 0.85,
     "pricing": null,
     "specialization": "architecture, side-effects, cross-file reasoning; agentic file-reading via Google's `agy` CLI on Gemini 3.7 Flash. Fast lap of the Gemini fleet. Rotation-pool member (not a baseline).",
-    "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.7 Flash (High)\"` \u2014 must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones \u2014 weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing \u2014 quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. FALLBACK POLICY REVISED 2026-08-22 (supersedes the 2026-07-01 no-fallback rule): on an ACCOUNT wall (quota/auth/suspension) or an agy panic this lap is re-run over OpenRouter against the same Gemini model, loudly \u2014 see or_fallback above. It is recorded as status \"fallback\", never \"ok\", so the leaderboard still down-weights the sick lane. On any other failure the lap still drops out and rotation covers the gap. MODEL BUMPED 2026-08-22: Gemini 3.5 Flash (High) \u2192 3.7 Flash (High). agy had been listing 3.6 and 3.7 Flash for weeks while this seat stayed pinned to 3.5 \u2014 detection never noticed because detect_reviewers.sh only greps the models list for a 3.1 Pro entry, and the 6h agy_models.txt cache hid the rest. No draw_boost: a Flash point-release is the same seat, not a new identity (contrast deepseek/nemotron in #59, which changed tier and model outright)."
+    "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.7 Flash (High)\"` — must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones — weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing — quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. FALLBACK POLICY REVISED 2026-08-22 (supersedes the 2026-07-01 no-fallback rule): on an ACCOUNT wall (quota/auth/suspension) or an agy panic this lap is re-run over OpenRouter against the same Gemini model, loudly — see or_fallback above. It is recorded as status \"fallback\", never \"ok\", so the leaderboard still down-weights the sick lane. On any other failure the lap still drops out and rotation covers the gap. MODEL BUMPED 2026-08-22: Gemini 3.5 Flash (High) → 3.7 Flash (High). agy had been listing 3.6 and 3.7 Flash for weeks while this seat stayed pinned to 3.5 — detection never noticed because detect_reviewers.sh only greps the models list for a 3.1 Pro entry, and the 6h agy_models.txt cache hid the rest. No draw_boost: a Flash point-release is the same seat, not a new identity (contrast deepseek/nemotron in #59, which changed tier and model outright)."
   },
   "gemini-pro": {
-    "or_fallback": { "enabled": true, "model": "google/gemini-3.1-pro-preview" },
+    "or_fallback": {
+      "enabled": true,
+      "model": "google/gemini-3.1-pro-preview"
+    },
     "timeout_s": 900,
     "provider": "google",
     "cli": "agy",
@@ -56,10 +65,13 @@
     "synthesis_weight": 1.0,
     "pricing": null,
     "specialization": "deep reasoning, multi-step logic, architectural and semantic-drift findings the Flash lap misses. Slower and more expensive than antigravity (Flash). Deep lap of the Gemini fleet. Rotation-pool member (not a baseline).",
-    "notes": "Same `agy` CLI as antigravity, just pinned to `--model \"Gemini 3.1 Pro (High)\"`. Previously routed through the standalone `gemini` CLI (-m gemini-3.1-pro-preview); migrated to agy in the 2026-06-18 sunset since agy now hosts Gemini 3.1 Pro and exposes --model. Pro is a preview tier \u2014 surface model-availability errors to the user, don't auto-retry. NOTE: antigravity + gemini-pro are the SAME provider (Google) \u2014 their agreement is NOT independent the way codex/kimi convergence is; treat Flash+Pro overlap as one provider's vote, not two. Pro triggers agy's SIGSEGV panic (RunCommandHandler nil-deref, agy \u22641.0.15) far more than Flash \u2014 it roams files/commands harder; exit 2 + ~20-45s + empty output = the panic, not your diff. Quota semantics: same as antigravity (check failure_kind). FALLBACK POLICY REVISED 2026-08-22: an ACCOUNT wall or an agy panic re-runs this lap over OpenRouter against the same Pro model (see or_fallback); any other failure still drops the lap. Recorded as status \"fallback\", never \"ok\"."
+    "notes": "Same `agy` CLI as antigravity, just pinned to `--model \"Gemini 3.1 Pro (High)\"`. Previously routed through the standalone `gemini` CLI (-m gemini-3.1-pro-preview); migrated to agy in the 2026-06-18 sunset since agy now hosts Gemini 3.1 Pro and exposes --model. Pro is a preview tier — surface model-availability errors to the user, don't auto-retry. NOTE: antigravity + gemini-pro are the SAME provider (Google) — their agreement is NOT independent the way codex/kimi convergence is; treat Flash+Pro overlap as one provider's vote, not two. Pro triggers agy's SIGSEGV panic (RunCommandHandler nil-deref, agy ≤1.0.15) far more than Flash — it roams files/commands harder; exit 2 + ~20-45s + empty output = the panic, not your diff. Quota semantics: same as antigravity (check failure_kind). FALLBACK POLICY REVISED 2026-08-22: an ACCOUNT wall or an agy panic re-runs this lap over OpenRouter against the same Pro model (see or_fallback); any other failure still drops the lap. Recorded as status \"fallback\", never \"ok\"."
   },
   "kimi": {
-    "or_fallback": { "enabled": true, "model": "moonshotai/kimi-k2.7-code" },
+    "or_fallback": {
+      "enabled": true,
+      "model": "moonshotai/kimi-k2.7-code"
+    },
     "cli_model_alias": "kimi-k27-code",
     "timeout_s": 600,
     "provider": "moonshot",
@@ -75,7 +87,7 @@
     "synthesis_weight": 0.85,
     "pricing": null,
     "specialization": "single-turn correctness, race conditions, defensive guards; reasons on the diff as given without tools",
-    "notes": "Strong on the diff-as-given. Frequent Low/nit output is skip-worthy unless convergent. China-origin provider \u2014 surface for security-sensitive repos."
+    "notes": "Strong on the diff-as-given. Frequent Low/nit output is skip-worthy unless convergent. China-origin provider — surface for security-sensitive repos."
   },
   "kimi27": {
     "timeout_s": 600,
@@ -94,10 +106,13 @@
     "draw_boost": 1.0,
     "pricing": null,
     "specialization": "single-turn diff reasoning on Moonshot's code-specialized k2.7; rotation-pool member on the DIRECT Moonshot platform API (same billing rail as the kimi baseline, NOT OpenRouter).",
-    "notes": "BENCHED 2026-08-22 (per Gabriel): removed from select_roster.sh's draw pool, seat definition and history retained. The kimi BASELINE now runs kimi-k2.7-code itself via cli_model_alias \u2014 with file-reading tools, which this diff-only curl seat does not have \u2014 so this became pure redundancy on a provider (Moonshot) that already votes once whether one seat answers or three. Not deleted: 122 references across 17 files, 65 of them test fixtures, on the fail-closed baseline path; benching is one line, reversible, and keeps this seat's leaderboard history readable. Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it would be drawn frequently while earning leaderboard data. Retired to draw_boost 1.0 on 2026-07-12 after reaching 10 sampled runs (score 72, 7/16 findings convergent) \u2014 now competes on the same footing as the rest of the pool. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) \u2014 surface for security-sensitive repos."
+    "notes": "BENCHED 2026-08-22 (per Gabriel): removed from select_roster.sh's draw pool, seat definition and history retained. The kimi BASELINE now runs kimi-k2.7-code itself via cli_model_alias — with file-reading tools, which this diff-only curl seat does not have — so this became pure redundancy on a provider (Moonshot) that already votes once whether one seat answers or three. Not deleted: 122 references across 17 files, 65 of them test fixtures, on the fail-closed baseline path; benching is one line, reversible, and keeps this seat's leaderboard history readable. Kimi k2.7-code via the direct Moonshot platform API (api.moonshot.ai/v1, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-03 per Gabriel with draw_boost 2.5 so it would be drawn frequently while earning leaderboard data. Retired to draw_boost 1.0 on 2026-07-12 after reaching 10 sampled runs (score 72, 7/16 findings convergent) — now competes on the same footing as the rest of the pool. Same provider as the kimi baseline: kimi+kimi27 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) — surface for security-sensitive repos."
   },
   "kimi3": {
-    "or_fallback": { "enabled": true, "model": "moonshotai/kimi-k3" },
+    "or_fallback": {
+      "enabled": true,
+      "model": "moonshotai/kimi-k3"
+    },
     "timeout_s": 950,
     "provider": "moonshot",
     "cli": "moonshot",
@@ -114,7 +129,7 @@
     "draw_boost": 1.0,
     "pricing": null,
     "specialization": "single-turn diff reasoning on Moonshot's flagship Kimi K3 (2.8T MoE, 16/896 experts active, 1M context); rotation-pool member on the DIRECT Moonshot platform API (same billing rail as the kimi baseline and kimi27, NOT OpenRouter).",
-    "notes": "Kimi K3 via the direct Moonshot platform API (api.moonshot.ai/v1, model id `kimi-k3`, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-18 per Gabriel, two days after Moonshot's 2026-07-16 K3 release \u2014 draw_boost was 2.5 while it earned leaderboard data; RETIRED to 1.0 on 2026-08-22 per Gabriel (enough samples), matching the kimi27 precedent. This seat is now drawn at the ordinary unboosted weight. Full open weights weren't out yet at add-time (expected 2026-07-27) \u2014 this seat hits the hosted API, not local weights. Same provider as kimi/kimi27: kimi+kimi27+kimi3 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) \u2014 surface for security-sensitive repos."
+    "notes": "Kimi K3 via the direct Moonshot platform API (api.moonshot.ai/v1, model id `kimi-k3`, key from MOONSHOT_API_KEY or ~/.config/moonshot/key). Added 2026-07-18 per Gabriel, two days after Moonshot's 2026-07-16 K3 release — draw_boost was 2.5 while it earned leaderboard data; RETIRED to 1.0 on 2026-08-22 per Gabriel (enough samples), matching the kimi27 precedent. This seat is now drawn at the ordinary unboosted weight. Full open weights weren't out yet at add-time (expected 2026-07-27) — this seat hits the hosted API, not local weights. Same provider as kimi/kimi27: kimi+kimi27+kimi3 agreement counts as ONE provider vote at synthesis. China-origin provider (Moonshot) — surface for security-sensitive repos."
   },
   "glm": {
     "timeout_s": 900,
@@ -132,7 +147,7 @@
     "synthesis_weight": 0.8,
     "pricing": { "prompt_per_m": 1.40, "completion_per_m": 4.40 },
     "specialization": "single-turn diff reasoning; independent provider vote (Zhipu). Rotation-pool member.",
-    "notes": "GLM 5.3 via the OpenRouter chat-completions API \u2014 no CLI, no agentic tools; the diff is inlined (8000-line cap, same as kimi). Requires an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key); without one the wrapper skips it. Added 2026-07-01; verified live (caught a planted one-line bug as Critical on its first run). Priors start conservative (mirroring kimi); let leaderboard.sh data drive tuning. China-origin provider (Zhipu), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos. MODEL BUMPED 2026-08-22: glm-5.2 \u2192 glm-5.3 (released 2026-08-18, billed for complex software engineering and long-horizon agent tasks). NOTE THE PRICE: $0.97/M in, $3.04/M out \u2192 $1.40/M in, $4.40/M out, a ~45% rise. select_roster.sh divides draw weight by observed avg cost, so the seat self-throttles if 5.3 does not earn the difference. No draw_boost \u2014 point release, same family. MEASURED 2026-08-22 (PR #64): 5.3 is ~10x slower and much pricier per round than 5.2 \u2014 342s and 24,170 completion tokens (23,318 reasoning) for $0.159, against 5.2\u0027s steady 32-36s. One dispatch that round hit the old 600s ceiling and died having received only whitespace keepalives, so timeout_s is raised 600 \u2192 900. 5.3 is NOT broken: it was the only reviewer to produce findings that round (4, all verified real). It is simply a slow, expensive seat now, and select_roster.sh\u0027s cost divisor will throttle it on observed spend."
+    "notes": "GLM 5.3 via the OpenRouter chat-completions API — no CLI, no agentic tools; the diff is inlined (8000-line cap, same as kimi). Requires an OpenRouter key ($OPENROUTER_API_KEY or ~/.config/openrouter/key); without one the wrapper skips it. Added 2026-07-01; verified live (caught a planted one-line bug as Critical on its first run). Priors start conservative (mirroring kimi); let leaderboard.sh data drive tuning. China-origin provider (Zhipu), routed through OpenRouter (US) — surface both for security-sensitive repos. MODEL BUMPED 2026-08-22: glm-5.2 → glm-5.3 (released 2026-08-18, billed for complex software engineering and long-horizon agent tasks). NOTE THE PRICE: $0.97/M in, $3.04/M out → $1.40/M in, $4.40/M out, a ~45% rise. select_roster.sh divides draw weight by observed avg cost, so the seat self-throttles if 5.3 does not earn the difference. No draw_boost — point release, same family. MEASURED 2026-08-22 (PR #64): 5.3 is ~10x slower and much pricier per round than 5.2 — 342s and 24,170 completion tokens (23,318 reasoning) for $0.159, against 5.2's steady 32-36s. One dispatch that round hit the old 600s ceiling and died having received only whitespace keepalives, so timeout_s is raised 600 → 900. 5.3 is NOT broken: it was the only reviewer to produce findings that round (4, all verified real). It is simply a slow, expensive seat now, and select_roster.sh's cost divisor will throttle it on observed spend."
   },
   "deepseek": {
     "timeout_s": 600,
@@ -151,7 +166,7 @@
     "draw_boost": 2.5,
     "pricing": null,
     "specialization": "single-turn diff reasoning, reasoning tier; independent provider vote (DeepSeek). Rotation-pool member. Also the designated OpenRouter substitute for the fact-check pass when agy is down.",
-    "notes": "DeepSeek V4 Pro (0813) via OpenRouter ($0.43/M in, $0.87/M out, 1M ctx). Added 2026-07-01 as V4 Flash; **upgraded to V4 Pro 2026-08-14** because the Flash seat was the worst paid performer on the board (score 52 over 6 runs \u2014 3 findings, 0 convergent, 2 disproven). Pro is ~3x Flash's price and still among the cheapest paid seats; the bet is that the disproven rate was a capability floor, not a prompt problem. Reset expectations: treat pre-2026-08-14 deepseek leaderboard rows as a different model — and because the seat name is the leaderboard key, that reset is not automatic: draw_boost 2.5 was added 2026-08-14 so the score-52 Flash history stops suppressing the new model's chance to earn its own. Retire the boost after ~10 sampled runs, same as seed/grok. China-origin provider (DeepSeek), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
+    "notes": "DeepSeek V4 Pro (0813) via OpenRouter ($0.43/M in, $0.87/M out, 1M ctx). Added 2026-07-01 as V4 Flash; **upgraded to V4 Pro 2026-08-14** because the Flash seat was the worst paid performer on the board (score 52 over 6 runs — 3 findings, 0 convergent, 2 disproven). Pro is ~3x Flash's price and still among the cheapest paid seats; the bet is that the disproven rate was a capability floor, not a prompt problem. Reset expectations: treat pre-2026-08-14 deepseek leaderboard rows as a different model — and because the seat name is the leaderboard key, that reset is not automatic: draw_boost 2.5 was added 2026-08-14 so the score-52 Flash history stops suppressing the new model's chance to earn its own. Retire the boost after ~10 sampled runs, same as seed/grok. China-origin provider (DeepSeek), routed through OpenRouter (US) — surface both for security-sensitive repos."
   },
   "mimo": {
     "timeout_s": 600,
@@ -170,8 +185,8 @@
     "draw_boost": 0.2,
     "pricing": null,
     "specialization": "single-turn diff reasoning; independent provider vote (Xiaomi). Rotation-pool member.",
-    "bench_note": "2026-08-03: benched \u2014 5/8 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
-    "notes": "Xiaomi MiMo v2.5 via OpenRouter. Added 2026-07-01, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (Xiaomi), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos. 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets \u2014 see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data \u2014 re-evaluate after clean rounds."
+    "bench_note": "2026-08-03: benched — 5/8 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
+    "notes": "Xiaomi MiMo v2.5 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Xiaomi), routed through OpenRouter (US) — surface both for security-sensitive repos. 2026-07-03: sampled failures fall in a machine-sleep window (pmset Dark Wake thermal churn; wall clock overran enforced budgets — see wall_over_budget/sleep_suspect telemetry). Record is contaminated; do NOT cut or tune on that data — re-evaluate after clean rounds."
   },
   "minimax": {
     "timeout_s": 600,
@@ -189,7 +204,7 @@
     "synthesis_weight": 0.75,
     "pricing": null,
     "specialization": "single-turn diff reasoning; independent provider vote (MiniMax). Rotation-pool member.",
-    "notes": "MiniMax M3 via OpenRouter. Added 2026-07-01, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (MiniMax), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
+    "notes": "MiniMax M3 via OpenRouter. Added 2026-07-01, rookie — priors conservative until leaderboard data accumulates. China-origin provider (MiniMax), routed through OpenRouter (US) — surface both for security-sensitive repos."
   },
   "qwen": {
     "timeout_s": 600,
@@ -208,8 +223,8 @@
     "draw_boost": 0.2,
     "pricing": { "prompt_per_m": 0.11, "completion_per_m": 0.80 },
     "specialization": "single-turn diff reasoning; independent provider vote (Alibaba). Rotation-pool member.",
-    "bench_note": "2026-08-03: benched \u2014 4/5 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
-    "notes": "Qwen3 Coder Next via OpenRouter ($0.11/M in, $0.80/M out; code-specialized MoE). Added 2026-07-02 filling fugu's seat, rookie \u2014 priors conservative until leaderboard data accumulates. China-origin provider (Alibaba), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
+    "bench_note": "2026-08-03: benched — 4/5 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
+    "notes": "Qwen3 Coder Next via OpenRouter ($0.11/M in, $0.80/M out; code-specialized MoE). Added 2026-07-02 filling fugu's seat, rookie — priors conservative until leaderboard data accumulates. China-origin provider (Alibaba), routed through OpenRouter (US) — surface both for security-sensitive repos."
   },
   "devstral": {
     "timeout_s": 600,
@@ -228,8 +243,8 @@
     "draw_boost": 0.2,
     "pricing": { "prompt_per_m": 0.50, "completion_per_m": 1.50 },
     "specialization": "single-turn diff reasoning; independent provider vote (Mistral). Rotation-pool member.",
-    "bench_note": "2026-08-03: benched \u2014 2/2 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
-    "notes": "Devstral 2 via OpenRouter ($0.40/M in, $2/M out; Mistral's agentic-coding model). Added 2026-07-02, rookie \u2014 priors conservative until leaderboard data accumulates. France-origin provider (Mistral), routed through OpenRouter (US). Repointed 2026-08-03: mistralai/devstral-2512 was delisted from OpenRouter and Mistral has no current Devstral route; this seat exists for lab diversity (France), so it now rides mistral-large-2512, 262k context, $0.50/$1.50 per M."
+    "bench_note": "2026-08-03: benched — 2/2 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs",
+    "notes": "Devstral 2 via OpenRouter ($0.40/M in, $2/M out; Mistral's agentic-coding model). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. France-origin provider (Mistral), routed through OpenRouter (US). Repointed 2026-08-03: mistralai/devstral-2512 was delisted from OpenRouter and Mistral has no current Devstral route; this seat exists for lab diversity (France), so it now rides mistral-large-2512, 262k context, $0.50/$1.50 per M."
   },
   "laguna": {
     "timeout_s": 600,
@@ -248,8 +263,8 @@
     "draw_boost": 0.2,
     "pricing": { "prompt_per_m": 0.09, "completion_per_m": 0.18 },
     "specialization": "single-turn diff reasoning; independent provider vote (Poolside). Rotation-pool member.",
-    "bench_note": "2026-08-03: benched \u2014 3/4 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs. Note: the shard brief that generated this bench also cited a delisted OpenRouter slug (poolside/laguna-m.1, 404s) as a factor, but that was already repointed to laguna-s-2.1 by commit b14ae15 before this change branched \u2014 see the `model`/`notes` fields below, which already reflect the fix. This bench_note therefore rests on the disproven-findings evidence alone.",
-    "notes": "Poolside Laguna M.1 via OpenRouter ($0.20/M in, $0.40/M out; code-only lab; a :free route also exists but paid chosen for rate-limit reliability). Added 2026-07-02, rookie \u2014 priors conservative until leaderboard data accumulates. US-origin provider (Poolside), routed through OpenRouter (US). Repointed 2026-08-03: poolside/laguna-m.1 was delisted from OpenRouter (404 'No endpoints found'); laguna-s-2.1 is the current generation, 1M context, $0.09/$0.18 per M."
+    "bench_note": "2026-08-03: benched — 3/4 findings fact-check-disproven over last 40 runs (runlog); revisit after 10 further sampled runs. Note: the shard brief that generated this bench also cited a delisted OpenRouter slug (poolside/laguna-m.1, 404s) as a factor, but that was already repointed to laguna-s-2.1 by commit b14ae15 before this change branched — see the `model`/`notes` fields below, which already reflect the fix. This bench_note therefore rests on the disproven-findings evidence alone.",
+    "notes": "Poolside Laguna M.1 via OpenRouter ($0.20/M in, $0.40/M out; code-only lab; a :free route also exists but paid chosen for rate-limit reliability). Added 2026-07-02, rookie — priors conservative until leaderboard data accumulates. US-origin provider (Poolside), routed through OpenRouter (US). Repointed 2026-08-03: poolside/laguna-m.1 was delisted from OpenRouter (404 'No endpoints found'); laguna-s-2.1 is the current generation, 1M context, $0.09/$0.18 per M."
   },
   "kat": {
     "timeout_s": 600,
@@ -267,7 +282,7 @@
     "synthesis_weight": 0.75,
     "pricing": { "prompt_per_m": 0.74, "completion_per_m": 2.96 },
     "specialization": "single-turn diff reasoning; independent provider vote (Kuaishou). Rotation-pool member.",
-    "notes": "KAT-Coder-Pro V2.5 via OpenRouter ($0.74/M in, $2.96/M out; Kuaishou's enterprise coding model). Added 2026-07-02 as V2; **bumped to V2.5 2026-08-14** (released 2026-07-10) \u2014 the V2 seat scored 91 with a 2s p50, so this is a version refresh on a healthy seat, not a rescue. Price roughly 2.5x V2's; still mid-pool. Carry the V2 leaderboard history forward, but expect the latency profile to shift. China-origin provider (Kuaishou), routed through OpenRouter (US) \u2014 surface both for security-sensitive repos."
+    "notes": "KAT-Coder-Pro V2.5 via OpenRouter ($0.74/M in, $2.96/M out; Kuaishou's enterprise coding model). Added 2026-07-02 as V2; **bumped to V2.5 2026-08-14** (released 2026-07-10) — the V2 seat scored 91 with a 2s p50, so this is a version refresh on a healthy seat, not a rescue. Price roughly 2.5x V2's; still mid-pool. Carry the V2 leaderboard history forward, but expect the latency profile to shift. China-origin provider (Kuaishou), routed through OpenRouter (US) — surface both for security-sensitive repos."
   },
   "north": {
     "timeout_s": 600,
@@ -324,7 +339,7 @@
     "synthesis_weight": 0.75,
     "pricing": { "prompt_per_m": 1.25, "completion_per_m": 4.25 },
     "specialization": "single-turn diff reasoning; independent provider vote (Meta). Rotation-pool member.",
-    "notes": "Meta Muse Spark 1.2 via OpenRouter ($1.25/M in, $4.25/M out; Meta Superintelligence Labs' first paid model, multimodal/agentic-oriented natively but run here diff-only-no-tools like the rest of the OR pool). Added 2026-07-19 (as 1.1), rookie \u2014 priors conservative until leaderboard data accumulates. US-origin provider (Meta), routed through OpenRouter (US). MODEL BUMPED 2026-08-22: muse-spark-1.1 \u2192 1.2, identical price. DELIBERATELY NOT muse-spark-1.2-contributor: that tier is 12x cheaper ($0.10/$0.20) and a discount that size at an unchanged model is bought with something \u2014 read Meta\u0027s contributor terms before seating it, because this skill ships diffs of private repositories. No draw_boost \u2014 point release, same family."
+    "notes": "Meta Muse Spark 1.2 via OpenRouter ($1.25/M in, $4.25/M out; Meta Superintelligence Labs' first paid model, multimodal/agentic-oriented natively but run here diff-only-no-tools like the rest of the OR pool). Added 2026-07-19 (as 1.1), rookie — priors conservative until leaderboard data accumulates. US-origin provider (Meta), routed through OpenRouter (US). MODEL BUMPED 2026-08-22: muse-spark-1.1 → 1.2, identical price. DELIBERATELY NOT muse-spark-1.2-contributor: that tier is 12x cheaper ($0.10/$0.20) and a discount that size at an unchanged model is bought with something — read Meta's contributor terms before seating it, because this skill ships diffs of private repositories. No draw_boost — point release, same family."
   },
   "seed": {
     "timeout_s": 600,
@@ -344,7 +359,7 @@
     "draw_boost": 2.5,
     "pricing": { "prompt_per_m": 0.50, "completion_per_m": 3.00 },
     "specialization": "single-turn diff reasoning, code-specialized tier; independent provider vote (ByteDance). Rotation-pool member.",
-    "notes": "DEAD FROM DAY ONE UNTIL 2026-08-22: every one of its first 6 dispatches failed rc=1 with 0 bytes. Root cause found by the PR #64 cross-review round \u2014 ByteDance Seed rejects response_format.type=json_object with a 400 InvalidParameter, and the curl lane always sent it. Fixed via supports_json_object:false. Its pre-2026-08-22 leaderboard row is 6 failures that say nothing about the model. ByteDance Seed 2.0 Code via OpenRouter ($0.50/M in, $3.00/M out, 262k ctx; released 2026-08-12). Added 2026-08-14 — ByteDance was unrepresented in the roster, so this is a genuinely new lab vote rather than another sample of an existing family. draw_boost 2.5 while it earns leaderboard data; retire the boost after ~10 sampled runs per the kimi27/kimi3 precedent. Rookie priors — conservative until data accumulates. China-origin provider (ByteDance), routed through OpenRouter (US) — surface both for security-sensitive repos."
+    "notes": "DEAD FROM DAY ONE UNTIL 2026-08-22: every one of its first 6 dispatches failed rc=1 with 0 bytes. Root cause found by the PR #64 cross-review round — ByteDance Seed rejects response_format.type=json_object with a 400 InvalidParameter, and the curl lane always sent it. Fixed via supports_json_object:false. Its pre-2026-08-22 leaderboard row is 6 failures that say nothing about the model. ByteDance Seed 2.0 Code via OpenRouter ($0.50/M in, $3.00/M out, 262k ctx; released 2026-08-12). Added 2026-08-14 — ByteDance was unrepresented in the roster, so this is a genuinely new lab vote rather than another sample of an existing family. draw_boost 2.5 while it earns leaderboard data; retire the boost after ~10 sampled runs per the kimi27/kimi3 precedent. Rookie priors — conservative until data accumulates. China-origin provider (ByteDance), routed through OpenRouter (US) — surface both for security-sensitive repos."
   },
   "grok": {
     "timeout_s": 600,
@@ -382,9 +397,8 @@
     "draw_boost": 2.5,
     "pricing": { "prompt_per_m": 0.30, "completion_per_m": 1.20 },
     "specialization": "single-turn diff reasoning; independent provider vote (Meituan). Rotation-pool member.",
-    "notes": "Meituan LongCat 2.0 via OpenRouter ($0.30/M in, $1.20/M out; sparse MoE, 48B active of 1.6T, 1M ctx). Added 2026-08-22, rookie \u2014 priors conservative until leaderboard data accumulates. Picked off the 2026-08 catalog sweep because its card names repository-level changes and long-horizon coding specifically, and Meituan held no seat, so it is a genuinely new provider vote rather than another draw from a lab already in the pool. FIRST ROUND (PR #64, 2026-08-22) WAS A NO-OP: returned {\"findings\":[]} after 18 completion tokens (8 reasoning) on a 39,401-token prompt, and still billed $0.0118 on the input. Structurally a clean verdict, behaviourally nothing \u2014 the exact shape flagged for minimax on 2026-08-14. Do NOT count a longcat clean verdict as corroboration without checking usage.completion_tokens. One sample; if the next two rounds repeat it, cut the seat rather than paying input cost for silence. draw_boost 2.5 while it earns leaderboard data; retire after ~10 sampled runs. China-origin provider (Meituan), routed through OpenRouter (US) \u2014 surface for security-sensitive repos, same caveat as glm/kimi."
+    "notes": "Meituan LongCat 2.0 via OpenRouter ($0.30/M in, $1.20/M out; sparse MoE, 48B active of 1.6T, 1M ctx). Added 2026-08-22, rookie — priors conservative until leaderboard data accumulates. Picked off the 2026-08 catalog sweep because its card names repository-level changes and long-horizon coding specifically, and Meituan held no seat, so it is a genuinely new provider vote rather than another draw from a lab already in the pool. FIRST ROUND (PR #64, 2026-08-22) WAS A NO-OP: returned {\"findings\":[]} after 18 completion tokens (8 reasoning) on a 39,401-token prompt, and still billed $0.0118 on the input. Structurally a clean verdict, behaviourally nothing — the exact shape flagged for minimax on 2026-08-14. Do NOT count a longcat clean verdict as corroboration without checking usage.completion_tokens. One sample; if the next two rounds repeat it, cut the seat rather than paying input cost for silence. draw_boost 2.5 while it earns leaderboard data; retire after ~10 sampled runs. China-origin provider (Meituan), routed through OpenRouter (US) — surface for security-sensitive repos, same caveat as glm/kimi."
   },
-
   "inkling": {
     "timeout_s": 600,
     "provider": "thinkingmachines",
@@ -402,9 +416,8 @@
     "draw_boost": 2.5,
     "pricing": { "prompt_per_m": 0.95, "completion_per_m": 4.05 },
     "specialization": "single-turn diff reasoning; independent provider vote (Thinking Machines Lab). Rotation-pool member.",
-    "notes": "Thinking Machines Inkling via OpenRouter ($0.95/M in, $4.05/M out; open-weight MoE, 41B active of 975B, 1M ctx). Added 2026-08-22, rookie \u2014 priors conservative until leaderboard data accumulates. Cost is in line with spark and below grok; the fugu precedent (cut 2026-07-02 at $5/$30) is the bar this clears. A `thinkingmachines/inkling:free` route also exists \u2014 NOT used here: it caps context at 262k against the paid route\u0027s 1M, and free OpenRouter routes carry different data-retention terms, which matters because this skill ships private diffs. BILLING CAVEAT, measured live 2026-08-22 on a trivial 20-token prompt: 24 of 32 completion tokens were REASONING tokens, billed as output. Sticker output price is $4.05/M but effective cost per useful token is several times that, and (as first observed) a hand-set max_tokens too low returns finish_reason=length with content:null and no findings at all \u2014 the seat looks broken when it is merely truncated mid-reasoning. NOT a truncation risk as wired, though: run_reviewers.sh sends NO max_tokens on the OpenRouter lane, so the seat uses the provider default \u2014 the null-content mode only reproduces if a caller caps it by hand. FIRST ROUND (PR #64, 2026-08-22): clean, real work (6,896 reasoning of 7,486 completion on a 39k prompt, $0.066), no findings \u2014 a genuine vote. This is the shape of the fugu problem (hidden orchestration tokens billed as output) at a survivable magnitude; watch avg cost per finding on the leaderboard and cut it if it drifts toward fugu territory. draw_boost 2.5 while it earns leaderboard data; retire after ~10 sampled runs. US-origin provider (Thinking Machines Lab), routed through OpenRouter (US)."
+    "notes": "Thinking Machines Inkling via OpenRouter ($0.95/M in, $4.05/M out; open-weight MoE, 41B active of 975B, 1M ctx). Added 2026-08-22, rookie — priors conservative until leaderboard data accumulates. Cost is in line with spark and below grok; the fugu precedent (cut 2026-07-02 at $5/$30) is the bar this clears. A `thinkingmachines/inkling:free` route also exists — NOT used here: it caps context at 262k against the paid route's 1M, and free OpenRouter routes carry different data-retention terms, which matters because this skill ships private diffs. BILLING CAVEAT, measured live 2026-08-22 on a trivial 20-token prompt: 24 of 32 completion tokens were REASONING tokens, billed as output. Sticker output price is $4.05/M but effective cost per useful token is several times that, and (as first observed) a hand-set max_tokens too low returns finish_reason=length with content:null and no findings at all — the seat looks broken when it is merely truncated mid-reasoning. NOT a truncation risk as wired, though: run_reviewers.sh sends NO max_tokens on the OpenRouter lane, so the seat uses the provider default — the null-content mode only reproduces if a caller caps it by hand. FIRST ROUND (PR #64, 2026-08-22): clean, real work (6,896 reasoning of 7,486 completion on a 39k prompt, $0.066), no findings — a genuine vote. This is the shape of the fugu problem (hidden orchestration tokens billed as output) at a survivable magnitude; watch avg cost per finding on the leaderboard and cut it if it drifts toward fugu territory. draw_boost 2.5 while it earns leaderboard data; retire after ~10 sampled runs. US-origin provider (Thinking Machines Lab), routed through OpenRouter (US)."
   },
-
   "_synthesis_rules": {
     "skip_unless_convergent": "Drop a single-reviewer finding at this severity unless another reviewer flagged the same file/area.",
     "trust_if_convergent": "Promote/keep when 2+ reviewers agree; downgrade or verify when solo.",
@@ -412,10 +425,39 @@
     "high_precision": "Solo finding still ranks; treat as near-certain real.",
     "medium_precision": "Solo finding ranks but apply judgment; convergence boosts confidence.",
     "synthesis_weight_use": "Tie-breaker when reviewers disagree on severity. Higher weight wins. Also used by analyze_runlog.sh to compute weighted reliability scores.",
-    "provider_independence": "antigravity and gemini-pro share the Google/Gemini provider \u2014 count their agreement as a single provider vote when judging convergence. True independent convergence means agreement ACROSS providers; each profile carries an explicit `provider` field (openai, google, moonshot, zhipu, deepseek, xiaomi, minimax, sakana, cohere, nvidia). OpenRouter is a ROUTER, not a provider: glm through OpenRouter is the Zhipu vote, nemotron is the NVIDIA vote, etc. With a rotating roster, 3+ distinct-provider agreement is the near-certain tier.",
-    "context_access": "Second independence axis (issue #70). Provider identity is one shared blind spot; INPUT TRUNCATION is another \u2014 two seats that only saw the diff hunk can agree on a claim that needs whole-file knowledge, and that agreement is the same inference from the same partial input, not corroboration. score_findings.sh derives each seat's context_access from its dispatch lane (prompt_style: builtin_review\u2192agent, custom_with_tools\u2192workspace_read, diff_only_no_tools\u2192diff_only) and upgrades it from <run_dir>/raw/<seat>.meta.json (file_context | snapshot, stamped by run_reviewers.sh) when --meta-dir is passed. A finding converges only when provider_votes >= 2 AND the sum of each provider's best context weight reaches convergence_min_capability. Do NOT hand-maintain a context field per seat \u2014 the lane is the source of truth, so it cannot drift from the dispatch code.",
-    "context_access_weights": { "agent": 1.0, "workspace_read": 1.0, "file_context": 1.0, "snapshot": 1.0, "diff_only": 0.5 },
+    "provider_independence": "antigravity and gemini-pro share the Google/Gemini provider — count their agreement as a single provider vote when judging convergence. True independent convergence means agreement ACROSS providers; each profile carries an explicit `provider` field (openai, google, moonshot, zhipu, deepseek, xiaomi, minimax, sakana, cohere, nvidia). OpenRouter is a ROUTER, not a provider: glm through OpenRouter is the Zhipu vote, nemotron is the NVIDIA vote, etc. With a rotating roster, 3+ distinct-provider agreement is the near-certain tier.",
+    "context_access": "Second independence axis (issue #70). Provider identity is one shared blind spot; INPUT TRUNCATION is another — two seats that only saw the diff hunk can agree on a claim that needs whole-file knowledge, and that agreement is the same inference from the same partial input, not corroboration. score_findings.sh derives each seat's context_access from its dispatch lane (prompt_style: builtin_review→agent, custom_with_tools→workspace_read, diff_only_no_tools→diff_only) and upgrades it from <run_dir>/raw/<seat>.meta.json (file_context | snapshot, stamped by run_reviewers.sh) when --meta-dir is passed. A finding converges only when provider_votes >= 2 AND the sum of each provider's best context weight reaches convergence_min_capability. Do NOT hand-maintain a context field per seat — the lane is the source of truth, so it cannot drift from the dispatch code. Since 2026-08-27 the chat lanes may also run the wrapper-owned tool loop: context_access tool_read (file tools) / tool_check (file tools + the repo verify entrypoint), both weight 1.0 — a seat that read the surrounding code or ran the suite is a full capability vote.",
+    "context_access_weights": {
+      "agent": 1.0,
+      "workspace_read": 1.0,
+      "file_context": 1.0,
+      "snapshot": 1.0,
+      "diff_only": 0.5,
+      "tool_read": 1.0,
+      "tool_check": 1.0
+    },
     "convergence_min_capability": 1.5,
-    "rotation": "codex and kimi are fixed baselines (`baseline: true`) \u2014 always on. Everything else is drawn per-round by select_roster.sh, weighted by leaderboard.sh scores (see those scripts for the formula). OpenRouter fallback for first-party reviewers is ENABLED per-seat as of 2026-08-22 (see each seat's or_fallback), superseding the 2026-07-01 no-fallback rule: an account wall re-runs the lap over OpenRouter against the same model and records status \"fallback\", never \"ok\". Any other failure still drops the lap."
+    "rotation": "codex and kimi are fixed baselines (`baseline: true`) — always on. Everything else is drawn per-round by select_roster.sh, weighted by leaderboard.sh scores (see those scripts for the formula). OpenRouter fallback for first-party reviewers is ENABLED per-seat as of 2026-08-22 (see each seat's or_fallback), superseding the 2026-07-01 no-fallback rule: an account wall re-runs the lap over OpenRouter against the same model and records status \"fallback\", never \"ok\". Any other failure still drops the lap.",
+    "tool_policy": {
+      "_doc": "Wrapper-owned tool loop for the chat-completions lanes (lib_tool_loop.sh) and the per-seat arm learner (tool_policy.sh). Arms: off = single shot (pre-2026-08-27), read = read_file/search/list_files executed by the wrapper, check = read + run_check (the repo's OWN verify entrypoint, never a model-chosen command). default_mode applies only to a seat with no chat-lane ledger data; after that the arm is learned per seat by UCB over reward = 0.6*r_q + 0.4*r_ok - cost_lambda*cost_usd (see tool_policy.sh header). A seat-level `tools: {mode, max_steps, read_budget_bytes}` pins that seat and stops learning for it. CROSS_REVIEW_TOOL_MODE=off|read|check overrides every seat for a round (auto = learn).",
+      "default_mode": "read",
+      "arms": [
+        "off",
+        "read",
+        "check"
+      ],
+      "ucb_c": 0.5,
+      "min_samples": 3,
+      "cost_lambda": 2.0,
+      "window": 40,
+      "optimistic_prior": 0.75,
+      "demote_reliability_below": 0.5,
+      "max_steps": 8,
+      "max_calls_per_turn": 6,
+      "read_budget_bytes": 400000,
+      "call_cap_bytes": 40000,
+      "check_timeout_s": 300,
+      "tool_context": "files"
+    }
   }
 }

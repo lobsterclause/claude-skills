@@ -146,7 +146,7 @@ fi
 # string would accept "agent diff_only" as a substring of two adjacent kinds
 # (codex, PR #72 pass 2).
 known_access="$(jq -c --slurpfile profiles "$profiles" -n '
-  ({agent:1, workspace_read:1, file_context:1, snapshot:1, diff_only:1}
+  ({agent:1, workspace_read:1, file_context:1, snapshot:1, diff_only:1, tool_read:1, tool_check:1}
    + (($profiles[0]._synthesis_rules // {}).context_access_weights // {})) | keys')"
 observed_json='{}'
 if [[ -n "$meta_dir" ]]; then
@@ -239,7 +239,7 @@ def access_from_style($ps):
   else "unknown" end;
 
 ($profiles[0]) as $p
-| ({agent: 1.0, workspace_read: 1.0, file_context: 1.0, snapshot: 1.0, diff_only: 0.5}
+| ({agent: 1.0, workspace_read: 1.0, file_context: 1.0, snapshot: 1.0, diff_only: 0.5, tool_read: 1.0, tool_check: 1.0}
    + (($p._synthesis_rules // {}).context_access_weights // {})) as $ctxw
 | ((($p._synthesis_rules // {}).convergence_min_capability // 1.5) | tonumber) as $ctxmin
 | ($p | to_entries | map(select(.value | type == "object" and has("prompt_style")))

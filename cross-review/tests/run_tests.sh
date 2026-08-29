@@ -13,6 +13,13 @@
 # timeout (gtimeout on macOS via brew).
 
 set -uo pipefail
+# The OpenRouter-lane blocks below drive run_reviewers.sh against a single-shot
+# curl shim. Pin the tool arm off so those runs never consult the LIVE ledger
+# (tool_policy.sh reads runlog.jsonl next to the scripts when no fixture is
+# set): a learned `read` decision would send tool calls the shim cannot serve.
+# Bit 2026-08-27 when a learner fix flipped live glm from off to read and the
+# cost-accounting block went red. The tool suites unset this themselves.
+export CROSS_REVIEW_TOOL_MODE=off
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 S="$SKILL_DIR/scripts"
@@ -388,6 +395,10 @@ chmod +x "$T/bin/curl"
 bash "$S/run_reviewers.sh" --base main --out "$T/o7" --reviewers glm >/dev/null 2>&1 || true
 assert_eq "retried run reports summed cost" "$(jq -r '.cost_usd' "$T/o7/glm.meta.json")" "0.030000"
 assert_eq "second attempt recorded" "$(jq -r '.attempt' "$T/o7/glm.meta.json")" "2"
+# token counters accumulate across attempts like cost (codex P2, cache-telemetry PR)
+assert_eq "retried run sums prompt tokens"     "$(jq -r '.tokens_prompt' "$T/o7/glm.meta.json")" "1800"
+assert_eq "retried run sums completion tokens" "$(jq -r '.tokens_completion' "$T/o7/glm.meta.json")" "49"
+assert_eq "retried run keeps cache null when neither attempt reported it" "$(jq -r '.tokens_cached' "$T/o7/glm.meta.json")" "null"
 rm -f "$T/bin/curl" "$T/curl_calls"
 
 # leaderboard: avg_cost_usd aggregates; roster draw halves a $0.50 reviewer
@@ -1241,7 +1252,7 @@ echo "── standalone suites: json-output / score / report-block / digest ─�
 # harness as one assertion per suite so CI stays a single entrypoint.
 # One list, used here AND by the auto-discovery loop near the end of this
 # file, so the two can never drift (kimi, PR #120 review).
-LEGACY_SUITES=(test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan)
+LEGACY_SUITES=(test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan test_tool_loop test_tool_policy)
 for suite in "${LEGACY_SUITES[@]}"; do
   if [[ -f "$SKILL_DIR/tests/$suite.sh" ]]; then
     if bash "$SKILL_DIR/tests/$suite.sh" >"$T/$suite.log" 2>&1; then
