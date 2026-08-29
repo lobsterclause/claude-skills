@@ -104,8 +104,11 @@ assert_eq "the unrescued vacuous lane is reported failed, not ok" \
   "$(grep -c '^codex: failed' "$T/o3.err")" "1"
 assert_eq "the restored meta.json does not say exit_code 0" \
   "$(jq -r '.exit_code != 0' "$T/o3/codex.meta.json" 2>/dev/null)" "true"
+# Since #61 a codex wall is named specifically (quota_exhausted, with the
+# reset ETA in codex.quota_exhausted); the generic vacuous_success label is
+# for rc=0 runs that carry no recognisable wall at all.
 assert_eq "the restored meta.json names the failure" \
-  "$(jq -r '.failure_kind' "$T/o3/codex.meta.json" 2>/dev/null)" "vacuous_success"
+  "$(jq -r '.failure_kind' "$T/o3/codex.meta.json" 2>/dev/null)" "quota_exhausted"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

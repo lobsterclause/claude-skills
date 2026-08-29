@@ -149,6 +149,10 @@
 #                                (~5s in); the concurrent sibling usually burns
 #                                its own doomed call first (2s stagger). No
 #                                fallback — the lap drops out of the round.
+#   <out>/codex.quota_exhausted — sentinel: codex hit its usage cap; carries the
+#                                 reset ETA from the wall message (#61). Spares
+#                                 retries; unlike agy, codex may still be
+#                                 rescued via or_fallback, else it drops out.
 #   <out>/run.meta.json        — overall run metadata (skipped reason, etc.)
 #
 # meta.json extras: agy laps carry `failure_kind` (quota_exhausted | agy_panic |
@@ -795,7 +799,7 @@ maybe_or_fallback() {
       if [[ -f "$out/$name.meta.json" ]] && command -v jq >/dev/null 2>&1; then
         local stamped
         stamped="$(jq --argjson ec "$drop_rc" --arg r "$reason" \
-          '. + {exit_code: $ec, failure_kind: "vacuous_success", fallback: {used: false, reason: $r, warning: "fallback could not run"}}' \
+          '. + {exit_code: $ec, failure_kind: (.failure_kind // "vacuous_success"), fallback: {used: false, reason: $r, warning: "fallback could not run"}}' \
           "$out/$name.meta.json" 2>/dev/null)" && [[ -n "$stamped" ]] && printf '%s\n' "$stamped" >"$out/$name.meta.json" || true
       fi
       echo "$drop_rc"
@@ -1220,6 +1224,15 @@ if [[ -f "$json_suffix_file" ]]; then
   json_findings_suffix="$(cat "$json_suffix_file")"
 fi
 
+# codex_output_has_verdict_marker <file> — true when the transcript carries a
+# review verdict/severity marker (fallback_eligible.sh's vocabulary) once the
+# startup banner's metadata lines are removed. Used by the quota gate above.
+CODEX_VACUOUS_MAX_BYTES=1024
+codex_output_has_verdict_marker() {
+  grep -viE '^(reasoning (effort|summaries)|model|provider|approval|sandbox|workdir|session id):' "$1" 2>/dev/null \
+    | grep -qiE '(^|[^[:alnum:]])(critical|high|medium|low)([^[:alnum:]]|$)|no (significant |material )?(issues?|findings?|problems?|concerns?|regressions?)|looks (good|correct|fine)|lgtm|approved|\[P[0-9]\]|findings?:|reviewed [0-9]|"findings"'
+}
+
 # ── AGENTS.md carrier for the no-deps note (codex lane) ──────────────────────
 # State is script-global so the EXIT/INT/TERM trap can undo it: a signal
 # during the codex run used to leave the note in the user's file for good
@@ -1338,7 +1351,36 @@ run_codex() {
   local bytes
   bytes=$(output_bytes_of "$out/codex.stdout")
   local fk_json="null"
-  if [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/codex.stdout"; then
+  # Quota exhaustion reads as an ordinary rc=1 failure, which is how codex
+  # dropped out of NINE consecutive rounds on 2026-08-14 and seven more on
+  # 08-15 while `detect_reviewers.sh` kept reporting it available (it is on
+  # PATH; it just has no credits). Stamp it so the selector can bench the
+  # seat and the operator sees the reset time instead of a mystery rc=1.
+  # Gated like run_agy_reviewer's quota block: a successful review (rc=0,
+  # >=512B) that merely QUOTES these phrases — this repo's own diffs do —
+  # must never self-classify (glm High + codex M, PR #61 review). A wall is
+  # a failed run or a near-empty one.
+  # rc=0 arm aligned with fallback_eligible.sh: a wall can carry codex's
+  # startup banner (measured 485-564 B), so the cut is CODEX_VACUOUS_MAX_BYTES
+  # (1024, = fallback_eligible's VACUOUS_MAX_BYTES) AND no verdict/severity
+  # marker — a real review is never this short without one (codex + kimi +
+  # antigravity, #61 pass 2). The banner's own `reasoning effort: high` line
+  # is metadata, not a verdict: it is dropped before the marker scan (codex,
+  # #61 pass 3). Vocabulary is fallback_eligible's, `reviewed [0-9]` included.
+  if { [[ $rc -ne 0 ]] || { [[ "$bytes" -lt "$CODEX_VACUOUS_MAX_BYTES" ]] && ! codex_output_has_verdict_marker "$out/codex.stdout"; }; } \
+     && grep -qiE "hit your usage limit|purchase more credits|usage limit reached" "$out/codex.stdout" 2>/dev/null; then
+    local reset_eta
+    reset_eta="$(grep -oiE "try again at [^.]*" "$out/codex.stdout" 2>/dev/null | head -1)"
+    printf '%s\n' "${reset_eta:-reset time not reported}" >"$out/codex.quota_exhausted"
+    echo "codex: usage limit reached — baseline drops out of this round (${reset_eta:-reset time not reported})" >&2
+    fk_json='"quota_exhausted"'
+    # rc=0 wall → 5, never 3: rc=3 is agy's quota signal and
+    # fallback_eligible.sh treats it as agy-only (#113), so a 3 disqualified
+    # codex from its own OpenRouter rescue. 5 keeps the lane a failure even
+    # when no fallback is configured, and stays eligible for the rescue
+    # (glm + codex, PR #61 review).
+    [[ $rc -eq 0 ]] && rc=5
+  elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/codex.stdout"; then
     echo "codex: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
     rc=5
