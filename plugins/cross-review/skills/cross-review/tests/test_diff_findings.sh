@@ -210,8 +210,10 @@ for shape in '{}' '{"findings":null}' '{"findings":{"a":1}}'; do
   printf '%s' "$shape" >"$T/shape.json"
   "$D" --prev "$T/shape.json" --curr "$ROUND2" --format json >/dev/null 2>&1; rc=$?
   assert_eq "shape $shape is rejected, not an empty snapshot" "$rc" "1"
+  "$D" --prev "$ROUND1" --curr "$T/shape.json" --format json >/dev/null 2>&1; rc=$?
+  assert_eq "shape $shape is rejected as --curr too" "$rc" "1"
 done
-printf '{"run_id":"other-1","event":"proposed","finding_id":"f-x","project":"remote:github.com/other/repo"}\n{not json\n' >"$T/foreign.jsonl"
+printf '{"run_id":"other-1","event":"proposed","finding_id":"f-x","project":"remote:github.com/other/repo"}\n{not json\n{"run_id":"","event":"proposed","finding_id":"f-y"}\n' >"$T/foreign.jsonl"
 CROSS_REVIEW_FINDING_EVENTS="$T/foreign.jsonl" "$D" --curr "$ROUND2" --run-id run-2 --project p --format json >/dev/null 2>"$T/foreign.err"; rc=$?
 assert_eq "a ledger with no usable run for our project exits 1" "$rc" "1"
 assert_contains "…and says so" "$(cat "$T/foreign.err")" "no usable run"

@@ -230,7 +230,10 @@ else
   # Distinct run_ids in first-appearance (== chronological, ledger is
   # append-only) order, restricted to our namespace.
   run_ids_ordered="$tmp_dir/run_ids.txt"
-  jq -r '.run_id // empty' "$events_ok" | awk '!seen[$0]++' > "$run_ids_ordered"
+  # Only non-empty string run_ids: an event with run_id:"" wrote a blank line
+  # that made the "no usable run" guard below see a non-empty file (codex,
+  # #85 pass 3).
+  jq -r 'select((.run_id | type) == "string" and .run_id != "") | .run_id' "$events_ok" | awk '!seen[$0]++' > "$run_ids_ordered"
 
   # A ledger with bytes but no usable run in OUR namespace (all malformed,
   # all another project's, or run_id-less) is as empty as a missing one and
