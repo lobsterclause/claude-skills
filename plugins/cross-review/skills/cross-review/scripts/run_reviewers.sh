@@ -142,6 +142,8 @@
 #                                request/response/meta shape as the OR pool,
 #                                different endpoint — see run_openrouter_reviewer)
 #   <out>/agy.quota_exhausted  — sentinel: agy hit the shared Individual quota
+#   <out>/codex.quota_exhausted — sentinel: codex hit its usage cap; carries the
+#                                 reset ETA from the wall message (#61)
 #                                this run (contains the reset ETA). Spares
 #                                retries and any lap that starts AFTER detection
 #                                (~5s in); the concurrent sibling usually burns
@@ -774,7 +776,7 @@ maybe_or_fallback() {
       if [[ -f "$out/$name.meta.json" ]] && command -v jq >/dev/null 2>&1; then
         local stamped
         stamped="$(jq --argjson ec "$drop_rc" --arg r "$reason" \
-          '. + {exit_code: $ec, failure_kind: "vacuous_success", fallback: {used: false, reason: $r, warning: "fallback could not run"}}' \
+          '. + {exit_code: $ec, failure_kind: (.failure_kind // "vacuous_success"), fallback: {used: false, reason: $r, warning: "fallback could not run"}}' \
           "$out/$name.meta.json" 2>/dev/null)" && [[ -n "$stamped" ]] && printf '%s\n' "$stamped" >"$out/$name.meta.json" || true
       fi
       echo "$drop_rc"
@@ -1134,17 +1136,23 @@ run_codex() {
   # 08-15 while `detect_reviewers.sh` kept reporting it available (it is on
   # PATH; it just has no credits). Stamp it so the selector can bench the
   # seat and the operator sees the reset time instead of a mystery rc=1.
-  if grep -qiE "hit your usage limit|purchase more credits|usage limit reached" \
+  # Gated like run_agy_reviewer's quota block: a successful review (rc=0,
+  # >=512B) that merely QUOTES these phrases — this repo's own diffs do —
+  # must never self-classify (glm High + codex M, PR #61 review). A wall is
+  # a failed run or a near-empty one.
+  if { [[ $rc -ne 0 ]] || [[ "$bytes" -lt 512 ]]; } && grep -qiE "hit your usage limit|purchase more credits|usage limit reached" \
        "$out/codex.stdout" 2>/dev/null; then
     local reset_eta
     reset_eta="$(grep -oiE "try again at [^.]*" "$out/codex.stdout" 2>/dev/null | head -1)"
     printf '%s\n' "${reset_eta:-reset time not reported}" >"$out/codex.quota_exhausted"
     echo "codex: usage limit reached — baseline drops out of this round (${reset_eta:-reset time not reported})" >&2
     fk_json='"quota_exhausted"'
-    # No rc remap: rc=3 is agy's quota signal and fallback_eligible.sh treats
-    # it as agy-only (#113), so remapping here silently disqualified codex
-    # from its OpenRouter rescue. A wall printed with rc=0 is left to the
-    # vacuous-success path, which turns it into a failure or a fallback.
+    # rc=0 wall → 5, never 3: rc=3 is agy's quota signal and
+    # fallback_eligible.sh treats it as agy-only (#113), so a 3 disqualified
+    # codex from its own OpenRouter rescue. 5 keeps the lane a failure even
+    # when no fallback is configured, and stays eligible for the rescue
+    # (glm + codex, PR #61 review).
+    [[ $rc -eq 0 ]] && rc=5
   elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/codex.stdout"; then
     echo "codex: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
