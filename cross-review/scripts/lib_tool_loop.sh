@@ -78,12 +78,12 @@ tl_trim_split_utf8() {
   local s="$1" n k=0 b need=0
   n=${#s}
   while (( k < 3 && n - k > 0 )); do
-    b=$(printf '%d' "'${s:$((n - k - 1)):1}")
+    b=$(printf '%d' "'${s:$((n - k - 1)):1}"); (( b < 0 )) && b=$((b + 256))   # bash 3.2 signs high bytes
     (( b >= 128 && b < 192 )) || break
     k=$((k + 1))
   done
   (( n - k > 0 )) || { printf '%s' "$s"; return; }
-  b=$(printf '%d' "'${s:$((n - k - 1)):1}")
+  b=$(printf '%d' "'${s:$((n - k - 1)):1}"); (( b < 0 )) && b=$((b + 256))
   if   (( b >= 240 )); then need=3
   elif (( b >= 224 )); then need=2
   elif (( b >= 192 )); then need=1
@@ -274,7 +274,7 @@ tl_list_files() {
   printf '%s' "$outp"
 }
 
-# tl_run_check <repo_root> <out_dir> [<depth>] — runs (or reuses) the round's single
+# tl_run_check <repo_root> <out_dir> — runs (or reuses) the round's single
 # verify run. Concurrency: lanes are parallel background jobs; the first one
 # to mkdir the lock runs it, the others wait for the result file.
 tl_run_check() {
@@ -292,7 +292,15 @@ tl_run_check() {
     (( _rem < 5 )) && _rem=5
     (( _rem < check_budget )) && { check_budget=$_rem; clamped=true; }
   fi
-  if [[ ! -f "$result" ]]; then
+  # Arbitration is a loop, not a recursion: a lane that lost mkdir waits; if
+  # the holder hands the lock back without a round result (a partial timeout
+  # below), the waiter tries to become the holder itself — as many times as
+  # it takes, bounded. (Depth-counted recursion left every waiter of a
+  # second partial holder with no run of its own — codex P2, #154 pass 3.)
+  local attempt=0
+  while [[ ! -f "$result" ]]; do
+    attempt=$((attempt + 1))
+    if (( attempt > 3 )); then printf 'error: the verify run kept being cut short by other lanes'"'"' budgets — treat runtime claims as unverified'; return; fi
     if mkdir "$lock" 2>/dev/null; then
       local t0 t1 rc=0 timed_out=false
       t0=$(date +%s)
@@ -315,11 +323,13 @@ tl_run_check() {
         # A timeout forced by THIS lane's short remaining budget says nothing
         # about the suite; caching it would deny every later seat a real run
         # (codex P2, #154 pass 2). Keep it lane-private and free the lock.
-        mv "$result.tmp" "$outd/check.result.partial.$$.json"
-        result="$outd/check.result.partial.$$.json"; rmdir "$lock" 2>/dev/null || true
-      else
-        mv "$result.tmp" "$result"
+        # mktemp, not $$: background lanes all share the parent's $$.
+        local mine
+        mine="$(mktemp "$outd/check.result.partial.XXXXXX")" && mv "$result.tmp" "$mine" && result="$mine"
+        rmdir "$lock" 2>/dev/null || true
+        break
       fi
+      mv "$result.tmp" "$result"
     else
       # Wait for the HOLDER's run, bounded by the holder's ceiling and by this
       # lane's own deadline — not by this lane's check_budget, which can be far
@@ -331,14 +341,10 @@ tl_run_check() {
         (( wait_cap < 2 )) && wait_cap=2
       fi
       while [[ ! -f "$result" && -d "$lock" ]] && (( waited < wait_cap )); do sleep 2; waited=$((waited + 2)); done
-      if [[ ! -f "$result" && ! -d "$lock" && "${3:-0}" == "0" ]]; then
-        # The holder gave the lock back without a round result (its partial
-        # timeout above): this lane has budget of its own — run it once.
-        tl_run_check "$root" "$outd" 1; return
-      fi
+      [[ ! -f "$result" && ! -d "$lock" ]] && continue   # holder went partial: try to hold
       [[ -f "$result" ]] || { printf 'error: the verify run started by another reviewer has not finished — treat runtime claims as unverified'; return; }
     fi
-  fi
+  done
   TL_CHECK_RAN=true
   TL_CHECK_RC="$(jq -r '.rc' "$result")"
   jq -r '"verify command: \(.cmd)\nexit code: \(.rc) (\(if .rc == 0 then "PASS" else "FAIL" end))\(if .timed_out then " — TIMED OUT" else "" end)\(if .partial then " after only \(.timeout_s)s — cut short by this lane\u0027s remaining budget, not a verdict on the suite" else "" end)\nduration: \(.duration_s)s\n--- output (tail) ---\n\(.output_tail)"' "$result"

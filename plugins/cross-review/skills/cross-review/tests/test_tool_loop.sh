@@ -287,6 +287,12 @@ if printf '%s' "$UOUT" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then ok "cut b
 UOUT2="$( CROSS_REVIEW_TOOL_CALL_CAP_BYTES=51 bash -c '. "$1/lib_tool_loop.sh"; tl_read_file "$2" u.txt 1 1; printf "\nREAD_BYTES=%s" "$TL_READ_BYTES"' _ "$S" "$UREPO" )"
 assert_contains "odd cap: marker says 51"                   "$UOUT2" "[truncated at 51 bytes]"
 assert_contains "odd cap: split byte dropped → 50 charged"  "$UOUT2" "READ_BYTES=50"
+# Pass 3 (codex P2): bash 3.2's printf %d signs high bytes (0xC3 → -61).
+if [[ -x /bin/bash ]]; then
+  UOUT3="$( CROSS_REVIEW_TOOL_CALL_CAP_BYTES=51 /bin/bash -c '. "$1/lib_tool_loop.sh"; tl_read_file "$2" u.txt 1 1; printf "\nREAD_BYTES=%s" "$TL_READ_BYTES"' _ "$S" "$UREPO" )"
+  assert_contains "odd cap under /bin/bash ($(/bin/bash -c 'echo $BASH_VERSION')): 50 charged" "$UOUT3" "READ_BYTES=50"
+  if printf '%s' "$UOUT3" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then ok "…and the body is valid UTF-8"; else bad "…body invalid UTF-8 under /bin/bash"; fi
+fi
 # Pass 2 (codex P2): a body past the pipe buffer used to be emitted TWICE
 # under pipefail (printf's SIGPIPE tripped the old || fallback).
 ( cd "$UREPO" && python3 -c "print('\n'.join('L%04d ' % i + 'y' * 400 for i in range(400)))" >big.txt && git add -A && git commit -qm big )
@@ -300,7 +306,7 @@ CK="$T/ck"; mkdir -p "$CK"
 _t0=$(date +%s)
 CKT="$( CROSS_REVIEW_CHECK_CMD='sleep 40' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; TL_DEADLINE=$3; tl_run_check "$2" "$4"' _ "$S" "$REPO" "$(( _t0 + 12 ))" "$CK" )"
 _t1=$(date +%s)
-CKR="$(cat "$CK"/check.result.partial.*.json 2>/dev/null)"
+CKR="$(cat "$CK"/check.result.partial.* 2>/dev/null)"
 assert_eq "check timed out under the lane budget" "$(jq -r .timed_out <<<"$CKR")" "true"
 assert_eq "timeout_s clamped to the 5 s floor (12 s left - 10 s margin)" "$(jq -r .timeout_s <<<"$CKR")" "5"
 if (( _t1 - _t0 < 30 )); then ok "returned well before the 40 s command would have"; else bad "returned well before the 40 s command (took $((_t1 - _t0))s)"; fi
@@ -312,6 +318,19 @@ assert_contains "…and the model is told so"               "$CKT" "not a verdic
 CKR2="$( CROSS_REVIEW_CHECK_CMD='echo FULL_RUN' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; tl_run_check "$2" "$3" >/dev/null; cat "$3/check.result.json"' _ "$S" "$REPO" "$CK" )"
 assert_eq "next seat with budget runs the real check"    "$(jq -r .rc <<<"$CKR2")" "0"
 assert_eq "…and that one is cached round-wide"           "$(jq -r .partial <<<"$CKR2")" "false"
+# Pass 3 (codex P2): partial files are unique per lane ($$ is shared by background lanes).
+CKP="$T/ckp"; mkdir -p "$CKP"
+for i in 1 2; do ( CROSS_REVIEW_CHECK_CMD='sleep 40' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; TL_DEADLINE=$(( $(date +%s) + 12 )); tl_run_check "$2" "$3" >/dev/null' _ "$S" "$REPO" "$CKP" ); done
+assert_eq "two sequential partial runs keep two files" "$(ls "$CKP"/check.result.partial.* | wc -l | tr -d ' ')" "2"
+# Pass 3 (codex P2): a waiter whose holder went partial becomes the holder and runs the real check.
+CKA="$T/cka"; mkdir -p "$CKA"
+( CROSS_REVIEW_CHECK_CMD='sleep 7; echo REAL_DONE' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; TL_DEADLINE=$(( $(date +%s) + 12 )); tl_run_check "$2" "$3" >/dev/null' _ "$S" "$REPO" "$CKA" ) &
+sleep 1
+AOUT="$( CROSS_REVIEW_CHECK_CMD='sleep 7; echo REAL_DONE' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; TL_DEADLINE=$(( $(date +%s) + 90 )); tl_run_check "$2" "$3"' _ "$S" "$REPO" "$CKA" )"
+wait
+assert_contains "waiter took over after the holder's partial and ran the real check" "$AOUT" "REAL_DONE"
+assert_contains "…with a full pass"                                                    "$AOUT" "exit code: 0"
+[[ -f "$CKA/check.result.json" ]] && ok "…cached round-wide by the waiter-turned-holder" || bad "no round-wide result after takeover"
 # Pass 2 (kimi High): a waiter with a small budget still waits for the holder's run.
 CKW="$T/ckw"; mkdir -p "$CKW"
 ( CROSS_REVIEW_CHECK_CMD='sleep 4; echo HOLDER_DONE' bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; tl_run_check "$2" "$3" >/dev/null' _ "$S" "$REPO" "$CKW" ) &
