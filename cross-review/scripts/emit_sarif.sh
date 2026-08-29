@@ -95,7 +95,9 @@ jq -S '
       # Only a NEW-side anchor names a line that exists in the reviewed tree;
       # an old-side anchor (a deleted line) would annotate whatever now sits
       # at that number (codex, PR #80 review). Old-side → file-level result.
-      | (($f.anchor.resolved // false) and (($f.anchor.side // "new") == "new")) as $resolved
+      # side must be an explicit "new": a resolved anchor with no side is
+      # legacy/malformed input and must not annotate a head line (codex, #80 p2).
+      | (($f.anchor.resolved // false) and ($f.anchor.side == "new")) as $resolved
       | {
           ruleId: "cross-review-finding",
           level: levelOf($f.severity // ""),

@@ -117,6 +117,18 @@ cat >"$FINDINGS" <<'EOF'
       "factcheck": { "verdict": "keep", "reason": "diff confirms" }
     },
     {
+      "id": "f-nosideanch1",
+      "local_id": "f8",
+      "severity": "Low",
+      "file": "src/h.ts",
+      "line": 5,
+      "claim": "legacy anchor without side",
+      "snippet": "x",
+      "sources": ["kimi"],
+      "anchor": { "resolved": true, "start_line": 5, "end_line": 5 },
+      "factcheck": { "verdict": "keep", "reason": "diff confirms" }
+    },
+    {
       "id": "f-noanchor001",
       "local_id": "f6",
       "severity": "Medium",
@@ -154,7 +166,7 @@ else
   assert_eq "tool.driver.name is set" "$driver_name" "cross-review"
 
   n_results="$(jq '.runs[0].results | length' "$OUT1")"
-  assert_eq "dropped finding excluded -> 6 results remain" "$n_results" "6"
+  assert_eq "dropped finding excluded -> 7 results remain" "$n_results" "7"
 
   # anchor.resolved=true -> region present with right lines
   anchored_region="$(jq -c '.runs[0].results[] | select(.partialFingerprints.crFingerprint == "f-anchored01") | .locations[0].physicalLocation.region' "$OUT1")"
@@ -172,6 +184,8 @@ else
   # anchor.side=old (a deleted line) -> file-level result, no region (codex, PR #80 review)
   oldside_has_region="$(jq -r '.runs[0].results[] | select(.partialFingerprints.crFingerprint == "f-oldside0001") | .locations[0].physicalLocation | has("region")' "$OUT1")"
   assert_eq "old-side anchored finding has NO region key" "$oldside_has_region" "false"
+  noside_has_region="$(jq -r '.runs[0].results[] | select(.partialFingerprints.crFingerprint == "f-nosideanch1") | .locations[0].physicalLocation | has("region")' "$OUT1")"
+  assert_eq "resolved anchor without a side has NO region key (codex, #80 p2)" "$noside_has_region" "false"
 
   # dropped finding is absent entirely
   dropped_present="$(jq '[.runs[0].results[] | select(.partialFingerprints.crFingerprint == "f-dropped001")] | length' "$OUT1")"
