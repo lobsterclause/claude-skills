@@ -1038,6 +1038,82 @@ snapshot_for() {
   return 1
 }
 
+# build_review_background — assembles the short PR/issue/commit-log context
+# block substituted into {{BACKGROUND}} in review_prompt.txt, so reviewers can
+# check the "semantic drift" question (does the change do what it claims?)
+# against something concrete instead of the diff alone (issue #75).
+#
+# Sourcing order:
+#   1. `gh pr view --json title,body` for the current branch, plus the issue
+#      it closes/fixes/resolves if one is linked in the title or body.
+#   2. Fallback: `git log` subjects for <base>..HEAD (the common case for
+#      local-branch runs of this skill, where there is no open PR yet).
+#   3. Fallback: a harmless static sentence — never an empty string.
+#
+# MUST fail open in every failure mode: no `gh` binary, no network, `gh`
+# non-zero, no PR, empty body. A background lookup must never fail a review
+# round, so every gh/git call here is guarded with `|| true` / `2>/dev/null`
+# and this function never propagates a nonzero exit under `set -uo pipefail`.
+#
+# Cap: 4000 bytes (documented here; far below the 100KB argv-truncation guard
+# further down), elided at the last newline before the cap so we never cut
+# mid-sentence.
+build_review_background() {
+  local cap=4000
+  local text=""
+  local gh_timeout=()
+  [[ -n "${TIMEOUT_BIN:-}" ]] && gh_timeout=("$TIMEOUT_BIN" 10)
+
+  if command -v gh >/dev/null 2>&1; then
+    local pr_json title body issue_num issue_json
+    pr_json="$("${gh_timeout[@]}" gh pr view --json title,body 2>/dev/null)" || pr_json=""
+    if [[ -n "$pr_json" ]] && command -v jq >/dev/null 2>&1; then
+      title="$(printf '%s' "$pr_json" | jq -r '.title // ""' 2>/dev/null || true)"
+      body="$(printf '%s' "$pr_json" | jq -r '.body // ""' 2>/dev/null || true)"
+      if [[ -n "$title" || -n "$body" ]]; then
+        text="PR title: $title"$'\n\n'"PR description:"$'\n'"$body"
+        # Best-effort linked-issue lookup: "closes/fixes/resolves #NN" in the
+        # title or body. Never fatal if this finds nothing or gh fails.
+        issue_num="$(printf '%s\n%s' "$title" "$body" \
+          | grep -Eio '(clos|fix|resolv)(e[sd]?|ing)?[[:space:]]+#[0-9]+' \
+          | grep -Eo '[0-9]+' | head -1 || true)"
+        if [[ -n "$issue_num" ]]; then
+          issue_json="$("${gh_timeout[@]}" gh issue view "$issue_num" --json title,body 2>/dev/null)" || issue_json=""
+          if [[ -n "$issue_json" ]]; then
+            local ititle ibody
+            ititle="$(printf '%s' "$issue_json" | jq -r '.title // ""' 2>/dev/null || true)"
+            ibody="$(printf '%s' "$issue_json" | jq -r '.body // ""' 2>/dev/null || true)"
+            if [[ -n "$ititle" || -n "$ibody" ]]; then
+              text="$text"$'\n\n'"Linked issue #$issue_num: $ititle"$'\n'"$ibody"
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  if [[ -z "$text" ]]; then
+    local log
+    log="$(git log --pretty=format:'- %s' "$base"..HEAD 2>/dev/null | head -n 50 || true)"
+    [[ -n "$log" ]] && text="Commit messages on this branch (no PR found):"$'\n'"$log"
+  fi
+
+  [[ -z "$text" ]] && text="No PR, issue, or commit-log context is available for this change."
+
+  # Defuse a literal placeholder in untrusted PR/issue text so it can never
+  # re-open the substitution point (same class of guard as the </diff> defuse
+  # further down in run_kimi).
+  text="${text//\{\{BACKGROUND\}\}/[BACKGROUND]}"
+
+  if [[ "${#text}" -gt "$cap" ]]; then
+    text="${text:0:$cap}"
+    [[ "$text" == *$'\n'* ]] && text="${text%$'\n'*}"
+    text="$text"$'\n'"[... background truncated at ${cap} bytes]"
+  fi
+
+  printf '%s' "$text"
+}
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompt_file="$script_dir/../references/review_prompt.txt"
 
@@ -1063,7 +1139,17 @@ Rank findings as Critical / High / Medium / Low. Skip pure style nits."
 
 if [[ -f "$prompt_file" ]]; then
   review_prompt="$(cat "$prompt_file")"
+  # bash >= 5.2 enables `patsub_replacement`, under which a bare `&` in a
+  # ${x//pat/rep} replacement expands to the MATCHED text. The background
+  # block is attacker-adjacent free text (a PR title, an issue body): a PR
+  # called "R&D support" would substitute the placeholder back into itself
+  # and ship a literal {{BACKGROUND}} to every reviewer, on bash 5.2 only.
+  # Same defence as the file-context attribute escaping above; harmless
+  # (unknown option) on older bash. Covers {{BASE}} too — a branch name may
+  # legally contain '&'.
+  shopt -u patsub_replacement 2>/dev/null || true
   review_prompt="${review_prompt//\{\{BASE\}\}/$base}"
+  review_prompt="${review_prompt//\{\{BACKGROUND\}\}/$(build_review_background)}"
 else
   review_prompt="$default_prompt"
 fi

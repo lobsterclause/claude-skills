@@ -1,5 +1,7 @@
 You are performing a code review of the changes on the current branch against '{{BASE}}'.
 
+{{BACKGROUND}}
+
 Your goal is to find problems a careful human reviewer would flag before merging. Focus on, in priority order:
 
 1. Correctness bugs — off-by-ones, unhandled null/undefined, race conditions, wrong error handling, swapped arguments, broken edge cases.
