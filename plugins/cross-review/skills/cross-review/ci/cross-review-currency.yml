@@ -421,7 +421,13 @@ jobs:
           persist-credentials: false
 
       # Best-effort: this workflow has no producer of its own, so absence of
-      # the artifact is the expected common case until one exists.
+      # the artifact is the expected common case until one exists. NOTE:
+      # download-artifact@v4 only sees artifacts of THIS workflow run. A
+      # producer in another workflow needs a `workflow_run` trigger here plus
+      # `run-id: ${{ github.event.workflow_run.id }}` and `github-token:` on
+      # this step; without those this step is a no-op by construction
+      # (codex, PR #80 review). The producer must upload the artifact under
+      # the name `cross-review-findings` containing findings.verified.json.
       - name: Fetch findings.verified.json, if a producer uploaded one
         id: fetch
         continue-on-error: true

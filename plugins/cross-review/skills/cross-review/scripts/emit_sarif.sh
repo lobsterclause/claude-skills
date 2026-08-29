@@ -22,6 +22,8 @@
 # Mapping:
 #   - anchor.resolved == true  -> physicalLocation.region from
 #     anchor.start_line/anchor.end_line.
+#   - anchor.resolved == true but anchor.side == "old" (a deleted line) ->
+#     file-level result too: the line number belongs to the base, not the head.
 #   - anchor.resolved != true, or the "anchor" key is absent entirely -> a
 #     file-level result: an artifactLocation with NO region key. Never a
 #     guessed line.
@@ -90,7 +92,10 @@ jq -S '
   | sort_by(.id)
   | map(
       . as $f
-      | ($f.anchor.resolved // false) as $resolved
+      # Only a NEW-side anchor names a line that exists in the reviewed tree;
+      # an old-side anchor (a deleted line) would annotate whatever now sits
+      # at that number (codex, PR #80 review). Old-side → file-level result.
+      | (($f.anchor.resolved // false) and (($f.anchor.side // "new") == "new")) as $resolved
       | {
           ruleId: "cross-review-finding",
           level: levelOf($f.severity // ""),

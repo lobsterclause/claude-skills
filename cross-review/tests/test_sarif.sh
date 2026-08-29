@@ -105,6 +105,18 @@ cat >"$FINDINGS" <<'EOF'
       "factcheck": { "verdict": "keep", "reason": "diff confirms" }
     },
     {
+      "id": "f-oldside0001",
+      "local_id": "f7",
+      "severity": "High",
+      "file": "src/g.ts",
+      "line": 30,
+      "claim": "deleted guard",
+      "snippet": "if (!ok) return",
+      "sources": ["codex"],
+      "anchor": { "resolved": true, "start_line": 30, "end_line": 31, "side": "old" },
+      "factcheck": { "verdict": "keep", "reason": "diff confirms" }
+    },
+    {
       "id": "f-noanchor001",
       "local_id": "f6",
       "severity": "Medium",
@@ -142,7 +154,7 @@ else
   assert_eq "tool.driver.name is set" "$driver_name" "cross-review"
 
   n_results="$(jq '.runs[0].results | length' "$OUT1")"
-  assert_eq "dropped finding excluded -> 5 results remain" "$n_results" "5"
+  assert_eq "dropped finding excluded -> 6 results remain" "$n_results" "6"
 
   # anchor.resolved=true -> region present with right lines
   anchored_region="$(jq -c '.runs[0].results[] | select(.partialFingerprints.crFingerprint == "f-anchored01") | .locations[0].physicalLocation.region' "$OUT1")"
@@ -157,6 +169,9 @@ else
   # missing anchor key entirely -> also treated as unresolved (no region)
   noanchor_has_region="$(jq -r '.runs[0].results[] | select(.partialFingerprints.crFingerprint == "f-noanchor001") | (.locations[0].physicalLocation | has("region"))' "$OUT1")"
   assert_eq "finding with no anchor key at all has NO region key" "$noanchor_has_region" "false"
+  # anchor.side=old (a deleted line) -> file-level result, no region (codex, PR #80 review)
+  oldside_has_region="$(jq -r '.runs[0].results[] | select(.partialFingerprints.crFingerprint == "f-oldside0001") | .locations[0].physicalLocation | has("region")' "$OUT1")"
+  assert_eq "old-side anchored finding has NO region key" "$oldside_has_region" "false"
 
   # dropped finding is absent entirely
   dropped_present="$(jq '[.runs[0].results[] | select(.partialFingerprints.crFingerprint == "f-dropped001")] | length' "$OUT1")"
