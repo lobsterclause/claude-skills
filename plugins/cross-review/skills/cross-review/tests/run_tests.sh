@@ -720,7 +720,7 @@ fbclass "control: no fallback object, rc=0 with output → ok" \
 fbclass "control: no fallback object, rc=1 → failed" \
   '{"exit_code":1,"duration_s":2,"timed_out":false,"output_bytes":0}' "failed"
 
-echo "── analyze_runlog.sh knows the `fallback` status it is fed ──"
+echo '── analyze_runlog.sh knows the `fallback` status it is fed ──'
 # [pin: 2026-08-22 — PR #66 taught append_runlog.sh to emit status "fallback"
 # for a first-party lane rescued over OpenRouter, but analyze_runlog.sh bucketed
 # only ok/timed_out/empty/failed/quota. A rescued attempt therefore landed in
@@ -1250,7 +1250,10 @@ printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings
 echo "── standalone suites: json-output / score / report-block / digest ──"
 # Each standalone suite exits 0 all-green, 1 on any failure; fold into this
 # harness as one assertion per suite so CI stays a single entrypoint.
-for suite in test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan test_tool_loop test_tool_policy; do
+# One list, used here AND by the auto-discovery loop near the end of this
+# file, so the two can never drift (kimi, PR #120 review).
+LEGACY_SUITES=(test_json_output test_score_findings test_report_block test_digest test_snapshot test_file_context test_or_timeout_meta test_profiles test_leaderboard_events test_fix_safety test_secret_content_scan test_tool_loop test_tool_policy)
+for suite in "${LEGACY_SUITES[@]}"; do
   if [[ -f "$SKILL_DIR/tests/$suite.sh" ]]; then
     if bash "$SKILL_DIR/tests/$suite.sh" >"$T/$suite.log" 2>&1; then
       ok "$suite suite green ($(grep -oE '[0-9]+ passed' "$T/$suite.log" | tail -1))"
@@ -1276,11 +1279,10 @@ assert_contains "models resolve from reviewer_profiles.json" \
 
 # A profile with no `.model` must skip the reviewer with a named failure_kind
 # rather than POSTing an empty model and reading the 404 as unreliability.
+# The live profile is not mutated: the fixture copy is handed to the script
+# via CROSS_REVIEW_PROFILES_FILE (#136).
 jq 'del(.glm.model)' "$SKILL_DIR/references/reviewer_profiles.json" >"$T/profiles_nomodel.json"
-cp "$SKILL_DIR/references/reviewer_profiles.json" "$T/profiles.bak"
-cp "$T/profiles_nomodel.json" "$SKILL_DIR/references/reviewer_profiles.json"
-OPENROUTER_API_KEY=test-key bash "$S/run_reviewers.sh" --base main --out "$T/o17" --reviewers glm --timeout 60 >/dev/null 2>"$T/o17.err" || true
-cp "$T/profiles.bak" "$SKILL_DIR/references/reviewer_profiles.json"
+CROSS_REVIEW_PROFILES_FILE="$T/profiles_nomodel.json" OPENROUTER_API_KEY=test-key bash "$S/run_reviewers.sh" --base main --out "$T/o17" --reviewers glm --timeout 60 >/dev/null 2>"$T/o17.err" || true
 assert_eq "a reviewer with no profile model stamps no_model_configured" \
   "$(jq -r '.failure_kind' "$T/o17/glm.meta.json" 2>/dev/null)" "no_model_configured"
 assert_contains "the skip names the file to edit" \
@@ -2511,7 +2513,16 @@ fbe() { bash "$FBE" --name "$1" --rc "$2" --out "$FBT" 2>/dev/null; }
 : >"$FBT/kimi.stdout"
 printf 'Error code: 429 - account is suspended due to insufficient balance\n' >"$FBT/kimi.stdout"
 assert_eq "an account wall is eligible"        "$(fbe kimi 75)"  "account_limit"
-assert_eq "a success is never eligible"        "$(fbe kimi 0)"   ""
+
+# The rc=0 case gets its own fixture now, and the reason is worth stating: this
+# assertion used to reuse the wall fixture above, which is a 60-byte account-
+# suspended message. That is now precisely the shape the vacuous-success carve-
+# out treats as eligible, so reusing it would assert the opposite of the intent.
+# What "a success is never eligible" means is that a lane which actually
+# REVIEWED something is never eligible -- so the fixture is a review.
+printf 'Reviewed 3 files. No findings. The 429 retry path in client.ts is correct.\n' >"$FBT/kimiok.stdout"
+: >"$FBT/kimiok.stderr"
+assert_eq "a success is never eligible"        "$(fbe kimiok 0)" ""
 # A timeout must never fall back: the budget was already spent.
 assert_eq "a timeout (124) is never eligible"  "$(fbe kimi 124)" ""
 assert_eq "a SIGKILLed timeout (137) is never eligible" "$(fbe kimi 137)" ""
@@ -2534,6 +2545,73 @@ assert_eq "review prose containing 401/403/429/authentication is NOT eligible" "
 # but a genuine HTTP error still is
 printf 'openrouter API error: HTTP 429 Too Many Requests\n' >"$FBT/grok.stdout"
 assert_eq "a real HTTP 429 is eligible" "$(fbe grok 1)" "rate_limited"
+
+# LATE WALL + VACUOUS SUCCESS -- the two defects that made a genuinely walled
+# codex seat permanently ineligible for the fallback built for it.
+# (kindred-mama-ai #3582, 2026-08-27.)
+#
+# Replayed at real scale rather than in miniature: the whole point is that the
+# message is far enough into the file to fall outside a 4KB head window, so a
+# fixture that fits inside one would pass against the unfixed code.
+_fe_pad() { head -c "$1" /dev/zero | tr '\0' 'x'; }
+
+# (a) The wall is announced at the END of a long transcript.
+{ _fe_pad 120000; printf '\nERROR: You have hit your usage limit. Try again at 6:10 PM.\n'; } >"$FBT/latewall.stderr"
+: >"$FBT/latewall.stdout"
+assert_eq "a wall announced late in a long transcript is eligible" \
+  "$(fbe latewall 1)" "account_limit"
+
+# (b) The same transcript with no wall text stays ineligible -- the tail window
+#     must not become a new way to say yes.
+{ _fe_pad 120000; printf '\nreview complete: no findings\n'; } >"$FBT/latequiet.stderr"
+: >"$FBT/latequiet.stdout"
+assert_eq "a long clean transcript is still NOT eligible" "$(fbe latequiet 1)" ""
+
+# (c) rc=0 with only a banner is a vacuous success, not a success. This is the
+#     shape codex produced five times running while the account was walled:
+#     version, workdir, model, prompt line, then nothing.
+printf 'OpenAI Codex v0.144.4\nworkdir: /tmp/w\nmodel: gpt-5.6-sol\nERROR: You have hit your usage limit.\n' >"$FBT/vac.stdout"
+: >"$FBT/vac.stderr"
+assert_eq "rc=0 with a banner-only output and a wall message is eligible" \
+  "$(fbe vac 0)" "account_limit"
+
+# (d) The rc=0 guard still holds for everything else. A vacuous run with no
+#     wall text is not eligible...
+printf 'OpenAI Codex v0.144.4\nworkdir: /tmp/w\n' >"$FBT/vacquiet.stdout"
+: >"$FBT/vacquiet.stderr"
+assert_eq "rc=0 with a banner-only output and NO wall is NOT eligible" \
+  "$(fbe vacquiet 0)" ""
+
+# (e) ...and neither is a real review that merely discusses one — long OR
+#     short. The size gate separates (c) from the long one; the verdict-marker
+#     check separates it from the short one (a 34-byte "LGTM. Handles HTTP 429
+#     correctly." was eligible before — cross-review of #113).
+printf 'LGTM. Handles HTTP 429 correctly.\n' >"$FBT/shortrev.stdout"
+: >"$FBT/shortrev.stderr"
+assert_eq "rc=0 with a SHORT real review mentioning a status code is NOT eligible" \
+  "$(fbe shortrev 0)" ""
+printf 'Reviewed 2 files. No issues; the usage limit banner is handled.\n' >"$FBT/shortrev2.stdout"
+: >"$FBT/shortrev2.stderr"
+assert_eq "rc=0 with a short 'no issues' review mentioning a usage limit is NOT eligible" \
+  "$(fbe shortrev2 0)" ""
+# ...in every verdict format the prompt asks for: a [P1] line, a severity
+# heading with the status code on the NEXT line, and a "Looks correct".
+printf '[P1] client.ts:12: unhandled HTTP 429 error\n' >"$FBT/shortp1.stdout"; : >"$FBT/shortp1.stderr"
+assert_eq "rc=0 with a short [P1] review mentioning HTTP 429 is NOT eligible" "$(fbe shortp1 0)" ""
+printf '## High\nIn retry.go: status=429 retry loop lacks backoff.\n' >"$FBT/shorthigh.stdout"; : >"$FBT/shorthigh.stderr"
+assert_eq "rc=0 with a short '## High' heading review mentioning status=429 is NOT eligible" "$(fbe shorthigh 0)" ""
+printf 'Looks correct. The 401 Unauthorized branch re-auths once.\n' >"$FBT/shortok.stdout"; : >"$FBT/shortok.stderr"
+assert_eq "rc=0 with a short 'Looks correct' review mentioning 401 Unauthorized is NOT eligible" "$(fbe shortok 0)" ""
+# ...while a vacuous wall whose wording merely CONTAINS a severity word as a
+# substring ("slow down", "allowed", "below") is still rescued.
+printf 'OpenAI Codex v0.144.4\nworkdir: /tmp/w\nERROR: Rate limit reached (HTTP 429). Please slow down; see details below.\n' >"$FBT/vacslow.stdout"; : >"$FBT/vacslow.stderr"
+assert_eq "rc=0 vacuous wall containing 'slow'/'below' is still eligible" "$(fbe vacslow 0)" "rate_limited"
+printf 'OpenAI Codex v0.144.4\nprompt: highlight the allowed paths\nERROR: You have hit your usage limit.\n' >"$FBT/vachigh.stdout"; : >"$FBT/vachigh.stderr"
+assert_eq "rc=0 vacuous wall whose echoed prompt contains 'highlight'/'allowed' is still eligible" "$(fbe vachigh 0)" "account_limit"
+{ _fe_pad 5000; printf '\nthe handler should surface the usage limit to the caller\n'; } >"$FBT/realrev.stdout"
+: >"$FBT/realrev.stderr"
+assert_eq "rc=0 with a REAL review mentioning a usage limit is NOT eligible" \
+  "$(fbe realrev 0)" ""
 
 # TOKEN ANCHORING -- second defect of this class on this matcher. The first
 # rewrite required only that an HTTP-ish prefix and the digits appear on the
@@ -2795,6 +2873,32 @@ for _seat in $WIRE_SEATS; do
 done
 assert_eq "every openrouter seat declares a provider (else it is not an independent vote)" \
   "${WIRE_NOPROV# }" ""
+
+echo "── standalone tests (tests/test_*.sh) ──"
+# Auto-discovers every tests/test_*.sh and runs it, so a new standalone test
+# file is wired into this suite automatically (#103) instead of relying on
+# someone remembering to add it to a static list. audit_roster, plant_mutation,
+# severity_calibration, validate_ledgers, and fingerprint_namespace previously
+# shipped with no caller at all. Suites already asserted individually above
+# (the "for suite in ..." loop, kept for its per-suite pass-count reporting)
+# are skipped here to avoid running them twice. Keyed on exit code, not on
+# each suite's own summary text — the four legacy files print that in
+# slightly different shapes (`PASS=n FAIL=m`, `PASS: n  FAIL: m`).
+for f in "$SKILL_DIR"/tests/test_*.sh; do
+  [[ -f "$f" ]] || continue
+  base="$(basename "$f" .sh)"
+  skip=0
+  for s in "${LEGACY_SUITES[@]}"; do
+    [[ "$base" == "$s" ]] && { skip=1; break; }
+  done
+  [[ "$skip" -eq 1 ]] && continue
+  STANDALONE_LOG="$T/standalone-$base.log"
+  if bash "$f" >"$STANDALONE_LOG" 2>&1; then
+    ok "$(basename "$f") ($(tail -1 "$STANDALONE_LOG"))"
+  else
+    bad "$(basename "$f") — tail: $(tail -3 "$STANDALONE_LOG" | tr '\n' ' ')"
+  fi
+done
 
 echo "── dual-copy identity (repo context only) ──"
 

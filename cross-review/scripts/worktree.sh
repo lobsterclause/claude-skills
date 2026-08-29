@@ -130,7 +130,11 @@ case "$cmd" in
       exit 1
     fi
 
-    ts="$(date +%Y%m%dT%H%M%S)"
+    # UTC, not local (#118): append_runlog.sh's round_wall_s takes "now" on
+    # the UTC clock too, so pairing this started_at with that "now" can't
+    # drift onto two different clocks again (the class of bug #117/#118 both
+    # existed to close).
+    ts="$(date -u +%Y%m%dT%H%M%S)"
     pid="$$"
     # Slugify id so it's filesystem-safe.
     slug="$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
@@ -277,10 +281,55 @@ case "$cmd" in
     # truncate the record into malformed JSON that parses as "no run".
     jsonesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
 
-    json="$(printf '{"worktree": "%s", "run_dir": "%s", "size_files": %d, "size_lines": %d, "base": "%s", "base_sha": "%s", "head_sha": "%s", "ref": "%s", "id": "%s", "repo": "%s", "started_at": "%s", "warn_large_diff": %s, "warn_secrets": %s, "risky_files": "%s"}' \
+    # wrapper_sha / wrapper_dirty / wrapper_branch (#144): what the REVIEWING
+    # INSTALL's own checkout is on, not the target repo's ref. A round
+    # launched from the shared symlinked install (~/.claude/skills/cross-review
+    # -> this repo's cross-review/) reviews with whatever the shared checkout
+    # currently is — on 2026-08-27 a PR review ran on an unpushed branch and
+    # hit a bug master does not have, and nothing recorded which wrapper did
+    # the reviewing. "$(dirname "$0")/.." is the skill dir (the directory
+    # containing scripts/), i.e. this script's OWN repo, resolved from how it
+    # was invoked rather than from any fixed path -- so a fixture skill dir in
+    # the tests, or a relocated install, is picked up correctly either way.
+    # Fails open on everything: a skill dir that isn't a git checkout at all
+    # (e.g. a tarball install) must never abort a review start.
+    skill_git_dir="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)" || skill_git_dir=""
+    wrapper_sha_json="null"
+    wrapper_branch_json="null"
+    wrapper_dirty_json="null"
+    # The skill must be TRACKED by that repository, not merely sit inside one:
+    # a zip-extracted skill under a tracked ~/.dotfiles would otherwise record
+    # the dotfiles' HEAD as the wrapper and read as dirty (cross-review of #148).
+    if [[ -n "$skill_git_dir" ]] && git -C "$skill_git_dir" ls-files --error-unmatch scripts/worktree.sh >/dev/null 2>&1; then
+      _wrapper_sha="$(git -C "$skill_git_dir" rev-parse HEAD 2>/dev/null || true)"
+      if [[ "$_wrapper_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+        wrapper_sha_json="\"$_wrapper_sha\""
+      fi
+      # abbrev-ref prints "HEAD" for a detached checkout -- that is a real,
+      # honest answer (there is no branch), not an error worth suppressing.
+      _wrapper_branch="$(git -C "$skill_git_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      [[ -n "$_wrapper_branch" ]] && wrapper_branch_json="\"$(jsonesc "$_wrapper_branch")\""
+      # Scoped to the skill directory itself (`-- .`), not the whole repo the
+      # skill happens to live in -- an unrelated dirty file elsewhere in a
+      # monorepo checkout must not flag this wrapper as dirty.
+      # `if ... ; then` is one of set -e's exempted contexts, so a git
+      # failure here (permissions, corrupt index) leaves wrapper_dirty_json
+      # at its "null" default instead of aborting the whole `start` under
+      # set -e -- fail-open, matching every other optional field on this line.
+      if _wrapper_status="$(git -C "$skill_git_dir" status --porcelain -- . 2>/dev/null)"; then
+        if [[ -n "$_wrapper_status" ]]; then
+          wrapper_dirty_json="true"
+        else
+          wrapper_dirty_json="false"
+        fi
+      fi
+    fi
+
+    json="$(printf '{"worktree": "%s", "run_dir": "%s", "size_files": %d, "size_lines": %d, "base": "%s", "base_sha": "%s", "head_sha": "%s", "ref": "%s", "id": "%s", "repo": "%s", "started_at": "%s", "warn_large_diff": %s, "warn_secrets": %s, "risky_files": "%s", "wrapper_sha": %s, "wrapper_dirty": %s, "wrapper_branch": %s}' \
       "$(jsonesc "$worktree")" "$(jsonesc "$run_dir")" "$size_files" "$size_lines" \
       "$(jsonesc "$base")" "$base_sha" "$head_sha" "$(jsonesc "$ref")" "$(jsonesc "$id")" \
-      "$origin_slug" "$ts" "$warn_large" "$warn_secrets" "$(jsonesc "$risky_files")")"
+      "$origin_slug" "$ts" "$warn_large" "$warn_secrets" "$(jsonesc "$risky_files")" \
+      "$wrapper_sha_json" "$wrapper_dirty_json" "$wrapper_branch_json")"
 
     # Same bytes to both, so the caller's copy and the on-disk record can never
     # disagree about what was reviewed.

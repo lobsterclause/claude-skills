@@ -318,7 +318,9 @@ fi
 # This matches standard Unix conventions — explicit CLI always wins. The
 # previous order put profile above --timeout, which silently broke
 # `--timeout 30` smoke runs (caught by codex review on PR #10).
-profile_file="$(cd "$(dirname "$0")/.." && pwd)/references/reviewer_profiles.json"
+# CROSS_REVIEW_PROFILES_FILE overrides the location for tests, so a fixture
+# can drop or alter a seat without mutating the live profile in place.
+profile_file="${CROSS_REVIEW_PROFILES_FILE:-$(cd "$(dirname "$0")/.." && pwd)/references/reviewer_profiles.json}"
 profile_get() {
   # Usage: profile_get <reviewer> <key>; prints the string value from the
   # profile, or empty string if jq/file/key absent.
@@ -762,7 +764,23 @@ maybe_or_fallback() {
       [[ -f "$out/$name.primary-failed.$ext" ]] && mv -f "$out/$name.primary-failed.$ext" "$out/$name.$ext"
     done
     echo "WARN: $name: fallback could not run (rc=$frc) — primary failure preserved, lane drops out" >&2
-    echo "$rc"
+    # A vacuous rc=0 that was eligible but could not be rescued must not
+    # read as "ok" — not to the caller, and not in the restored meta.json that
+    # append_runlog.sh scores from: the lane reviewed nothing (cross-review
+    # pass 2 of #113).
+    if [[ "$rc" -eq 0 ]]; then
+      local drop_rc="${frc:-5}"
+      [[ "$drop_rc" -ne 0 ]] || drop_rc=5
+      if [[ -f "$out/$name.meta.json" ]] && command -v jq >/dev/null 2>&1; then
+        local stamped
+        stamped="$(jq --argjson ec "$drop_rc" --arg r "$reason" \
+          '. + {exit_code: $ec, failure_kind: "vacuous_success", fallback: {used: false, reason: $r, warning: "fallback could not run"}}' \
+          "$out/$name.meta.json" 2>/dev/null)" && [[ -n "$stamped" ]] && printf '%s\n' "$stamped" >"$out/$name.meta.json" || true
+      fi
+      echo "$drop_rc"
+    else
+      echo "$rc"
+    fi
     return
   fi
 
@@ -802,9 +820,11 @@ fallback_only() {
   export CROSS_REVIEW_ATTEMPT=1
   "$fn"
   local rc=$?
-  if [[ $rc -ne 0 ]]; then
-    rc="$(maybe_or_fallback "$name" "$rc")"
-  fi
+  # Unconditional: a vacuous rc=0 (banner only, wall in the text) is exactly
+  # what fallback_eligible.sh's rc=0 carve-out exists for, and gating this
+  # call on rc≠0 made that path unreachable in production (cross-review of
+  # #113). maybe_or_fallback echoes rc unchanged when the lane is not eligible.
+  rc="$(maybe_or_fallback "$name" "$rc")"
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
 }
@@ -846,9 +866,8 @@ retry_reviewer() {
     # retry would just consume it again.
     echo "$name: attempt 1 timed out (rc=$rc), not retrying — bump the timeout if this recurs" >&2
   fi
-  if [[ $rc -ne 0 ]]; then
-    rc="$(maybe_or_fallback "$name" "$rc")"
-  fi
+  # Unconditional for the same reason as fallback_only (cross-review of #113).
+  rc="$(maybe_or_fallback "$name" "$rc")"
   unset CROSS_REVIEW_ATTEMPT
   return "$rc"
 }
@@ -971,6 +990,34 @@ wall_over_budget() {
   if [[ "$dur" -gt $(( budget + 60 )) ]]; then echo "true"; else echo "false"; fi
 }
 
+# context_mode_json <context_access> — maps a lane's context_access to the
+# `context_mode` value ("tools" | "files" | "diff") for a JSON meta.json
+# field, quoted and ready for printf %s. MUST agree exactly with
+# append_runlog.sh's enrich_with_context_and_profile fallback derivation
+# (#93) — that function keeps the SAME mapping for older meta.json rows
+# written before this field existed; this is that same table, stamped at
+# dispatch time instead of inferred later.
+context_mode_json() {
+  case "$1" in
+    agent|workspace_read|tool_read) printf '"tools"' ;;
+    file_context|snapshot)          printf '"files"' ;;
+    *)                               printf '"diff"' ;;
+  esac
+}
+
+# intended_context_mode_json <reviewer-slug> — the context_mode a text-only
+# lane WOULD have been given, for meta.json rows written before the prompt is
+# built (the no_model_configured early exit). Same table as context_mode_json,
+# resolved from the inputs instead of the outcome: a snapshot file for the
+# slug wins, then --context-mode files, else diff. Stamping a constant there
+# misreported --context-mode files rounds as "diff" (cross-review of #130).
+intended_context_mode_json() {
+  if snapshot_for "$1" >/dev/null; then printf '"files"'
+  elif [[ "$context_mode" == "files" ]]; then printf '"files"'
+  else printf '"diff"'
+  fi
+}
+
 # snapshot_for <reviewer-slug> — prints the path to that reviewer's
 # repomix-handoff snapshot under $snapshot_dir (checked in .md, .xml, .txt
 # order — first match wins) and returns 0, or returns 1 with nothing printed
@@ -1091,7 +1138,7 @@ run_codex() {
     fk_json='"no_verdict_output"'
     rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "agent"}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "agent", "context_mode": "tools"}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" "$fk_json" "$(wall_over_budget "$((end - start))" "$codex_timeout")" >"$out/codex.meta.json"
   # IMPORTANT: return $rc so the caller's `wait "$pid"` sees the real exit code.
   # Previous version ended with `printf` whose success (exit 0) masked every
@@ -1163,8 +1210,8 @@ run_openrouter_reviewer() {
   # reading a 404 as reviewer unreliability.
   if [[ -z "$model" ]]; then
     echo "$slug: no model configured — add \"model\" to references/reviewer_profiles.json (this script keeps no fallback copy)" >&2
-    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured"}\n' \
-      "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$cli" >"$out/${slug}.meta.json"
+    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured", "context_mode": %s}\n' \
+      "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$cli" "$(intended_context_mode_json "$slug")" >"$out/${slug}.meta.json"
     return 2
   fi
   local key
@@ -1540,10 +1587,10 @@ $json_findings_suffix"
   if [[ "$context_access" == file_context || ( "$tl_mode" != off && "$tool_context" == files && "$context_mode" == files ) ]]; then
     ctx_n="$context_files_included"; ctx_o="$context_files_omitted"
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s, "tokens_cached": %s, "tokens_cache_write": %s, "upstream_provider": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "tool_policy": %s, "tool_stats": %s}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s, "tokens_cached": %s, "tokens_cache_write": %s, "upstream_provider": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "tool_policy": %s, "tool_stats": %s, "context_mode": %s}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$cli" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" \
     "$tokcached_json" "$tokcw_json" "$provider_json" \
-    "$context_access" "$ctx_n" "$ctx_o" "$tool_policy_json" "$tool_stats_json" >"$out/${slug}.meta.json"
+    "$context_access" "$ctx_n" "$ctx_o" "$tool_policy_json" "$tool_stats_json" "$(context_mode_json "$context_access")" >"$out/${slug}.meta.json"
   return "$rc"
 }
 
@@ -1596,7 +1643,7 @@ run_agy_reviewer() {
 
   if [[ -z "$model" ]]; then
     echo "$slug: no model configured — add \"model\" to references/reviewer_profiles.json (this script keeps no fallback copy)" >&2
-    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured"}\n' \
+    printf '{"exit_code": 2, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "", "cli": "%s", "failure_kind": "no_model_configured", "context_mode": "tools"}\n' \
       "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "agy" >"$out/${slug}.meta.json"
     return 2
   fi
@@ -1606,7 +1653,7 @@ run_agy_reviewer() {
   # or an earlier attempt already hit the wall, don't burn another agy call.
   if [[ -f "$out/agy.quota_exhausted" ]]; then
     echo "$slug: agy quota already exhausted this run ($(cat "$out/agy.quota_exhausted" 2>/dev/null)) — skipping agy" >&2
-    printf '{"exit_code": 3, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": "quota_exhausted", "agy_call_skipped": true}\n' \
+    printf '{"exit_code": 3, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": "quota_exhausted", "agy_call_skipped": true, "context_mode": "tools"}\n' \
       "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" >"$out/${slug}.meta.json"
     return 3
   fi
@@ -1876,7 +1923,7 @@ $context_intro HARD CONSTRAINT: you are running headless with no interactive per
   [[ -n "$resolved_model" ]] && rm_json="\"$resolved_model\""
   [[ -n "$failure_kind" ]] && fk_json="\"$failure_kind\""
   [[ -n "$quota_resets_in" ]] && qr_json="\"$quota_resets_in\""
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s, "model_resolved": %s, "context_access": "workspace_read"}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s, "model_resolved": %s, "context_access": "workspace_read", "context_mode": "tools"}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$rm_json" >"$out/${slug}.meta.json"
   cp -f "$out/${slug}.meta.json" "$out/${slug}.attempt${attempt_n}.meta.json" 2>/dev/null || true
   # No fallback: a failed agy lap stays failed (failure_kind says why). Roster
@@ -2099,9 +2146,10 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
     fk_json='"no_verdict_output"'
     rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "context_mode": %s}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_budget" "$fk_json" "$(wall_over_budget "$((end - start))" "$kimi_budget")" \
     "$context_access" "$([[ "$context_access" == file_context ]] && echo "$context_files_included" || echo 0)" "$([[ "$context_access" == file_context ]] && echo "$context_files_omitted" || echo 0)" \
+    "$(context_mode_json "$context_access")" \
     >"$out/kimi.meta.json"
   return "$rc"
 }

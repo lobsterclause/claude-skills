@@ -28,9 +28,9 @@
 #                          (run_id = basename of the run-dir; see worktree.sh)
 #   --fields <json-obj>    optional event-specific payload (JSON object
 #                          string), merged into the entry. Identity fields
-#                          (event/ts/finding_id/run_id) always win if
-#                          --fields tries to set them too — a caller can't
-#                          clobber the join keys.
+#                          (event/ts/finding_id/run_id/schema_version) always
+#                          win if --fields tries to set them too — a caller
+#                          can't clobber the join keys.
 #
 # Exit: 0 ok, 2 usage / bad --fields, 1 io error (jq missing).
 #
@@ -39,6 +39,11 @@
 # callers never set it.
 
 set -uo pipefail
+
+# Ledger schema version stamped on every event this script writes (#96).
+# Readers that don't know about this field treat its absence as 0 — bump this
+# only alongside a documented, additive schema change.
+SCHEMA_VERSION=1
 
 event=""
 finding_id=""
@@ -88,7 +93,8 @@ entry=$(jq -nc \
   --arg ts "$ts" \
   --arg finding_id "$finding_id" \
   --arg run_id "$run_id" \
-  '$fields + {event: $event, ts: $ts, finding_id: $finding_id, run_id: $run_id}')
+  --argjson schema_version "$SCHEMA_VERSION" \
+  '$fields + {event: $event, ts: $ts, finding_id: $finding_id, run_id: $run_id, schema_version: $schema_version}')
 
 # Same flock-with-fallback append pattern as append_runlog.sh (mirrored, not
 # reimplemented): POSIX write() atomicity below PIPE_BUF makes concurrent

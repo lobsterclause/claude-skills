@@ -172,6 +172,86 @@ for _r in "${REVIEWERS[@]}"; do
   reviewer_stats+=("$(analyze_reviewer "$_r")")
 done
 
+# ── round wall-clock, trailer, critical path (#91) ──────────────────────────
+# round_wall_s / trailing_reviewer are additive fields append_runlog.sh may or
+# may not have stamped (they depend on context.json / reviewer meta being
+# present that pass). Entries missing either are simply excluded from these
+# stats, same as legacy pre-Phase-2 entries are excluded from everything else
+# in this script. Sleep-suspect rounds (`wall_over_budget: true` on the
+# entry) are excluded from wall-clock stats, matching the existing
+# sleep_suspect handling for per-reviewer duration stats above.
+# A round is sleep-suspect when any reviewer row carries wall_over_budget --
+# append_runlog.sh never stamps it at the entry top level (antigravity +
+# codex, PR #117 review); a top-level flag is honoured too if one ever lands.
+round_wall_stats=$(printf '%s\n' "$structured" | jq -s '
+  def sleep_suspect: ((.wall_over_budget // false) == true)
+    or ((.reviewers // {}) | to_entries | any(.value.wall_over_budget == true));
+  map(select(.round_wall_s != null and (sleep_suspect | not))) as $clean
+  | (map(select(.round_wall_s != null and sleep_suspect)) | length) as $suspect
+  | ($clean | map(.round_wall_s) | sort) as $durs
+  | ($durs | length) as $dn
+  # percentiles need a sample: below 3 they are just the min/max in disguise
+  | (if $dn < 3 then null else $durs[($dn / 2 | floor)] end) as $p50
+  | (if $dn < 3 then null else $durs[($dn * 0.95 | floor) | (if . >= $dn then $dn - 1 else . end)] end) as $p95
+  | ($clean | map(select(.trailing_reviewer.reviewer != null and .trailing_reviewer.duration_s != null))) as $trailed
+  | (($trailed | map(.trailing_reviewer.duration_s) | add) // 0) as $trail_sum
+  # same denominator population as the numerator (antigravity)
+  | (($trailed | map(.round_wall_s) | add) // 0) as $wall_sum
+  | (if $wall_sum == 0 then null else (($trail_sum * 100) / $wall_sum | floor) end) as $trail_share
+  | ($trailed | reduce .[] as $e ({}; .[$e.trailing_reviewer.reviewer] += 1)) as $crit_path
+  | { n_clean: $dn, sleep_suspect: $suspect,
+      p50_round_wall_s: $p50, p95_round_wall_s: $p95,
+      trailer_share_pct: $trail_share,
+      critical_path: $crit_path }
+')
+
+# ── telemetry completeness (#89) ─────────────────────────────────────────────
+# Computed as a jq filter (not a bash function) so the same program can be run
+# against either the --recent window (report) or a fixed last-10 window
+# (warn's threshold check) without duplicating the logic.
+completeness_filter='
+  length as $n
+  | (map(select(.run_id != null and .run_id != "")) | length) as $run_id_n
+  | (map(select(.roster_decision != null)) | length) as $rd_n
+  | (map(select(((.reviewers // {}) | to_entries | any(.value.findings_total != null))))
+     | length) as $find_n
+  | ([.[] | (.reviewers // {}) | to_entries[] | .value | select(.status != "skipped")]) as $rows
+  | ($rows | length) as $row_n
+  | ($rows | map(select(.model != null)) | length) as $model_n
+  | ($rows | map(select(.cost_usd != null)) | length) as $cost_n
+  | ($rows | map(select(.context_access != null)) | length) as $ctx_n
+  | { n_entries: $n,
+      pct_run_id: (if $n == 0 then null else (($run_id_n * 100) / $n | floor) end),
+      pct_findings: (if $n == 0 then null else (($find_n * 100) / $n | floor) end),
+      pct_roster_decision: (if $n == 0 then null else (($rd_n * 100) / $n | floor) end),
+      n_reviewer_rows: $row_n,
+      pct_model: (if $row_n == 0 then null else (($model_n * 100) / $row_n | floor) end),
+      pct_cost_usd: (if $row_n == 0 then null else (($cost_n * 100) / $row_n | floor) end),
+      pct_context_access: (if $row_n == 0 then null else (($ctx_n * 100) / $row_n | floor) end)
+    }
+'
+completeness=$(printf '%s\n' "$structured" | jq -s "$completeness_filter")
+
+# Fixed last-10 window for the warn threshold, independent of --recent (the
+# issue text pins the threshold to "the last 10", not the report window).
+last10_structured=$(jq -c 'select(.reviewers != null)' "$runlog" 2>/dev/null | tail -n 10)
+completeness10=$(printf '%s\n' "$last10_structured" | jq -s "$completeness_filter")
+
+# roster draw audit (#103, analyze half): shell out to audit_roster.sh with
+# the SAME window and the SAME resolved runlog path this script is already
+# using, rather than letting it re-resolve $CROSS_REVIEW_RUNLOG independently
+# (which would agree today but silently diverge if the two scripts' default
+# precedence ever changes).
+roster_audit_out() {
+  local a="$(dirname "$0")/audit_roster.sh"
+  if [[ -x "$a" ]]; then
+    "$a" --recent "$recent" --runlog "$runlog" 2>&1
+  else
+    # stdout with the WARN prefix so warn mode captures and formats it
+    echo "WARN roster audit unavailable: $a missing or not executable"
+  fi
+}
+
 # Suggest timeout bump if p95 is within 10% of current budget OR timeout rate >20%.
 # Both signals use the sleep-clean sample set: p50/p95 are already clean-only,
 # and clean_timeout_rate excludes sleep-killed timeouts — a round the machine
@@ -245,9 +325,80 @@ emit_warning() {
   '
 }
 
+# ── wrapper audit (#144) ─────────────────────────────────────────────────────
+# Which wrapper checkout -- this SKILL's own repo, as worktree.sh start
+# stamps it and append_runlog.sh copies it onto the entry -- did the
+# reviewing over the window, and was it safe to trust: reachable from
+# origin/master, and clean. A round launched from the shared symlinked
+# install can be sitting on an unpushed branch with a bug master doesn't
+# have; this is the surface that would have caught the 2026-08-27 incident
+# that motivated #144.
+#
+# Never fetches: ancestry is checked against whatever origin/master this
+# skill checkout already has on disk, same discipline the rest of this
+# script follows for git state.
+wrapper_entries=$(printf '%s\n' "$structured" | jq -c 'select((.wrapper_sha | type) == "string" and (.wrapper_sha | test("^[0-9a-f]{40}$|^[0-9a-f]{64}$")))')
+wrapper_n=$(printf '%s\n' "$wrapper_entries" | grep -c '^.' || true)
+
+wrapper_origin_master_known=0
+if git -C "$skill_dir" rev-parse --verify --quiet 'origin/master^{commit}' >/dev/null 2>&1; then
+  wrapper_origin_master_known=1
+fi
+
+wrapper_nonancestor_count=0
+wrapper_nonancestor_last_sha7=""
+wrapper_nonancestor_last_branch=""
+wrapper_dirty_count=0
+wrapper_dist_lines=""
+if [[ "$wrapper_n" -gt 0 ]]; then
+  # One jq pass for the whole window (not three forks per entry), and the sha
+  # is validated before it reaches git: a malformed row ({"wrapper_sha":
+  # "--all"}) must not become a git option or a phantom non-ancestor
+  # (cross-review of #148).
+  while IFS=$'\t' read -r w_sha w_branch w_dirty; do
+    [[ "$w_sha" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || continue
+    w_sha7="${w_sha:0:7}"
+    wrapper_dist_lines="${wrapper_dist_lines}${wrapper_dist_lines:+$'\n'}${w_sha7} ${w_branch} ${w_dirty}"
+    [[ "$w_dirty" == "true" ]] && wrapper_dirty_count=$((wrapper_dirty_count + 1))
+    if [[ "$wrapper_origin_master_known" -eq 1 ]]; then
+      if ! git -C "$skill_dir" merge-base --is-ancestor "$w_sha" origin/master 2>/dev/null; then
+        wrapper_nonancestor_count=$((wrapper_nonancestor_count + 1))
+        wrapper_nonancestor_last_sha7="$w_sha7"
+        wrapper_nonancestor_last_branch="$w_branch"
+      fi
+    fi
+  done < <(printf '%s\n' "$wrapper_entries" | jq -r '[(.wrapper_sha // ""), (.wrapper_branch // "?"), ((.wrapper_dirty // false) | tostring)] | @tsv')
+fi
+
 case "$mode" in
   warn)
     out=$(for stats in "${reviewer_stats[@]}"; do emit_warning "$stats"; done)
+    # Telemetry completeness (#89): fires only below the 80% run_id threshold,
+    # over the fixed last-10 window regardless of --recent.
+    comp10_n=$(jq -r '.n_entries' <<<"$completeness10")
+    comp10_run_id=$(jq -r '.pct_run_id' <<<"$completeness10")
+    if [[ "$comp10_n" -gt 0 && "$comp10_run_id" != "null" && "$comp10_run_id" -lt 80 ]]; then
+      out="${out}${out:+$'\n'}  WARN: telemetry completeness low — run_id present in only ${comp10_run_id}% of last $comp10_n runs (threshold 80%)"
+    fi
+    # Roster draw audit (#103): surface only its WARN lines here — the full
+    # table belongs to --mode report.
+    roster_warn=$(roster_audit_out | grep '^WARN ' || true)
+    if [[ -n "$roster_warn" ]]; then
+      out="${out}${out:+$'\n'}$(printf '%s\n' "$roster_warn" | sed 's/^/  /')"
+    fi
+    # Wrapper audit (#144): only fires when the window actually has
+    # wrapper_sha data (older entries, or a caller not going through
+    # worktree.sh, simply have none).
+    if [[ "$wrapper_n" -gt 0 ]]; then
+      if [[ "$wrapper_origin_master_known" -eq 1 && "$wrapper_nonancestor_count" -gt 0 ]]; then
+        out="${out}${out:+$'\n'}  WARN: wrapper: $wrapper_nonancestor_count of last $wrapper_n rounds ran on a wrapper that is not an ancestor of origin/master ($wrapper_nonancestor_last_sha7, branch $wrapper_nonancestor_last_branch)"
+      elif [[ "$wrapper_origin_master_known" -eq 0 && "$quiet" -eq 0 ]]; then
+        echo "analyze_runlog: wrapper ancestry check skipped -- skill dir has no origin/master to compare against (never fetched)" >&2
+      fi
+      if [[ "$wrapper_dirty_count" -gt 0 ]]; then
+        out="${out}${out:+$'\n'}  WARN: wrapper: $wrapper_dirty_count of last $wrapper_n rounds ran on a DIRTY wrapper"
+      fi
+    fi
     if [[ -n "$out" ]]; then
       echo "── cross-review pre-run check (last $n_entries runs) ──"
       echo "$out"
@@ -279,6 +430,55 @@ case "$mode" in
       echo "  none — all reviewers within tolerance"
     fi
     echo "──"
+
+    echo ""
+    echo "── round wall-clock (last $n_entries runs) ──"
+    jq -r '
+      if .n_clean == 0 then
+        "  no clean round_wall_s samples in window" + (if .sleep_suspect > 0 then " (\(.sleep_suspect) sleep-suspect excluded)" else "" end)
+      elif .n_clean < 3 then
+        "  n=\(.n_clean) clean sample(s) -- too few for percentiles  trailer_share=\(.trailer_share_pct // "—")%" +
+        (if .sleep_suspect > 0 then "  (\(.sleep_suspect) sleep-suspect excluded)" else "" end)
+      else
+        "  n=\(.n_clean)  p50=\(.p50_round_wall_s)s  p95=\(.p95_round_wall_s)s  trailer_share=\(.trailer_share_pct // "—")%" +
+        (if .sleep_suspect > 0 then "  (\(.sleep_suspect) sleep-suspect excluded)" else "" end)
+      end' <<<"$round_wall_stats"
+    echo "  critical path (times each seat was the trailer):"
+    crit_lines=$(jq -r '.critical_path | to_entries | sort_by(-.value) | .[] | "    \(.key): \(.value)"' <<<"$round_wall_stats")
+    if [[ -n "$crit_lines" ]]; then
+      echo "$crit_lines"
+    else
+      echo "    none — no trailing_reviewer data in window"
+    fi
+    echo "──"
+
+    echo ""
+    echo "── telemetry completeness (last $n_entries runs) ──"
+    jq -r '
+      "  run_id=\(.pct_run_id // "—")%  findings=\(.pct_findings // "—")%  roster_decision=\(.pct_roster_decision // "—")%",
+      "  reviewer rows (\(.n_reviewer_rows)): model=\(.pct_model // "—")%  cost_usd=\(.pct_cost_usd // "—")%  context_access=\(.pct_context_access // "—")%"
+    ' <<<"$completeness"
+    echo "──"
+
+    echo ""
+    echo "── wrapper audit (last $n_entries runs) ──"
+    if [[ "$wrapper_n" -eq 0 ]]; then
+      echo "  no wrapper_sha data in window"
+    else
+      echo "  distribution (sha7 → count):"
+      printf '%s\n' "$wrapper_dist_lines" | awk '{print $1}' | sort | uniq -c | sort -rn \
+        | awk '{printf "    %s → %s\n", $2, $1}'
+      echo "  dirty: $wrapper_dirty_count of $wrapper_n"
+      if [[ "$wrapper_origin_master_known" -eq 1 ]]; then
+        echo "  non-ancestor-of-origin/master: $wrapper_nonancestor_count of $wrapper_n"
+      else
+        echo "  NOTE: ancestry check skipped -- skill dir has no origin/master to compare against (never fetched)"
+      fi
+    fi
+    echo "──"
+
+    echo ""
+    roster_audit_out
     ;;
   *)
     echo "unknown mode: $mode (use warn|report)" >&2
