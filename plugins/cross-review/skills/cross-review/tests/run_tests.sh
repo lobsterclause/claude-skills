@@ -784,7 +784,7 @@ rm -rf "$GR"; mkdir -p "$GR"
 (
   cd "$GR"
   git init -q .; git config user.email t@t; git config user.name t
-  for i in 0 1 2 3; do printf 'line %s\n' "$i" >>f.txt; git add f.txt; git commit -qm "c$i"; done
+  for i in 0 1 2 3; do printf 'line %s\n' "$i" >>f.txt; git add f.txt; git commit -qm "commit $i: update f.txt *"; done
 ) >/dev/null 2>&1
 C0="$(cd "$GR" && git rev-parse HEAD~3)"; C1="$(cd "$GR" && git rev-parse HEAD~2)"
 C2="$(cd "$GR" && git rev-parse HEAD~1)"; C3="$(cd "$GR" && git rev-parse HEAD)"
@@ -801,6 +801,8 @@ assert_eq "a gap in the middle is NOT covered" \
   "$(rcv "$C0" "$C3" "$GAP" | jq -r .covered)" "false"
 assert_eq "and the uncovered commits are named" \
   "$(rcv "$C0" "$C3" "$GAP" | jq -r '.uncovered | length')" "2"
+assert_contains "…one entry per commit, subject intact (no word splitting/globbing)" \
+  "$(rcv "$C0" "$C3" "$GAP" | jq -r '.uncovered[0]')" "commit 1: update f.txt *"
 assert_eq "no records at all is not covered" \
   "$(rcv "$C0" "$C3" '[]' | jq -r .covered)" "false"
 # A head-only (legacy) stamp asserts ONE commit and nothing behind it. Treating
@@ -1948,6 +1950,12 @@ MARKER_NEW_PROSE_OLD="## Cross-review — pass 2\n<!-- cross-review: sha=$HEAD40
 MARKER_OLD_PROSE_NEW="## Cross-review — pass 2\n<!-- cross-review: sha=b813773500000000000000000000000000000000 pass=2 -->\n_Reviewed \`399df23d4\`._"
 MG_MARKER_WINS_PASS="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_NEW_PROSE_OLD\"}]}"
 MG_MARKER_WINS_DENY="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_OLD_PROSE_NEW\"}]}"
+# Marker-only records (no prose stamp at all) are records too (codex + antigravity, #67 pass 2).
+MARKER_ONLY_NEW="## Cross-review — pass 2\n<!-- cross-review: sha=$HEAD40 pass=2 -->\nFindings below."
+MARKER_ONLY_OLD="## Cross-review — pass 1\n<!-- cross-review: sha=b813773500000000000000000000000000000000 pass=1 -->\nFindings below."
+MG_MARKER_ONLY_PASS="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_ONLY_NEW\"}]}"
+MG_MARKER_ONLY_DENY="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_ONLY_OLD\"}]}"
+MG_OLD_PROSE_THEN_NEW_MARKER="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_OLD\"},{\"body\":\"$MARKER_ONLY_NEW\"}]}"
 
 # 1. The whole point: a record bound to a different commit blocks the merge.
 mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_OLD\"}]}" --pr 3207
@@ -2008,6 +2016,12 @@ assert_eq "marker current, prose stale → the marker clears the merge" \
   "$(mg_hook "$MG_MARKER_WINS_PASS" 'gh pr merge 3207')" "PASS"
 assert_eq "marker stale, prose current → the marker denies the merge" \
   "$(mg_hook "$MG_MARKER_WINS_DENY" 'gh pr merge 3207')" "deny"
+assert_eq "a marker-only record at the current head clears" \
+  "$(mg_hook "$MG_MARKER_ONLY_PASS" 'gh pr merge 3207')" "PASS"
+assert_eq "a marker-only record at an old head denies" \
+  "$(mg_hook "$MG_MARKER_ONLY_DENY" 'gh pr merge 3207')" "deny"
+assert_eq "the newest marker-only record wins over an older prose one" \
+  "$(mg_hook "$MG_OLD_PROSE_THEN_NEW_MARKER" 'gh pr merge 3207')" "PASS"
 # A merge reviewed at head is no longer waved through unconditionally: it must
 # also bind itself to that commit. See the TOCTOU block further down for why.
 assert_eq "control: hook allows a merge reviewed at head AND bound to it" \

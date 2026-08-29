@@ -142,7 +142,11 @@ fi
 # `## Cross-review` is post_comment.sh's own header (see its summary mode),
 # matched at the start of the body so a human quoting the header in a
 # discussion comment does not register as a review record.
-STAMP_RE='Reviewed `[0-9a-f]{7,40}`'
+# A record is one that carries EITHER stamp form: the marker (authoritative,
+# read_stamp.sh) or the prose. Requiring the prose here skipped marker-only
+# records and could pick an older prose-bearing comment over the newest
+# marker-bearing one (codex + antigravity, #67 pass 2).
+STAMP_RE='(<!-- cross-review: sha=[0-9a-f]{40}|Reviewed `[0-9a-f]{7,40}`)'
 review_body="$(printf '%s' "$comments_json" \
   | jq -r --arg re "$STAMP_RE" \
       '[.[] | .body | select(startswith("## Cross-review")) | select(test($re))] | last // ""' \
@@ -166,15 +170,20 @@ fi
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 reviewed_sha=""
 if [[ -x "$here/read_stamp.sh" ]]; then
-  reviewed_sha="$(printf '%s' "$review_body" | bash "$here/read_stamp.sh" --body-stdin 2>/dev/null | jq -r '.sha // ""' 2>/dev/null || true)"
+  # read_stamp.sh's stderr is the marker-vs-prose disagreement warning — let it
+  # through (kimi, #67 pass 2); only jq's own noise is suppressed.
+  reviewed_sha="$(printf '%s' "$review_body" | bash "$here/read_stamp.sh" --body-stdin | jq -r '.sha // ""' 2>/dev/null || true)"
 fi
 # post_comment.sh prints the SHA abbreviated to 9 chars: Reviewed `abc123def`.
 [[ -n "$reviewed_sha" ]] || reviewed_sha="$(printf '%s' "$review_body" \
   | sed -nE 's/.*Reviewed `([0-9a-f]{7,40})`.*/\1/p' | head -1)"
 
 # Compare on the stamp's own width. The stamp is abbreviated; headRefOid is not.
+# An EMPTY stamp must never clear: "${cur_sha:0:0}" == "" is true (antigravity
+# Critical, #67 pass 2). Unreachable while STAMP_RE selects the body, kept as
+# the guard it should always have been.
 n="${#reviewed_sha}"
-if [[ "${cur_sha:0:$n}" == "$reviewed_sha" ]]; then
+if [[ -n "$reviewed_sha" && "${cur_sha:0:$n}" == "$reviewed_sha" ]]; then
   emit clear 0 "PR #$pr was reviewed at its current head ${cur_sha:0:9}."
 fi
 
