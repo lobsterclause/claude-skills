@@ -124,7 +124,7 @@ if [[ ${#missing_baselines[@]} -gt 0 ]]; then
     echo "  shell function that never runs in a non-interactive shell." >&2
     echo "  Check 'command -v codex'; set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1" >&2
     echo "  only for a deliberate degraded spot check." >&2
-    exit 1
+    exit 3   # dedicated: run_reviewers.sh must not read this as "selector unavailable"
   fi
 fi
 

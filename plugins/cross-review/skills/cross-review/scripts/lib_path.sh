@@ -52,10 +52,13 @@ if [[ -d "$_cr_nvm_root/versions/node" ]]; then
   # alias/default may hold a bare major ("22") or a full version ("v22.22.2").
   _cr_default="$(cat "$_cr_nvm_root/alias/default" 2>/dev/null || true)"
   if [[ -n "$_cr_default" ]]; then
-    for _cr_d in "$_cr_nvm_root/versions/node/${_cr_default}/bin" \
-                 "$_cr_nvm_root/versions/node/v${_cr_default}".*/bin; do
-      if [[ -d "$_cr_d" ]]; then CROSS_REVIEW_NVM_BIN="$_cr_d"; break; fi
-    done
+    # A bare major ("22") matches several installed versions; nvm resolves it
+    # to the HIGHEST, so do the same (a glob's first match is alphabetical:
+    # v22.1.0 beat v22.22.2 — gemini-pro, PR #68 review).
+    _cr_d="$(ls -d "$_cr_nvm_root/versions/node/${_cr_default}/bin" \
+                   "$_cr_nvm_root/versions/node/v${_cr_default}/bin" \
+                   "$_cr_nvm_root/versions/node/v${_cr_default}".*/bin 2>/dev/null | sort -V | tail -1 || true)"
+    if [[ -n "$_cr_d" && -d "$_cr_d" ]]; then CROSS_REVIEW_NVM_BIN="$_cr_d"; fi
   fi
   if [[ -z "$CROSS_REVIEW_NVM_BIN" ]]; then
     # No usable default alias — fall back to the highest installed version.

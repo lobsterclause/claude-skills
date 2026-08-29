@@ -303,8 +303,23 @@ esac
 # it is). Missing/failed selector → classic fixed fleet.
 if [[ -z "$reviewers" ]]; then
   selector="$(cd "$(dirname "$0")" && pwd)/select_roster.sh"
-  if [[ -x "$selector" ]] && reviewers="$(bash "$selector")" && [[ -n "$reviewers" ]]; then
-    echo "roster (select_roster.sh): $reviewers" >&2
+  if [[ -x "$selector" ]]; then
+    # The selector's fail-closed exit (3: a baseline is not installed) is a
+    # verdict, not an outage. Treating every nonzero as "selector unavailable"
+    # substituted the fixed fleet, skipped the missing baselines at dispatch,
+    # and ran the exact baseline-less round the guard exists to stop (codex +
+    # glm convergent, PR #68 review).
+    sel_rc=0; reviewers="$(bash "$selector")" || sel_rc=$?
+    if [[ $sel_rc -eq 3 ]]; then
+      echo "run_reviewers: select_roster.sh refused the round (baseline missing) — not substituting a roster. Fix PATH or set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 for a deliberate degraded run." >&2
+      exit 1
+    fi
+    if [[ $sel_rc -eq 0 && -n "$reviewers" ]]; then
+      echo "roster (select_roster.sh): $reviewers" >&2
+    else
+      reviewers="codex,antigravity,gemini-pro,kimi,glm"
+      echo "roster: selector failed (rc=$sel_rc) — using fixed fallback fleet: $reviewers" >&2
+    fi
   else
     reviewers="codex,antigravity,gemini-pro,kimi,glm"
     echo "roster: selector unavailable — using fixed fallback fleet: $reviewers" >&2
@@ -1083,14 +1098,21 @@ fi
 # Appended after the prompt is resolved so a custom --prompt-file gets it too,
 # and gated on the condition actually holding: claiming deps are missing when
 # they are installed would be its own bad instruction.
-if [[ -f package.json && ! -d node_modules ]]; then
-  review_prompt="$review_prompt
-
-ENVIRONMENT: this is a bare git worktree — dependencies are NOT installed \
-(package.json is present, node_modules is not). Do not run tests, builds, \
+# Anchored to the repo root, not the cwd (kimi + glm); Yarn PnP zero-install
+# repos have usable deps without node_modules (.pnp.cjs) and are exempt
+# (codex); the note claims only what was checked (glm).
+NO_DEPS_NOTE=""
+_nd_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [[ -f "$_nd_root/package.json" && ! -d "$_nd_root/node_modules" && ! -f "$_nd_root/.pnp.cjs" && ! -f "$_nd_root/.pnp.js" ]]; then
+  NO_DEPS_NOTE="ENVIRONMENT: dependencies are NOT installed in this checkout \
+(package.json is present, node_modules is absent). Do not run tests, builds, \
 linters or typecheckers: they fail on missing modules, and that failure tells \
 you nothing about the diff. Review by reading the code."
+  review_prompt="$review_prompt
+
+$NO_DEPS_NOTE"
 fi
+unset _nd_root
 
 # json_findings_suffix: schema-mandate text appended ONLY in the curl lane
 # (run_openrouter_reviewer — the OpenRouter pool plus direct-Moonshot seats
@@ -1135,6 +1157,20 @@ run_codex() {
   # "the fallback re-runs the SAME model" guarantee an unverified guess that
   # would break silently the moment the CLI default moved. `cli_model` pins it
   # here, and a test asserts it agrees with or_fallback.model. (glm, PR #66.)
+  # `codex exec review --base` never sees $review_prompt, so the no-deps note
+  # above did not reach the ONE lane it was written for (four seats converged
+  # on this, PR #68 review). codex reads the project's AGENTS.md as standing
+  # instructions: put the note there for the duration of the run — appended
+  # to an existing file, created otherwise — and restore it afterwards.
+  local agents_md="AGENTS.md" agents_bak="" agents_created=0
+  if [[ -n "${NO_DEPS_NOTE:-}" ]]; then
+    if [[ -f "$agents_md" ]]; then
+      agents_bak="$(mktemp "${TMPDIR:-/tmp}/cr-agents.XXXXXX")" && cp "$agents_md" "$agents_bak"
+    else
+      agents_created=1
+    fi
+    printf '\n\n## cross-review environment note\n\n%s\n' "$NO_DEPS_NOTE" >>"$agents_md"
+  fi
   local codex_model codex_model_args=()
   codex_model="$(profile_get codex cli_model)"
   if [[ -n "$codex_model" ]]; then
@@ -1147,6 +1183,8 @@ run_codex() {
     ${codex_cfg[@]+"${codex_cfg[@]}"} \
     >"$out/codex.stdout" 2>&1
   rc=$?
+  # Put AGENTS.md back exactly as it was (or remove the one we created).
+  if [[ -n "$agents_bak" ]]; then mv -f "$agents_bak" "$agents_md"; elif [[ "$agents_created" == 1 ]]; then rm -f "$agents_md"; fi
   end=$(date +%s)
   local timed_out="false"
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)

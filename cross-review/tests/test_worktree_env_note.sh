@@ -68,10 +68,28 @@ git checkout -qb feat
 printf 'one\ntwo\n' >f.txt
 git add .; git -c user.email=t@t -c user.name=t commit -qm change
 
-NOTE="ENVIRONMENT: this is a bare git worktree"
+NOTE="ENVIRONMENT: dependencies are NOT installed"
 
 echo "── deps absent: reviewers are told not to run the suite ──"
 bash "$S/run_reviewers.sh" --base main --out "$T/no_deps" --reviewers glm >/dev/null 2>&1 || true
+# codex never sees $review_prompt (codex exec review --base): the note must
+# reach it through AGENTS.md, and only for the duration of the run.
+cat >"$T/bin/codex" <<'CSHIM'
+#!/bin/sh
+cat >/dev/null 2>&1 || true
+if [ -f AGENTS.md ]; then printf 'AGENTS_SEEN: '; cat AGENTS.md; else printf 'AGENTS_ABSENT\n'; fi
+printf '\ncodex\n[P3] nothing\n'
+CSHIM
+chmod +x "$T/bin/codex"
+printf '# project rules\nkeep it simple\n' >AGENTS.md
+bash "$S/run_reviewers.sh" --base main --out "$T/no_deps_codex" --reviewers codex >/dev/null 2>&1 || true
+assert_contains "codex receives the note through AGENTS.md" "$(cat "$T/no_deps_codex/codex.stdout")" "dependencies are NOT installed"
+assert_contains "…appended to the existing AGENTS.md, not replacing it" "$(cat "$T/no_deps_codex/codex.stdout")" "keep it simple"
+assert_eq "AGENTS.md is restored byte-for-byte after the run" "$(cat AGENTS.md)" "$(printf '# project rules\nkeep it simple')"
+rm -f AGENTS.md
+bash "$S/run_reviewers.sh" --base main --out "$T/no_deps_codex2" --reviewers codex >/dev/null 2>&1 || true
+assert_contains "no AGENTS.md before → note still delivered" "$(cat "$T/no_deps_codex2/codex.stdout")" "AGENTS_SEEN"
+[[ ! -f AGENTS.md ]] && ok "…and the created AGENTS.md is removed afterwards" || bad "created AGENTS.md left behind"
 PROMPT_NO="$(jq -r '.messages[0].content' "$T/no_deps/glm.request.json" 2>/dev/null)"
 assert_contains "a prompt was actually captured" "$PROMPT_NO" "code review of the changes"
 assert_contains "prompt carries the no-deps environment note" "$PROMPT_NO" "$NOTE"
