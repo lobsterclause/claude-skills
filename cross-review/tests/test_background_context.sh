@@ -83,10 +83,39 @@ fi
 echo "── gh absent from PATH entirely → prompt still valid, no literal placeholder, script exits 0 ──"
 rm -f "$T/bin/gh"
 rm -f "$CAPTURE"
-STRIPPED_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | while read -r d; do
-  [[ -n "$d" && -x "$d/gh" ]] && continue
-  printf '%s\n' "$d"
-done | paste -s -d: -)"
+# Build a PATH with gh genuinely absent. Dropping every gh-bearing DIRECTORY
+# (what this used to do) is wrong on Linux: GitHub runners ship gh in
+# /usr/bin, so the strip took git/jq/sed with it and run_reviewers.sh died
+# with rc=127 before it could prove anything. It passed on macOS only because
+# Homebrew gives gh its own bin dir. Mirror each gh-bearing dir into a symlink
+# farm that omits gh alone, and leave every other dir untouched.
+NOGH="$T/nogh"; mkdir -p "$NOGH"
+STRIPPED_PATH=""
+while IFS= read -r d; do
+  [[ -n "$d" ]] || continue
+  if [[ -x "$d/gh" ]]; then
+    for f in "$d"/*; do
+      [[ -e "$f" ]] || continue
+      b="$(basename "$f")"
+      [[ "$b" == "gh" ]] && continue
+      [[ -e "$NOGH/$b" ]] || ln -s "$f" "$NOGH/$b" 2>/dev/null || true
+    done
+  else
+    STRIPPED_PATH="${STRIPPED_PATH:+$STRIPPED_PATH:}$d"
+  fi
+done < <(printf '%s' "$PATH" | tr ':' '\n')
+STRIPPED_PATH="${STRIPPED_PATH:+$STRIPPED_PATH:}$NOGH"
+# The point of the fixture, asserted rather than assumed: gh is unreachable
+# and the tools run_reviewers.sh needs are not.
+if PATH="$STRIPPED_PATH" command -v gh >/dev/null 2>&1; then
+  bad "fixture: gh is still reachable on the stripped PATH"
+else
+  ok "fixture: gh is unreachable on the stripped PATH"
+fi
+for _tool in git jq sed awk; do
+  PATH="$STRIPPED_PATH" command -v "$_tool" >/dev/null 2>&1 \
+    || bad "fixture: stripped PATH lost $_tool — the rc assertion below would be meaningless"
+done
 PATH="$STRIPPED_PATH" bash "$S/run_reviewers.sh" --base main --out "$T/o2" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1
 RC=$?
 assert_eq "run_reviewers.sh exits 0 with no gh on PATH" "$RC" "0"
