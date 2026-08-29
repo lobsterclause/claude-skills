@@ -94,7 +94,8 @@ echo "── markdown output covers all three buckets ──"
 OUT1_MD="$T/diff1.md"
 "$D" --prev "$ROUND1" --curr "$ROUND2" --format md --out "$OUT1_MD"
 md1="$(cat "$OUT1_MD")"
-assert_contains "markdown mentions the fixed finding's claim" "$md1" "SQL injection via string concat"
+assert_contains "markdown mentions the fixed finding's claim" "$md1" "Missing null check on user input"
+assert_contains "markdown lists the fixed finding under its heading" "$(printf '%s' "$md1" | sed -n '/### Fixed/,/### /p')" "src/api.ts"
 assert_contains "markdown mentions the newly introduced finding's claim" "$md1" "drops the transaction on error"
 assert_contains "markdown mentions the fixed finding's file" "$md1" "src/api.ts"
 
@@ -176,6 +177,35 @@ this line is not json at all
 {"event":"proposed","ts":"2026-08-02T00:00:01Z","finding_id":"f-dddddddd","run_id":"run-2","reviewer":"kimi27","all_sources":["kimi27"],"severity":"Medium","file":"src/db.ts","claim":"New helper drops the transaction on error"}
 {"event":"proposed","ts":"2026-08-02T00:00:02Z","finding_id":"f-bbbbbbbb","run_id":"run-2","project":"remote:github.com/other-org/other-repo","reviewer":"codex","all_sources":["codex"],"severity":"Critical","file":"src/auth.ts","claim":"unrelated finding from a different project sharing the same hash"}
 EOF
+
+echo "── error paths (PR #85 review: kimi, codex, spark) ──"
+printf '{"findings": "not-an-array"}' >"$T/bad-shape.json"
+"$D" --prev "$T/bad-shape.json" --curr "$ROUND2" --format json --out "$T/should-not-exist.json" >/dev/null 2>"$T/bad-shape.err"; rc=$?
+assert_eq "a findings file with the wrong shape exits 1" "$rc" "1"
+[[ ! -f "$T/should-not-exist.json" ]] && ok "…and writes no partial --out" || bad "partial --out written on error"
+printf '{not json' >"$T/bad.json"
+"$D" --prev "$T/bad.json" --curr "$ROUND2" --format json >/dev/null 2>&1; rc=$?
+assert_eq "invalid --prev JSON exits non-zero" "$(( rc != 0 ))" "1"
+"$D" --prev "$ROUND1" --curr "$ROUND2" --prev-diff "$T/bad.json" --format json >/dev/null 2>&1; rc=$?
+assert_eq "invalid --prev-diff JSON exits non-zero" "$(( rc != 0 ))" "1"
+CROSS_REVIEW_FINDING_EVENTS="$T/no-such-ledger.jsonl" "$D" --curr "$ROUND2" --run-id run-2 --project p --format json >/dev/null 2>"$T/noledger.err"; rc=$?
+assert_eq "missing ledger exits 1 when --prev is omitted" "$rc" "1"
+assert_contains "…and names the path" "$(cat "$T/noledger.err")" "ledger not found or empty"
+CROSS_REVIEW_FINDING_EVENTS="$T/no-such-ledger.jsonl" "$D" --curr "$ROUND2" --run-id run-2 --project p --format json --allow-empty-prev >"$T/empty-prev.json" 2>/dev/null; rc=$?
+assert_eq "--allow-empty-prev permits a first round" "$rc" "0"
+assert_eq "…everything is newly_introduced" "$(jq -r '.counts.newly_introduced' "$T/empty-prev.json")" "2"
+assert_eq "…and prev provenance says so" "$(jq -r '.prev.source' "$T/empty-prev.json")" "empty_ledger"
+CROSS_REVIEW_FINDING_EVENTS="$LEDGER" "$D" --curr "$ROUND3" --run-id "no-such-run" --repo-root "$REPO_A" --format json --out "$T/lastrun.json" 2>"$T/lastrun.err" >/dev/null
+assert_eq "unknown --run-id falls back to the newest run and says which" "$(jq -r '.prev.source' "$T/lastrun.json")" "ledger_last_run"
+assert_contains "…with a WARN on stderr" "$(cat "$T/lastrun.err")" "not in the ledger"
+printf '{"findings":[{"id":null,"severity":"Low","file":"x","claim":"no id"},{"id":"","severity":"Low","file":"y","claim":"empty id"},{"id":"f-eeeeeeee","severity":"Low","file":"z","claim":"ok"}]}' >"$T/nullid.json"
+"$D" --prev "$ROUND1" --curr "$T/nullid.json" --format json --out "$T/nullid.out.json" >/dev/null 2>&1
+assert_eq "null/empty ids are dropped from the buckets" "$(jq -r '[.newly_introduced[].id] | join(",")' "$T/nullid.out.json")" "f-eeeeeeee"
+assert_eq "explicit --prev provenance is recorded" "$(jq -r '.prev.source' "$T/nullid.out.json")" "file"
+mkdir -p "$T/ro"; chmod 555 "$T/ro"
+"$D" --prev "$ROUND1" --curr "$ROUND2" --format json --out "$T/ro/out.json" >/dev/null 2>&1; rc=$?
+chmod 755 "$T/ro"
+assert_eq "unwritable --out exits 1" "$rc" "1"
 
 echo "── malformed ledger line is skipped, counted on stderr, never fatal ──"
 STDERR_FILE="$T/ledger-stderr.txt"

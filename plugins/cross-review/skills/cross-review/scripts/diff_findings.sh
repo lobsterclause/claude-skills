@@ -14,7 +14,12 @@
 #                     (--prev <findings.verified.json> |
 #                      --run-id <id> (--repo-root <path> | --project <name>))
 #                     [--prev-diff <prior diff_findings.sh JSON output>]
-#                     [--out <file>] [--format md|json]
+#                     [--out <file>] [--format md|json] [--allow-empty-prev]
+#
+# --allow-empty-prev: a missing or empty ledger is otherwise an ERROR when
+#   --prev is omitted — a typo in CROSS_REVIEW_FINDING_EVENTS would silently
+#   report every current finding as newly_introduced (kimi, PR #85 review).
+#   Pass this for a genuine first round.
 #
 # --prev <file>: explicit previous round's findings.verified.json (or any
 #   object with a top-level "findings" array, or a bare array — same
@@ -86,6 +91,7 @@
 # Exit: 0 ok, 2 usage error, 1 io error (missing jq, bad --prev/--curr JSON).
 
 set -uo pipefail
+allow_empty_prev=0
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib_project_namespace.sh
@@ -105,6 +111,7 @@ while [[ $# -gt 0 ]]; do
     --repo-root)  need_val "$1" "$#"; repo_root="$2";  shift 2 ;;
     --out)        need_val "$1" "$#"; out="$2";        shift 2 ;;
     --format)     need_val "$1" "$#"; format="$2";     shift 2 ;;
+    --allow-empty-prev) allow_empty_prev=1;             shift ;;
     *) echo "diff_findings: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -170,6 +177,7 @@ normalize_kept() {
     (if type=="array" then . else (.findings // []) end)
     | .[]
     | select((.factcheck.verdict // "keep") != "drop")
+    | select((.id | type) == "string" and .id != "")
     | {id: .id, file: (.file // ""), line: (.line // null),
        claim: (.claim // ""), severity: (.severity // ""),
        sources: (.sources // [])}
@@ -177,19 +185,26 @@ normalize_kept() {
 }
 
 curr_kept="$tmp_dir/curr.kept.jsonl"
-normalize_kept "$curr" > "$curr_kept"
+# A findings file that parses as JSON but is not a findings shape must not
+# become an empty current set and a plausible, wrong diff (codex, PR #85).
+normalize_kept "$curr" > "$curr_kept" || { echo "diff_findings: --curr is not a findings JSON (array or {findings:[...]}): $curr" >&2; exit 1; }
 
 prev_kept="$tmp_dir/prev.kept.jsonl"
 malformed_ledger_lines=0
 
 if [[ -n "$prev" ]]; then
-  normalize_kept "$prev" > "$prev_kept"
+  normalize_kept "$prev" > "$prev_kept" || { echo "diff_findings: --prev is not a findings JSON (array or {findings:[...]}): $prev" >&2; exit 1; }
 else
   # ── Ledger reconstruction ────────────────────────────────────────────
   ledger="${CROSS_REVIEW_FINDING_EVENTS:-$(cd "$(dirname "$0")/.." && pwd)/finding_events.jsonl}"
   : > "$prev_kept"
   events_ok="$tmp_dir/events.ok.jsonl"
   : > "$events_ok"
+  untagged_events=0
+  if [[ ! -s "$ledger" && "$allow_empty_prev" != 1 ]]; then
+    echo "diff_findings: ledger not found or empty: $ledger — pass --prev, or --allow-empty-prev for a genuine first round" >&2
+    exit 1
+  fi
   if [[ -f "$ledger" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
       [[ -z "$line" ]] && continue
@@ -205,6 +220,7 @@ else
       if [[ -n "$ev_project" && "$ev_project" != "$project" ]]; then
         continue
       fi
+      [[ -z "$ev_project" ]] && untagged_events=$((untagged_events + 1))
       printf '%s\n' "$parsed" >> "$events_ok"
     done < "$ledger"
   fi
@@ -214,15 +230,31 @@ else
   run_ids_ordered="$tmp_dir/run_ids.txt"
   jq -r '.run_id // empty' "$events_ok" | awk '!seen[$0]++' > "$run_ids_ordered"
 
-  prev_run_id=""
-  if grep -qxF "$run_id" "$run_ids_ordered" 2>/dev/null; then
+  prev_run_id=""; prev_source="ledger"
+  if grep -qxF -- "$run_id" "$run_ids_ordered" 2>/dev/null; then
     prev_run_id="$(awk -v cur="$run_id" '
       $0==cur { print prev; found=1; exit }
       { prev=$0 }
       END { if (!found) exit 0 }
     ' "$run_ids_ordered")"
   else
+    # The current run is not in the ledger yet (fingerprint not run, or a
+    # mistyped --run-id): the newest run is the previous one. Say so — a typo
+    # here would otherwise produce a plausible diff against the wrong round.
     prev_run_id="$(tail -n 1 "$run_ids_ordered" 2>/dev/null || true)"
+    if [[ -z "$prev_run_id" ]]; then
+      prev_source="empty_ledger"   # --allow-empty-prev: a genuine first round
+    else
+      prev_source="ledger_last_run"
+      echo "diff_findings: WARN run_id '$run_id' not in the ledger — using the newest run ($prev_run_id) as the previous round" >&2
+    fi
+  fi
+  # Untagged events are treated as ours (issue #86: the emitters do not stamp
+  # a project yet), which on a ledger shared across repos can pick another
+  # project's run as the previous round (codex, PR #85). Count them and say
+  # so; the JSON carries the number so a consumer can refuse to trust it.
+  if (( untagged_events > 0 )); then
+    echo "diff_findings: WARN $untagged_events ledger event(s) carry no project tag and were assumed to be ours (see issue #86)" >&2
   fi
 
   if [[ -n "$prev_run_id" ]]; then
@@ -238,7 +270,7 @@ else
       | jq -c '.[]' \
       | while IFS= read -r pf; do
           fid="$(jq -r '.finding_id' <<<"$pf")"
-          if grep -qxF "$fid" "$dropped_ids" 2>/dev/null; then
+          if grep -qxF -- "$fid" "$dropped_ids" 2>/dev/null; then
             continue
           fi
           jq -c '{id: .finding_id, file: (.file // ""), line: null,
@@ -258,8 +290,9 @@ curr_ids_json="$(jq -s -c '[.[].id]' "$curr_kept" 2>/dev/null || echo '[]')"
 prev_map="$(jq -s -c 'map({(.id): .}) | add // {}' "$prev_kept" 2>/dev/null || echo '{}')"
 curr_map="$(jq -s -c 'map({(.id): .}) | add // {}' "$curr_kept" 2>/dev/null || echo '{}')"
 
-# rounds lookup from --prev-diff (still_open + newly_introduced entries only;
-# a "fixed" entry in --prev-diff has nothing still open to carry forward).
+# rounds lookup from --prev-diff: still_open entries only. A newly_introduced
+# entry carries no rounds field and defaults to 2 when it becomes still_open;
+# a "fixed" entry has nothing still open to carry forward.
 rounds_map="{}"
 if [[ -n "$prev_diff" ]]; then
   rounds_map="$(jq -c '
@@ -289,6 +322,14 @@ result="$(jq -n -c \
   | . + {counts: {fixed: (.fixed|length), still_open: (.still_open|length), newly_introduced: (.newly_introduced|length)}}
   | {counts, fixed, still_open, newly_introduced}
   ")"
+# Provenance of the previous round: explicit file, or which ledger run and how
+# many untagged events were assumed local (0 unless reconstructed).
+if [[ -n "$prev" ]]; then
+  result="$(jq -c --arg p "$prev" '. + {prev: {source: "file", path: $p}}' <<<"$result")"
+else
+  result="$(jq -c --arg s "${prev_source:-ledger}" --arg r "${prev_run_id:-}" --argjson u "${untagged_events:-0}" \
+    '. + {prev: {source: $s, run_id: $r, untagged_events: $u}}' <<<"$result")"
+fi
 
 render_md() {
   local json="$1"
@@ -330,7 +371,10 @@ else
 fi
 
 if [[ -n "$out" ]]; then
-  printf '%s\n' "$rendered" > "$out"
+  # Atomic, and a failed write is a failure — not a success with no file.
+  out_tmp="$(mktemp "$(dirname "$out")/.diff_findings.XXXXXX" 2>/dev/null)" \
+    && printf '%s\n' "$rendered" > "$out_tmp" && mv "$out_tmp" "$out" \
+    || { echo "diff_findings: cannot write --out $out" >&2; rm -f "${out_tmp:-}"; exit 1; }
 else
   printf '%s\n' "$rendered"
 fi
