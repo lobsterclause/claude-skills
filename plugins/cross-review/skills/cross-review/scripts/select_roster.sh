@@ -187,11 +187,11 @@ lb_json="$(bash "$script_dir/leaderboard.sh" --mode json 2>/dev/null || echo '[]
 # to make a deliberately-seated reviewer (kimi27, 2026-07-03) come up
 # frequently while it earns leaderboard data; retire boosts once real scores
 # accumulate.
-# CROSS_REVIEW_PROFILES overrides the profile path for fixture tests only,
+# CROSS_REVIEW_PROFILES_FILE overrides the profile path for fixture tests only,
 # same contract as CROSS_REVIEW_RUNLOG and CROSS_REVIEW_FINDING_EVENTS. It
 # exists so the draw_boost semantics (0 = never drawn, garbage = default 1)
 # can be pinned against a synthetic profile instead of mutating the real one.
-profile_file="${CROSS_REVIEW_PROFILES:-$script_dir/../references/reviewer_profiles.json}"
+profile_file="${CROSS_REVIEW_PROFILES_FILE:-$script_dir/../references/reviewer_profiles.json}"
 draw_boost_of() {
   [[ -f "$profile_file" ]] || { echo 1; return; }
   jq -r --arg r "$1" '.[$r].draw_boost // 1' "$profile_file" 2>/dev/null || echo 1

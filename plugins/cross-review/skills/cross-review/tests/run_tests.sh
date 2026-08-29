@@ -1041,7 +1041,7 @@ assert_contains "unboosted rookie weight unchanged" \
 BOOST0_ERR="$T/boost0.err"
 BOOST0_PROF="$T/boost0_profiles.json"
 jq '.spark.draw_boost = 0' "$SKILL_DIR/references/reviewer_profiles.json" > "$BOOST0_PROF"
-CROSS_REVIEW_PROFILES="$BOOST0_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
+CROSS_REVIEW_PROFILES_FILE="$BOOST0_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
   bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST0_ERR"
 BOOST0_LINE="$(grep ' spark ' "$BOOST0_ERR" || true)"
 if [[ "$BOOST0_LINE" == *"weight=0.0"* ]]; then
@@ -1053,7 +1053,7 @@ fi
 # rank it last. 25 seeds is enough that a non-zero weight would surface.
 BOOST0_DRAWN=0
 for _s in $(seq 1 25); do
-  if CROSS_REVIEW_PROFILES="$BOOST0_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
+  if CROSS_REVIEW_PROFILES_FILE="$BOOST0_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
      bash "$S/select_roster.sh" --seed "$_s" --extras 4 2>/dev/null | grep -q 'spark'; then
     BOOST0_DRAWN=$((BOOST0_DRAWN + 1))
   fi
@@ -1070,7 +1070,7 @@ for _bad_boost in '"abc"' '-1' '""'; do
   BOOSTX_PROF="$T/boostx_profiles.json"
   jq ".spark.draw_boost = $_bad_boost" "$SKILL_DIR/references/reviewer_profiles.json" > "$BOOSTX_PROF"
   BOOSTX_ERR="$T/boostx.err"
-  CROSS_REVIEW_PROFILES="$BOOSTX_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
+  CROSS_REVIEW_PROFILES_FILE="$BOOSTX_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
     bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOSTX_ERR"
   assert_contains "malformed draw_boost $_bad_boost falls back to the 1.0 default" \
     "$(grep ' spark ' "$BOOSTX_ERR")" "weight=75.0"
