@@ -29,6 +29,8 @@ findings=""
 pass="1"
 pass_explicit=0
 head_sha=""
+base_sha=""
+digest=""
 
 need_val() {
   local flag="$1"
@@ -47,6 +49,8 @@ while [[ $# -gt 0 ]]; do
     --findings) need_val --findings "$#"; findings="$2"; shift 2 ;;
     --pass)     need_val --pass     "$#"; pass="$2"; pass_explicit=1; shift 2 ;;
     --head-sha) need_val --head-sha "$#"; head_sha="$2"; shift 2 ;;
+    --base-sha) need_val --base-sha "$#"; base_sha="$2"; shift 2 ;;
+    --digest)   need_val --digest   "$#"; digest="$2";   shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -72,6 +76,45 @@ fi
 #
 # Fails open: an unwritable run dir must never cost the user a posted review.
 run_dir="$(dirname "$findings")"
+
+# A stamp that records only the HEAD can answer one question -- "is this record
+# current?" -- and no other. It cannot say what a record COVERS, so a re-review
+# of a 300-line delta looks exactly like no review at all, and every fix that
+# answers a finding invalidates the record containing it. Recording the RANGE
+# (base..head) plus a digest of the reviewed content is what lets the union of
+# several records cover a PR no single record covers.
+#
+# Both are optional and derived, never required: worktree.sh already wrote
+# base_sha into context.json, and the digest is computable whenever the two
+# refs resolve locally. A record that cannot determine them still posts with
+# the old head-only marker -- degrading to the previous behaviour, not failing.
+if [[ -z "$base_sha" && -f "$run_dir/context.json" ]] && command -v jq >/dev/null 2>&1; then
+  base_sha="$(jq -r '.base_sha // ""' "$run_dir/context.json" 2>/dev/null || true)"
+fi
+# base must be a full sha BEFORE the digest is derived from it, or the marker
+# ends up with digest= and no base= (kimi, PR #67 review); an abbreviated base
+# is expanded first, like head_sha. An explicit --digest is validated too
+# (spark): a malformed one would look authoritative and verify nothing.
+if [[ -n "$base_sha" && ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] && command -v git >/dev/null 2>&1; then
+  base_sha="$(git rev-parse --verify -q "$base_sha^{commit}" 2>/dev/null || true)"
+fi
+[[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || base_sha=""
+[[ -z "$digest" || "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "post_comment: ignoring malformed --digest" >&2; digest=""; }
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
+if [[ -z "$digest" && -n "$base_sha" && -n "$head_sha" ]] && command -v git >/dev/null 2>&1; then
+  # Content, not commit ids: a rebase rewrites every sha while changing nothing
+  # a reviewer read. Digesting the diff is what lets a record survive one.
+  # `git diff base head` (two-dot) is the tree-to-tree comparison, which is what
+  # the reviewers were actually shown.
+  if git rev-parse --verify -q "$base_sha^{commit}" >/dev/null 2>&1 \
+     && git rev-parse --verify -q "$head_sha^{commit}" >/dev/null 2>&1; then
+    digest="$(git diff "$base_sha" "$head_sha" 2>/dev/null | sha256 2>/dev/null | cut -d" " -f1)"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || digest=""
+  fi
+fi
+# Only well-formed values reach the marker; a half-written stamp is worse than
+# an absent one, because it reads as authoritative.
+[[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || base_sha=""
 jsonesc() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
 # Without --repo, `gh pr view 3280` resolves the number against whatever
 # repository the CALLER happens to be standing in. reconcile.sh scans a runs
@@ -165,11 +208,16 @@ fi
 # must never cost the user a posted review.
 if [[ "$mode" == "summary" && "$pass_explicit" -eq 0 && -n "$pr" ]] &&
   command -v jq >/dev/null 2>&1; then
-  # The capture tolerates trailing tokens after pass=<n> (the #144
-  # `wrapper=<sha>` token) — without that, every wrapper-bearing marker was
-  # invisible here and each new round posted as pass=1 (cross-review of #148).
+  # Field-tolerant on purpose. This capture used to anchor pass= directly
+  # between sha= and the closing -->, so adding base=/digest= to the marker
+  # silently broke it -- max() fell to 0 and every subsequent record would have
+  # been labelled pass=1 again, quietly destroying the ordering that the
+  # newest-record-wins rule depends on. Match the field, not its position.
+  # (A comment placed INSIDE the line continuation below swallows the --jq
+  # argument entirely and produces exactly that failure -- done live, caught by
+  # the pass-numbering test.)
   prior="$(gh pr view "$pr" ${gh_repo[@]+"${gh_repo[@]}"} --json comments \
-    --jq '[.comments[].body | capture("<!-- cross-review: sha=[0-9a-f]{40} pass=(?<n>[0-9]+)( [^>]*)? -->").n | tonumber] | max // 0' \
+    --jq '[.comments[].body | capture("<!-- cross-review:[^>]* pass=(?<n>[0-9]+)").n | tonumber] | max // 0' \
     2>/dev/null || true)"
   if [[ "$prior" =~ ^[0-9]+$ ]]; then
     pass="$((prior + 1))"
@@ -307,7 +355,17 @@ case "$mode" in
       [[ "$wrapper_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || wrapper_sha=""
     fi
     marker=""
-    [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] && marker="<!-- cross-review: sha=${head_sha} pass=${pass}${wrapper_sha:+ wrapper=${wrapper_sha}} -->"
+    # Field order is `sha= pass= [wrapper=] [base=] [digest=]`: the
+    # `sha=<40> pass=<n>` prefix is byte-stable (pinned by #148's
+    # test_wrapper_sha and CR_MARKER_RE); every parser (read_stamp.sh,
+    # post_comment's pass capture, the currency CI) matches fields by name.
+    if [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+      marker="<!-- cross-review: sha=${head_sha} pass=${pass}"
+      [[ -n "$wrapper_sha" ]] && marker+=" wrapper=${wrapper_sha}"
+      [[ -n "$base_sha" ]] && marker+=" base=${base_sha}"
+      [[ -n "$digest" ]] && marker+=" digest=${digest}"
+      marker+=" -->"
+    fi
 
     {
       printf '## Cross-review — pass %s\n\n' "$pass"

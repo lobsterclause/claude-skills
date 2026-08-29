@@ -720,6 +720,120 @@ fbclass "control: no fallback object, rc=0 with output → ok" \
 fbclass "control: no fallback object, rc=1 → failed" \
   '{"exit_code":1,"duration_s":2,"timed_out":false,"output_bytes":0}' "failed"
 
+echo "── read_stamp.sh is the ONE parser for record stamps ──"
+# [pin: 2026-08-22 — the two halves of the stamp had two readers.
+# merge_preflight.sh (the hook that actually blocks merges) parsed the PROSE
+# line; ci/cross-review-currency.sh parsed the HTML MARKER. Nothing tied them
+# together, and it bit for real: a record corrected in the marker alone left
+# the merge gate clearing on a superseded prose stamp. A guarantee living in
+# two parsers is not a guarantee.]
+RS="$S/read_stamp.sh"
+rs() { printf '%s' "$1" | bash "$RS" --body-stdin 2>/dev/null | jq -r "$2"; }
+SHA40="17185c47824a9a3144fa92d65ed072f354f38a2c"
+BASE40="8f49b407726c50045d24527680b6b9a87796df60"
+DIG64="aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+FULL="## Cross-review
+<!-- cross-review: sha=$SHA40 base=$BASE40 pass=3 digest=$DIG64 -->
+Reviewed \`${SHA40:0:9}\`."
+assert_eq "marker is the source of truth"        "$(rs "$FULL" .source)" "marker"
+assert_eq "marker yields the full 40-char sha"   "$(rs "$FULL" .sha)"    "$SHA40"
+assert_eq "marker yields the base for coverage"  "$(rs "$FULL" .base)"   "$BASE40"
+assert_eq "marker yields the content digest"     "$(rs "$FULL" .digest)" "$DIG64"
+assert_eq "marker yields the pass number"        "$(rs "$FULL" .pass)"   "3"
+# Legacy shapes must keep parsing, or this unification silently reclassifies
+# every record written before today as unstamped — turning a working gate off.
+LEGACY_M="## Cross-review
+<!-- cross-review: sha=$SHA40 pass=1 -->
+Reviewed \`${SHA40:0:9}\`."
+assert_eq "a pre-base marker still parses"       "$(rs "$LEGACY_M" .source)" "marker"
+assert_eq "a pre-base marker has no base"        "$(rs "$LEGACY_M" .base)"   ""
+LEGACY_P="## Cross-review
+Reviewed \`${SHA40:0:9}\`."
+assert_eq "prose-only records still parse"       "$(rs "$LEGACY_P" .source)" "prose"
+assert_eq "prose yields the abbreviated sha"     "$(rs "$LEGACY_P" .sha)"    "${SHA40:0:9}"
+assert_eq "an unstamped body is not stamped"     "$(rs "## Cross-review
+no stamp here" .stamped)" "false"
+# When the halves disagree the marker wins AND the disagreement is reported —
+# a record contradicting itself is the corruption this file exists to surface.
+DISAGREE="## Cross-review
+<!-- cross-review: sha=$SHA40 pass=3 -->
+Reviewed \`deadbeef1\`."
+assert_eq "on disagreement the marker wins"      "$(rs "$DISAGREE" .sha)" "$SHA40"
+DIS_ERR="$(printf '%s' "$DISAGREE" | bash "$RS" --body-stdin 2>&1 >/dev/null)"
+assert_contains "a self-contradicting record warns" "$DIS_ERR" "disagrees with prose"
+# Fields come from ONE marker: a marker quoted in the findings must not lend
+# its base=/digest= to the record's own marker (codex, PR #67 review).
+TWO="## Cross-review
+<!-- cross-review: sha=$SHA40 pass=1 -->
+Quoted from another PR: <!-- cross-review: sha=$BASE40 base=$BASE40 pass=7 digest=$DIG64 -->"
+assert_eq "two markers: sha comes from the first"   "$(rs "$TWO" .sha)"    "$SHA40"
+assert_eq "two markers: no base borrowed"            "$(rs "$TWO" .base)"   ""
+assert_eq "two markers: no digest borrowed"          "$(rs "$TWO" .digest)" ""
+assert_eq "two markers: pass from the first"         "$(rs "$TWO" .pass)"   "1"
+
+echo "── range_coverage.sh: the union of records, not one point ──"
+# [pin: 2026-08-22 — point-equality gating made the merge gate a treadmill.
+# Every fix that answers a finding moves the head, so the record containing the
+# finding stops covering the code; PR #66 hit this three times in one session
+# and the only exits were a fourth round or an override. Neither is a check.
+# Coverage asks the honest question: is every commit being merged covered by
+# SOME record?]
+RCV="$S/range_coverage.sh"
+GR="$T/coverage-repo"
+rm -rf "$GR"; mkdir -p "$GR"
+(
+  cd "$GR"
+  git init -q .; git config user.email t@t; git config user.name t
+  for i in 0 1 2 3; do printf 'line %s\n' "$i" >>f.txt; git add f.txt; git commit -qm "commit $i: update f.txt *"; done
+) >/dev/null 2>&1
+C0="$(cd "$GR" && git rev-parse HEAD~3)"; C1="$(cd "$GR" && git rev-parse HEAD~2)"
+C2="$(cd "$GR" && git rev-parse HEAD~1)"; C3="$(cd "$GR" && git rev-parse HEAD)"
+rcv() { (cd "$GR" && bash "$RCV" --base "$1" --head "$2" --records "$3") 2>/dev/null; }
+
+# THE CASE THAT MOTIVATED THIS: three rounds, each covering the delta the last
+# one created. No single record covers C0..C3; together they cover all of it.
+UNION="[{\"sha\":\"$C1\",\"base\":\"$C0\",\"digest\":\"\"},{\"sha\":\"$C3\",\"base\":\"$C1\",\"digest\":\"\"}]"
+assert_eq "consecutive records cover the whole range" \
+  "$(rcv "$C0" "$C3" "$UNION" | jq -r .covered)" "true"
+# NON-VACUITY: a real gap must still be caught, or "covered" means nothing.
+GAP="[{\"sha\":\"$C3\",\"base\":\"$C2\",\"digest\":\"\"}]"
+assert_eq "a gap in the middle is NOT covered" \
+  "$(rcv "$C0" "$C3" "$GAP" | jq -r .covered)" "false"
+assert_eq "and the uncovered commits are named" \
+  "$(rcv "$C0" "$C3" "$GAP" | jq -r '.uncovered | length')" "2"
+# rev-list is newest-first; look for the entry rather than pinning an index.
+assert_contains "…one entry per commit, subject intact (no word splitting/globbing)" \
+  "$(rcv "$C0" "$C3" "$GAP" | jq -r '.uncovered[]' | grep -F 'commit 1: update f.txt *')" "commit 1: update f.txt *"
+assert_eq "no records at all is not covered" \
+  "$(rcv "$C0" "$C3" '[]' | jq -r .covered)" "false"
+# A head-only (legacy) stamp asserts ONE commit and nothing behind it. Treating
+# it as covering all prior history would bless a whole branch off one point.
+HEADONLY="[{\"sha\":\"$C3\",\"base\":\"\",\"digest\":\"\"}]"
+assert_eq "a head-only stamp covers only its own commit" \
+  "$(rcv "$C0" "$C3" "$HEADONLY" | jq -r '.uncovered | length')" "2"
+# Rebase survival: ids all change, content does not. Digest equality is the
+# only thing that can see through that, so it is checked before id matching.
+REAL_DIG="$( (cd "$GR" && git diff "$C0" "$C3" | shasum -a 256 | cut -d" " -f1) )"
+DEAD="[{\"sha\":\"deadbeef00000000000000000000000000000000\",\"base\":\"deadbeef11111111111111111111111111111111\",\"digest\":\"$REAL_DIG\"}]"
+assert_eq "a matching digest survives a rebase" \
+  "$(rcv "$C0" "$C3" "$DEAD" | jq -r .covered)" "true"
+assert_eq "and reports that it used the digest path" \
+  "$(rcv "$C0" "$C3" "$DEAD" | jq -r .method)" "digest"
+# CONTROL: dead ids with a WRONG digest must not pass, or the rebase path is a
+# universal bypass rather than a content check.
+DEADBAD="[{\"sha\":\"deadbeef00000000000000000000000000000000\",\"base\":\"deadbeef11111111111111111111111111111111\",\"digest\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]"
+assert_eq "control: dead ids with a wrong digest do NOT pass" \
+  "$(rcv "$C0" "$C3" "$DEADBAD" | jq -r .covered)" "false"
+assert_eq "an empty range needs no coverage" \
+  "$(rcv "$C3" "$C3" '[]' | jq -r .covered)" "true"
+# Stock macOS /bin/bash is 3.2: no mapfile, no associative arrays. The union
+# path must work there or the gate silently degrades to "stale" (kimi High).
+if [[ -x /bin/bash ]]; then
+  rcv32() { (cd "$GR" && /bin/bash "$RCV" --base "$1" --head "$2" --records "$3") 2>/dev/null; }
+  assert_eq "under /bin/bash ($(/bin/bash -c 'echo ${BASH_VERSION%%(*}')): union covers" "$(rcv32 "$C0" "$C3" "$UNION" | jq -r .covered)" "true"
+  assert_eq "under /bin/bash: a gap is still caught, 2 uncovered" "$(rcv32 "$C0" "$C3" "$GAP" | jq -r '.uncovered | length')" "2"
+fi
+
 echo '── analyze_runlog.sh knows the `fallback` status it is fed ──'
 # [pin: 2026-08-22 — PR #66 taught append_runlog.sh to emit status "fallback"
 # for a first-party lane rescued over OpenRouter, but analyze_runlog.sh bucketed
@@ -1878,6 +1992,17 @@ mg_status() { printf '%s' "$MG_OUT" | jq -r '.status // ""' 2>/dev/null; }
 HEAD40='399df23d4d5945162d0c5ed623484d608337165d'
 REVIEWED_OLD='## Cross-review — pass 1\n\n_Automated review by codex + kimi. Reviewed `b81377350`. See below._'
 REVIEWED_NEW='## Cross-review — pass 2\n\n_Automated review by codex. Reviewed `399df23d4`. See below._'
+# Marker and prose disagree: the MARKER decides (one parser — codex High, #67).
+MARKER_NEW_PROSE_OLD="## Cross-review — pass 2\n<!-- cross-review: sha=$HEAD40 pass=2 -->\n_Reviewed \`b81377350\`._"
+MARKER_OLD_PROSE_NEW="## Cross-review — pass 2\n<!-- cross-review: sha=b813773500000000000000000000000000000000 pass=2 -->\n_Reviewed \`399df23d4\`._"
+MG_MARKER_WINS_PASS="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_NEW_PROSE_OLD\"}]}"
+MG_MARKER_WINS_DENY="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_OLD_PROSE_NEW\"}]}"
+# Marker-only records (no prose stamp at all) are records too (codex + antigravity, #67 pass 2).
+MARKER_ONLY_NEW="## Cross-review — pass 2\n<!-- cross-review: sha=$HEAD40 pass=2 -->\nFindings below."
+MARKER_ONLY_OLD="## Cross-review — pass 1\n<!-- cross-review: sha=b813773500000000000000000000000000000000 pass=1 -->\nFindings below."
+MG_MARKER_ONLY_PASS="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_ONLY_NEW\"}]}"
+MG_MARKER_ONLY_DENY="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_ONLY_OLD\"}]}"
+MG_OLD_PROSE_THEN_NEW_MARKER="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_OLD\"},{\"body\":\"$MARKER_ONLY_NEW\"}]}"
 
 # 1. The whole point: a record bound to a different commit blocks the merge.
 mg_pf "{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$REVIEWED_OLD\"}]}" --pr 3207
@@ -1934,6 +2059,23 @@ MG_CLEAR="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\"
 
 assert_eq "hook denies a stale merge" \
   "$(mg_hook "$MG_STALE" 'gh pr merge 3207 --squash --auto')" "deny"
+# A clear record still needs --match-head-commit (the hook's TOCTOU rule).
+assert_eq "marker current, prose stale → the marker clears the merge" \
+  "$(mg_hook "$MG_MARKER_WINS_PASS" "gh pr merge 3207 --match-head-commit $HEAD40")" "PASS"
+assert_eq "marker stale, prose current → the marker denies the merge" \
+  "$(mg_hook "$MG_MARKER_WINS_DENY" 'gh pr merge 3207')" "deny"
+assert_eq "a marker-only record at the current head clears" \
+  "$(mg_hook "$MG_MARKER_ONLY_PASS" "gh pr merge 3207 --match-head-commit $HEAD40")" "PASS"
+assert_eq "a marker-only record at an old head denies" \
+  "$(mg_hook "$MG_MARKER_ONLY_DENY" 'gh pr merge 3207')" "deny"
+assert_eq "the newest marker-only record wins over an older prose one" \
+  "$(mg_hook "$MG_OLD_PROSE_THEN_NEW_MARKER" "gh pr merge 3207 --match-head-commit $HEAD40")" "PASS"
+# An unterminated marker prefix is not a record (codex, #67 pass 3): it must
+# not mask a valid current review that precedes it.
+MARKER_BROKEN="## Cross-review — pass 3\n<!-- cross-review: sha=b813773500000000000000000000000000000000 pass=3\nno closing tag"
+MG_BROKEN_AFTER_GOOD="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\",\"comments\":[{\"body\":\"$MARKER_ONLY_NEW\"},{\"body\":\"$MARKER_BROKEN\"}]}"
+assert_eq "an unterminated marker after a current record does not mask it" \
+  "$(mg_hook "$MG_BROKEN_AFTER_GOOD" "gh pr merge 3207 --match-head-commit $HEAD40")" "PASS"
 # A merge reviewed at head is no longer waved through unconditionally: it must
 # also bind itself to that commit. See the TOCTOU block further down for why.
 assert_eq "control: hook allows a merge reviewed at head AND bound to it" \

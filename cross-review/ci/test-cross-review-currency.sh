@@ -522,15 +522,51 @@ echo "── the skill emits what the gate reads ──"
 # on this machine — the gate's regex must match the string the skill writes.
 PCS="$CR_PCS_PATH"
 if [[ -f "$PCS" ]]; then
-  emitted="$(grep -o '<!-- cross-review: sha=[^>]*-->' "$PCS" | head -1)"
+  # BEHAVIOURAL, not textual. This used to grep the marker literal out of
+  # post_comment.sh and sed the shell expansions away -- so it asserted on how
+  # the file is WRITTEN rather than what it EMITS, and building the marker
+  # across several lines (to make base=/digest= optional) broke the simulation
+  # while the emitted marker stayed perfectly valid. A parity test that a
+  # reformat can fail, and that a genuinely wrong marker could pass, is not
+  # checking parity. Run the thing and read its output.
+  PARITY_T="$(mktemp -d)"; mkdir -p "$PARITY_T/bin" "$PARITY_T/run"
+  cat >"$PARITY_T/bin/gh" <<'GHSTUB'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "pr view") printf '%s\n' "${CR_TEST_PR_JSON:-}" ; exit 0 ;;
+  "pr comment")
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--body-file" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
+        shift
+      done
+      exit 0 ;;
+esac
+exit 0
+GHSTUB
+  chmod +x "$PARITY_T/bin/gh"
+  printf '# findings\n\nnothing to report\n' >"$PARITY_T/run/findings.md"
+  CR_TEST_CAPTURE="$PARITY_T/body.md" ; : >"$CR_TEST_CAPTURE"
+  PATH="$PARITY_T/bin:$PATH" CR_TEST_CAPTURE="$CR_TEST_CAPTURE" \
+    CR_TEST_PR_JSON="{\"headRefOid\":\"$HEAD40\",\"state\":\"OPEN\"}" \
+    bash "$PCS" --pr 1 --mode summary --findings "$PARITY_T/run/findings.md" \
+      --head-sha "$HEAD40" >/dev/null 2>&1
+  emitted="$(grep -o '<!-- cross-review: sha=[^>]*-->' "$CR_TEST_CAPTURE" 2>/dev/null | head -1)"
   assert_contains "post_comment.sh emits a marker" "$emitted" "cross-review: sha="
-  # Substitute the shell expansions out and check the literal shape matches.
-  rendered="$(printf '%s' "$emitted" | sed -e "s/\${head_sha}/$HEAD40/" -e 's/\${pass}/1/')"
-  if [[ "$rendered" =~ $CR_MARKER_RE ]]; then
+  if [[ "$emitted" =~ $CR_MARKER_RE ]]; then
     ok "and the gate's marker regex matches what it emits"
   else
-    bad "the gate's regex does not match the skill's marker: $rendered"
+    bad "the gate's regex does not match the skill's marker: $emitted"
   fi
+  # The prose half must agree with the marker half. These are the two stamps
+  # that drifted apart for real: the merge hook read one, this CI read the
+  # other, and a record corrected in one left the hook clearing on the other.
+  if grep -q "Reviewed \`${HEAD40:0:9}\`" "$CR_TEST_CAPTURE" 2>/dev/null; then
+    ok "and the prose stamp agrees with the marker"
+  else
+    bad "the prose stamp does not carry the same sha as the marker"
+  fi
+  rm -rf "$PARITY_T"
   # CONTROL: the regex must reject a marker carrying an abbreviated sha, or it
   # is not enforcing the full-width contract the marker exists to provide.
   if [[ "$(marker "${HEAD40:0:9}" 1)" =~ $CR_MARKER_RE ]]; then
