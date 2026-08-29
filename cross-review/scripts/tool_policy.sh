@@ -63,7 +63,7 @@
 #   tool_policy.sh --reviewer <slug> [--repo-root <dir>] [--mode json|table] [--explain]
 #   tool_policy.sh --all [--repo-root <dir>] [--mode table]        # every chat-lane seat
 # Env (fixture tests): CROSS_REVIEW_RUNLOG, CROSS_REVIEW_FINDING_EVENTS,
-#   CROSS_REVIEW_PROFILES.
+#   CROSS_REVIEW_PROFILES_FILE.
 # Output (json): {reviewer, mode, basis, check_available, arms:{<arm>:{n, ok,
 #   reliability, mean, ucb, cost_avg, eligible}}, window_runs, excluded_runs}
 
@@ -90,7 +90,7 @@ command -v jq >/dev/null 2>&1 || { echo "tool_policy: jq required" >&2; exit 1; 
 [[ -n "$reviewer" || "$all" == true ]] || { echo "usage: $0 --reviewer <slug> | --all" >&2; exit 2; }
 [[ -n "$repo_root" ]] || repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
-profiles="${CROSS_REVIEW_PROFILES:-$script_dir/../references/reviewer_profiles.json}"
+profiles="${CROSS_REVIEW_PROFILES_FILE:-$script_dir/../references/reviewer_profiles.json}"
 runlog="${CROSS_REVIEW_RUNLOG:-$script_dir/../runlog.jsonl}"
 events="${CROSS_REVIEW_FINDING_EVENTS:-$(dirname "$runlog")/finding_events.jsonl}"
 
