@@ -94,7 +94,7 @@ assert_contains "no AGENTS.md before → note still delivered" "$(cat "$T/no_dep
 # the note lands in the ROOT's AGENTS.md even from a subdirectory.
 printf '# project rules\n' >AGENTS.md; chmod 644 AGENTS.md
 bash "$S/run_reviewers.sh" --base main --out "$T/no_deps_codex3" --reviewers codex >/dev/null 2>&1 || true
-assert_eq "AGENTS.md keeps its mode (0644) after the round trip" "$(stat -f %Lp AGENTS.md 2>/dev/null || stat -c %a AGENTS.md)" "644"
+assert_eq "AGENTS.md keeps its mode (0644) after the round trip" "$(stat -c %a AGENTS.md 2>/dev/null || stat -f %Lp AGENTS.md)" "644"
 assert_eq "…and its content"                                   "$(cat AGENTS.md)" "# project rules"
 [[ ! -e .AGENTS.md.cross-review.lock ]] && ok "lock released" || bad "lock left behind"
 rm -f AGENTS.md; printf 'TARGET\n' >"$T/target.md"; ln -s "$T/target.md" AGENTS.md
