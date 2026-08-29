@@ -641,10 +641,14 @@ tool_loop_run() {
       jq -c --arg id "$id" --arg name "$name" --arg c "$result" '. + [{role:"tool", tool_call_id:$id, name:$name, content:$c}]' "$msgs" >"$msgs.tmp" && mv "$msgs.tmp" "$msgs"
       i=$((i + 1))
     done
+    # One clock read for the wall check below: two reads straddling a second
+    # boundary could pass the >= 10 guard and fail the < bound, or vice
+    # versa (codex Low, PR #162 pass 2).
+    local wall_left=$(( budget - ($(date +%s) - start) ))
     if (( TL_STEPS >= TL_MAX_STEPS )); then
       force_final=true
       jq -c '. + [{role:"user", content:"Tool budget exhausted. Do not call any more tools. Answer now with your findings in the required JSON shape, based on what you have already seen; mark anything you could not verify as unverified."}]' "$msgs" >"$msgs.tmp" && mv "$msgs.tmp" "$msgs"
-    elif (( budget - ($(date +%s) - start) >= 10 && budget - ($(date +%s) - start) < 2 * TL_TURN_MAX_S + 10 )); then
+    elif (( wall_left >= 10 && wall_left < 2 * TL_TURN_MAX_S + 10 )); then
       # Wall-aware stop (#159): every turn re-sends the whole prefix, so a
       # turn costs about what the slowest one did. If two more of those do
       # not fit (one tool turn + the answer), spend what is left on the
@@ -657,7 +661,7 @@ tool_loop_run() {
       # timed-out run would say "answered" about a lane that did not (kimi
       # Low, PR #162 pass 1).
       force_final=true; TL_WALL_FORCED=true
-      echo "$slug: wall budget cannot fit another tool turn (slowest ${TL_TURN_MAX_S}s, $(( budget - ($(date +%s) - start) ))s left) — forcing the final answer after $TL_STEPS step(s)" >>"$err"
+      echo "$slug: wall budget cannot fit another tool turn (slowest ${TL_TURN_MAX_S}s, ${wall_left}s left) — forcing the final answer after $TL_STEPS step(s)" >>"$err"
       jq -c '. + [{role:"user", content:"Time budget nearly exhausted. Do not call any more tools. Answer now with your findings in the required JSON shape, based on what you have already seen; mark anything you could not verify as unverified."}]' "$msgs" >"$msgs.tmp" && mv "$msgs.tmp" "$msgs"
     fi
   done
