@@ -31,6 +31,8 @@ jobs:
         run: |
           diff -r \
             --exclude 'runlog.jsonl*' \
+            --exclude 'finding_events.jsonl' \
+            --exclude 'state' \
             --exclude 'iteration-1' \
             --exclude '*.bak*' \
             --exclude '.DS_Store' \
