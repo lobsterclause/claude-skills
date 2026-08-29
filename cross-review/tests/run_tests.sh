@@ -399,6 +399,31 @@ assert_eq "second attempt recorded" "$(jq -r '.attempt' "$T/o7/glm.meta.json")" 
 assert_eq "retried run sums prompt tokens"     "$(jq -r '.tokens_prompt' "$T/o7/glm.meta.json")" "1800"
 assert_eq "retried run sums completion tokens" "$(jq -r '.tokens_completion' "$T/o7/glm.meta.json")" "49"
 assert_eq "retried run keeps cache null when neither attempt reported it" "$(jq -r '.tokens_cached' "$T/o7/glm.meta.json")" "null"
+assert_eq "…and no cache denominator either" "$(jq -r '.tokens_cache_prompt' "$T/o7/glm.meta.json")" "null"
+rm -f "$T/bin/curl" "$T/curl_calls"
+
+# retry with MIXED cache reporting: attempt 1 reports cache counters, attempt 2
+# does not. tokens_prompt sums both attempts (real spend), but the cache ratio
+# must be measured against attempt 1 alone — summing the denominator while the
+# numerator covers one attempt understates the hit rate (codex, #152).
+cat >"$T/canned_or_preamble_cached.json" <<'EOF'
+{"choices":[{"message":{"content":"I will now begin reviewing the changes."}}],"usage":{"prompt_tokens":900,"completion_tokens":9,"cost":0.01,"prompt_tokens_details":{"cached_tokens":200,"cache_write_tokens":0}}}
+EOF
+rm -f "$T/curl_calls"
+cat >"$T/bin/curl" <<SHIM
+#!/bin/sh
+echo x >> "$T/curl_calls"
+if [ "\$(wc -l < "$T/curl_calls" | tr -d ' ')" -ge 2 ]; then
+  cat "$T/canned_or_good.json"
+else
+  cat "$T/canned_or_preamble_cached.json"
+fi
+SHIM
+chmod +x "$T/bin/curl"
+bash "$S/run_reviewers.sh" --base main --out "$T/o7c" --reviewers glm >/dev/null 2>&1 || true
+assert_eq "mixed-retry run still sums prompt tokens"      "$(jq -r '.tokens_prompt' "$T/o7c/glm.meta.json")" "1800"
+assert_eq "mixed-retry run keeps the measured cache hit"  "$(jq -r '.tokens_cached' "$T/o7c/glm.meta.json")" "200"
+assert_eq "…and divides it by the measured attempt only"  "$(jq -r '.tokens_cache_prompt' "$T/o7c/glm.meta.json")" "900"
 rm -f "$T/bin/curl" "$T/curl_calls"
 
 # leaderboard: avg_cost_usd aggregates; roster draw halves a $0.50 reviewer
@@ -764,6 +789,26 @@ EOF
 FB_CTL="$(CROSS_REVIEW_RUNLOG="$FBLOG2" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
 assert_contains "control: ok/failed still bucket normally" "$FB_CTL" "ok=2/3"
 assert_contains "control: no fallback counted when none occurred" "$FB_CTL" "fallback=0"
+
+echo "── analyze_runlog.sh divides the cache hit rate by the measured prompt tokens ──"
+# The consumer side of #151/#152. tokens_cache_prompt is the prompt tokens of the
+# turns/attempts that actually reported cache counters; tokens_prompt covers every
+# one of them. Dividing by the latter understates any run whose reporting was mixed.
+# Rows written before the field existed must keep dividing by tokens_prompt, or the
+# archive silently re-reads at a different rate than it was ever measured at.
+CACHELOG="$T/cache-runlog.jsonl"
+cat >"$CACHELOG" <<'EOF'
+{"ts":"2026-08-29T01:00:00Z","reviewers":{"glm":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":50,"timeout_budget_s":600,"tokens_prompt":1000,"tokens_cached":400,"tokens_cache_prompt":500},"minimax":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":50,"timeout_budget_s":600,"tokens_prompt":1000,"tokens_cached":200},"seed":{"status":"ok","exit_code":0,"duration_s":10,"output_bytes":50,"timeout_budget_s":600,"tokens_prompt":1000}}}
+EOF
+CACHE_REP="$(CROSS_REVIEW_RUNLOG="$CACHELOG" bash "$S/analyze_runlog.sh" --mode report 2>&1)"
+assert_contains "mixed-reporting run divides by the measured turns (400/500)" "$CACHE_REP" "cache_hit=80% (1 runs)"
+assert_contains "a legacy row without the field still divides by tokens_prompt (200/1000)" "$CACHE_REP" "cache_hit=20% (1 runs)"
+CACHE_SEED="$(printf '%s\n' "$CACHE_REP" | grep '  seed:' || true)"
+if printf '%s' "$CACHE_SEED" | grep -q 'cache_hit'; then
+  bad "a row with no cache counters is excluded from the hit rate"
+else
+  ok "a row with no cache counters is excluded from the hit rate"
+fi
 
 echo "── analyze_runlog.sh sleep-suspect samples (wall clock past enforced budget) ──"
 # [pin: 2026-07-03 — the Mac slept mid-round (pmset: Dark Wake Thermal

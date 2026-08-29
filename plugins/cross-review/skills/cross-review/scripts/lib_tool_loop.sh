@@ -482,7 +482,11 @@ tl_num() { jq -r "$1 | if type==\"number\" then tostring else \"0\" end" "$2" 2>
 # the wall budget runs out, or the API errors. Sets:
 #   TL_RC          0 ok | 1 api error | 124 timeout | 5 empty final content
 #   TL_COST TL_TOKP TL_TOKC   summed over every turn (null when nothing returned)
-#   TL_TOKCACHED TL_TOKCW     prompt-cache hit / write tokens, summed likewise
+#   TL_TOKCACHED TL_TOKCW     prompt-cache hit / write tokens, summed over the
+#                             turns that REPORTED them (not every turn)
+#   TL_TOKPCACHE   prompt tokens of those same turns — the denominator the
+#                  hit rate must be divided by, which is not TL_TOKP when a
+#                  mid-loop re-route lands on a host that omits the object
 #   TL_PROVIDER    upstream host that answered the last turn ("null" if unknown)
 #   TL_STEPS       assistant turns that carried tool calls
 #   TL_TURNS       total API calls made
@@ -499,7 +503,8 @@ tool_loop_run() {
   TL_READ_BYTES=0; TL_BUDGET_EXHAUSTED=false; TL_CHECK_RAN=false; TL_CHECK_RC="null"
   TL_C_READ=0; TL_C_SEARCH=0; TL_C_LIST=0; TL_C_CHECK=0; TL_C_UNKNOWN=0
   TL_RC=0; TL_COST="null"; TL_TOKP="null"; TL_TOKC="null"; TL_STEPS=0; TL_TURNS=0
-  TL_TOKCACHED="null"; TL_TOKCW="null"; TL_PROVIDER="null"; TL_PROVIDER_PIN=""
+  TL_TOKCACHED="null"; TL_TOKCW="null"; TL_TOKPCACHE="null"
+  TL_PROVIDER="null"; TL_PROVIDER_PIN=""
   TL_RF_DROPPED=false; TL_API_ERROR=""; TL_FAILURE_KIND=""
   local check_avail=false
   [[ "$mode" == "check" ]] && tl_resolve_check_cmd "$root" >/dev/null 2>&1 && check_avail=true
@@ -511,7 +516,8 @@ tool_loop_run() {
   local start now elapsed remaining
   start=$(date +%s)
   TL_DEADLINE=$((start + budget))   # tl_run_check caps itself by this
-  local cost_sum=0 tokp_sum=0 tokc_sum=0 tokcached_sum=0 tokcw_sum=0 any_usage=false any_cache=false
+  local cost_sum=0 tokp_sum=0 tokc_sum=0 tokcached_sum=0 tokcw_sum=0 tokpcache_sum=0
+  local any_usage=false any_cache=false
   local turn=0 final_content="" force_final=false
   while :; do
     turn=$((turn + 1)); TL_TURNS=$turn
@@ -567,20 +573,32 @@ tool_loop_run() {
       # number (0.0123), and a padded 0.012300 here would make the same run
       # look different across arms in the runlog.
       cost_sum="$(jq -n --argjson a "$cost_sum" --argjson b "$(tl_num .usage.cost "$resp")" '$a + $b')"
-      tokp_sum=$((tokp_sum + $(tl_num .usage.prompt_tokens "$resp" | cut -d. -f1)))
+      local t_p t_cached t_cw
+      t_p="$(tl_num .usage.prompt_tokens "$resp" | cut -d. -f1)"
+      tokp_sum=$((tokp_sum + t_p))
       tokc_sum=$((tokc_sum + $(tl_num .usage.completion_tokens "$resp" | cut -d. -f1)))
       # Prompt-cache counters (OpenRouter normalises every host to
       # prompt_tokens_details.{cached_tokens,cache_write_tokens}; hosts that
-      # do not cache report 0, Moonshot-direct omits the object → 0).
+      # do not cache report 0, Moonshot-direct omits the object).
       # any_cache gates publishing: a host that omits the object (Moonshot
       # direct) must stay null → excluded from the hit-rate denominator, not
       # a measured 0% sample (codex P2, this PR).
-      local t_cached t_cw
-      jq -e '.usage.prompt_tokens_details | type == "object"' "$resp" >/dev/null 2>&1 && any_cache=true
-      t_cached="$(tl_num .usage.prompt_tokens_details.cached_tokens "$resp" | cut -d. -f1)"
-      t_cw="$(tl_num .usage.prompt_tokens_details.cache_write_tokens "$resp" | cut -d. -f1)"
-      tokcached_sum=$((tokcached_sum + t_cached)); tokcw_sum=$((tokcw_sum + t_cw))
-      echo "$slug: turn $turn provider=$(jq -r '.provider // "?"' "$resp" 2>/dev/null) prompt_tokens=$(tl_num .usage.prompt_tokens "$resp" | cut -d. -f1) cached=$t_cached" >>"$err"
+      #
+      # Numerator and denominator must cover the SAME turns. any_cache is set
+      # by ANY reporting turn while tokp_sum counts EVERY turn, so a loop that
+      # re-routes mid-way to a host which omits the object used to divide one
+      # host's cached tokens by both hosts' prompt tokens and understate the
+      # hit rate — exactly the re-route this PR exists to measure. tokpcache_sum
+      # is the denominator restricted to the reporting turns (codex, #151).
+      t_cached=none
+      if jq -e '.usage.prompt_tokens_details | type == "object"' "$resp" >/dev/null 2>&1; then
+        any_cache=true
+        t_cached="$(tl_num .usage.prompt_tokens_details.cached_tokens "$resp" | cut -d. -f1)"
+        t_cw="$(tl_num .usage.prompt_tokens_details.cache_write_tokens "$resp" | cut -d. -f1)"
+        tokcached_sum=$((tokcached_sum + t_cached)); tokcw_sum=$((tokcw_sum + t_cw))
+        tokpcache_sum=$((tokpcache_sum + t_p))
+      fi
+      echo "$slug: turn $turn provider=$(jq -r '.provider // "?"' "$resp" 2>/dev/null) prompt_tokens=$t_p cached=$t_cached" >>"$err"
     fi
     # Which upstream answered. The last one wins for meta.json; the FIRST one
     # becomes the pin for the rest of this loop (see the request builder).
@@ -642,7 +660,9 @@ tool_loop_run() {
   rm -f "$msgs.assistant" "$msgs.tmp" "$outd/${slug}.tool.result.txt"
   if [[ "$any_usage" == true ]]; then
     TL_COST="$cost_sum"; TL_TOKP="$tokp_sum"; TL_TOKC="$tokc_sum"
-    if [[ "$any_cache" == true ]]; then TL_TOKCACHED="$tokcached_sum"; TL_TOKCW="$tokcw_sum"; fi
+    if [[ "$any_cache" == true ]]; then
+      TL_TOKCACHED="$tokcached_sum"; TL_TOKCW="$tokcw_sum"; TL_TOKPCACHE="$tokpcache_sum"
+    fi
   fi
   if [[ $TL_RC -eq 0 ]]; then
     printf '%s' "$final_content" >"$outd/${slug}.stdout"

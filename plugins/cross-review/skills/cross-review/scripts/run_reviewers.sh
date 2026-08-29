@@ -1504,7 +1504,7 @@ $json_findings_suffix"
   # is visible in telemetry instead of only on a billing dashboard. Null
   # (older entries, failed calls, providers that omit usage) degrades to 0.
   local cost_json="null" tokp_json="null" tokc_json="null"
-  local tokcached_json="null" tokcw_json="null" provider_json="null"
+  local tokcached_json="null" tokcw_json="null" tokpcache_json="null" provider_json="null"
   if [[ -s "$resp_file" ]]; then
     # jq type check instead of a permissive bash regex (nemotron, PR #28
     # pass 1): anything non-numeric — strings, objects, corrupt provider
@@ -1529,10 +1529,15 @@ $json_findings_suffix"
     # needs (a timeout). Observed twice 2026-08-26 (deepseek, nemotron); #74.
     cost_json="${cost_json:-null}"; tokp_json="${tokp_json:-null}"; tokc_json="${tokc_json:-null}"
     tokcached_json="${tokcached_json:-null}"; tokcw_json="${tokcw_json:-null}"; provider_json="${provider_json:-null}"
+    # The denominator for THIS response's cache counters. Single-shot, so it is
+    # the whole prompt — but only when the counters exist at all, so a host that
+    # omits them contributes to neither side of the ratio (#151/#152).
+    if [[ "$tokcached_json" != "null" ]]; then tokpcache_json="$tokp_json"; fi
   fi
   if [[ "$tl_used" == true ]]; then
     cost_json="${TL_COST:-null}"; tokp_json="${TL_TOKP:-null}"; tokc_json="${TL_TOKC:-null}"
     tokcached_json="${TL_TOKCACHED:-null}"; tokcw_json="${TL_TOKCW:-null}"
+    tokpcache_json="${TL_TOKPCACHE:-null}"
     provider_json="$(jq -n --arg p "${TL_PROVIDER:-null}" 'if $p == "null" or $p == "" then null else $p end')"
   fi
   # A retried attempt overwrites meta — but attempt 1's spend was real money
@@ -1553,8 +1558,13 @@ $json_findings_suffix"
     # cache-hit rate is computed from the second prompt alone — which is
     # exactly the one most likely to have hit the cache attempt 1 wrote
     # (codex P2, cache-telemetry PR). Integer sums; null + null stays null.
+    #
+    # tokens_cache_prompt rides along so the ratio stays coherent when only ONE
+    # attempt reported cache counters: the measured attempt's cached tokens are
+    # kept, and the denominator keeps that attempt's prompt tokens alone rather
+    # than the sum of both — which used to understate the hit rate (codex, #152).
     local _k _prior _cur
-    for _k in tokens_prompt tokens_completion tokens_cached tokens_cache_write; do
+    for _k in tokens_prompt tokens_completion tokens_cached tokens_cache_write tokens_cache_prompt; do
       _prior="$(jq -r --arg k "$_k" '.[$k] | if type=="number" then tostring else "null" end' "$out/${slug}.meta.json" 2>/dev/null || echo null)"
       _prior="${_prior:-null}"
       [[ "$_prior" == "null" ]] && continue
@@ -1563,6 +1573,7 @@ $json_findings_suffix"
         tokens_completion)  _cur="$tokc_json" ;;
         tokens_cached)      _cur="$tokcached_json" ;;
         tokens_cache_write) _cur="$tokcw_json" ;;
+        tokens_cache_prompt) _cur="$tokpcache_json" ;;
       esac
       if [[ "$_cur" == "null" ]]; then _cur="$_prior"; else _cur=$(( ${_cur%%.*} + ${_prior%%.*} )); fi
       case "$_k" in
@@ -1570,6 +1581,7 @@ $json_findings_suffix"
         tokens_completion)  tokc_json="$_cur" ;;
         tokens_cached)      tokcached_json="$_cur" ;;
         tokens_cache_write) tokcw_json="$_cur" ;;
+        tokens_cache_prompt) tokpcache_json="$_cur" ;;
       esac
     done
   fi
@@ -1592,9 +1604,9 @@ $json_findings_suffix"
   if [[ "$context_access" == file_context || ( "$tl_mode" != off && "$tool_context" == files && "$context_mode" == files ) ]]; then
     ctx_n="$context_files_included"; ctx_o="$context_files_omitted"
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s, "tokens_cached": %s, "tokens_cache_write": %s, "upstream_provider": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "tool_policy": %s, "tool_stats": %s, "context_mode": %s}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "%s", "failure_kind": %s, "wall_over_budget": %s, "cost_usd": %s, "tokens_prompt": %s, "tokens_completion": %s, "tokens_cached": %s, "tokens_cache_write": %s, "tokens_cache_prompt": %s, "upstream_provider": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "tool_policy": %s, "tool_stats": %s, "context_mode": %s}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$cli" "$fk_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$cost_json" "$tokp_json" "$tokc_json" \
-    "$tokcached_json" "$tokcw_json" "$provider_json" \
+    "$tokcached_json" "$tokcw_json" "$tokpcache_json" "$provider_json" \
     "$context_access" "$ctx_n" "$ctx_o" "$tool_policy_json" "$tool_stats_json" "$(context_mode_json "$context_access")" >"$out/${slug}.meta.json"
   return "$rc"
 }
