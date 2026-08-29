@@ -206,6 +206,16 @@ assert_eq "armed glm context_mode == tools" \
   "$(jq -r '.context_mode' "$T/o9/glm.meta.json")" "tools"
 rm -f "$T/bin/curl"
 
+echo "── (h) tool loop armed (check): context_access tool_check -> context_mode tools (#155) ──"
+canned_or_response
+CROSS_REVIEW_TOOL_MODE=check CROSS_REVIEW_CHECK_CMD=true bash "$S/run_reviewers.sh" --base main --out "$T/o10" \
+  --reviewers glm --context-mode files >/dev/null 2>&1 || true
+assert_eq "armed glm context_access == tool_check" \
+  "$(jq -r '.context_access' "$T/o10/glm.meta.json")" "tool_check"
+assert_eq "armed glm context_mode == tools" \
+  "$(jq -r '.context_mode' "$T/o10/glm.meta.json")" "tools"
+rm -f "$T/bin/curl"
+
 echo ""
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]] || exit 1

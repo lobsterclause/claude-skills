@@ -231,7 +231,9 @@ run_lane "$T/o7" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=rf400 --
 META="$T/o7/glm.meta.json"
 assert_eq "exit_code 0"                      "$(jq -r .exit_code "$META")" "0"
 assert_eq "rf_dropped=true"                  "$(jq -r .tool_stats.rf_dropped "$META")" "true"
-assert_eq "retried request has no response_format" "$(jq -r 'has("response_format")' "$T/o7/glm.turn.1.request.json")" "false"
+assert_eq "rejected turn 1 kept its request (had response_format)" "$(jq -r 'has("response_format")' "$T/o7/glm.turn.1.request.json")" "true"
+assert_eq "retried request (turn 2) has no response_format" "$(jq -r 'has("response_format")' "$T/o7/glm.turn.2.request.json")" "false"
+assert_eq "turns counts the rejected call too" "$(jq -r '.tool_stats.turns >= 2' "$META")" "true"
 assert_contains "stderr explains"            "$(cat "$T/o7/glm.stderr")" "retrying this turn without it"
 
 echo "── profile opt-out (supports_json_object=false) reaches the tool loop ──"
@@ -248,6 +250,33 @@ echo "── tool_context=diff drops the whole-file paste when tools are on ─�
 run_lane "$T/o8" CROSS_REVIEW_TOOL_MODE=read CROSS_REVIEW_TOOL_CONTEXT=diff --
 assert_not_contains "no <files> block" "$(jq -r '.messages[0].content' "$T/o8/glm.turn.1.request.json")" "<files>"
 assert_eq "context_files=0 when the paste was dropped" "$(jq -r .context_files "$T/o8/glm.meta.json")" "0"
+assert_not_contains "intro no longer promises whole files" "$(jq -r '.messages[0].content' "$T/o8/glm.turn.1.request.json")" "whole-file contents that follow"
+assert_contains "intro says the files are not pasted"      "$(jq -r '.messages[0].content' "$T/o8/glm.turn.1.request.json")" "NOT pasted"
+
+echo "── search honours the secret-path policy (codex P1, PR #154) ──"
+SRCH="$( . "$S/lib_tool_loop.sh"; tl_search "$REPO" "." )"
+assert_contains     "search still returns ordinary files" "$SRCH" "src/a.txt:"
+assert_not_contains "search drops hits inside .env"        "$SRCH" ".env:"
+assert_not_contains "…so the secret never leaves"          "$SRCH" "should-never-be-read"
+assert_contains     "search refuses a secret path_glob"    "$( . "$S/lib_tool_loop.sh"; tl_search "$REPO" "." ".env" )" "secret-path policy"
+
+echo "── read_file caps in bytes, not characters (codex P2, PR #154) ──"
+UREPO="$T/urepo"; mkdir -p "$UREPO"
+( cd "$UREPO" && git init -q && git config user.email t@t && git config user.name t
+  python3 -c "print('é' * 40)" >u.txt && git add -A && git commit -qm u )
+UOUT="$( CROSS_REVIEW_TOOL_CALL_CAP_BYTES=50 bash -c '. "$1/lib_tool_loop.sh"; tl_read_file "$2" u.txt 1 1; printf "\nREAD_BYTES=%s" "$TL_READ_BYTES"' _ "$S" "$UREPO" )"
+assert_contains "82-byte body is cut at the 50-byte cap" "$UOUT" "[truncated at 50 bytes]"
+assert_contains "read_bytes counts the capped bytes"     "$UOUT" "READ_BYTES=50"
+if printf '%s' "$UOUT" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then ok "cut body is still valid UTF-8"; else bad "cut body is still valid UTF-8 (invalid UTF-8)"; fi
+
+echo "── run_check is bounded by the lane's remaining budget (codex P2, PR #154) ──"
+CK="$T/ck"; mkdir -p "$CK"
+_t0=$(date +%s)
+CKR="$( CROSS_REVIEW_CHECK_CMD='sleep 40' TL_DEADLINE=$(( _t0 + 12 )) bash -c '. "$1/lib_tool_loop.sh"; TIMEOUT_BIN="$(command -v gtimeout || command -v timeout)"; TL_DEADLINE=$3; tl_run_check "$2" "$4" >/dev/null; cat "$4/check.result.json"' _ "$S" "$REPO" "$(( _t0 + 12 ))" "$CK" )"
+_t1=$(date +%s)
+assert_eq "check timed out under the lane budget" "$(jq -r .timed_out <<<"$CKR")" "true"
+assert_eq "timeout_s clamped to the 5 s floor (12 s left - 10 s margin)" "$(jq -r .timeout_s <<<"$CKR")" "5"
+if (( _t1 - _t0 < 30 )); then ok "returned well before the 40 s command would have"; else bad "returned well before the 40 s command (took $((_t1 - _t0))s)"; fi
 
 echo "── a snapshot seat stays single-shot ──"
 mkdir -p "$T/snap"; printf 'SNAPSHOT_BODY\n' >"$T/snap/snapshot-glm.md"

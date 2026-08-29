@@ -999,7 +999,7 @@ wall_over_budget() {
 # dispatch time instead of inferred later.
 context_mode_json() {
   case "$1" in
-    agent|workspace_read|tool_read) printf '"tools"' ;;
+    agent|workspace_read|tool_read|tool_check) printf '"tools"' ;;
     file_context|snapshot)          printf '"files"' ;;
     *)                               printf '"diff"' ;;
   esac
@@ -1311,7 +1311,12 @@ run_openrouter_reviewer() {
   local tools_intro="You have no file-reading or shell tools."
   if [[ "$tl_mode" != "off" ]]; then
     context_access="tool_$tl_mode"
-    if [[ "$tool_context" == "diff" ]]; then files_block=""; fi
+    if [[ "$tool_context" == "diff" ]]; then
+      # The intro above promised whole files after the diff; they are not
+      # coming. Say so, or the model skips the reads this mode exists for.
+      files_block=""
+      context_intro="Base your review on the diff below. The changed files are NOT pasted — read the surrounding code with your tools before relying on anything outside a hunk."
+    fi
     tools_intro="You have tools: read_file (a range of any tracked file, post-change), search (git grep -E across the repo) and list_files. Before reporting anything that depends on code outside a hunk — an unhandled case, a missing check, a caller you assume exists, a portability claim — READ the surrounding code or SEARCH for it and cite what you found; if the code already handles it, do not report it. Keep tool use focused: a few targeted reads beat reading every file. Your tool budget is limited; when it runs out, answer with what you have and mark unverified claims as such."
     if [[ "$tl_mode" == "check" ]]; then
       tools_intro="$tools_intro You also have run_check, which runs this repository's own verification entrypoint once (cached for the round): call it at most once, only when a finding turns on runtime behaviour (\"this breaks the tests\", \"this fails to compile\"), and report what it actually printed."

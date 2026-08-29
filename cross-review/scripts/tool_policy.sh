@@ -93,10 +93,19 @@ profiles="${CROSS_REVIEW_PROFILES:-$script_dir/../references/reviewer_profiles.j
 runlog="${CROSS_REVIEW_RUNLOG:-$script_dir/../runlog.jsonl}"
 events="${CROSS_REVIEW_FINDING_EVENTS:-$(dirname "$runlog")/finding_events.jsonl}"
 
-check_available=false
-tl_resolve_check_cmd "$repo_root" >/dev/null 2>&1 && check_available=true
-
+# `check` runs a command the REVIEWED BRANCH controls (.claude/verify.sh,
+# package.json verify, Makefile verify/check) in the wrapper's own
+# environment — HOME, keys, network. Whether that is acceptable is the
+# operator's call, never the learner's: the arm exists only when the repo
+# declares an entrypoint AND the operator vouched for it — for this round
+# (CROSS_REVIEW_TOOL_MODE=check) or standing (CROSS_REVIEW_TOOL_CHECK_TRUST=1).
+# Leave both unset for pull requests from strangers. (codex P1, PR #154.)
 override="${CROSS_REVIEW_TOOL_MODE:-auto}"
+check_entrypoint=false; check_trusted=false; check_available=false
+tl_resolve_check_cmd "$repo_root" >/dev/null 2>&1 && check_entrypoint=true
+[[ "$override" == "check" || "${CROSS_REVIEW_TOOL_CHECK_TRUST:-0}" == "1" ]] && check_trusted=true
+[[ "$check_entrypoint" == true && "$check_trusted" == true ]] && check_available=true
+
 case "$override" in off|read|check|auto) ;; *) echo "CROSS_REVIEW_TOOL_MODE must be off|read|check|auto (got '$override')" >&2; exit 2 ;; esac
 
 [[ -f "$profiles" ]] || { echo "tool_policy: profiles not found: $profiles" >&2; exit 1; }
@@ -124,7 +133,7 @@ fi
 
 decide_one() {
   local r="$1"
-  jq -n -c --arg r "$r" --arg override "$override" --argjson check_available "$check_available" \
+  jq -n -c --arg r "$r" --arg override "$override" --argjson check_available "$check_available" --argjson check_entrypoint "$check_entrypoint" --argjson check_trusted "$check_trusted" \
      --slurpfile runs_f "$tp_tmp/runs.json" --slurpfile ev_f "$tp_tmp/ev.json" --slurpfile prof "$profiles" '
     ($runs_f[0]) as $runs | ($ev_f[0]) as $ev |
     def clip: if . < 0 then 0 elif . > 1 then 1 else . end;
@@ -177,14 +186,14 @@ decide_one() {
        else {mode: $learned, basis: "learned"} end) as $d
     | (if $d.mode == "check" and ($check_available | not)
        then {mode: "read", basis: ($d.basis + ":no_check_entrypoint")} else $d end) as $d
-    | { reviewer: $r, mode: $d.mode, basis: $d.basis, check_available: $check_available,
+    | { reviewer: $r, mode: $d.mode, basis: $d.basis, check_available: $check_available, check_entrypoint: $check_entrypoint, check_trusted: $check_trusted,
         window_runs: $N, excluded_runs: $excluded, arms: $stats,
         max_steps: ($pin.max_steps // null),
         read_budget_bytes: ($pin.read_budget_bytes // null) }'
 }
 
 print_table() {
-  jq -r '"\(.reviewer): mode=\(.mode) (\(.basis)) window_runs=\(.window_runs) excluded_runs=\(.excluded_runs) check_available=\(.check_available)"
+  jq -r '"\(.reviewer): mode=\(.mode) (\(.basis)) window_runs=\(.window_runs) excluded_runs=\(.excluded_runs) check_available=\(.check_available) (entrypoint=\(.check_entrypoint) trusted=\(.check_trusted))"
          + (.arms | to_entries | map("\n    \(.key | . + "     " | .[0:5])  n=\(.value.n)  ok=\(.value.ok)  rel=\(.value.reliability // "-")  mean=\(.value.mean)  ucb=\(.value.ucb)  cost_avg=\(.value.cost_avg)\(if .value.eligible then "" else "  DEMOTED" end)") | join(""))'
 }
 

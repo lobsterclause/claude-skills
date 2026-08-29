@@ -170,8 +170,14 @@ tl_read_file() {
   local body
   body="$(awk -v s="$s" -v e="$e" 'NR>=s && NR<=e { printf "%d\t%s\n", NR, substr($0, 1, 500) } NR>e { exit }' "$root/$p" \
           | sed -E "s/$TL_SECRET_CONTENT_PATTERN/[REDACTED]/g")"
-  local bytes=${#body}
-  if (( bytes > TL_CALL_CAP_BYTES )); then body="${body:0:$TL_CALL_CAP_BYTES}"$'\n'"[truncated at $TL_CALL_CAP_BYTES bytes]"; bytes=$TL_CALL_CAP_BYTES; fi
+  # ${#body} and ${body:0:N} count CHARACTERS under a UTF-8 locale; the cap
+  # and the budget are bytes. Measure with wc, cut with head -c, and let
+  # iconv -c drop the partial sequence a byte cut can leave at the end.
+  local bytes; bytes="$(printf '%s' "$body" | wc -c | tr -d ' ')"
+  if (( bytes > TL_CALL_CAP_BYTES )); then
+    body="$(printf '%s' "$body" | head -c "$TL_CALL_CAP_BYTES" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null || printf '%s' "$body" | head -c "$TL_CALL_CAP_BYTES")"$'\n'"[truncated at $TL_CALL_CAP_BYTES bytes]"
+    bytes=$TL_CALL_CAP_BYTES
+  fi
   TL_READ_BYTES=$((TL_READ_BYTES + bytes))
   (( TL_READ_BYTES >= TL_READ_BUDGET_BYTES )) && TL_BUDGET_EXHAUSTED=true
   printf '%s (lines %d-%d of %d)%s\n%s' "$p" "$s" "$(( e < total ? e : total ))" "$total" \
@@ -188,6 +194,7 @@ tl_search() {
   if [[ -n "$glob" ]]; then
     glob="${glob#./}"
     if tl_bad_path "$glob" && [[ "$glob" != "." ]]; then printf 'error: invalid path_glob %s' "$glob"; return; fi
+    if printf '%s' "$glob" | grep -qE "$TL_SECRET_PATH_PATTERN"; then printf 'error: path_glob matches the secret-path policy — refused'; return; fi
     [[ "$glob" == :* ]] && { printf 'error: pathspec magic is not allowed in path_glob'; return; }
     # Models write `src/**/*.py`; git's default pathspec has no `**`, so that
     # silently matched nothing on the first live probe (2026-08-27). The
@@ -205,6 +212,10 @@ tl_search() {
   local outp rc
   outp="$(git -C "$root" grep -n -I -E --no-color -e "$pat" ${spec[@]+"${spec[@]}"} 2>&1 | head -n "$TL_SEARCH_MAX_LINES" | cut -c1-400 \
           | sed -E "s/$TL_SECRET_CONTENT_PATTERN/[REDACTED]/g")"; rc=$?
+  # read_file refuses secret paths; git grep would hand their lines straight
+  # back. Same policy on the way out: drop every hit whose path matches.
+  # (ENVIRON, not -v: awk -v unescapes the pattern's backslashes.)
+  outp="$(printf '%s\n' "$outp" | PAT="$TL_SECRET_PATH_PATTERN" awk -F: 'NF && $1 !~ ENVIRON["PAT"]')"
   if [[ -z "$outp" ]]; then printf 'no matches'; return; fi
   local n; n="$(printf '%s\n' "$outp" | wc -l | tr -d ' ')"
   printf '%s' "$outp"
@@ -236,14 +247,22 @@ tl_run_check() {
   if ! cmd="$(tl_resolve_check_cmd "$root")"; then
     printf 'error: this repository declares no verify entrypoint (no .claude/verify.sh, package.json verify script, or Makefile verify/check target) — nothing can be run'; return
   fi
+  # The check gets the smaller of its own timeout and what is left of the
+  # lane: a 60 s lane must not run a 300 s check (codex P2, PR #154).
+  local check_budget="$TL_CHECK_TIMEOUT_S"
+  if [[ "${TL_DEADLINE:-}" =~ ^[0-9]+$ ]]; then
+    local _rem=$(( TL_DEADLINE - $(date +%s) - 10 ))
+    (( _rem < 5 )) && _rem=5
+    (( _rem < check_budget )) && check_budget=$_rem
+  fi
   if [[ ! -f "$result" ]]; then
     if mkdir "$lock" 2>/dev/null; then
       local t0 t1 rc=0 timed_out=false
       t0=$(date +%s)
       if [[ -n "${TIMEOUT_BIN:-}" ]]; then
-        ( cd "$root" && "$TIMEOUT_BIN" -k 10 "$TL_CHECK_TIMEOUT_S" bash -c "$cmd" ) >"$raw" 2>&1 || rc=$?
+        ( cd "$root" && "$TIMEOUT_BIN" -k 10 "$check_budget" bash -c "$cmd" ) >"$raw" 2>&1 || rc=$?
       elif declare -F run_with_timeout >/dev/null; then
-        ( cd "$root" && run_with_timeout "$TL_CHECK_TIMEOUT_S" bash -c "$cmd" ) >"$raw" 2>&1 || rc=$?
+        ( cd "$root" && run_with_timeout "$check_budget" bash -c "$cmd" ) >"$raw" 2>&1 || rc=$?
       else
         ( cd "$root" && bash -c "$cmd" ) >"$raw" 2>&1 || rc=$?
       fi
@@ -251,11 +270,11 @@ tl_run_check() {
       [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out=true
       local tail_txt
       tail_txt="$(tail -c "$TL_CHECK_TAIL_BYTES" "$raw" 2>/dev/null | LC_ALL=C tr -d '\000' | sed -E "s/$TL_SECRET_CONTENT_PATTERN/[REDACTED]/g")"
-      jq -n --arg cmd "$cmd" --argjson rc "$rc" --argjson dur "$((t1 - t0))" --argjson to "$timed_out" --arg tail "$tail_txt" \
-        '{cmd:$cmd, rc:$rc, duration_s:$dur, timed_out:$to, output_tail:$tail}' >"$result.tmp" && mv "$result.tmp" "$result"
+      jq -n --arg cmd "$cmd" --argjson rc "$rc" --argjson dur "$((t1 - t0))" --argjson to "$timed_out" --argjson ts "$check_budget" --arg tail "$tail_txt" \
+        '{cmd:$cmd, rc:$rc, duration_s:$dur, timed_out:$to, timeout_s:$ts, output_tail:$tail}' >"$result.tmp" && mv "$result.tmp" "$result"
     else
       local waited=0
-      while [[ ! -f "$result" ]] && (( waited < TL_CHECK_TIMEOUT_S + 30 )); do sleep 2; waited=$((waited + 2)); done
+      while [[ ! -f "$result" ]] && (( waited < check_budget + 30 )); do sleep 2; waited=$((waited + 2)); done
       [[ -f "$result" ]] || { printf 'error: the verify run started by another reviewer has not finished — treat runtime claims as unverified'; return; }
     fi
   fi
@@ -424,6 +443,7 @@ tool_loop_run() {
   jq -n --rawfile p "$prompt_file" '[{role:"user", content:$p}]' >"$msgs"
   local start now elapsed remaining
   start=$(date +%s)
+  TL_DEADLINE=$((start + budget))   # tl_run_check caps itself by this
   local cost_sum=0 tokp_sum=0 tokc_sum=0 tokcached_sum=0 tokcw_sum=0 any_usage=false any_cache=false
   local turn=0 final_content="" force_final=false
   while :; do
@@ -467,7 +487,9 @@ tool_loop_run() {
       # unparseable rather than losing it.
       if [[ "$rf_arg" != "null" ]] && printf '%s' "$api_error" | grep -qiE 'response_format|json_object|json mode|tool'; then
         echo "$slug: provider rejected response_format with tools ($api_error) — retrying this turn without it" >>"$err"
-        TL_RF_DROPPED=true; turn=$((turn - 1)); continue
+        # The rejected call keeps its turn number: its request/response stay
+        # on disk and TL_TURNS counts every API call made (codex P2, #154).
+        TL_RF_DROPPED=true; continue
       fi
       echo "$slug: $cli API error: $api_error" >>"$err"
       TL_API_ERROR="$api_error"; TL_FAILURE_KIND="$(tl_classify_api_error "$resp")"; TL_RC=1; break

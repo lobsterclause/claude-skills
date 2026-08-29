@@ -391,7 +391,7 @@ enrich_with_context_and_profile() {
     (.context_access // "") as $ca
     | (.cli // "") as $cli
     | . + {context_mode: (
-        if ($ca == "agent" or $ca == "workspace_read" or $ca == "tool_read") then "tools"
+        if ($ca == "agent" or $ca == "workspace_read" or $ca == "tool_read" or $ca == "tool_check") then "tools"
         elif ($ca == "file_context" or $ca == "snapshot") then "files"
         elif ($ca == "diff_only") then "diff"
         elif ($cli == "codex" or $cli == "agy") then "tools"
