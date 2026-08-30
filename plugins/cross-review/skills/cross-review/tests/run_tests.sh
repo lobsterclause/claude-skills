@@ -3126,6 +3126,39 @@ assert_eq "dual-copy: identical copies exit 0" "$(dc_rc "$DC_TMP")" "0"
 mkdir -p "$DC_TMP/cross-review/state"; echo x > "$DC_TMP/cross-review/state/last_base.json"
 assert_eq "dual-copy: runtime state/ is not drift" "$(dc_rc "$DC_TMP")" "0"
 assert_eq "dual-copy: no copies to compare exits 2, not 0" "$(dc_rc "$DC_TMP/nope")" "2"
+
+# [pin: 2026-08-30] Every runtime artifact .gitignore names must be excluded
+# here, derived rather than restated. The hand-kept list had already drifted
+# from .gitignore twice — merge_override_audit.jsonl was never excluded, and
+# iteration-* was excluded as the literal "iteration-1" so iteration-2 read as
+# drift. Both fail toward a FALSE report of drift on a developer machine while
+# CI stays green (git archive carries no gitignored files), and a guard that
+# cries wolf only locally is one people learn to run with `|| true`.
+#
+# This reads the real .gitignore, so adding a new runtime path there without
+# teaching the check about it fails HERE rather than in someone's terminal.
+DC_GI="$(cd "$SKILL_DIR/.." && git rev-parse --show-toplevel 2>/dev/null || true)/.gitignore"
+if [[ -r "$DC_GI" ]]; then
+  dc_uncovered=""
+  while IFS= read -r gi_line; do
+    [[ "$gi_line" == cross-review/* ]] || continue
+    gi_pat="${gi_line#cross-review/}"; gi_pat="${gi_pat%/}"
+    [[ -z "$gi_pat" || "$gi_pat" == */* ]] && continue
+    # Materialise whatever the pattern names, in the ROOT copy only. A glob
+    # gets a concrete instance ("iteration-*" -> "iteration-9") so a literal
+    # exclude cannot pass by accident.
+    gi_probe="${gi_pat//\*/9}"
+    T2="$(mktemp -d)"
+    mkdir -p "$T2/cross-review" "$T2/plugins/cross-review/skills/cross-review"
+    mkdir -p "$T2/cross-review/$gi_probe" 2>/dev/null || touch "$T2/cross-review/$gi_probe"
+    [[ -d "$T2/cross-review/$gi_probe" ]] && touch "$T2/cross-review/$gi_probe/f"
+    [[ "$(dc_rc "$T2")" == "0" ]] || dc_uncovered="$dc_uncovered $gi_pat"
+    rm -rf "$T2"
+  done < "$DC_GI"
+  assert_eq "dual-copy: every gitignored runtime path is excluded" "${dc_uncovered# }" ""
+else
+  echo "  skip dual-copy gitignore coverage (.gitignore unreadable)"
+fi
 rm -rf "$DC_TMP"
 
 echo "── ci/ merge gate (delegated harness) ──"
