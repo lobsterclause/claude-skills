@@ -232,7 +232,7 @@ drawn, enforced at the weight since #99).
 |---|---|---|
 | inkling | 2.5 → **0** | retired — <60% ok and >40% drop at once, $0.49/kept |
 | deepseek | 2.5 → **0.2** | throttled — 40% drop, 0 C/H since bench, $0.31/kept era |
-| grok | 2.5 → **0.2** | throttled on cost — $0.32/run, $0.95/kept, 16% of all spend for 7 kept |
+| grok | 2.5 → **0** | retired — provider choice (per Gabriel); on cost alone it would have been a 0.2 throttle: $0.32/run, $0.95/kept, 16% of all spend for 7 kept |
 | seed | 2.5 → **1.0** | bring-up boost retired — 48 draws for 1 C/H |
 | longcat | 2.5 → **1.0** | bring-up boost retired — 58% ok, 516s p50 |
 | north | 0.2 (unchanged) | already benched 08-03; only 2 draws since 08-27 — test pins it at 0.2 |

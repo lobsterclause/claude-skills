@@ -384,8 +384,8 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.75,
-    "draw_boost": 0.2,
-    "bench_note": "2026-08-30: throttled 2.5 -> 0.2 on cost, not precision. 0% drop and 93-96% ok, but $0.32/run (12x the fleet median), $0.95/kept, 0 Critical/High in 15 since-bench seats and 2 C/H in 51 era seats — $6.64, 16% of all fleet spend, for 7 kept findings. select_roster's cost divisor (1 + $/0.50) was being overridden by the boost. Keep drawing it occasionally: it is precise and the only xAI vote. Revisit after 10 further sampled runs or a price cut. (evidence: docs/investigation-cr-model-cost-2026-08-29.md, since-bench window 2026-08-27→30 plus the 2026-07-04→ stamped era)",
+    "draw_boost": 0,
+    "bench_note": "2026-08-30: RETIRED (draw_boost 0), per Gabriel — a provider choice, not a performance verdict; the numbers below are the record it retires on. Cost case on its own would have been a throttle to 0.2: 0% drop and 93-96% ok, but $0.32/run (12x the fleet median), $0.95/kept, 0 Critical/High in 15 since-bench seats and 2 C/H in 51 era seats — $6.64, 16% of all fleet spend, for 7 kept findings. Kept in POOL and fully wired so the seat-wiring invariant holds and the bench is one field to reverse. (evidence: docs/investigation-cr-model-cost-2026-08-29.md)",
     "pricing": { "prompt_per_m": 2.00, "completion_per_m": 6.00 },
     "specialization": "single-turn diff reasoning, frontier tier, 500k context; independent provider vote (xAI). Rotation-pool member.",
     "notes": "xAI Grok 4.6 via OpenRouter ($2.00/M in, $6.00/M out, 500k ctx; released 2026-08-12). Added 2026-08-14 — xAI held zero seats, so this closes the last major frontier-lab gap in the fleet. Priciest OR-pool seat after spark; select_roster.sh already divides weight by avg cost, so it will self-throttle if it proves expensive per finding. draw_boost 2.5 while it earns leaderboard data; retire after ~10 sampled runs. US-origin provider (xAI), routed through OpenRouter (US)."
