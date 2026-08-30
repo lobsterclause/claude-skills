@@ -101,11 +101,14 @@ Before spending tokens on a fresh round, glance at the last 10 runs to see if an
 ```bash
 bash ~/.claude/skills/cross-review/scripts/analyze_runlog.sh --recent 10 --mode warn
 bash ~/.claude/skills/cross-review/scripts/validate_or_models.sh
+bash ~/.claude/skills/cross-review/scripts/measure_codex_effort.sh --if-due
 ```
 
 `validate_or_models.sh` checks every `cli: "openrouter"` model slug in `reviewer_profiles.json` against OpenRouter's live catalog (24h cache) and WARNs about any that have been delisted. A dead slug otherwise costs a whole round: the seat 404s in about a second and drops out, which reads as reviewer flakiness rather than stale config — `poolside/laguna-m.1` did exactly that on 2026-08-03, and `mistralai/devstral-2512` was silently queued to do the same. Fix the `model` field in the profile (the ONLY place slugs live) and re-run. This step is also what warms the cache: `run_reviewers.sh` re-checks at dispatch with `--no-fetch`, so no HTTP ever runs in front of the reviewers.
 
 If a warning prints (e.g. *"WARN: gemini-pro timed out 35% of last 10 runs — consider --timeout-gemini-pro 1100"*), surface it to the user and ask whether to apply the suggested override for this run. Do not auto-apply — surface-and-confirm only. If no warning, proceed silently.
+
+`measure_codex_effort.sh --if-due` prints nothing until the codex effort ladder's review date, then prints a banner and a before/after table of what stepping effort down on later passes actually did — see the ladder table under step 6. It is there because the ladder shipped on a projection, and "check back in a week" is only a mechanism if something does the checking. When it fires, read it, decide (keep / move the pass-3+ floor / revert), and move `REVIEW_DUE` in the script so it stops asking. Its `findings/run` and `CLEAN%` columns are proxies for review quality, not review quality — the script says so itself, and on pass 3+ a drop is genuinely ambiguous.
 
 - **Ledger hygiene:** `bash ~/.claude/skills/cross-review/scripts/validate_ledgers.sh --json | jq .errors` — a non-zero count is worth surfacing to the user, but never blocks the run.
 
@@ -500,6 +503,26 @@ After committing, re-run steps 3–5 — but **incrementally**: pass the *previo
 > `CROSS_REVIEW_ALLOW_FULL_REREVIEW=1`) — the escape hatch this paragraph
 > already allowed, now stated explicitly rather than assumed. The guard fails
 > **open**: a missing or unreadable state record never blocks a round.
+>
+> The same record also sets **codex's reasoning effort**. `~/.codex/config.toml`
+> pins `model_reasoning_effort = "xhigh"` globally, tuned for interactive deep
+> work, and every one of August's 1,426 review runs inherited it — including
+> pass-3 confirmations on 39-line diffs returning a 15-byte "no findings"
+> verdict. The record now carries a pass counter, and effort follows what the
+> pass is actually doing:
+>
+> | pass | effort | why |
+> | ---- | ------ | --- |
+> | 1 | `xhigh` (whatever the config says) | the full diff, first look |
+> | 2 | `high` | a narrow fix check — still productive, 51% `FIXES_APPLIED` |
+> | 3+ | `medium` | mostly confirming an earlier verdict — 57% `CLEAN` (115/202) |
+>
+> It stops at `medium`: nothing measured says a confirmation pass at `low` still
+> catches regressions, and a re-pass that quietly stops looking is worse than an
+> expensive one. The counter restarts when the record goes stale, so a branch
+> revisited days later pays full effort again. Pin the level with
+> `--codex-effort <minimal|low|medium|high|xhigh>` or `CROSS_REVIEW_CODEX_EFFORT`
+> — worth doing when a late pass is really a structural re-review.
 
 Keep iterating until any of:
 
