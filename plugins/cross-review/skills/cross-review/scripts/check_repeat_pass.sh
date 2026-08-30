@@ -38,12 +38,17 @@
 #   check_repeat_pass.sh --record --project <p> --branch <b> --base-sha <sha> --head-sha <sha>
 #   check_repeat_pass.sh --pass-context [--project <p>] [--branch <b>]
 #
-# --pass-context is a QUERY, not a gate: it prints "first" or "repeat" and
-# exits 0, answering "has this project+branch already been reviewed inside the
-# window?" from the SAME record and the SAME staleness rule the block above
-# uses. It exists so callers can cheapen a repeat pass (run_reviewers.sh drops
-# codex's reasoning effort) without deriving the state key a second time — a
+# --pass-context is a QUERY, not a gate: it prints the pass number of the round
+# ABOUT TO RUN (1 for a first pass, 2 for the next, ...) and exits 0, derived
+# from the SAME record and the SAME staleness rule the block above uses. It
+# exists so callers can cheapen a later pass (run_reviewers.sh steps codex's
+# reasoning effort down) without deriving the state key a second time — a
 # duplicated derivation is how the two copies of a check drift apart.
+#
+# It answers about the round about to run, NOT the one last recorded, because
+# that is the round whose cost the caller is deciding. Query it BEFORE
+# --record. Anything unreadable, absent, or stale answers 1 — the same
+# fail-open direction as the gate.
 #
 # exit 0 — proceed (no prior round, incremental base, retry, stale, or override)
 # exit 3 — blocked: this is a full re-review of an already-reviewed diff
@@ -121,19 +126,36 @@ record_is_fresh() {
   (( now_epoch - e < window_hours * 3600 ))
 }
 
+# next_pass: the number of the round about to run. One shared derivation for
+# --pass-context (which reports it) and --record (which stores it), so the
+# number a caller acts on and the number that persists cannot disagree.
+#
+# A record with no "passes" field predates the counter; a fresh one still
+# means exactly one prior pass, so it reads as 1.
+next_pass() {
+  local e="" n=""
+  [[ -f "$rec" ]] || { echo 1; return; }
+  e="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+  record_is_fresh "$e" || { echo 1; return; }
+  n="$(sed -n 's/.*"passes":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=1 ;; esac
+  (( n < 1 )) && n=1
+  echo $(( n + 1 ))
+}
+
 if [[ "$pass_context" == 1 ]]; then
-  # Unreadable, absent, or stale all answer "first" — the same fail-open
-  # direction as the gate: without evidence of a prior pass, treat this as one.
-  _e=""
-  [[ -f "$rec" ]] && _e="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
-  if record_is_fresh "$_e"; then echo repeat; else echo first; fi
+  next_pass
   exit 0
 fi
 
 if [[ "$record" == 1 ]]; then
   mkdir -p "$state_dir" || exit 0   # advisory state: never fail the round
-  printf '{"project":%s,"branch":%s,"base_sha":%s,"head_sha":%s,"epoch":%s}\n' \
-    "\"$project\"" "\"$branch\"" "\"$base_sha\"" "\"$head_sha\"" "$now_epoch" \
+  # The counter is what separates pass 2 (a fix check, still productive: 51%
+  # FIXES_APPLIED in August) from pass 5 (mostly codex confirming its own
+  # earlier verdict: pass 3+ was 57% CLEAN, 115/202). A stale record starts a
+  # new review, so the count restarts with it.
+  printf '{"project":%s,"branch":%s,"base_sha":%s,"head_sha":%s,"epoch":%s,"passes":%s}\n' \
+    "\"$project\"" "\"$branch\"" "\"$base_sha\"" "\"$head_sha\"" "$now_epoch" "$(next_pass)" \
     > "$rec" 2>/dev/null || true
   exit 0
 fi

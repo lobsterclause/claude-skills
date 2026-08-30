@@ -524,13 +524,25 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # through to metered OpenRouter on account_limit. The cost of a repeat pass
   # is what took codex out of the fleet for five days on 2026-08-22.
   #
-  # A repeat pass is answering a narrow question about the fix commits, which
-  # the guard above now forces to be an incremental diff. `high` is the step
-  # down for that; pass 1 keeps xhigh. --codex-effort / CROSS_REVIEW_CODEX_EFFORT
-  # pin it when the caller knows better (a structural re-review, say).
+  # The ladder follows what each pass is actually doing, measured over August:
+  #
+  #   pass 1   xhigh (config)  the full diff, first look
+  #   pass 2   high            a narrow fix check — still productive,
+  #                            51% FIXES_APPLIED
+  #   pass 3+  medium          mostly codex confirming its own earlier
+  #                            verdict — 57% CLEAN (115/202)
+  #
+  # It stops at medium. Nothing measured says a confirmation pass at `low`
+  # still catches regressions, and a re-pass that silently stops looking is
+  # worse than an expensive one. --codex-effort / CROSS_REVIEW_CODEX_EFFORT
+  # pin the level when the caller knows better — a late pass that is really a
+  # structural re-review wants xhigh back.
   if [[ -z "$codex_effort" ]]; then
-    _pc="$(bash "$_guard" --pass-context 2>/dev/null || echo first)"
-    [[ "$_pc" == "repeat" ]] && codex_effort="high"
+    _pc="$(bash "$_guard" --pass-context 2>/dev/null || echo 1)"
+    case "$_pc" in ''|*[!0-9]*) _pc=1 ;; esac
+    if   (( _pc >= 3 )); then codex_effort="medium"
+    elif (( _pc == 2 )); then codex_effort="high"
+    fi
   fi
 
   # Record only once we are committed to dispatching this round.

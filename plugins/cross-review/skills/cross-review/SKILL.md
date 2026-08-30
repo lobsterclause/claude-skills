@@ -505,10 +505,21 @@ After committing, re-run steps 3–5 — but **incrementally**: pass the *previo
 > pins `model_reasoning_effort = "xhigh"` globally, tuned for interactive deep
 > work, and every one of August's 1,426 review runs inherited it — including
 > pass-3 confirmations on 39-line diffs returning a 15-byte "no findings"
-> verdict. A round on a branch already reviewed inside the window now runs codex
-> at `high`; a first pass is unchanged. Pin it with `--codex-effort
-> <minimal|low|medium|high|xhigh>` or `CROSS_REVIEW_CODEX_EFFORT` — worth doing
-> when a re-pass is a structural re-review rather than a narrow fix check.
+> verdict. The record now carries a pass counter, and effort follows what the
+> pass is actually doing:
+>
+> | pass | effort | why |
+> | ---- | ------ | --- |
+> | 1 | `xhigh` (whatever the config says) | the full diff, first look |
+> | 2 | `high` | a narrow fix check — still productive, 51% `FIXES_APPLIED` |
+> | 3+ | `medium` | mostly confirming an earlier verdict — 57% `CLEAN` (115/202) |
+>
+> It stops at `medium`: nothing measured says a confirmation pass at `low` still
+> catches regressions, and a re-pass that quietly stops looking is worse than an
+> expensive one. The counter restarts when the record goes stale, so a branch
+> revisited days later pays full effort again. Pin the level with
+> `--codex-effort <minimal|low|medium|high|xhigh>` or `CROSS_REVIEW_CODEX_EFFORT`
+> — worth doing when a late pass is really a structural re-review.
 
 Keep iterating until any of:
 
