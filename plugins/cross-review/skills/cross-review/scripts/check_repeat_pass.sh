@@ -36,6 +36,14 @@
 #   check_repeat_pass.sh --project <p> --branch <b> --base-sha <sha> --head-sha <sha>
 #                        [--state-dir <d>] [--window-hours <n>] [--allow-full-rereview]
 #   check_repeat_pass.sh --record --project <p> --branch <b> --base-sha <sha> --head-sha <sha>
+#   check_repeat_pass.sh --pass-context [--project <p>] [--branch <b>]
+#
+# --pass-context is a QUERY, not a gate: it prints "first" or "repeat" and
+# exits 0, answering "has this project+branch already been reviewed inside the
+# window?" from the SAME record and the SAME staleness rule the block above
+# uses. It exists so callers can cheapen a repeat pass (run_reviewers.sh drops
+# codex's reasoning effort) without deriving the state key a second time — a
+# duplicated derivation is how the two copies of a check drift apart.
 #
 # exit 0 — proceed (no prior round, incremental base, retry, stale, or override)
 # exit 3 — blocked: this is a full re-review of an already-reviewed diff
@@ -49,7 +57,7 @@ set -uo pipefail
 
 project=""; branch=""; base_sha=""; head_sha=""
 state_dir=""; window_hours="${CROSS_REVIEW_REPEAT_WINDOW_HOURS:-24}"
-record=0; allow="${CROSS_REVIEW_ALLOW_FULL_REREVIEW:-0}"
+record=0; allow="${CROSS_REVIEW_ALLOW_FULL_REREVIEW:-0}"; pass_context=0
 
 need_val() { [[ "$2" -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
@@ -61,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --state-dir)           need_val "$1" "$#"; state_dir="$2";    shift 2 ;;
     --window-hours)        need_val "$1" "$#"; window_hours="$2"; shift 2 ;;
     --record)              record=1; shift ;;
+    --pass-context)        pass_context=1; shift ;;
     --allow-full-rereview) allow=1;  shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -71,7 +80,14 @@ done
 [[ -z "$project"  ]] && project="$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")"
 [[ -z "$branch"   ]] && branch="$(git branch --show-current 2>/dev/null || echo detached)"
 [[ -z "$head_sha" ]] && head_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-if [[ -z "$project" || -z "$branch" || -z "$base_sha" || -z "$head_sha" ]]; then
+# --pass-context needs only project+branch; the sha args identify a round,
+# and the query is about the branch, not about any particular round.
+if [[ "$pass_context" == 1 ]]; then
+  if [[ -z "$project" || -z "$branch" ]]; then
+    echo "usage: $0 --pass-context [--project <p>] [--branch <b>]" >&2
+    exit 2
+  fi
+elif [[ -z "$project" || -z "$branch" || -z "$base_sha" || -z "$head_sha" ]]; then
   echo "usage: $0 --project <p> --branch <b> --base-sha <sha> --head-sha <sha> [--record]" >&2
   exit 2
 fi
@@ -96,6 +112,24 @@ rec="$state_dir/$key.json"
 
 now_epoch="$(date +%s)"
 
+# Staleness, in one place: a record older than the window is not evidence of a
+# prior pass, for the block below and for --pass-context alike.
+case "$window_hours" in ''|*[!0-9]*) window_hours=24 ;; esac
+record_is_fresh() {
+  local e="$1"
+  [[ -n "$e" ]] || return 1
+  (( now_epoch - e < window_hours * 3600 ))
+}
+
+if [[ "$pass_context" == 1 ]]; then
+  # Unreadable, absent, or stale all answer "first" — the same fail-open
+  # direction as the gate: without evidence of a prior pass, treat this as one.
+  _e=""
+  [[ -f "$rec" ]] && _e="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+  if record_is_fresh "$_e"; then echo repeat; else echo first; fi
+  exit 0
+fi
+
 if [[ "$record" == 1 ]]; then
   mkdir -p "$state_dir" || exit 0   # advisory state: never fail the round
   printf '{"project":%s,"branch":%s,"base_sha":%s,"head_sha":%s,"epoch":%s}\n' \
@@ -112,9 +146,8 @@ prev_epoch="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
 [[ -n "$prev_base" && -n "$prev_head" && -n "$prev_epoch" ]] || exit 0
 
 # Stale records must not block forever — a branch legitimately revisited days
-# later is a new review, not a repeat pass.
-case "$window_hours" in ''|*[!0-9]*) window_hours=24 ;; esac
-if (( now_epoch - prev_epoch >= window_hours * 3600 )); then exit 0; fi
+# later is a new review, not a repeat pass. Same predicate --pass-context uses.
+record_is_fresh "$prev_epoch" || exit 0
 
 [[ "$base_sha" == "$prev_base" ]] || exit 0    # base advanced -> incremental
 [[ "$head_sha" != "$prev_head" ]] || exit 0    # HEAD unmoved -> retry, allow

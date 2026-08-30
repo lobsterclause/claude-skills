@@ -96,6 +96,31 @@ if [[ -z "$(find "$STATE" -mindepth 2 -type d 2>/dev/null)" ]]; then
   ok "no nested directories created from the branch name"
 else bad "branch name created nested directories"; fi
 
+echo "── --pass-context: the query the effort dial reads ──"
+# pc <label> <want> [args...] — asserts the printed answer AND that a query
+# never gates: --pass-context must exit 0 even where the gate would exit 3.
+pc() {
+  local label="$1" want="$2"; shift 2
+  local got rc
+  got="$(bash "$GUARD" --pass-context --state-dir "$STATE" "$@" 2>/dev/null)"; rc=$?
+  if [[ "$got" == "$want" && "$rc" -eq 0 ]]; then ok "$label"
+  else bad "$label (got='$got' rc=$rc want='$want' rc=0)"; fi
+}
+
+pc "unreviewed branch -> first"        first  --project demo --branch feat/never
+pc "recorded branch -> repeat"         repeat --project demo --branch feat/x
+pc "a sibling branch is still first"   first  --project demo --branch feat/other
+pc "a different project is first"      first  --project other --branch feat/x
+# Staleness is the gate's own rule, reused: a record past the window is not
+# evidence of a prior pass, so a revisit days later pays full effort again.
+pc "a stale record -> first"           first  --project demo --branch feat/x --window-hours 0
+# The query must answer even for a branch the gate would BLOCK — the caller
+# reads it on exactly that path, and an exit 3 here would abort the round.
+pc "queries the blocked shape, does not block" repeat --project demo --branch feat/x
+
+# A missing state dir must not make the query fail; effort just stays default.
+pc "absent state dir -> first, not an error" first --project demo --branch feat/x --state-dir "$TMP/nonexistent"
+
 # ── integration: the guard must stop run_reviewers.sh BEFORE it dispatches ──
 #
 # Regression pin. The first wiring used `if ! bash "$guard"; then _grc=$?`,
@@ -139,6 +164,64 @@ if [[ -f "$RR" ]] && command -v git >/dev/null 2>&1; then
     ok "no reviewer was dispatched"
   else bad "a reviewer was dispatched despite the block"; fi
   unset CROSS_REVIEW_STATE_DIR
+
+  # ── the effort dial reaches the codex argv (not just the variable) ──
+  #
+  # The dial is worth nothing if it stops at a shell variable, so assert on
+  # what codex is actually invoked with. A stub named `codex` on PATH records
+  # its argv and exits 0; no network, no real reviewer.
+  BIN="$TMP/bin"; mkdir -p "$BIN"
+  cat > "$BIN/codex" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$CODEX_ARGV_OUT"
+echo "Critical: stub finding at f.txt:1"
+STUB
+  chmod +x "$BIN/codex"
+
+  effort_run() {  # effort_run <state_dir> <argv_out> [extra run_reviewers args]
+    local sd="$1" argv_out="$2"; shift 2
+    # run_reviewers diffs the CURRENT repo — it must run from inside $REPO,
+    # not from the harness's cwd, or it short-circuits before dispatching.
+    (cd "$REPO" && CROSS_REVIEW_STATE_DIR="$sd" CODEX_ARGV_OUT="$argv_out" PATH="$BIN:$PATH" \
+      timeout 120 bash "$RR" --base "$B" --out "$(mktemp -d)" \
+        --reviewers codex --timeout-codex 30 "$@") >/dev/null 2>&1
+  }
+
+  # Pass 1: no record for this branch, so nothing is pinned and codex inherits
+  # ~/.codex/config.toml — the pre-existing behaviour, unchanged.
+  effort_run "$TMP/eff_state1" "$TMP/argv1"
+  if [[ -f "$TMP/argv1" ]] && ! grep -q model_reasoning_effort "$TMP/argv1"; then
+    ok "pass 1 leaves reasoning effort to the config"
+  else
+    bad "pass 1 must not pin effort"; echo "      argv: $(tr '\n' ' ' < "$TMP/argv1" 2>/dev/null)"
+  fi
+
+  # Pass 2: the round above recorded this branch, so the repeat pass steps down.
+  (cd "$REPO" && echo four >> f.txt && git commit -qam fix3) >/dev/null 2>&1
+  effort_run "$TMP/eff_state1" "$TMP/argv2" --base "$H1"
+  if grep -q 'model_reasoning_effort="high"' "$TMP/argv2" 2>/dev/null; then
+    ok "a repeat pass steps codex down to high"
+  else
+    bad "repeat pass effort"; echo "      argv: $(tr '\n' ' ' < "$TMP/argv2" 2>/dev/null)"
+  fi
+
+  # An explicit flag outranks the derivation, in both directions.
+  effort_run "$TMP/eff_state2" "$TMP/argv3" --codex-effort low
+  if grep -q 'model_reasoning_effort="low"' "$TMP/argv3" 2>/dev/null; then
+    ok "--codex-effort pins the level on a first pass"
+  else
+    bad "--codex-effort pin"; echo "      argv: $(tr '\n' ' ' < "$TMP/argv3" 2>/dev/null)"
+  fi
+
+  # A typo must not be handed to `-c`. Whether codex ignores an unknown level
+  # or rejects it is unverified and beside the point — neither outcome is one
+  # to discover in the middle of a round.
+  effort_run "$TMP/eff_state3" "$TMP/argv4" --codex-effort xxhigh
+  if [[ -f "$TMP/argv4" ]] && ! grep -q model_reasoning_effort "$TMP/argv4"; then
+    ok "an unknown effort is dropped, not passed to codex"
+  else
+    bad "unknown effort must be dropped"; echo "      argv: $(tr '\n' ' ' < "$TMP/argv4" 2>/dev/null)"
+  fi
 else
   echo "  skip run_reviewers.sh integration (script or git unavailable)"
 fi

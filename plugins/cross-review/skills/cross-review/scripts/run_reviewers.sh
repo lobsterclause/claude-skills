@@ -231,6 +231,9 @@ reviewers=""
 timeout_s_default=600
 timeout_s=""               # set when --timeout is explicitly passed
 timeout_codex=""
+# Reasoning effort for the codex lane. Empty = derive it (see the resolution
+# block below the repeat-pass guard); an explicit value pins it.
+codex_effort="${CROSS_REVIEW_CODEX_EFFORT:-}"
 timeout_antigravity=""
 timeout_gemini_pro=""
 timeout_kimi=""
@@ -277,6 +280,7 @@ while [[ $# -gt 0 ]]; do
     --reviewers)          need_val --reviewers          "$#"; reviewers="$2";          shift 2 ;;
     --timeout)            need_val --timeout            "$#"; timeout_s="$2";          shift 2 ;;
     --timeout-codex)      need_val --timeout-codex      "$#"; timeout_codex="$2";      shift 2 ;;
+    --codex-effort)       need_val --codex-effort       "$#"; codex_effort="$2";       shift 2 ;;
     --timeout-antigravity) need_val --timeout-antigravity "$#"; timeout_antigravity="$2"; shift 2 ;;
     --timeout-gemini-pro) need_val --timeout-gemini-pro "$#"; timeout_gemini_pro="$2"; shift 2 ;;
     --timeout-kimi)       need_val --timeout-kimi       "$#"; timeout_kimi="$2";       shift 2 ;;
@@ -509,9 +513,39 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
     fi
     echo "check_repeat_pass: guard returned $_grc — continuing (fail open)" >&2
   fi
+  # Reasoning effort for codex, decided BEFORE the record below flips this
+  # branch's answer from "first" to "repeat".
+  #
+  # ~/.codex/config.toml sets model_reasoning_effort = "xhigh" globally, tuned
+  # for interactive deep work, and run_codex() never overrode it — so a pass-3
+  # confirmation on a 39-line incremental diff that returns a 15-byte "no
+  # findings" verdict was billed at the same effort as the first full review.
+  # Measured 2026-08-29: 1,426 review runs, all at xhigh; 90 of them fell
+  # through to metered OpenRouter on account_limit. The cost of a repeat pass
+  # is what took codex out of the fleet for five days on 2026-08-22.
+  #
+  # A repeat pass is answering a narrow question about the fix commits, which
+  # the guard above now forces to be an incremental diff. `high` is the step
+  # down for that; pass 1 keeps xhigh. --codex-effort / CROSS_REVIEW_CODEX_EFFORT
+  # pin it when the caller knows better (a structural re-review, say).
+  if [[ -z "$codex_effort" ]]; then
+    _pc="$(bash "$_guard" --pass-context 2>/dev/null || echo first)"
+    [[ "$_pc" == "repeat" ]] && codex_effort="high"
+  fi
+
   # Record only once we are committed to dispatching this round.
   bash "$_guard" --record --base-sha "$_base_sha" --head-sha "$_head_sha" || true
 fi
+
+# Fail closed toward the config default. An unknown level is a typo, and what
+# codex does with one is not something to find out mid-round: at best it is
+# ignored (the dial silently does nothing), at worst it aborts every codex run
+# and reads like a reviewer outage. Empty means "inherit the config".
+case "$codex_effort" in
+  ''|minimal|low|medium|high|xhigh) ;;
+  *) echo "run_reviewers: ignoring unknown --codex-effort '$codex_effort' (want minimal|low|medium|high|xhigh)" >&2
+     codex_effort="" ;;
+esac
 
 # Whole-file context for the text-only lanes (--context-mode files). Built
 # ONCE here, before dispatch, because every text-only seat gets the identical
@@ -1353,6 +1387,8 @@ run_codex() {
   # guessing (it guessed wrong on chain-racing PR #42). Verified empirically
   # via `codex sandbox macos` 2026-06-10 on codex-cli 0.128.0.
   local -a codex_cfg=()
+  # Empty = inherit ~/.codex/config.toml, which is the pass-1 behaviour.
+  [[ -n "$codex_effort" ]] && codex_cfg+=(-c "model_reasoning_effort=\"$codex_effort\"")
   if [[ -f project.godot ]]; then
     codex_cfg+=(-c "sandbox_workspace_write.writable_roots=[\"$HOME/Library/Application Support/Godot\"]")
   fi

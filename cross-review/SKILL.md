@@ -500,6 +500,15 @@ After committing, re-run steps 3–5 — but **incrementally**: pass the *previo
 > `CROSS_REVIEW_ALLOW_FULL_REREVIEW=1`) — the escape hatch this paragraph
 > already allowed, now stated explicitly rather than assumed. The guard fails
 > **open**: a missing or unreadable state record never blocks a round.
+>
+> The same record also sets **codex's reasoning effort**. `~/.codex/config.toml`
+> pins `model_reasoning_effort = "xhigh"` globally, tuned for interactive deep
+> work, and every one of August's 1,426 review runs inherited it — including
+> pass-3 confirmations on 39-line diffs returning a 15-byte "no findings"
+> verdict. A round on a branch already reviewed inside the window now runs codex
+> at `high`; a first pass is unchanged. Pin it with `--codex-effort
+> <minimal|low|medium|high|xhigh>` or `CROSS_REVIEW_CODEX_EFFORT` — worth doing
+> when a re-pass is a structural re-review rather than a narrow fix check.
 
 Keep iterating until any of:
 
