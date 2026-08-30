@@ -235,6 +235,10 @@ timeout_codex=""
 # Reasoning effort for the codex lane. Empty = derive it (see the resolution
 # block below the repeat-pass guard); an explicit value pins it.
 codex_effort="${CROSS_REVIEW_CODEX_EFFORT:-}"
+# Subject identity for the repeat-pass guard's state key. Empty = let the
+# guard derive it from git, which is right for a plain checkout and useless in
+# a worktree — see the note above the guard block.
+subject_id="${CROSS_REVIEW_SUBJECT_ID:-}"
 timeout_antigravity=""
 timeout_gemini_pro=""
 timeout_kimi=""
@@ -287,6 +291,7 @@ while [[ $# -gt 0 ]]; do
     --timeout)            need_val --timeout            "$#"; timeout_s="$2";          shift 2 ;;
     --timeout-codex)      need_val --timeout-codex      "$#"; timeout_codex="$2";      shift 2 ;;
     --codex-effort)       need_val --codex-effort       "$#"; codex_effort="$2";       shift 2 ;;
+    --subject-id)        need_val --subject-id        "$#"; subject_id="$2";        shift 2 ;;
     --timeout-antigravity) need_val --timeout-antigravity "$#"; timeout_antigravity="$2"; shift 2 ;;
     --timeout-gemini-pro) need_val --timeout-gemini-pro "$#"; timeout_gemini_pro="$2"; shift 2 ;;
     --timeout-kimi)       need_val --timeout-kimi       "$#"; timeout_kimi="$2";       shift 2 ;;
@@ -500,6 +505,37 @@ fi
 # Placed AFTER the empty-diff short-circuit so a no-op round neither blocks nor
 # records, and BEFORE any reviewer is dispatched so nothing is spent. It fails
 # OPEN by design: a missing or unreadable state record allows the round.
+# WHY --subject-id EXISTS.
+#
+# The guard keys its state on (project, branch), and without a branch there is
+# no key. It falls back to git for the branch, and in a cross-review worktree
+# git has no answer: worktrees run on a DETACHED HEAD, where
+# `git branch --show-current` prints nothing. So the gate never fired, --record
+# wrote nothing, and (since #168) --pass-context answered 1 forever, leaving
+# codex at full effort on every pass. Both the repeat-pass guard and the effort
+# ladder were merged inert in the only environment cross-review actually runs
+# in, and every test passed throughout because tests run on a branch.
+#
+# The fix is to be TOLD the identity rather than to guess it. Deliberately a
+# plain string and not a read of the worktree's context.json: run_reviewers.sh
+# works fine against a plain checkout today, and reaching into a worktree
+# artifact would bind it to a worktree-shaped invocation to fix a worktree-
+# shaped bug. The worktree flow fills this in (SKILL.md step 2); a plain
+# checkout omits it and keeps the git-derived behaviour unchanged.
+#
+# PASS worktree.sh's --id, NOT its --ref. The id is a stable per-PR slug
+# ("pr-213"), which is what the key needs: constant across the passes of one
+# review, distinct between reviews. --ref is documented as "branch-or-sha" and
+# is a SHA in the common flow — keying on it would mint a fresh key every pass,
+# so the guard would find no prior round and never fire. That failure is
+# silent and looks exactly like the bug being fixed here.
+#
+# A per-round ref is also the only *safe* key. Substituting a literal like
+# "detached" would collide every detached review of a repo onto one key — and
+# since they also share a base, the guard would start refusing unrelated PRs.
+_guard_id_args=()
+[[ -n "$subject_id" ]] && _guard_id_args=(--branch "$subject_id")
+
 _guard="$(cd "$(dirname "$0")" && pwd)/check_repeat_pass.sh"
 _base_sha="$(git rev-parse --verify --quiet "$base^{commit}" 2>/dev/null || echo "")"
 _head_sha="$(git rev-parse --verify --quiet HEAD 2>/dev/null || echo "")"
@@ -508,7 +544,7 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # result (0), not the guard's exit code — which silently turned every block
   # into a "guard returned 0 — continuing" and dispatched the round anyway.
   # Caught by the integration test in tests/test_repeat_pass_guard.sh.
-  _guard_args=(--base-sha "$_base_sha" --head-sha "$_head_sha")
+  _guard_args=(${_guard_id_args[@]+"${_guard_id_args[@]}"} --base-sha "$_base_sha" --head-sha "$_head_sha")
   [[ "$allow_full_rereview" == 1 ]] && _guard_args+=(--allow-full-rereview)
   bash "$_guard" "${_guard_args[@]}"
   _grc=$?
@@ -546,7 +582,7 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # pin the level when the caller knows better — a late pass that is really a
   # structural re-review wants xhigh back.
   if [[ -z "$codex_effort" ]]; then
-    _pc="$(bash "$_guard" --pass-context 2>/dev/null || echo 1)"
+    _pc="$(bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --pass-context 2>/dev/null || echo 1)"
     case "$_pc" in ''|*[!0-9]*) _pc=1 ;; esac
     if   (( _pc >= 3 )); then codex_effort="medium"
     elif (( _pc == 2 )); then codex_effort="high"
@@ -2949,8 +2985,16 @@ done
 # Record this round for the repeat-pass guard now that a reviewer has actually
 # reviewed something. A round where every lane failed leaves no record, so the
 # retry after it is treated as a first pass rather than a repeat.
+#
+# THIS CALL NEEDS $_guard_id_args, and it is the easy one to forget: it sits
+# ~2400 lines from the gate and --pass-context, which pass the same identity.
+# Drop it here and the round records under a git-derived branch (nothing, in a
+# worktree) while the gate keyed on --subject-id, so the guard reads its own
+# writes and finds none — inert again, silently, exactly the bug this flag
+# fixes. It was lost once already, in the rebase that brought these two changes
+# together, and caught only because the detached end-to-end test went red.
 if [[ "$any_ok" -eq 1 && -f "${_guard:-}" && -n "${_base_sha:-}" && -n "${_head_sha:-}" ]]; then
-  bash "$_guard" --record --base-sha "$_base_sha" --head-sha "$_head_sha" || true
+  bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --record --base-sha "$_base_sha" --head-sha "$_head_sha" || true
 fi
 
 [[ "$any_ok" -eq 1 ]] || exit 1

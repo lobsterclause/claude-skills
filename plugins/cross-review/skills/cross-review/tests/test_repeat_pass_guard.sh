@@ -164,6 +164,58 @@ else bad "corrupt counter (got='$got' want='2')"; fi
 # integration was inert: the guard was correct and the caller ignored it.
 #
 # Offline by construction: if the guard works, no reviewer is ever reached.
+# ── the guard has to work where cross-review actually runs: DETACHED ──
+#
+# This is the pin the whole --subject-id flag exists for. Cross-review reviews
+# inside a worktree, and a worktree is on a detached HEAD, where
+# `git branch --show-current` prints NOTHING and exits 0. With no branch there
+# is no state key: the gate could not fire, --record wrote nothing, and
+# --pass-context answered 1 forever, so the codex effort ladder sat at default
+# effort on every pass. #166 and #168 both shipped inert in production for this
+# reason, and every test passed the whole time — because tests run on a branch.
+#
+# So these run on a real detached HEAD. A test for a detached-HEAD bug that
+# checks out a branch first is testing the case that already worked.
+echo "── detached HEAD: identity must come from --subject-id, not from git ──"
+DET="$TMP/detached"; mkdir -p "$DET"
+(
+  cd "$DET" || exit 1
+  git init -q . && git config user.email t@t && git config user.name t
+  echo a > f.txt && git add f.txt && git commit -qm one
+  git checkout -q --detach HEAD
+) >/dev/null 2>&1
+
+if [[ "$(cd "$DET" && git branch --show-current 2>/dev/null; echo "rc=$?")" == "rc=0" ]]; then
+  ok "precondition: git names no branch on a detached HEAD (and exits 0)"
+else bad "precondition: detached HEAD fixture"; fi
+
+DST="$TMP/det_state"
+det() { (cd "$DET" && bash "$GUARD" --state-dir "$DST" "$@" 2>/dev/null); }
+
+# Without an identity the guard cannot key anything — that is the bug, pinned
+# so a future change cannot quietly reintroduce it while looking fixed.
+det --record --base-sha aaa --head-sha bbb >/dev/null 2>&1
+if [[ -z "$(ls "$DST" 2>/dev/null)" ]]; then
+  ok "detached + no identity: nothing is recorded (the defect, pinned)"
+else bad "detached + no identity should record nothing"; fi
+
+# With one, everything works — and the counter must CLIMB, or the ladder can
+# never reach its pass-3 step.
+seq_det=""
+for i in 1 2 3; do
+  seq_det="$seq_det$(det --pass-context --branch pr-42)"
+  det --record --branch pr-42 --base-sha "b$i" --head-sha "h$i" >/dev/null 2>&1
+done
+if [[ "$seq_det" == "123" ]]; then ok "detached + --subject-id: pass counter climbs 1,2,3"
+else bad "detached counter (got='$seq_det' want='123')"; fi
+
+# Two PRs reviewed detached must not share a key. This is why a literal
+# "detached" would have been the wrong fix: they also share a base, so the
+# guard would start refusing unrelated PRs.
+if [[ "$(det --pass-context --branch pr-99)" == "1" ]]; then
+  ok "a second subject on a detached HEAD gets its own key"
+else bad "detached subjects must not collide"; fi
+
 echo "── integration: run_reviewers.sh honours the block ──"
 RR="$SKILL_DIR/scripts/run_reviewers.sh"
 if [[ -f "$RR" ]] && command -v git >/dev/null 2>&1; then
@@ -261,6 +313,68 @@ STUB
     ok "pass 4 stays at medium — the ladder has a floor"
   else
     bad "pass 4 floor"; echo "      argv: $(tr '\n' ' ' < "$TMP/argv6" 2>/dev/null)"
+  fi
+
+  # ── end-to-end: does the ladder ENGAGE in a worktree-shaped run? ──
+  #
+  # The unit pins above prove the guard can key on --subject-id. This proves
+  # run_reviewers.sh actually passes it, on a detached HEAD, all the way
+  # through to codex's argv. Without the flag the ladder stays at default
+  # effort forever no matter how many passes run; with it, pass 2 steps down.
+  DREPO="$TMP/drepo"; mkdir -p "$DREPO"
+  (
+    cd "$DREPO" || exit 1
+    git init -q . && git config user.email t@t && git config user.name t
+    echo one > f.txt && git add f.txt && git commit -qm base
+    git rev-parse HEAD > "$TMP/dbase"
+    echo two >> f.txt && git commit -qam fix1
+    git checkout -q --detach HEAD          # exactly how a cross-review worktree sits
+  ) >/dev/null 2>&1
+  DB="$(cat "$TMP/dbase")"
+
+  det_run() {  # det_run <state_dir> <argv_out> [extra args...]
+    local sd="$1" argv_out="$2"; shift 2
+    (cd "$DREPO" && CROSS_REVIEW_STATE_DIR="$sd" CODEX_ARGV_OUT="$argv_out" PATH="$BIN:$PATH" \
+      timeout 120 bash "$RR" --base "$DB" --out "$(mktemp -d)" \
+        --reviewers codex --timeout-codex 30 "$@") >/dev/null 2>&1
+  }
+
+  # Two passes WITHOUT --subject-id: no identity, so no state, so pass 2 still
+  # reads as pass 1 and effort is never stepped down. The regression this
+  # whole change exists to end.
+  det_run "$TMP/det_s1" "$TMP/dargv1"
+  (cd "$DREPO" && echo three >> f.txt && git commit -qam fix2) >/dev/null 2>&1
+  det_run "$TMP/det_s1" "$TMP/dargv2"
+  if [[ -f "$TMP/dargv2" ]] && ! grep -q model_reasoning_effort "$TMP/dargv2"; then
+    ok "detached without --subject-id: ladder never engages (the bug, pinned)"
+  else
+    bad "expected no effort pin"; echo "      argv: $(tr '\n' ' ' < "$TMP/dargv2" 2>/dev/null)"
+  fi
+
+  # The same two passes WITH it. Note pass 2 must use pass 1's HEAD as its
+  # base: with an identity the guard is now live, and reusing pass 1's base
+  # would be refused as a full re-review (exit 3, nothing dispatched). That
+  # refusal is the guard working — it is also why the first draft of this test
+  # failed, which is a better demonstration than the assertion below.
+  det_run "$TMP/det_s2" "$TMP/dargv3" --subject-id pr-777
+  DH1="$(cd "$DREPO" && git rev-parse HEAD)"
+  (cd "$DREPO" && echo four >> f.txt && git commit -qam fix3) >/dev/null 2>&1
+  det_run "$TMP/det_s2" "$TMP/dargv4" --subject-id pr-777 --base "$DH1"
+  if grep -q 'model_reasoning_effort="high"' "$TMP/dargv4" 2>/dev/null; then
+    ok "detached with --subject-id: pass 2 steps codex down to high"
+  else
+    bad "detached ladder engagement"; echo "      argv: $(tr '\n' ' ' < "$TMP/dargv4" 2>/dev/null)"
+  fi
+
+  # The env var is the same channel — the worktree flow may export rather than
+  # pass a flag, and a channel that silently does nothing is worse than none.
+  DH2="$(cd "$DREPO" && git rev-parse HEAD)"
+  (cd "$DREPO" && echo five >> f.txt && git commit -qam fix4) >/dev/null 2>&1
+  CROSS_REVIEW_SUBJECT_ID=pr-777 det_run "$TMP/det_s2" "$TMP/dargv5" --base "$DH2"
+  if grep -q model_reasoning_effort "$TMP/dargv5" 2>/dev/null; then
+    ok "CROSS_REVIEW_SUBJECT_ID works as the flag does"
+  else
+    bad "env channel"; echo "      argv: $(tr '\n' ' ' < "$TMP/dargv5" 2>/dev/null)"
   fi
 
   # An explicit flag outranks the derivation, in both directions.

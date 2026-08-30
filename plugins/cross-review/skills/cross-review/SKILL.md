@@ -274,8 +274,30 @@ roster="$(jq -r '.roster' "$run_dir/roster_decision.json")"
 bash ~/.claude/skills/cross-review/scripts/run_reviewers.sh \
   --base <base-branch> \
   --reviewers "$roster" \
+  --subject-id <the same --id you gave worktree.sh> \
   --out "$run_dir/raw"
 ```
+
+**`--subject-id` is not optional in the worktree flow.** The repeat-pass guard and
+the codex effort ladder key their state on (project, subject), and without a
+subject there is no key. `run_reviewers.sh` falls back to asking git for the
+branch, and inside a worktree git has no answer — a worktree sits on a detached
+HEAD, where `git branch --show-current` prints nothing and exits 0. So the gate
+never fires, `--record` writes nothing, and the pass counter answers 1 forever,
+leaving codex at full effort on every pass. Both guards shipped inert in
+production for exactly this reason (2026-08-30), and every test passed
+throughout, because tests run on a branch.
+
+Pass the **`--id`** you gave `worktree.sh start`, not the `--ref`. The id is a
+stable per-review slug (`pr-213`): constant across the passes of one review,
+distinct between reviews. `--ref` is documented as branch-or-sha and is a SHA in
+the common flow, so keying on it would mint a fresh key every pass — the guard
+would find no prior round and never fire, silently, looking exactly like the bug
+this flag fixes. `CROSS_REVIEW_SUBJECT_ID` is the same channel if you would
+rather export it.
+
+Omit it when reviewing a plain checkout that is on a real branch; the git-derived
+behaviour is unchanged there.
 
 `select_roster.sh --json` picks codex + kimi (fixed baselines) plus a leaderboard-weighted random draw from the rotation pool (default 2 picks, always ≥3 reviewers total), and its stdout carries the full decision record: `roster`, `baselines`, `selected`, `seed`, `policy_version`, and a `candidates` array (every pool member considered, with its score/weight/latest_status). The stderr candidate lines are still printed for the log tail — surface the roster line to the user same as before. Pass `--reviewers <comma-list>` directly to `run_reviewers.sh` (skipping `select_roster.sh` entirely) only when the user asks for specific reviewers or for the full fleet.
 
