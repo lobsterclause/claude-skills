@@ -1240,19 +1240,22 @@ assert_eq "detect reports kimi3 available with Moonshot key" \
 assert_eq "detect still reports kimi27 available (positional coupling check)" \
   "$(jq -r '.kimi27' <<<"$DETECT_OUT3")" "true"
 BOOST_ERR3="$T/boost3.err"
-CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR3"
-assert_contains "selector draws kimi3 as a candidate" "$(cat "$BOOST_ERR3")" "kimi3"
-# What this pins is that draw_boost actually MULTIPLIES the drawn weight --
-# kimi3 was only ever the vehicle, and its boost was retired to 1.0 on
-# 2026-08-22 (per Gabriel: enough data gathered), which broke this assertion.
-# Repointed to `inkling`, a seat that genuinely still carries 2.5. THE SEAT
-# NAMED HERE MUST BE ONE WITH draw_boost 2.5 AND NO RUNLOG HISTORY -- when
-# inkling's boost is retired in turn, repoint again rather than editing the
-# expected number, or this stops testing the multiplier at all. Same failure
-# the deepseek/nemotron swap caused on 2026-08-14.
+# What this pins is that draw_boost actually MULTIPLIES the drawn weight.
+# It used to name a live seat that "genuinely carries 2.5" (kimi3, then
+# inkling) and broke every time that seat's boost was retired on real
+# evidence (2026-08-14 nemotron, 2026-08-22 kimi3, 2026-08-30 inkling bench).
+# The boost is now injected through CROSS_REVIEW_PROFILES_FILE, the same
+# fixture pattern the draw_boost-0 pin uses above, so fleet decisions in
+# reviewer_profiles.json cannot break a test about the weight formula. The
+# vehicle still has to be a seat with NO runlog history in $FIXLOG (rookie).
 # rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0;
 # draw_boost 2.5 → 75.0 * 2.5 = 187.5.
-assert_contains "a boosted rookie seat's weight reflects its draw_boost (inkling, 2.5)" \
+BOOST25_PROF="$T/boost25_profiles.json"
+jq '.inkling.draw_boost = 2.5' "$SKILL_DIR/references/reviewer_profiles.json" > "$BOOST25_PROF"
+CROSS_REVIEW_PROFILES_FILE="$BOOST25_PROF" CROSS_REVIEW_RUNLOG="$FIXLOG" \
+  bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR3"
+assert_contains "selector draws kimi3 as a candidate" "$(cat "$BOOST_ERR3")" "kimi3"
+assert_contains "a boosted rookie seat's weight reflects its draw_boost (fixture-injected 2.5)" \
   "$(grep 'inkling ' "$BOOST_ERR3")" "weight=187.5"
 # and the retired seat is now drawn at the unboosted rookie weight
 assert_contains "kimi3 draws unboosted after its 2026-08-22 boost retirement" \
