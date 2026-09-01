@@ -104,7 +104,56 @@ has kimi && kimi=true
 if command -v curl >/dev/null 2>&1; then
   if [[ -n "${OPENROUTER_API_KEY:-}" || -s "$HOME/.config/openrouter/key" ]]; then
     openrouter=true
+
+    # SOLVENCY, not just presence. A key that is present but cannot pay looks
+    # exactly like a healthy key here, and on 2026-09-01 that cost about five
+    # hours: OpenRouter credits ran out mid-day and every subsequent round lost
+    # its whole pool AND the first-party or_fallback lanes to 402s in ~1s each,
+    # while detection kept reporting the pool available. One key funds fifteen
+    # seats plus every fallback, so this single number decides most of a roster.
+    #
+    # /api/v1/credits is a free GET and definitive (total_usage >= total_credits
+    # means the next call 402s). Deliberately NOT the /api/v1/key endpoint: it
+    # reports rate-limit config, and its "limit": null reads as healthy on a
+    # broke account — that misreading is what delayed the diagnosis.
+    #
+    # Fails OPEN in every ambiguous case: only a parsed, exhausted balance
+    # flips the pool off. A network blip must not bench fifteen reviewers.
+    if [[ "${CROSS_REVIEW_SKIP_BALANCE_PROBE:-0}" != "1" ]]; then
+      _or_key="${OPENROUTER_API_KEY:-$(cat "$HOME/.config/openrouter/key" 2>/dev/null)}"
+      _cred_cache="$HOME/.cross-review/cache/openrouter_credits.json"
+      # 10-minute TTL: a balance can hit zero mid-session, so the agy models
+      # cache's 6h would be far too stale to protect anything.
+      if [[ ! -s "$_cred_cache" || -n "$(find "$_cred_cache" -mmin +10 2>/dev/null)" ]]; then
+        mkdir -p "$(dirname "$_cred_cache")" 2>/dev/null
+        _tmp="$_cred_cache.tmp.$$"
+        if curl -fsS --max-time 8 -H "Authorization: Bearer $_or_key" \
+             https://openrouter.ai/api/v1/credits -o "$_tmp" 2>/dev/null; then
+          mv "$_tmp" "$_cred_cache" 2>/dev/null || rm -f "$_tmp"
+        else
+          rm -f "$_tmp"
+        fi
+      fi
+      if [[ -s "$_cred_cache" ]] && command -v jq >/dev/null 2>&1; then
+        _tc="$(jq -r '.data.total_credits // empty' "$_cred_cache" 2>/dev/null)"
+        _tu="$(jq -r '.data.total_usage // empty' "$_cred_cache" 2>/dev/null)"
+        if [[ -n "$_tc" && -n "$_tu" ]] && awk -v c="$_tc" -v u="$_tu" 'BEGIN{exit !(u>=c)}'; then
+          openrouter=false
+          printf 'WARNING: OpenRouter credits exhausted (used %s of %s) — the whole OpenRouter pool\n' "$_tu" "$_tc" >&2
+          printf '  and every or_fallback lane will 402. Add credits at https://openrouter.ai/settings/credits\n' >&2
+          printf '  Override with CROSS_REVIEW_SKIP_BALANCE_PROBE=1 if this is wrong.\n' >&2
+        fi
+      fi
+    fi
   fi
+
+  # NOTE on Moonshot (kimi / kimi27 / kimi3, one shared balance): there is no
+  # free solvency probe. Verified 2026-09-01 against a genuinely suspended
+  # account — GET /v1/models returned 200 with a full model list, so presence
+  # of a working key proves nothing about billing. Only a chat completion
+  # surfaces the 429 "suspended due to insufficient balance". We do not spend a
+  # call here; check_provider_floor.sh catches the resulting thin round
+  # post-hoc, which covers this and every other cause.
   # kimi27 (k2.7-code rotation seat) rides the DIRECT Moonshot API — its own
   # key, independent of both the kimi CLI baseline and the OpenRouter pool.
   if [[ -n "${MOONSHOT_API_KEY:-}" || -s "$HOME/.config/moonshot/key" ]]; then

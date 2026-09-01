@@ -72,6 +72,27 @@ directory itself (via `alias/default`, falling back to the newest installed
 version), so a correct install should just work — check `which codex` before
 assuming otherwise.
 
+#### Presence is not solvency
+
+A key that exists but cannot pay looks identical to a healthy one. On
+2026-09-01 OpenRouter credits ran dry mid-day and the next five hours of rounds
+lost their whole pool **and** every first-party `or_fallback` lane to 402s in
+about a second each, while detection kept reporting the pool available. One key
+funds fifteen seats plus every fallback, so `detect_reviewers.sh` now probes
+`/api/v1/credits` (a free GET, 10-minute cache) and reports the pool
+unavailable when `total_usage >= total_credits`. It fails **open** on any
+ambiguity — a network blip must never bench fifteen reviewers — and
+`CROSS_REVIEW_SKIP_BALANCE_PROBE=1` disables it.
+
+Do NOT use `/api/v1/key` for this. It reports rate-limit configuration, and its
+`"limit": null` reads as healthy on a broke account; misreading it that way is
+what delayed the diagnosis on the day.
+
+**Moonshot has no free equivalent.** Verified against a genuinely suspended
+account: `GET /v1/models` returned 200 with a full model list, so a working key
+proves nothing about billing there. Only a chat completion surfaces the 429.
+The post-hoc provider floor (step 9) is what catches that case.
+
 To run degraded on purpose, make it explicit at the call site:
 
 ```bash
@@ -773,6 +794,7 @@ bash ~/.claude/skills/cross-review/scripts/report_block.sh \
   --findings "$run_dir/findings.verified.json" --pass <N> \
   --verdict <CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED> \
   --record "$run_dir/findings.md" --next <stop|re-review|ask-user|apply-fixes> \
+  --meta-dir "$run_dir/raw" \
   [--pr-url <url>] [--notes "<≤1 sentence>"] [--roster-decision "$run_dir/roster_decision.json"]
 ```
 
@@ -788,6 +810,24 @@ Next:    stop | re-review | ask-user | apply-fixes
 Notes:   <≤1 sentence if something non-obvious happened — reviewer disagreement, rate-limit retries, partial failure>
 ──────────────────────────────
 ```
+
+**`--meta-dir` makes the provider floor binding.** This document has always
+said a round needs at least 3 reviewers and counts convergence by distinct
+provider, and until 2026-09-01 nothing checked either. A census of the previous
+25 rounds found PR #3677 graded **CLEAN** on two returning seats and PR #173
+reporting NEEDS_DECISION on **one**. With `--meta-dir`, `report_block.sh` calls
+`check_provider_floor.sh`, counts how many distinct providers actually returned
+output, and forces the verdict to `BLOCKED` with `Next: ask-user` when fewer
+than three did — whatever verdict the caller passed. Pass it on every round.
+
+The check is deliberately post-hoc rather than a pre-flight probe: counting what
+came back catches every cause (billing, quota, a timeout, an agy panic, a
+delisted model slug) and cannot be wrong about it, whereas a probe only catches
+the failure it was written for. It groups seats by `provider`, so kimi + kimi27
++ kimi3 is one vote, not three. It fails **open** when the meta dir is missing —
+it answers a question about evidence, and with none it declines rather than
+inventing a verdict. Override the threshold with `--floor N` or
+`CROSS_REVIEW_PROVIDER_FLOOR`.
 
 **Verdict semantics:**
 
@@ -863,6 +903,14 @@ The script reads each `$run_dir/<reviewer>.meta.json` to fill in per-reviewer te
 **Always pass `--findings` with the most-verified findings JSON you have** (note: it hard-rejects any `verdict:"drop"` finding whose `factcheck.reason` is empty — falsification evidence is mandatory, not advisory) (post-anchor, post-factcheck). It enriches each reviewer's entry with `findings_total` / `findings_convergent` / `findings_dropped` — the quality signals `leaderboard.sh` scores on. Skipping it starves the leaderboard: that reviewer's run scores on reliability alone.
 
 Append once per pass (not once per multi-pass run). The runlog is JSONL: one line per pass, append-only, safe under concurrent splitstream rounds.
+
+Each entry also carries a `provider_floor` object (`providers_returned`,
+`floor`, `meets_floor`, and the seat/provider lists) whenever `--run-dir` has a
+`raw/` to read, so the ledger itself records whether a round was thin instead of
+every census re-deriving it from `meta.json` by hand. It is telemetry, not a
+gate — step 9 is where the floor binds a verdict — and `append_runlog.sh` only
+WARNs when it sees a sub-floor round. Fails open: any problem leaves the field
+null and never blocks an append.
 
 Every appended entry carries a `schema_version`; see `docs/decisions/2026-08-27-cross-review-ledger-schema-version-policy.md` for when that number is allowed to bump and what a reader must do about it.
 

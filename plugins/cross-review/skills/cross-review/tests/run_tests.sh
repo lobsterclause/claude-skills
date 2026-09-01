@@ -48,6 +48,12 @@ chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export OPENROUTER_API_KEY="sk-or-test-shim"   # lights the OR pool; never called
 export MOONSHOT_API_KEY="sk-ms-test-shim"     # lights the kimi27 seat; never called
+# detect_reviewers.sh probes the OpenRouter BALANCE (a real GET) before
+# reporting the pool available. This suite is offline by contract, and the shim
+# key above would make that probe a live network call, so it is disabled here.
+# The probe's own logic is covered offline in tests/test_provider_floor.sh via
+# a pre-seeded credits cache.
+export CROSS_REVIEW_SKIP_BALANCE_PROBE=1
 # Sandbox HOME: the selector caches `agy models` output under
 # $HOME/.cross-review/cache with a 6h TTL — running tests against the real
 # HOME would poison real roster draws with the shim's list (codex P2, PR #19).
