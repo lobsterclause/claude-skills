@@ -200,6 +200,7 @@ done
 export PATH
 
 base=""
+allow_full_rereview="${CROSS_REVIEW_ALLOW_FULL_REREVIEW:-0}"
 out=""
 # Empty default: no per-reviewer snapshots. When set via --snapshot-dir, a
 # reviewer whose slug has a matching $snapshot_dir/snapshot-<r>.{md,xml,txt}
@@ -276,6 +277,11 @@ need_val() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base)               need_val --base               "$#"; base="$2";               shift 2 ;;
+    # Documented in SKILL.md's re-review loop as the escape hatch for a
+    # deliberate full re-review. It was documented but never parsed, so the
+    # only way past the guard was the env var and the documented flag killed
+    # the round with "unknown arg".
+    --allow-full-rereview) allow_full_rereview=1;                                         shift ;;
     --out)                need_val --out                "$#"; out="$2";                shift 2 ;;
     --reviewers)          need_val --reviewers          "$#"; reviewers="$2";          shift 2 ;;
     --timeout)            need_val --timeout            "$#"; timeout_s="$2";          shift 2 ;;
@@ -502,7 +508,9 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # result (0), not the guard's exit code — which silently turned every block
   # into a "guard returned 0 — continuing" and dispatched the round anyway.
   # Caught by the integration test in tests/test_repeat_pass_guard.sh.
-  bash "$_guard" --base-sha "$_base_sha" --head-sha "$_head_sha"
+  _guard_args=(--base-sha "$_base_sha" --head-sha "$_head_sha")
+  [[ "$allow_full_rereview" == 1 ]] && _guard_args+=(--allow-full-rereview)
+  bash "$_guard" "${_guard_args[@]}"
   _grc=$?
   if [[ "$_grc" -ne 0 ]]; then
     # 3 = blocked. Any other non-zero is a guard malfunction (usage error,
@@ -545,8 +553,12 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
     fi
   fi
 
-  # Record only once we are committed to dispatching this round.
-  bash "$_guard" --record --base-sha "$_base_sha" --head-sha "$_head_sha" || true
+  # The record is written AFTER the lanes finish, and only if a reviewer
+  # actually produced a review — see the `any_ok` block at the end of this
+  # script. Recording at dispatch poisoned the state when a round died (quota
+  # exhaustion, timeout): the next attempt saw base=B/head-moved and was
+  # refused, and the refusal told the caller to re-base onto a HEAD whose diff
+  # NOBODY had reviewed, silently dropping that coverage.
 fi
 
 # Fail closed toward the config default. An unknown level is a typo, and what
@@ -2933,6 +2945,13 @@ for i in "${!pids[@]}"; do
     esac
   fi
 done
+
+# Record this round for the repeat-pass guard now that a reviewer has actually
+# reviewed something. A round where every lane failed leaves no record, so the
+# retry after it is treated as a first pass rather than a repeat.
+if [[ "$any_ok" -eq 1 && -f "${_guard:-}" && -n "${_base_sha:-}" && -n "${_head_sha:-}" ]]; then
+  bash "$_guard" --record --base-sha "$_base_sha" --head-sha "$_head_sha" || true
+fi
 
 [[ "$any_ok" -eq 1 ]] || exit 1
 exit 0

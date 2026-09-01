@@ -280,6 +280,87 @@ STUB
   else
     bad "unknown effort must be dropped"; echo "      argv: $(tr '\n' ' ' < "$TMP/argv4" 2>/dev/null)"
   fi
+  # The remaining integrations need the round to actually reach dispatch, so a
+  # reviewer must LOOK installed. A stub `codex` keeps this offline and fast:
+  # the real CLI is resolved through lib_path.sh (~/.local/bin + the nvm bin
+  # dir), so $HOME and $NVM_DIR are redirected too, or the machine's own codex
+  # would be found and a live review billed from a unit test.
+  BIN_SBX="$TMP/bin_sandbox"; mkdir -p "$BIN_SBX" "$TMP/fakehome"
+  cat > "$BIN_SBX/codex" <<'STUB'
+#!/bin/sh
+case " $* " in *--version*) echo "codex 0.0.0-stub"; exit 0 ;; esac
+echo "no findings"
+exit "${STUB_RC:-0}"
+STUB
+  chmod +x "$BIN_SBX/codex"
+  # sandbox_rr <state_dir> <out_dir> <stub_rc> [extra run_reviewers args...]
+  sandbox_rr() {
+    local sd="$1" od="$2" src="$3"; shift 3
+    (cd "$REPO" && timeout 90 env "PATH=$BIN_SBX:/usr/bin:/bin" "HOME=$TMP/fakehome" \
+       "NVM_DIR=$TMP/no-nvm" "STUB_RC=$src" "CROSS_REVIEW_STATE_DIR=$sd" \
+       bash "$RR" --base "$B" --out "$od" --reviewers codex "$@") >/dev/null 2>&1
+  }
+
+  # --allow-full-rereview is documented in SKILL.md as THE escape hatch, but
+  # run_reviewers.sh never parsed it: the documented flag fell through to the
+  # arg parser's `unknown arg` branch and killed the round (exit 2) instead of
+  # allowing it. Same blocked state as above; only the flag differs.
+  sandbox_rr "$TMP/integ_state" "$TMP/ovr_out" 0 --allow-full-rereview; rc=$?
+  if [[ "$rc" -ne 2 && "$rc" -ne 3 ]]; then
+    ok "run_reviewers.sh --allow-full-rereview is parsed and overrides the block"
+  else bad "--allow-full-rereview (rc=$rc, want neither 2 nor 3)"; fi
+
+  # A round where every lane failed reviewed NOTHING, so it must not be
+  # recorded. Recording at dispatch time made the retry after a dead round
+  # (quota exhaustion, timeout) look like a repeat pass, and the refusal then
+  # pointed the caller at a base whose diff nobody had reviewed — turning a
+  # cost guard into silent coverage loss.
+  sandbox_rr "$TMP/fail_state" "$TMP/fail_out" 1
+  if [[ -z "$(find "$TMP/fail_state" -type f 2>/dev/null)" ]]; then
+    ok "a round with no successful reviewer records no state"
+  else bad "a failed round poisoned the guard state"; fi
+  (cd "$REPO" && echo four >> f.txt && git commit -qam fix3) >/dev/null 2>&1
+  sandbox_rr "$TMP/fail_state" "$TMP/fail_out2" 1; rc=$?
+  if [[ "$rc" -ne 3 ]]; then ok "retry after a failed round is not blocked"
+  else bad "retry after a failed round was blocked (rc=3)"; fi
+
+  # ...but a round that DID review must still be recorded, or the guard has
+  # nothing to compare the next pass against and never fires again.
+  sandbox_rr "$TMP/ok_state" "$TMP/ok_out" 0
+  if [[ -n "$(find "$TMP/ok_state" -type f 2>/dev/null)" ]]; then
+    ok "a round with a successful reviewer is recorded"
+  else bad "a successful round was not recorded"; fi
+
+  # Detached HEAD: `git branch --show-current` prints NOTHING and exits 0, so
+  # the old `|| echo detached` fallback never fired and the guard exited 2 — a
+  # usage error on every detached checkout, recording nothing and blocking
+  # nothing. A literal "detached" key would be worse (every detached review of
+  # a repo shares one key AND one base), so it must fail OPEN instead.
+  echo "── detached HEAD has no branch identity: fail open, never exit 2 ──"
+  (cd "$REPO" && git checkout -q --detach) >/dev/null 2>&1
+  run_det() {
+    local want="$1" label="$2"; shift 2
+    local o r
+    o="$(cd "$REPO" && bash "$GUARD" --state-dir "$TMP/det_state" "$@" 2>&1)"; r=$?
+    if [[ "$r" == "$want" ]]; then ok "$label"
+    else bad "$label (rc=$r want=$want)"; echo "      out: ${o//$'\n'/ | }"; fi
+  }
+  run_det 0 "detached check -> guard skipped, round allowed" --base-sha "$B" --head-sha "$H1"
+  run_det 0 "detached --record -> no-op, not a usage error"   --record --base-sha "$B" --head-sha "$H1"
+  run_det 2 "a missing --base-sha is still a usage error"     --project demo --branch feat/x
+
+  # --pass-context is the SECOND way a detached HEAD disabled #168's effort
+  # ladder: it has its own usage path (project+branch, no shas), so it exited 2
+  # before reading any record, run_reviewers swallowed that as `|| echo 1`, and
+  # every pass got default effort from round 1 onward -- independent of whether
+  # the state record itself was repaired. Its contract is "always prints a
+  # number"; a caller's `case ''` sanitizer inventing the same 1 is not the
+  # script honouring a contract.
+  pc="$(cd "$REPO" && bash "$GUARD" --state-dir "$TMP/det_state" --pass-context 2>/dev/null)"; rc=$?
+  if [[ "$rc" -eq 0 && "$pc" == 1 ]]; then
+    ok "detached --pass-context prints 1, does not fall silent or exit 2"
+  else bad "detached --pass-context (rc=$rc out='$pc' want rc=0 out=1)"; fi
+  (cd "$REPO" && git checkout -q feat/guard) >/dev/null 2>&1
 else
   echo "  skip run_reviewers.sh integration (script or git unavailable)"
 fi

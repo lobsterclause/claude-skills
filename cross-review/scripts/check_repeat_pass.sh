@@ -50,7 +50,8 @@
 # --record. Anything unreadable, absent, or stale answers 1 — the same
 # fail-open direction as the gate.
 #
-# exit 0 — proceed (no prior round, incremental base, retry, stale, or override)
+# exit 0 — proceed (no prior round, incremental base, retry, stale, override,
+#          or no resolvable branch identity to key state on)
 # exit 3 — blocked: this is a full re-review of an already-reviewed diff
 # exit 2 — usage error
 #
@@ -83,18 +84,42 @@ done
 # Fall back to git only for what the caller omitted, so the guard is fully
 # testable without a repo (and usable from inside one without plumbing).
 [[ -z "$project"  ]] && project="$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")"
-[[ -z "$branch"   ]] && branch="$(git branch --show-current 2>/dev/null || echo detached)"
+[[ -z "$branch"   ]] && branch="$(git symbolic-ref --short -q HEAD 2>/dev/null || true)"
 [[ -z "$head_sha" ]] && head_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-# --pass-context needs only project+branch; the sha args identify a round,
-# and the query is about the branch, not about any particular round.
-if [[ "$pass_context" == 1 ]]; then
-  if [[ -z "$project" || -z "$branch" ]]; then
-    echo "usage: $0 --pass-context [--project <p>] [--branch <b>]" >&2
-    exit 2
-  fi
-elif [[ -z "$project" || -z "$branch" || -z "$base_sha" || -z "$head_sha" ]]; then
+
+# --base-sha has no sane default: without it there is nothing to compare, and a
+# caller that forgot it has a bug worth reporting. --pass-context is exempt: it
+# is a query about the BRANCH, not about any particular round, so it needs no
+# shas to answer.
+if [[ "$pass_context" != 1 && -z "$base_sha" ]]; then
   echo "usage: $0 --project <p> --branch <b> --base-sha <sha> --head-sha <sha> [--record]" >&2
   exit 2
+fi
+
+# A detached HEAD has no branch name: `git branch --show-current` (and
+# symbolic-ref) print NOTHING and exit 0/1, so the old `|| echo detached`
+# fallback never fired and the guard exited 2 on every detached checkout --
+# blocking nothing and, worse, recording nothing, so the next pass had no state
+# to compare against either. Substituting a literal "detached" would be worse
+# still: every detached review of a repo would share one key, and since they
+# also share a base (origin/master) the guard would block unrelated PRs.
+#
+# With no branch identity there is no safe key, so honour the fail-open
+# contract explicitly: skip the guard, do not invent one.
+if [[ -z "$project" || -z "$branch" || -z "$head_sha" ]]; then
+  # --pass-context's contract is "always prints a number", so it answers 1
+  # rather than falling silent. Silence would leave the caller's `_pc` empty
+  # and lean on its `case ''` sanitizer to invent the same 1 -- a contract held
+  # up by the caller's error handling is not a contract. 1 is also the honest
+  # answer: with no branch identity there is no prior pass to count.
+  #
+  # This is the SECOND way a detached HEAD disabled the effort ladder. Even
+  # with the state record repaired, --pass-context took its own usage path and
+  # exited 2 before reading any record, the caller swallowed it as `|| echo 1`,
+  # and every pass got default effort from the first round onward.
+  if [[ "$pass_context" == 1 ]]; then echo 1; exit 0; fi
+  echo "check_repeat_pass: no branch identity (detached HEAD?) — guard skipped" >&2
+  exit 0
 fi
 
 skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
