@@ -36,7 +36,8 @@
 #   measure_codex_effort.sh [--since <YYYY-MM-DD>] [--runlog <path>] [--if-due]
 #
 #   --since   the cutover — rows on/after it are "after", earlier ones
-#             "before". Defaults to the ladder's ship date.
+#             "before". Defaults to the date the ladder went LIVE, which is not
+#             the date it was written; see LADDER_LIVE below for why.
 #   --runlog  defaults to ~/.claude/skills/cross-review/runlog.jsonl
 #   --if-due  print nothing before the review date, the banner and the report
 #             on or after it. This is the hook: SKILL.md step 1.5 calls it on
@@ -50,15 +51,29 @@
 
 set -uo pipefail
 
-LADDER_SHIPPED="2026-08-29"
-# A week of real rounds after the ship date. Written out rather than computed
+# WRITTEN vs LIVE are different dates, and only the second one is a cutover.
+# The ladder was written 2026-08-29 and merged the same day, but it did nothing
+# in production until 2026-09-01: cross-review runs on a detached worktree, and
+# the guard it reads its pass number from could not build a state key there, so
+# every pass answered 1 and drew default effort. #172 and #173 fixed that and
+# the installed skill was moved onto master on 2026-09-01. Rounds between those
+# dates ran the ladder's code and none of its behaviour.
+#
+# So the cutover is the live date. Using the write date would have put five days
+# of unchanged rounds in the "after" bucket and diluted whatever effect exists
+# toward zero -- the measurement reporting no effect because it measured the
+# wrong days, which is the failure this whole mechanism exists to avoid.
+LADDER_WRITTEN="2026-08-29"
+LADDER_LIVE="2026-09-01"
+
+# A week of real rounds after the LIVE date. Written out rather than computed
 # because `date -d` and `date -v` disagree across BSD and GNU, and a date this
 # script gets wrong is a check that silently never fires.
 # Overridable ONLY so the tests can exercise the due path — a check first
 # exercised on the day it fires is a check nobody has ever seen work.
-REVIEW_DUE="${CROSS_REVIEW_EFFORT_REVIEW_DUE:-2026-09-05}"
+REVIEW_DUE="${CROSS_REVIEW_EFFORT_REVIEW_DUE:-2026-09-08}"
 
-since="$LADDER_SHIPPED"
+since="$LADDER_LIVE"
 if_due=0
 runlog="${CROSS_REVIEW_RUNLOG:-$HOME/.claude/skills/cross-review/runlog.jsonl}"
 
@@ -92,8 +107,9 @@ fi
 if [[ "$if_due" == 1 ]]; then
   cat <<BANNER
 ─────────────────────────────────────────────────────────────────────────────
- REVIEW DUE: the codex reasoning-effort ladder shipped $LADDER_SHIPPED on a
- projection, and it is now past $REVIEW_DUE. The numbers below are the check.
+ REVIEW DUE: the codex reasoning-effort ladder was written $LADDER_WRITTEN on a
+ projection and went live $LADDER_LIVE (it was inert before that -- see the
+ header). It is now past $REVIEW_DUE. The numbers below are the check.
  Decide one of: keep it, move the pass-3+ floor, or revert — then update
  REVIEW_DUE in this script (or delete the --if-due call in SKILL.md step 1.5)
  so this stops asking.
