@@ -529,6 +529,27 @@ fi
 
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+# ── Provider floor stamp ──────────────────────────────────────────────────
+# Additive telemetry, not a gate: report_block.sh is where the floor BINDS a
+# verdict. Recording it here means the ledger itself carries whether a round
+# was thin, so leaderboard/analyze can discount a thin round instead of every
+# census having to re-derive it from meta.json by hand (which is how the
+# 2026-09-01 degradation went unnoticed for ~5 hours across sessions).
+# Fails open: any problem leaves the field null, never blocks an append.
+provider_floor_json="null"
+if [[ -n "${run_dir:-}" && -d "${run_dir:-}/raw" ]]; then
+  _pf="$("$(cd "$(dirname "$0")" && pwd)/check_provider_floor.sh" --meta-dir "$run_dir/raw" --json 2>/dev/null)" || true
+  if [[ -n "$_pf" ]] && printf '%s' "$_pf" | jq -e . >/dev/null 2>&1; then
+    provider_floor_json="$_pf"
+    if printf '%s' "$_pf" | jq -e '.meets_floor == false' >/dev/null 2>&1; then
+      _got="$(printf '%s' "$_pf" | jq -r '.providers_returned // 0')"
+      _need="$(printf '%s' "$_pf" | jq -r '.floor // 3')"
+      printf 'append_runlog: WARNING — provider floor not met (%s/%s) for verdict %s. This round is not a cross-review.\n' \
+        "$_got" "$_need" "$verdict" >&2
+    fi
+  fi
+fi
+
 entry=$(jq -nc \
   --arg ts "$ts" \
   --arg project "$project" \
@@ -565,6 +586,7 @@ entry=$(jq -nc \
   --arg run_id "$run_id" \
   --argjson roster_decision "$roster_decision_json" \
   --argjson schema_version "$SCHEMA_VERSION" \
+  --argjson provider_floor "$provider_floor_json" \
   --arg round_wall_s "$round_wall_s_val" \
   --argjson phases "$phases_json" \
   --argjson synthetic "$([[ "$synthetic" -eq 1 ]] && echo true || echo false)" \
@@ -595,6 +617,7 @@ entry=$(jq -nc \
     reviewers: $reviewers,
     convergent_count: $convergent,
     verdict: $verdict,
+    provider_floor: $provider_floor,
     top_finding: (if $top == "" then null else $top end),
     notes: (if $notes == "" then null else $notes end)
   }

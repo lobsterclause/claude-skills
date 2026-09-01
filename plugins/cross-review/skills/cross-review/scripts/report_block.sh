@@ -54,7 +54,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULT_PROFILES="$SCRIPT_DIR/../references/reviewer_profiles.json"
 
 findings="" ; pass="" ; verdict="" ; record="" ; next=""
-pr_url="" ; notes="" ; profiles="$DEFAULT_PROFILES" ; roster_decision=""
+pr_url="" ; notes="" ; profiles="$DEFAULT_PROFILES" ; roster_decision="" ; meta_dir=""
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
@@ -68,11 +68,12 @@ while [[ $# -gt 0 ]]; do
     --notes)            need_val "$1" "$#"; notes="$2";            shift 2 ;;
     --profiles)         need_val "$1" "$#"; profiles="$2";         shift 2 ;;
     --roster-decision)  need_val "$1" "$#"; roster_decision="$2";  shift 2 ;;
+    --meta-dir)         need_val "$1" "$#"; meta_dir="$2";         shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-usage="usage: $0 --findings <json> --pass <N> --verdict <CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED> --record <path> --next <stop|re-review|ask-user|apply-fixes> [--pr-url <url>] [--notes <text>] [--profiles <json>] [--roster-decision <json>]"
+usage="usage: $0 --findings <json> --pass <N> --verdict <CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED> --record <path> --next <stop|re-review|ask-user|apply-fixes> [--pr-url <url>] [--notes <text>] [--profiles <json>] [--roster-decision <json>] [--meta-dir <run_dir/raw>]"
 
 [[ -z "$findings" || -z "$pass" || -z "$verdict" || -z "$record" || -z "$next" ]] && {
   echo "$usage" >&2; exit 2;
@@ -94,6 +95,33 @@ esac
 
 if [[ -n "$roster_decision" && ! -f "$roster_decision" ]]; then
   echo "report_block: --roster-decision file not found: $roster_decision" >&2; exit 1
+fi
+
+# ── Provider floor ────────────────────────────────────────────────────────
+# SKILL.md has always said a round needs >=3 reviewers and >=3 providers to
+# count. Nothing checked it, and on 2026-09-01 a census of the previous 25
+# rounds found PR #3677 graded CLEAN on two returning seats and PR #173
+# reporting NEEDS_DECISION on ONE. A verdict is the thing callers act on, so
+# the floor binds here: with --meta-dir, a round that did not clear it cannot
+# report anything but BLOCKED, whatever the caller passed.
+#
+# The check itself fails OPEN (see check_provider_floor.sh) so a missing meta
+# dir never stops a report; only a round we can SEE was thin is overridden.
+floor_note=""
+if [[ -n "$meta_dir" ]]; then
+  floor_json="$("$SCRIPT_DIR/check_provider_floor.sh" --meta-dir "$meta_dir" --profiles "$profiles" --json 2>/dev/null)"
+  floor_rc=$?
+  if [[ $floor_rc -eq 3 ]]; then
+    got="$(printf '%s' "$floor_json" | jq -r '.providers_returned // 0' 2>/dev/null)"
+    need="$(printf '%s' "$floor_json" | jq -r '.floor // 3' 2>/dev/null)"
+    who="$(printf '%s' "$floor_json" | jq -r '(.seats // []) | join("+")' 2>/dev/null)"
+    if [[ "$verdict" != "BLOCKED" ]]; then
+      echo "report_block: provider floor not met (${got}/${need}) — overriding verdict ${verdict} -> BLOCKED" >&2
+      verdict="BLOCKED"
+      next="ask-user"
+    fi
+    floor_note="INVALID ROUND: only ${got} of ${need} required providers returned output (${who:-none}); not a cross-review, do not stamp"
+  fi
 fi
 
 # ── Provider map: read dynamically from reviewer_profiles.json so new
@@ -148,6 +176,9 @@ if [[ -z "$notes" && -n "$roster_decision" ]]; then
     | ($d + $fl) as $all
     | if ($all | length) == 0 then "" else ($all | join("; ")) end
   ' "$roster_decision" 2>/dev/null)"
+fi
+if [[ -n "$floor_note" ]]; then
+  if [[ -n "$notes" && "$notes" != "—" ]]; then notes="$floor_note; $notes"; else notes="$floor_note"; fi
 fi
 [[ -z "$notes" ]] && notes="—"
 
