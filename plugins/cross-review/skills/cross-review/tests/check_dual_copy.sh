@@ -56,7 +56,10 @@ copy_b="$repo_root/plugins/cross-review/skills/cross-review"
 excludes=()
 gitignore="$repo_root/.gitignore"
 if [[ -r "$gitignore" ]]; then
-  while IFS= read -r line; do
+  # `|| [[ -n "$line" ]]`: read returns non-zero on a final line with no
+  # trailing newline, having already assigned it. Without this the last
+  # .gitignore entry would be silently dropped.
+  while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%$'\r'}"
     [[ -z "$line" || "$line" == \#* ]] && continue
     case "$line" in
@@ -81,10 +84,22 @@ if [[ "${#excludes[@]}" -eq 0 ]]; then
   )
 fi
 
-# Rotated logs (runlog.jsonl.1) are the same artifact and are not separately
-# gitignored; .DS_Store is Finder's, not ours. Neither belongs in .gitignore
-# just to satisfy this check.
-excludes+=(--exclude 'runlog.jsonl.*' --exclude '.DS_Store')
+# Artifacts that are NOT gitignored and so cannot be derived above. This tail
+# runs on both paths -- derived and fallback -- so nothing here can be lost by
+# .gitignore changing shape.
+#
+#   runlog.jsonl.*  rotated logs, the same artifact as runlog.jsonl
+#   .DS_Store       Finder's, not ours
+#   *.bak*          plant_mutation.sh:300 runs `sed -E -i.bak` and removes the
+#                   backup on the NEXT line; a round interrupted between those
+#                   two lines leaves <file>.bak in the root copy. .gitignore
+#                   carries only `**/*.bak-*`, which does not match `foo.bak`,
+#                   so deriving the list narrowed this exclusion and brought
+#                   back a false LOCAL drift report -- the exact wolf-crying
+#                   failure this file's header says teaches people to run the
+#                   guard with `|| true`. Broad on purpose: a stray backup file
+#                   is never the drift we are hunting.
+excludes+=(--exclude 'runlog.jsonl.*' --exclude '.DS_Store' --exclude '*.bak*')
 
 diff -r "${excludes[@]}" "$copy_a" "$copy_b" >/dev/null 2>&1 || exit 1
 exit 0
