@@ -179,9 +179,47 @@ if [[ "$record" == 1 ]]; then
   # FIXES_APPLIED in August) from pass 5 (mostly codex confirming its own
   # earlier verdict: pass 3+ was 57% CLEAN, 115/202). A stale record starts a
   # new review, so the count restarts with it.
-  printf '{"project":%s,"branch":%s,"base_sha":%s,"head_sha":%s,"epoch":%s,"passes":%s}\n' \
-    "\"$project\"" "\"$branch\"" "\"$base_sha\"" "\"$head_sha\"" "$now_epoch" "$(next_pass)" \
-    > "$rec" 2>/dev/null || true
+  #
+  # A ROUND, NOT A WRITE. next_pass() adds one to whatever is stored, so two
+  # writes for the same (base, head) used to count one pass as two. That is not
+  # a hypothetical: SKILL.md step 3 tells the caller to dispatch a slow seat as
+  # a SEPARATE background run_reviewers.sh into the same run_dir, and step 6
+  # lets the next pass start while it trails -- so both processes reach the
+  # `any_ok` record with identical shas. The ladder then served `medium` on a
+  # real pass 2, stepping down early and silently, on exactly the large rounds
+  # that trail because they are large. Found by codex on PR #173 round 1;
+  # reproduced by recording the same pair twice and watching --pass-context go
+  # 2 -> 3.
+  #
+  # So: same pair as the fresh record on disk -> refresh the epoch, keep the
+  # count. Different pair -> a genuinely new round, increment.
+  _rec_passes="$(next_pass)"
+  if [[ -f "$rec" ]]; then
+    _pe="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+    if record_is_fresh "$_pe"; then
+      _pb="$(sed -n 's/.*"base_sha":"\([^"]*\)".*/\1/p' "$rec" 2>/dev/null)"
+      _ph="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$rec" 2>/dev/null)"
+      if [[ "$_pb" == "$base_sha" && "$_ph" == "$head_sha" ]]; then
+        _stored="$(sed -n 's/.*"passes":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+        case "$_stored" in ''|*[!0-9]*) _stored=1 ;; esac
+        (( _stored < 1 )) && _stored=1
+        _rec_passes="$_stored"
+      fi
+    fi
+  fi
+  # Write via temp-and-rename so a reader never sees a half-written record, and
+  # so two lanes finishing together produce one whole record rather than an
+  # interleaved one. This does not order the writers -- last rename still wins
+  # -- but with the same-pair case above collapsed, the surviving race is two
+  # DIFFERENT rounds, which the epoch check below already treats as stale.
+  _tmp="$rec.$$.tmp"
+  if printf '{"project":%s,"branch":%s,"base_sha":%s,"head_sha":%s,"epoch":%s,"passes":%s}\n' \
+    "\"$project\"" "\"$branch\"" "\"$base_sha\"" "\"$head_sha\"" "$now_epoch" "$_rec_passes" \
+    > "$_tmp" 2>/dev/null; then
+    mv -f "$_tmp" "$rec" 2>/dev/null || rm -f "$_tmp" 2>/dev/null
+  else
+    rm -f "$_tmp" 2>/dev/null
+  fi
   exit 0
 fi
 
