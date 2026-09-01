@@ -136,6 +136,41 @@ done
 if [[ "$seq_got" == "1234" ]]; then ok "the counter climbs across rounds (1,2,3,4)"
 else bad "counter sequence (got='$seq_got' want='1234')"; fi
 
+# ...but a ROUND is not a WRITE. SKILL.md step 3 tells the caller to dispatch a
+# slow seat as a SEPARATE background run_reviewers.sh into the same run_dir, and
+# step 6 lets the next pass begin while it trails, so two processes reach the
+# `any_ok` record with IDENTICAL shas. next_pass() adds one to whatever is
+# stored, so that counted one pass as two and the ladder served `medium` on a
+# real pass 2 — stepping down early and silently, on exactly the large rounds
+# that trail because they are large. codex, PR #173 round 1.
+IDEM="$TMP/idem_state"
+pc_i() { bash "$GUARD" --pass-context --state-dir "$IDEM" --project i --branch feat/i 2>/dev/null; }
+rec_i() { bash "$GUARD" --record --state-dir "$IDEM" --project i --branch feat/i \
+            --base-sha "$1" --head-sha "$2" >/dev/null 2>&1; }
+rec_i B H1
+first_i="$(pc_i)"
+rec_i B H1                      # the trailing lane, same round, same shas
+rec_i B H1                      # and again, for good measure
+if [[ "$(pc_i)" == "$first_i" && "$first_i" == "2" ]]; then
+  ok "a trailing lane re-recording the same round does not advance the counter"
+else bad "idempotent record (first='$first_i' after-retries='$(pc_i)' want both 2)"; fi
+
+# The other half of the same rule: collapsing repeats must not freeze the dial.
+rec_i H1 H2
+if [[ "$(pc_i)" == "3" ]]; then ok "…and a genuinely new round still increments"
+else bad "new round after repeats (got='$(pc_i)' want 3)"; fi
+
+# The record is written temp-and-rename, so a reader never sees a partial one
+# and no scratch file is left behind for the next round to trip over.
+# CHARACTERIZATION, not a regression pin: it is green against the pre-fix guard
+# too (which wrote in place and so also left nothing). It exists to catch a
+# future leak in the rename path, and it has never been red — said plainly
+# because the two pins above it were verified red against 4b26352 and this one
+# cannot make that claim.
+if [[ -z "$(ls -A "$IDEM" 2>/dev/null | grep '\.tmp$')" ]]; then
+  ok "record write leaves no temp file behind"
+else bad "temp file left in $IDEM: $(ls -A "$IDEM" | tr '\n' ' ')"; fi
+
 # A record written before the counter existed is still evidence of one pass.
 # --state-dir is used verbatim (the /last_base suffix is only appended to the
 # DEFAULT), so the record files sit directly in it.
