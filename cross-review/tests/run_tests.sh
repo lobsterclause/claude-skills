@@ -3116,8 +3116,14 @@ fi
 # so pin them here rather than trusting the workflow to be read correctly.
 DC_SH="$SKILL_DIR/tests/check_dual_copy.sh"
 dc_rc() { bash "$DC_SH" "$1" >/dev/null 2>&1; echo $?; }
+DC_GI="$(cd "$SKILL_DIR/.." && git rev-parse --show-toplevel 2>/dev/null || true)/.gitignore"
 DC_TMP="$(mktemp -d)"
 mkdir -p "$DC_TMP/cross-review" "$DC_TMP/plugins/cross-review/skills/cross-review"
+# The fixture gets the REAL .gitignore. Without it check_dual_copy.sh finds
+# nothing to derive from and silently takes its hardcoded fallback branch, so
+# every assertion below would be about the fallback list -- see the pin further
+# down for why that is the one thing these tests must not do.
+[[ -r "$DC_GI" ]] && cp "$DC_GI" "$DC_TMP/.gitignore"
 echo a > "$DC_TMP/cross-review/f.txt"
 echo b > "$DC_TMP/plugins/cross-review/skills/cross-review/f.txt"
 assert_eq "dual-copy: drifted copies exit 1" "$(dc_rc "$DC_TMP")" "1"
@@ -3126,6 +3132,95 @@ assert_eq "dual-copy: identical copies exit 0" "$(dc_rc "$DC_TMP")" "0"
 mkdir -p "$DC_TMP/cross-review/state"; echo x > "$DC_TMP/cross-review/state/last_base.json"
 assert_eq "dual-copy: runtime state/ is not drift" "$(dc_rc "$DC_TMP")" "0"
 assert_eq "dual-copy: no copies to compare exits 2, not 0" "$(dc_rc "$DC_TMP/nope")" "2"
+
+# An interrupted mutation drill (plant_mutation.sh:300 `sed -E -i.bak`, removed
+# on the next line) leaves <file>.bak behind. .gitignore names only
+# `**/*.bak-*`, so this is covered by the unconditional tail, not by derivation
+# -- which is exactly why it needs its own pin: deriving the list once dropped
+# it and reintroduced a false local drift report (codex, PR #171 round 1).
+touch "$DC_TMP/cross-review/interrupted.bak"
+assert_eq "dual-copy: a stray .bak from an interrupted drill is not drift" "$(dc_rc "$DC_TMP")" "0"
+rm -f "$DC_TMP/cross-review/interrupted.bak"
+
+# The fallback branch, exercised on purpose rather than by accident: same tree,
+# no .gitignore. It must still cover the runtime paths, because a checkout with
+# an unreadable .gitignore is the case the fallback exists for.
+DC_NOGI="$(mktemp -d)"
+cp -R "$DC_TMP/cross-review" "$DC_NOGI/cross-review"
+mkdir -p "$DC_NOGI/plugins/cross-review/skills"
+cp -R "$DC_TMP/plugins/cross-review/skills/cross-review" "$DC_NOGI/plugins/cross-review/skills/cross-review"
+rm -rf "$DC_NOGI/cross-review/state" 2>/dev/null || true
+mkdir -p "$DC_NOGI/cross-review/state"; echo x > "$DC_NOGI/cross-review/state/last_base.json"
+assert_eq "dual-copy: fallback list still covers runtime state/ with no .gitignore" "$(dc_rc "$DC_NOGI")" "0"
+rm -rf "$DC_NOGI"
+
+# [pin: 2026-08-30] Every runtime artifact .gitignore names must be excluded
+# here, derived rather than restated. The hand-kept list had already drifted
+# from .gitignore twice — merge_override_audit.jsonl was never excluded, and
+# iteration-* was excluded as the literal "iteration-1" so iteration-2 read as
+# drift. Both fail toward a FALSE report of drift on a developer machine while
+# CI stays green (git archive carries no gitignored files), and a guard that
+# cries wolf only locally is one people learn to run with `|| true`.
+#
+# This reads the real .gitignore, so adding a new runtime path there without
+# teaching the check about it fails HERE rather than in someone's terminal.
+if [[ -r "$DC_GI" ]]; then
+  # dc_probe <tree> <pattern> — materialise what <pattern> names in the ROOT
+  # copy only and report check_dual_copy.sh's verdict. A glob gets a concrete
+  # instance ("iteration-*" -> "iteration-9") so a literal exclude cannot pass
+  # by accident.
+  dc_probe() {
+    local tree="$1" pat="$2" probe="${2//\*/9}"
+    mkdir -p "$tree/cross-review/$probe" 2>/dev/null || touch "$tree/cross-review/$probe"
+    [[ -d "$tree/cross-review/$probe" ]] && touch "$tree/cross-review/$probe/f"
+    local rc; rc="$(dc_rc "$tree")"
+    rm -rf "${tree:?}/cross-review/${probe:?}"
+    echo "$rc"
+  }
+
+  dc_uncovered=""
+  while IFS= read -r gi_line || [[ -n "$gi_line" ]]; do
+    # Both forms check_dual_copy.sh parses, not just the first. `**/*.bak-*`
+    # used to be skipped here, and it was the single line whose derivation
+    # regressed behaviour -- the one entry the test did not probe.
+    case "$gi_line" in
+      cross-review/*) gi_pat="${gi_line#cross-review/}" ;;
+      '**/'*)         gi_pat="${gi_line#**/}" ;;
+      *)              continue ;;
+    esac
+    gi_pat="${gi_pat%/}"
+    [[ -z "$gi_pat" || "$gi_pat" == */* ]] && continue
+    T2="$(mktemp -d)"
+    mkdir -p "$T2/cross-review" "$T2/plugins/cross-review/skills/cross-review"
+    # THE .gitignore GOES IN THE FIXTURE. Without this line the check finds no
+    # .gitignore, falls through to its hardcoded fallback list, and this pin
+    # asserts that the fallback covers .gitignore -- validating the very list
+    # the derivation replaced, and failing loudly the moment someone adds a
+    # runtime path, which is precisely the workflow this change exists to end.
+    # Caught by gemini-pro on PR #171 round 1; verified by running the check
+    # with and without the file and getting rc=0 vs rc=1 on the same tree.
+    cp "$DC_GI" "$T2/.gitignore"
+    [[ "$(dc_probe "$T2" "$gi_pat")" == "0" ]] || dc_uncovered="$dc_uncovered $gi_pat"
+    rm -rf "$T2"
+  done < "$DC_GI"
+  assert_eq "dual-copy: every gitignored runtime path is excluded" "${dc_uncovered# }" ""
+
+  # Control: this pin has to be capable of going red. A path named ONLY in a
+  # .gitignore, that no fallback entry matches, must be covered when the file
+  # is present and must read as drift when it is not. If both answers were the
+  # same the loop above would prove nothing about derivation -- which was the
+  # defect, not a hypothetical.
+  T3="$(mktemp -d)"
+  mkdir -p "$T3/cross-review" "$T3/plugins/cross-review/skills/cross-review"
+  touch "$T3/cross-review/zzz-derived-only.log"
+  printf 'cross-review/zzz-derived-only.log\n' > "$T3/.gitignore"
+  assert_eq "dual-copy: a path only .gitignore names IS excluded (derivation runs)" "$(dc_rc "$T3")" "0"
+  rm -f "$T3/.gitignore"
+  assert_eq "dual-copy: …and reads as drift without it (the fallback cannot know it)" "$(dc_rc "$T3")" "1"
+  rm -rf "$T3"
+else
+  echo "  skip dual-copy gitignore coverage (.gitignore unreadable)"
+fi
 rm -rf "$DC_TMP"
 
 echo "── ci/ merge gate (delegated harness) ──"
