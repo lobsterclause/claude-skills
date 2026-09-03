@@ -5,7 +5,13 @@
 #   lock.sh release <name>
 #   lock.sh status
 # Env: PR_DRAIN_WORKDIR (default: .pr-drain in cwd)
+#      PR_DRAIN_LOCK_PID — the pid to record as holder (default: $PPID, the
+#      shell that called us). NOT $$: this script exits the moment it acquires,
+#      so recording its own pid made every lock look stale to the next caller,
+#      who reaped it — two verifies overlapped and one failed on timeouts
+#      (2026-09-03 drain).
 set -euo pipefail
+HOLDER_PID="${PR_DRAIN_LOCK_PID:-$PPID}"
 
 WORKDIR="${PR_DRAIN_WORKDIR:-.pr-drain}"
 LOCKDIR="$WORKDIR/locks"
@@ -21,8 +27,8 @@ case "$cmd" in
     while :; do
       # mkdir is atomic — the canonical portable lock primitive.
       if mkdir "$lock" 2>/dev/null; then
-        echo $$ > "$lock/pid"
-        echo "acquired $name (pid $$)"
+        echo "$HOLDER_PID" > "$lock/pid"
+        echo "acquired $name (pid $HOLDER_PID)"
         exit 0
       fi
       holder=$(cat "$lock/pid" 2>/dev/null || echo "")
