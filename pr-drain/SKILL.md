@@ -25,25 +25,17 @@ zero incidents; every rule below earns its place by a specific failure it preven
   `PR_DRAIN_DRY_RUN=1` for every script call and NEVER run push / merge / issue-edit /
   comment commands — print what each would be instead.
 
-## Architecture: stations, not per-PR owners
+## Architecture: run inline
 
-Three roles. Context stays hot across PRs because the same agents keep working:
+You do all three jobs — orchestrate, review, fix. Context stays hot across PRs
+and the refutation library accumulates in your head, which is where it is most
+useful.
 
-- **Orchestrator (you)**: rehydrate position, dispatch work, watch CI, merge, write back
-  state, enforce stop conditions. Merging and checklist edits are NEVER delegated —
-  a single writer is what makes the state trustworthy.
-- **Reviewer** (named subagent `drain-reviewer`, spawned once, continued via SendMessage):
-  runs cross-review rounds, splits findings into apply-P0/P1 vs refute-with-evidence. It
-  accumulates a refutation library across PRs — by the fifth PR it already knows which
-  reviewer claims are provably false.
-- **Fixer** (named subagent `drain-fixer`): applies findings in the PR's worktree, runs
-  the single allowed verify, pushes with `--force-with-lease`.
-
-Spawn prompts for both stations are in `references/station-agents.md` — read it before the
-first dispatch. Inline handling (orchestrator doing all three roles) proved out to at
-least a 10-PR backlog in the live shakedown, so stations are an option for scale or
-parallel drains, not a requirement — when in doubt, run inline; the protocol is
-identical. (Honest status: the station prompts are designed but have not yet run live.)
+Station subagents (`references/station-agents.md`) were designed for scale and
+have now sat unused across **four consecutive drains** (2026-08-15, 08-16,
+08-24, 08-29). Adjudication is the expensive part of this work and it does not
+split: handing a claim to another agent costs more context than it returns.
+Treat the stations file as an archived idea, not an option to weigh each time.
 
 ## Durable state: three layers
 
@@ -67,6 +59,14 @@ Two locks exist and both matter:
 - `review` — one cross-review round at a time. Reviewer fleets share provider quotas;
   two concurrent rounds double the burn and can kill the remaining seats for days.
 
+**The lock was decorative until 2026-09-03.** `lock.sh` recorded its own pid, which is
+dead the instant it exits, so the next caller's stale-pid reaper removed every live
+lock. Two `pnpm verify` runs overlapped and one went red on a test that writes a fixed
+`/tmp` path (kindred-mama-ai #3737) — exactly the false red the lock exists to
+prevent. It now records `$PPID`; acquire and release in the SAME shell invocation so
+that pid stays alive across the critical section, and `grep HOLDER_PID lock.sh` before
+trusting a lock in a fresh session.
+
 ## Per-PR sequence (stop at the first failing step)
 
 1. **Mergeability**: `gh pr view <n> --json mergeable,mergeStateStatus`. UNKNOWN → re-poll
@@ -83,7 +83,138 @@ Two locks exist and both matter:
    opposite of the description. So before applying or rejecting anything, check the claim
    against the file and the live CI state — one grep or one check-run lookup kills most
    false P0s. Then the fixer station applies what survives; reviewer consensus is not
-   correctness in either direction.
+   correctness in either direction. (A second drain: 8 of 16 P0/P1 claims refuted. The
+   base rate is ~50%; budget for it.)
+
+   **Named false-P0 patterns, cheapest check first.** Run down this list before spending
+   real effort:
+   - **Self-refuting** — the finding's own closing sentence says "no correctness bug
+     here". Read to the end before acting. (Twice in one drain, same reviewer.)
+   - **Reasoned about output never executed** — "this command prints `X: y (y)`" when
+     running it prints a bare line. Convergent across two independent providers and still
+     wrong; convergence is not evidence. The same family covers "flag A makes flag B
+     silently ignored": run the command with a deliberately-bogus value for the flag in
+     question — a control that returns 0 rows proves the flag is honored (probes need a
+     PASSING control, or a broken probe is indistinguishable from a confirmed claim).
+   - **Wrong library major** — four reviewers called a Terraform stack syntactically
+     invalid using provider v4 syntax against a v5 pin; `tofu validate` → Success. Check
+     the pinned version before believing a "this cannot even parse" claim.
+   - **Premise absent from the build** — an argument from CSS Cascade Level 5 layer
+     precedence, where `grep -c '@layer'` on the *compiled* output returns 0.
+   - **Contradicted at the cited line** — "no try/catch around this read" when the cited
+     lines are exactly that. Open the file at the line number given.
+   - **"Import/module missing" on a refactor diff** — diff-only reviewers see new
+     symbols without seeing the import hunk or the (pre-existing) module and file
+     Criticals. 7 of 10 refuted claims on one reskin PR were this shape. One grep for
+     the import plus one `ls` of the module kills the whole family — and a green
+     type-checking CI run at that head already disproves it wholesale.
+   - **CI-adjudicable claim** — "this mock crashes the test env", "this import order
+     fails lint": the claim predicts a gate outcome, and the gate has already run.
+     A green run at the reviewed head refutes the whole family in one lookup
+     (2026-08-19b: a gemini-pro Critical fell to a 30-minute green mobile lane).
+     Check the live check-run BEFORE reading the code the claim cites.
+   - **Snippet-scoped reading** — "flag `--repo` is missing", where the flag sits on
+     the continuation line the reviewer's own snippet stopped at. The tell is a
+     finding whose quoted `snippet` ends in `\` or mid-expression. `sed -n '<line>,+3p'`
+     settles it. Four of one reviewer's seven claims on one PR were this shape, and
+     it is the dominant failure mode of the low-precision seats — see
+     `claims.sh prior`.
+   - **Claim that would invalidate a passing suite** — "the quoted pattern makes this
+     comparison literal, so staleness is NEVER detected". If true, a dozen existing
+     tests would be lying. A finding that implies the whole suite is vacuous is
+     almost always the reviewer misreading, not the suite being fake — but it is
+     cheap to settle, so settle it with one probe rather than dismissing it.
+   - **Refutable by a five-line probe** — a claim about language or API
+     semantics ("this descriptor is non-configurable, so re-stubbing breaks").
+     Two independent providers raised the same P1 on one PR and both were
+     wrong: `writable: true` permits *assignment* even when
+     `configurable: false`, and assignment is what the test framework actually
+     does. Convergence is not correctness — and a claim of this shape is
+     usually settled faster by running `node -e` than by reading the code it
+     cites. Check whether the claim also predicts a gate outcome first: a green
+     run at the reviewed head kills it for free.
+   - **Right conclusion, wrong mechanism** — the finding's stated cause is
+     false but a narrower true case exists ("a MISSING `githubRepo` errors" —
+     it does not; jq returns null; only a SCALAR one errors, and the reviewer's
+     suggested fix does not handle that either). Adjudicate the stated
+     mechanism, not just the conclusion, and record WHICH you verified: log it
+     APPLIED with the real cause, or REFUTED with the disproof, never a vague
+     "partially right". The mirror case also happens — a reviewer asks you to
+     justify something that a linked issue already mandates.
+   - **Guard-purpose inversion** — a change that is more correct in isolation is
+     wrong for what the guard is FOR. Resolving `export { type A as B }` to `B`
+     is correct alias parsing and wrong for a runtime-reachability check, where
+     recording a type as a value export lets a dormant module pass. Before
+     judging a parser/matcher change, ask what the caller DOES with the result.
+     (I made this error myself and a reviewer caught it — the direction of the
+     catch is not the point; asking the question earlier is.)
+   - **Design-intent inversion** — the reviewer reads a deliberate guard as the bug
+     ("this equality fails when there are multiple failures" — yes: that inequality IS
+     the only-failure condition). Check whether the "broken" case has a test pinning
+     it as intended before applying.
+   - **Claim about configuration that does not exist** — "the `${var-default}` is
+     defeated if the workflow maps it from an undefined `vars.*`". One grep of the
+     workflow for the variable name settles it: count 0 means nobody maps it, and the
+     claim is about a future edit, not this diff. Log it NOTED for whoever adds the
+     mapping; do not fix a hypothetical. (gemini-pro on #3650, 2026-09-03.)
+   - **Mirror-image finding** — the reviewer's P1 is the inversion of a P1 you applied
+     on the same PR two rounds ago: the `-y` adjective suffix admitted "toy chest"
+     (removed), then its absence missed "dirty face" (flagged). Both are true. Neither
+     is a bug in the fix; the class is open-ended and a regex list cannot bound it. This
+     is not a triage verdict, it is a STOP signal — see stop conditions. (#3362, 2026-09-03,
+     passes 6-8: 45 P0/P1 applied, 0 refuted, still oscillating.)
+   - **A passing test's expected output read as the failure** — `--log-failed` on a
+     red Dagger run printed `[audit] FAIL: 1 dead glob(s) … renamed-away.ts`, and I
+     diagnosed a wiki-audit fixture bug for two turns. That line was subtest 62's
+     EXPECTED output; the run was red for a `tsc` error 1,300 lines later. Read the
+     job's `Error:` / non-zero exit line first, then grep backwards from it — never
+     grep the whole log for `FAIL` and trust the first hit. (#3362, 2026-09-03.)
+
+   **A green that was never computed is the most dangerous result in a drain.** It is not
+   one bug, it is a family, and four distinct members showed up in a single night. Ask of
+   every green: *what would have made this red, and did that path actually run?*
+   - A review round that completes but writes no findings/record — reviewer output exists
+     only as raw files on disk; the stamp is absent or says "no review record". A green
+     status whose description says "no review record" is NOT a review.
+   - A test file no runner invokes (`*.test.mjs` under a vitest project globbing only
+     `*.test.ts`; a `node --test` file nothing calls). Confirm the runner's glob actually
+     matches the file before believing its pass count.
+   - A test that passes with the thing it tests DELETED — e.g. asserting `/500/` against a
+     whole file where "500MB" also appears in a comment, or a whole-file `includes()`
+     instead of an assertion about the specific key.
+   - A mutation probe that silently matches nothing and reports a clean pass — which is
+     indistinguishable from "the gate cannot fail". **Before trusting any mutation result,
+     red or green, confirm the mutant landed via `git diff --numstat`.** This bit two
+     independent agents in one drain.
+   - **A wrapper that announces its own success.** A harness ending in
+     `run X; echo "ROUND COMPLETE"` prints that banner even when X rejected its
+     arguments and did nothing. Observed: a cross-review round launched with an
+     unknown flag ran ZERO reviewers, printed COMPLETE, exited 0, and left a run
+     dir containing only `context.json`. Stamping from that notification would have
+     posted a clean review record for a review that never happened. **Prove a round
+     by its artifacts — `ls "$run_dir" | grep -c stdout` — never by a banner or an
+     exit code.** The banner is your own string; it knows nothing.
+   - **An orphaned test double.** Delete the code that made a call and its stub arm
+     survives, so reintroducing the call is silently satisfied by a stale fake.
+     Remove fixtures in the same commit as the capability, or make the dead arm log
+     and `exit 1` so reintroduction is loud.
+   - **A comment-only fix.** The commit says "re-sampled per run", the assignment is
+     still outside the loop, and the file now documents behaviour it does not have.
+     Prose is not a check. If a fix is worth a comment claiming it, it is worth an
+     assertion that fails when the comment stops being true.
+   When a fix claims to make a gate binding, require a control: break it, watch it go red,
+   restore it, watch it go green. "The tests pass" is not evidence that a gate works.
+
+   **A rising pass count is not rising coverage.** Deleting four real cases and adding
+   four duplicates moves the number in the reassuring direction. When the count changes
+   for a structural reason, say so in the commit.
+
+   **Fixing one bound moves the binding constraint to its neighbour.** Five consecutive
+   rounds on one PR: per-call timeouts made their sum matter, the sum made the scan's
+   share matter, the scan bound made its ordering matter. This is not the reviewer
+   nitpicking and it is not the design failing — it is what bounding a system looks
+   like. Fix it at the level that closes the class (clamp inside the shared helper, not
+   at each call site), or the next round finds the next instance.
 
    **Log every P0/P1 verdict**: `scripts/claims.sh log <reviewer> <severity>
    APPLIED|REFUTED|OUT_OF_DIFF|NOTED <pr> "<claim>" ["<evidence>"]` (REFUTED requires the
@@ -96,21 +227,174 @@ Two locks exist and both matter:
    explaining exactly what changed since the reviewed SHA.
 4. **Verify**: repo's verify entrypoint green in the PR's worktree (under the `verify`
    lock) before any push. Fresh-worktree runs are cold-cache — budget 3-4× the warm time.
-5. **Push and watch CI**: launch `scripts/poll-ci.sh <pr> <sha>` as a background task —
-   it watches required checks and auto-merges on all-green with `--match-head-commit`.
-   Before reading ANY check result, confirm its SHA equals the PR's current `headRefOid`.
+5. **Push and watch CI**: launch `scripts/poll-ci.sh <repo> <pr> <sha>` as a background
+   task — it watches required checks and auto-merges on all-green with
+   `--match-head-commit`. Before reading ANY check result, confirm its SHA equals the PR's
+   current `headRefOid`. **Verify the poller is actually alive** (`pgrep -f poll-ci.sh`)
+   after launching, and re-check each turn: a `nohup ... &` inside a backgrounded shell
+   dies with its wrapper, and a poller you believe is armed but isn't leaves PRs sitting
+   CLEAN and unmerged indefinitely. Polling by hand each turn beats a dead daemon.
+
+   **An empty OR SUSPICIOUSLY SHORT check list is a mergeability question, not a CI
+   one.** A CONFLICTING PR cannot build `refs/pull/N/merge`, so every
+   `pull_request`-triggered workflow silently never queues — while
+   `pull_request_target` ones keep firing normally. With even one such workflow in the
+   repo the PR shows exactly one check, which reads as an Actions hiccup rather than as
+   zero. `gh pr view N --json mergeable` settles it in one call;
+   `git merge-tree --write-tree origin/<base> HEAD` settles it with no network. The
+   conflict can be trivial — two additive stanzas in `.gitignore` took a PR's required
+   checks to zero while it still reported BLOCKED.
+
+   **Read a failing check's DURATION before diagnosing it.** An infra death (missing
+   runner externals, lost communication, container exec failure) fails in seconds at
+   Checkout; a real scan or build takes minutes. Same check name, opposite response:
+   rerun the fast one, read the findings of the slow one. Note WHICH runner it landed on —
+   a single broken runner in a shared label pool fails jobs at random across every PR in
+   the repo, and each casualty reads as a code failure to whoever sees the red X.
+
+   **And read an IN_PROGRESS check's AGE.** A required check running far past its
+   historical duration (~2× is the alarm line) is presumed wedged, not slow: a runner can
+   accept a job and idle silently forever, and nothing turns red while it does. Compare
+   the run's `createdAt` to now before assuming CI is merely busy; the remedy is
+   cancel + rerun, which reschedules across runners. (2026-08-20: a Dagger run sat
+   IN_PROGRESS 5 hours on a light runner while 20 heavy runners idled; the rerun landed
+   on a heavy box and went green in 12 minutes.)
+
+   **A security-scanner artifact's result COUNT is not its blocking count.** Semgrep SARIF
+   keeps `nosemgrep`-suppressed findings in `runs[0].results`, annotated
+   `"suppressions": [{"kind": "inSource"}]`, and excludes them from the `--error` exit
+   code. Gate on the exit code, or filter out results carrying `suppressions`. (Counting
+   raw results reported 3 blockers where there was 1, and produced a confident, wrong
+   theory about why two working suppressions had "stopped working".)
 6. **Merge** happens via the poller (or manually: `gh pr merge <n> --squash
    --match-head-commit <sha>`). The SHA binding is non-negotiable: it is the only thing
    that prevents merging a head some concurrent process force-pushed under you.
 
+## The fleet and the toolchain can fail mid-drain (each cost a round-trip)
+
+**Never construct a SHA — read it.** A short SHA is not a prefix you can
+complete. Passing a fabricated 40-char SHA to a pinned merge makes it report
+`HEAD_MOVED`, which is a *lie*: the head never moved, and you will go hunting a
+concurrent writer that does not exist. Read it at the moment of use —
+`gh pr view <n> --json headRefOid -q .headRefOid`, or `git rev-parse HEAD` —
+and pass the variable. `--oneline` output is for humans, never an input. When a
+pinned tool reports HEAD_MOVED, diff the two values character by character
+first: a shared prefix with a divergent tail is bad input, not a race.
+
+**Provider billing dies without warning, and `detect_reviewers.sh` cannot see
+it.** Detection probes for a key, not a balance. Mid-drain the Moonshot account
+was suspended for insufficient balance (killing the `kimi` BASELINE plus
+`kimi27`/`kimi3`) and the OpenRouter fallback then failed too on exhausted
+credits — which takes the entire OpenRouter pool with it. Two providers left.
+The tells are `<slug>.fallback.warning` and `<slug>.primary-failed.*` in the run
+dir, and `failure_kind: "provider_billing"`. When it happens: keep going if the
+surviving seats genuinely cover the diff, but **say the round was degraded in
+the stamp** — never let a 2-of-4 round read as a full fleet — and surface the
+billing failure to the user, because it blocks every future round, not just
+this one.
+
+**A bare worktree has no `node_modules`, so the git hooks abort and you will
+reach for `--no-verify`.** That removes the check, not the requirement. Both CI
+round-trips in the 08-29 drain came from this: prettier flagged files the
+pre-commit hook would have formatted, and a required interface field was missing
+from web test mocks the pre-push suite would have caught. Before committing in a
+worktree, run the repo's own formatter and the suites that actually cover your
+edit — including the app you did NOT edit if it mocks what you changed.
+
+**A CI red that fails in seconds at a POLICY step is not infra and not code.**
+`Refuse hosted pipeline for benched agent PRs` fails in ~5s with every later
+step skipped, and reads exactly like a checkout death. It means an agent PR
+touches CI-privileged paths without the approval label. **Never apply that label
+yourself** — the gate exists so a human reads a privileged diff, and an agent
+self-approving to unblock itself defeats the control it encodes. Recovery needs
+a NEW event after labeling (`git commit --allow-empty`); a plain re-run replays
+the frozen payload and cannot see the label. Read the failing STEP NAME before
+the duration, and the duration before the logs.
+
+**A background chain must gate its push on the verify EXIT STATUS.** `pnpm verify |
+tail | grep passed` keeps going when verify fails — one chain pushed an unverified
+head on 2026-09-03 (the rerun was green, by luck). Capture `vrc=$?` from the verify
+itself and `exit 1` before the push. In the same family: a wait loop of the shape
+`until ! pgrep -f 'pnpm verify'` matches its OWN command line and never exits — the
+chain sat wedged for 20 minutes. Wait on a lock or a file, not on a process-name grep.
+
+**The merge-gate hook inspects your COMMAND TEXT before it runs.** A PreToolUse hook
+rejects any Bash call containing `gh pr merge N` while the newest review record for N
+is stale — and it evaluates the whole command string BEFORE any of it executes. So
+"post the record, then merge" in ONE Bash call is refused every time: the record that
+would have made it current has not been posted yet when the hook looks. Post in one
+call, merge in the next. Same family: the shared main checkout blocks any command text
+containing `git merge`, `git merge-tree` or `git merge-base` even behind a `cd` — run
+those as `git -C <your-worktree> …`.
+
+**The author can merge a PR out from under your fix.** #3687 merged (by Gabriel, at the
+reviewed head) while its pass-2 fixes were being written on its branch. The push then
+landed on a branch whose PR was closed, and a `cherry-pick` onto develop from that
+branch produced NOTHING — silently, because the branch was behind develop and the
+pick resolved to an empty commit. Before pushing a fix, re-read `gh pr view N --json
+state`; if MERGED, branch from `origin/develop`, apply the change as a `git diff
+<old> <new> -- <paths> | git apply` (not a cherry-pick of a commit whose parent is
+stale), and open a follow-up PR that says `Refs #N` and why. Check the remote ref
+after every push (`git ls-remote`) — a pre-push hook refusal prints in the same
+place as success.
+
+**`GOOGLE_APPLICATION_CREDENTIALS` pins a service account over the user's ADC.** A
+`tofu init` 403 naming `claude-dev-automation@…` on a bucket the user can read is that
+env var, not a missing login. `env -u GOOGLE_APPLICATION_CREDENTIALS tofu …` uses the
+`authorized_user` ADC file; check `${GOOGLE_APPLICATION_CREDENTIALS:-unset}` before
+asking anyone to log in. And when a plan is supposed to be "just one output", read
+the `Plan: N to add` line before applying — the bootstrap plan carried a WIF provider
+develop had declared but never applied, and that needed its own approval.
+
+**`${var:-default}` is not "default when unset".** It also fires on an explicitly EMPTY
+value, so a test that sets `AGENT_AUTHORS=""` to mean "no agent authors" silently got
+the default back. `${var-default}` is the unset-only form. The pre-push suite caught
+it; the first push did not reach the remote.
+
 ## Pipelining (depth 2, no deeper)
 
-Whichever of CI (~10-15 min) and the review round (~10-15 min) is currently waiting is
-your dead time — fill it with the other lane's work on the next PR. In practice reviews
-are often the drum-beat, not CI: PRs that have sat open usually arrive with green checks,
-so the serial constraint is the review lock. Mechanical work (a conflict rebase, a
+**Pass N of a review round reviews the delta since the last reviewed head — unless you
+merged develop in between.** Then the merge-base of the old head and the new fix is the
+old head, and the diff carries every develop commit: on 2026-09-03 a pass-4 round
+shipped 7,688 lines to kimi (50-minute budget) and gemini-pro reviewed develop's
+contrast test instead of the fix. Use the MERGE COMMIT as `--base`, and read
+`size_lines` from `worktree.sh` before dispatching — a pass-N diff an order of
+magnitude larger than the fix commit is a wrong base, and the round should be killed,
+not read.
+
+**Measured 2026-09-03:** review rounds were the drum-beat again — ~10 minutes each,
+eight rounds on each of two PRs, while 33 heavy runners sat idle. OpenRouter credits
+were exhausted from the first round, so every rotation seat failed with
+`provider_billing` and rounds ran on codex, kimi and the Gemini laps (2-3 seats). Say
+the seat count in every stamp; a two-seat round is not a fleet.
+
+Whichever of CI and the review round is currently waiting is your dead time — fill it
+with the other lane's work on the next PR. Mechanical work (a conflict rebase, a
 stale-base develop merge) slots into review waits especially well — it needs neither
 lock. Do NOT go depth 3: a third lane just queues behind the locks and burns quota.
+
+**MEASURE the drum-beat before assuming it.** Which lane gates throughput is a property
+of the fleet that night, not a constant, and guessing wrong wastes the whole drain's
+pipelining. Two commands settle it:
+
+    gh api orgs/<org>/actions/runners --jq '.runners[] | "\(.name) busy=\(.busy) [\([.labels[].name]|join(","))]"'
+    gh run list --limit 30 --json status,name -q '[.[]|select(.status=="queued" or .status=="in_progress")]|length'
+
+If the heavy/required-check label resolves to ONE non-busy-capable runner, CI is the
+drum-beat and no amount of review pipelining helps — run reviews far ahead instead, so a
+freed CI slot always meets an already-stamped PR. (2026-08-16: a 12-PR drain assumed
+reviews were the constraint because "PRs that sat open arrive green". All 12 arrived with
+`cross-review/current` RED, and once stamped, throughput was ~1 PR/hour behind a single
+`heavy`-labeled runner doing 56-minute Dagger runs — one PR waited 76 min for a slot.)
+
+**The drum-beat can become YOU.** Measured on 2026-08-29: review currency
+gated the first half exactly as the dry-run predicted, with 30+ runners idle
+and CI hidden inside review waits. The second half was gated by self-inflicted
+CI round-trips — two full ~8-minute Dagger cycles burned on a prettier failure
+and a stale test mock, both of which the git hooks I bypassed would have
+caught. A round-trip you cause costs the same wall-clock as one you wait for,
+and unlike a queued runner it does not clear on its own. Budget the formatter
+and the covering suites into the fix step, not into CI.
 
 - Merges stay strictly serial and in checklist order.
 - **Overlapping-surface PRs stay serial relative to each other**: before pipelining N+1,
@@ -118,13 +402,30 @@ lock. Do NOT go depth 3: a third lane just queues behind the locks and burns quo
   until N merges (its review would be against a base about to move).
 - When N merges, the base advances under N+1. Don't auto-rebase; re-check before
   finalizing: if a reviewer flags a "deletion you didn't make", suspect stale base, not
-  your diff.
+  your diff — and check overlap with the PR you just merged before trusting any finding
+  about a file both touch.
+- **Diff against the MERGE-BASE, never two-dot `git diff origin/<base>`.** A branch a few
+  commits behind shows the base's own advances as deletions in your PR. Observed at 84
+  files / 5028 deletions where the true diff was 19 files / 1979 insertions / 0
+  deletions. Confirm with `git merge-tree --write-tree` before believing a revert
+  finding, and dispatch reviewers against the merge-base so the fleet can't repeat it.
 
 ## Safety invariants (each one paid for by a real incident)
 
 1. **No git mutation in the user's main checkout, ever.** All branch work happens in
    dedicated worktrees. Shared checkouts get their HEAD moved by concurrent sessions;
    commits land on the wrong branch and force-pushes can drop other people's work.
+   **A worktree you did not create is presumed CONTESTED.** Finding one already checked
+   out at the PR's head SHA is not luck — it usually means another session is mid-task in
+   it. Before adopting any worktree, probe it: `git status --porcelain` (dirty?), mtime of
+   the dirty files (written in the last minutes?), `git rev-list --count origin/<br>..HEAD`
+   (unpushed commits?). Every fixer's step 0 must re-assert HEAD == expected SHA and a
+   clean tree, and ABORT rather than edit. Re-verify each PR's `headRefOid` against GitHub
+   every iteration; never trust a local SHA you read earlier.
+   (2026-08-16: 8 concurrent sessions in one repo; 11 of 12 worktrees were already
+   checked out at the right SHAs, one was being written 6 seconds before the fixer looked,
+   and 3 PR heads moved mid-drain. The step-0 check is the only thing that prevented a
+   race.)
 2. **Force-pushes use `--force-with-lease=<branch>:<expected-sha>`**, and before any
    force-push, diff the old and new commit lists (`git log --oneline old..new` + patch-id
    compare). A replay that emits fewer commits than it consumed dropped work — the lease
@@ -132,6 +433,23 @@ lock. Do NOT go depth 3: a third lane just queues behind the locks and burns quo
    (`git tag salvage/...`), and hand it to the user.
 3. **Never claim green against a stale SHA.** Every check result, every merge, every
    "done" is verified against the current `headRefOid` at that moment.
+   **And never hand-type a SHA.** Twice in one drain (2026-08-19) a stamp was posted
+   against a 40-char SHA whose tail the orchestrator had confabulated from a 9-char
+   display prefix — the currency gate caught both as impossible self-mismatches
+   ("reviewed X, head is X"). A SHA in a command must be pasted from a tool result in
+   the same turn (`headRefOid`, `context.json`, `git rev-parse`), never recalled.
+3b. **A live-agent PR is contested until its authoring session is dead — and maybe
+   after.** Jules' CI Fixer blind-reverted a review fix ("trigger CI") when its PR
+   went red, and pushed the same re-add AGAIN after its session was archived. Rule:
+   archive the session BEFORE the first fix push; if the head still moves under you
+   after that, do not loop — either accept the bot's head when the delta is trivial
+   and fully read (re-stamp it, let the SHA-pinned merge race the bot), or block the
+   PR for a human. Two pushes by you against the same bot = you are the loop.
+3c. **cwd does not survive between orchestrator tool calls.** A `cd <worktree>` in
+   one Bash call is gone in the next; one drain contaminated the main checkout with
+   a `git checkout -- <file>` and verified claims against the wrong tree because of
+   this. Every git/test command in worktree work carries `git -C <wt>` or an
+   absolute path — a bare command that "should" run in the worktree is a bug.
 4. **No bare `git stash`** — the stash stack is repo-global across worktrees; concurrent
    bare pops swap contents between tasks. Use a WIP commit, or `stash push -m <tag>` and
    apply by SHA.
@@ -157,6 +475,13 @@ lock. Do NOT go depth 3: a third lane just queues behind the locks and burns quo
   not a code failure — Dagger Check may have already passed. Rerun the failed job once,
   relaunch the poller on the same SHA, and note which step the runner died in (a new
   resource-heavy step can be what killed the box).
+- **A station agent that stalls twice on the same task gets taken over inline.** On the
+  first stall (stream watchdog, no progress), snapshot the worktree state (`git status
+  --porcelain`, HEAD SHA, held locks) and resume the agent WITH that snapshot so it
+  can't re-do or double-apply work. On the second stall, stop resuming: do the task
+  inline — the third resume costs more wall-clock than the fix itself, and the recorded
+  worktree state makes an inline takeover safe. (2026-08-20: fixer stalled 3× on one
+  PR; the inline takeover shipped in ~25 min while three resume cycles had burned ~35.)
 
 ## Write-back (mandatory per iteration — an untracked iteration is a lost one)
 
@@ -164,8 +489,26 @@ lock. Do NOT go depth 3: a third lane just queues behind the locks and burns quo
   `MERGED` event. Nothing else changes in the issue.
 - **Blocked**: create a `pr-drain`-labeled issue (what was tried, exact failing check +
   SHA, smallest next action), append ` — blocked by #<new>` to the PR's line, label the
-  PR `needs-human`, append a `BLOCKED` event.
+  PR `needs-human`, append a `BLOCKED` event. When the blocker is an already-open PR or
+  issue, reference that instead of filing a redundant one.
 - Working notes → PR comments.
+
+**Check every queued PR for an EMPTY diff before reviewing it, and defuse its auto-close
+reference.** `gh pr view <n> --json changedFiles,additions,deletions` plus a tree
+comparison (`git rev-parse <sha>^{tree}` vs `<sha>^^{tree}` — identical trees prove an
+empty commit) settles it in one call. An agent-authored PR can claim implemented work,
+green tests, and `Closes #N` while containing zero commits of content; its checks all pass
+*vacuously* because every one is exercising the base branch. Merging it closes a live
+requirement and delivers nothing, and the next person finds a closed issue and assumes the
+work is done.
+
+Do not merge it, and do not silently close it either — closing someone's PR is the user's
+call. Instead: rewrite the body's closing keyword to a plain reference (`Closes #N` →
+`Refs #N`), label `needs-human`, annotate the checklist line, and surface it. **Sweep the
+whole queue for closing keywords once, up front** — one `gh pr view --json body` per PR.
+And when you write the explanatory note, do not restate the literal keyword in it: writing
+"the original `Closes #N` was changed" re-arms the parser you just disarmed. Grep the
+final body to confirm zero closing keywords remain rather than trusting the edit.
 
 ## Stop conditions (comment the reason on the checklist issue, then stop)
 
@@ -173,6 +516,15 @@ lock. Do NOT go depth 3: a third lane just queues behind the locks and burns quo
 - Any force-push that would drop commits.
 - CI red on 3+ different PRs → infra problem, not code.
 - Same PR fails the same check twice (honoring invariant 5's attribution rule).
+- **A round's P1s are mirror images of P1s you applied earlier on the same PR** — the
+  defect class is open-ended (regex over English noun phrases, idioms, speech frames)
+  and another list will not close it. Post the residual list on the PR with a
+  structural recommendation and hand off. Declare the hand-off pass number in advance
+  and HOLD it: on 2026-09-03 the drain declared pass 6 for #3362 and ran to pass 8,
+  each round's fixes seeding the next round's findings. Contrast #3734 the same day,
+  where each of eight rounds closed a real structural gap in an AST walker and the
+  eighth came back clean — same round count, opposite signal; the test is whether the
+  fixes are inversions of each other, not how many rounds there were.
 - All lines ticked or blocker-linked → run the retrospective (below), THEN close the
   issue with a summary and notify the user.
 

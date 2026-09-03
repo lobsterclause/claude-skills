@@ -16,7 +16,13 @@ set -euo pipefail
 
 WORKDIR="${PR_DRAIN_WORKDIR:-.pr-drain}"
 EVENTS="$WORKDIR/events.jsonl"
+# claims.sh writes the cross-drain ledger at ~/.pr-drain/claims.jsonl (see
+# SKILL.md step 3); a per-workdir claims.jsonl only exists if someone copied
+# one there. Prefer the workdir copy, fall back to the global ledger —
+# discovered 2026-08-19b when a drain with 9 logged claims retro'd as
+# "no claims logged".
 CLAIMS="$WORKDIR/claims.jsonl"
+[ -f "$CLAIMS" ] || CLAIMS="$HOME/.pr-drain/claims.jsonl"
 
 if [ "${1:-}" = "--mark-done" ]; then
   mkdir -p "$WORKDIR"
@@ -54,8 +60,13 @@ echo
 
 echo "## Claim accuracy (claims.jsonl)"
 if [ -f "$CLAIMS" ]; then
-  jq -rs '
-    map(select(.severity == "Critical" or .severity == "High")) as $p
+  # When reading the cross-drain ledger, scope to this drain: keep only
+  # claims stamped at/after the drain's first logged event.
+  SINCE=""
+  [ -f "$EVENTS" ] && SINCE="$(jq -rs 'map(.ts) | min // ""' "$EVENTS")"
+  jq -rs --arg since "$SINCE" '
+    map(select($since == "" or .ts >= $since))
+    | map(select(.severity == "Critical" or .severity == "High")) as $p
     | "P0/P1 claims: \($p | length)  applied: \($p | map(select(.verdict=="APPLIED")) | length)  refuted: \($p | map(select(.verdict=="REFUTED")) | length)  out-of-diff: \($p | map(select(.verdict=="OUT_OF_DIFF")) | length)",
     ($p | map(select(.verdict=="REFUTED")) | .[] | "  REFUTED [\(.reviewer)] #\(.pr): \(.claim) — \(.evidence)")
   ' "$CLAIMS"
