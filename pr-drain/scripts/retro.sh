@@ -21,8 +21,12 @@ EVENTS="$WORKDIR/events.jsonl"
 # one there. Prefer the workdir copy, fall back to the global ledger —
 # discovered 2026-08-19b when a drain with 9 logged claims retro'd as
 # "no claims logged".
-CLAIMS="$WORKDIR/claims.jsonl"
-[ -f "$CLAIMS" ] || CLAIMS="$HOME/.pr-drain/claims.jsonl"
+# Read BOTH ledgers: claims.sh writes the cross-drain one, but a per-workdir
+# file can appear when a concurrent session logs there, and "prefer the
+# workdir copy" then hid 47 logged claims behind 2 (2026-09-03). Merge them;
+# the since-filter below scopes to this drain either way.
+CLAIMS="$(mktemp)"
+cat "$HOME/.pr-drain/claims.jsonl" "$WORKDIR/claims.jsonl" 2>/dev/null | sort -u > "$CLAIMS"
 
 if [ "${1:-}" = "--mark-done" ]; then
   mkdir -p "$WORKDIR"
@@ -66,7 +70,7 @@ if [ -f "$CLAIMS" ]; then
   [ -f "$EVENTS" ] && SINCE="$(jq -rs 'map(.ts) | min // ""' "$EVENTS")"
   jq -rs --arg since "$SINCE" '
     map(select($since == "" or .ts >= $since))
-    | map(select(.severity == "Critical" or .severity == "High")) as $p
+    | map(select(.severity == "Critical" or .severity == "High" or .severity == "P0" or .severity == "P1")) as $p
     | "P0/P1 claims: \($p | length)  applied: \($p | map(select(.verdict=="APPLIED")) | length)  refuted: \($p | map(select(.verdict=="REFUTED")) | length)  out-of-diff: \($p | map(select(.verdict=="OUT_OF_DIFF")) | length)",
     ($p | map(select(.verdict=="REFUTED")) | .[] | "  REFUTED [\(.reviewer)] #\(.pr): \(.claim) — \(.evidence)")
   ' "$CLAIMS"
