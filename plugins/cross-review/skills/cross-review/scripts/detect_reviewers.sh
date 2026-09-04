@@ -98,16 +98,18 @@ if has agy; then
     gemini_pro=true
   fi
 fi
-has kimi && kimi=true
-
 # OpenRouter key + curl → the whole OpenRouter reviewer pool lights up.
 if command -v curl >/dev/null 2>&1; then
   if [[ -n "${OPENROUTER_API_KEY:-}" || -s "$HOME/.config/openrouter/key" ]]; then
     openrouter=true
   fi
-  # kimi27 (k2.7-code rotation seat) rides the DIRECT Moonshot API — its own
-  # key, independent of both the kimi CLI baseline and the OpenRouter pool.
+  # The kimi BASELINE and the kimi27/kimi3 rotation seats all ride the DIRECT
+  # Moonshot API (curl + platform key). kimi stopped being a CLI seat on
+  # 2026-09-03: the Kimi Code CLI's plan mode re-sent the whole prompt 3-25
+  # times per review and stamped no cost (~$20/day, invisible in runlog.jsonl).
+  # A `kimi` binary on PATH is no longer what lights the seat -- the key is.
   if [[ -n "${MOONSHOT_API_KEY:-}" || -s "$HOME/.config/moonshot/key" ]]; then
+    kimi=true
     kimi27=true
     # kimi3 (K3 rotation seat, added 2026-07-18) shares the exact same
     # direct-Moonshot key — same billing rail as kimi27 and the kimi baseline.

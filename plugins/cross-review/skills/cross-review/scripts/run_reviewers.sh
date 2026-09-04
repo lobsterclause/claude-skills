@@ -256,7 +256,7 @@ timeout_glm=""
 #
 # The names below are the API-lane reviewers whose model comes from the profile.
 # Resolution happens after profile_get is defined, further down.
-model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
+model_backed_reviewers=(antigravity gemini-pro kimi glm deepseek mimo minimax qwen
                         devstral laguna kat north nemotron spark seed grok
                         longcat inkling kimi27 kimi3)
 
@@ -2378,188 +2378,37 @@ run_kimi3()    { run_openrouter_reviewer kimi3    "$kimi3_model"    "$kimi3_time
                    "https://api.moonshot.ai/v1/chat/completions" moonshot; }
 
 run_kimi() {
-  local start end rc
-  start=$(date +%s)
-  # kimi (Moonshot's Kimi Code CLI) against Moonshot's OpenAI-compatible endpoint.
+  # kimi baseline: direct Moonshot chat-completions, same single-turn body as
+  # kimi27/kimi3 (run_openrouter_reviewer with the Moonshot endpoint + key).
   #
-  # We deliberately run kimi in single-turn, no-tools mode: pipe the full diff
-  # inline and instruct the model not to call any tools. Why:
-  #   (a) kimi-k2.5's thinking mode + multi-turn tool calls requires threading
-  #       `reasoning_content` between turns, and the `openai_legacy` adapter
-  #       doesn't preserve it — the second turn fails with "thinking is enabled
-  #       but reasoning_content is missing".
-  #   (b) Single-turn with thinking-on gives better review quality than
-  #       multi-turn with thinking-off.
-  #   (c) Code review is fundamentally a single-turn task: the diff IS the
-  #       input. codex and antigravity already do the agentic file-roaming;
-  #       kimi fills a different niche — deep reasoning on the diff as given.
+  # Until 2026-09-03 this lane shelled out to the Kimi Code CLI with
+  # `--plan --print --quiet`, on the belief that it ran single-turn with no
+  # tools ("--plan: defense in depth"). The CLI's session logs
+  # (~/.kimi/sessions/*/wire.jsonl) showed otherwise: plan mode makes every
+  # review >=3 API steps (write plan file, ExitPlanMode, answer) and up to 25
+  # after compaction, re-sending the whole 40K-200K-token prompt each step at
+  # the cache-miss rate. Measured on 2026-09-03: 88 reviews, 4.3M first-step
+  # tokens, 15.8M tokens actually sent, ~$20 drained from the Moonshot balance
+  # in one day -- and the CLI stamps no tokens or cost, so runlog.jsonl showed
+  # the seat as free. The curl lane sends the prompt once, stamps
+  # tokens_prompt/tokens_completion/cost_usd, and reaches files through the
+  # wrapper-owned, budgeted tool loop (lib_tool_loop.sh) when the seat's
+  # learned arm says so, instead of an unbounded agent loop.
   #
-  # --plan: defense in depth (can't edit files even if it tried).
-  # --print: non-interactive. Implies --yolo.
-  # --quiet: final assistant message only (drops tool-trace noise).
-  # Prompt is piped via stdin, NOT argv. Reasons:
-  #   - Linux MAX_ARG_STRLEN is 128KB per argument; argv-based prompts would
-  #     crash with E2BIG on any diff larger than that (macOS tolerates ~1MB,
-  #     which hid the bug in smoke tests).
-  #   - Putting the full diff in argv also exposes it via `ps` to other local
-  #     users for the duration of the kimi run — a privacy regression vs.
-  #     codex/antigravity which don't have this issue.
-  # kimi reads stdin as the prompt when --print is set and no -p is given
-  # (confirmed: `echo "..." | kimi --print --quiet` works).
-  local diff_summary diff_full diff_line_cap truncation_note truncated
-  diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
-  # Line-based cap (not byte-based). head -c can split mid-codepoint and
-  # produce invalid UTF-8; head -n respects line boundaries. 8000 lines keeps
-  # us well under k2.5's 256K-token context even for verbose diffs.
-  diff_line_cap=8000
-  local snapshot_path="" using_snapshot=false
-  if snapshot_path="$(snapshot_for kimi)"; then
-    using_snapshot=true
-  fi
-  local total_lines
-  if [[ "$using_snapshot" == true ]]; then
-    # Pre-built by repomix-handoff and already token-budgeted upstream — skip
-    # the line cap and truncation note, pass it whole (SKILL.md step 2.5).
-    diff_full="$(cat "$snapshot_path" 2>/dev/null || true)"
-    total_lines=0
-    truncated=false
-    truncation_note=""
-  else
-    diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -n "$diff_line_cap" || true)"
-    total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
-    if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
-      truncated=true
-      truncation_note="
-
-[WARNING: diff truncated to first $diff_line_cap of $total_lines lines. Your review will be INCOMPLETE — the tail of the patch is not shown. Note this limitation in your findings.]"
-    else
-      truncated=false
-      truncation_note=""
-    fi
-  fi
-  # Wrap the context block in an XML-ish tag rather than a markdown fence.
-  # Diffs (and snapshots built from them) can legitimately contain
-  # triple-backtick lines (e.g. doc changes that add a fenced code block),
-  # which close a markdown fence prematurely and corrupt the prompt.
-  # <diff>...</diff> / <snapshot>...</snapshot> has no such collision surface.
-  local context_label context_tag_open context_tag_close context_intro
-  if [[ "$using_snapshot" == true ]]; then
-    # Defuse a literal closing tag inside untrusted snapshot content so it
-    # can't close the fence early and inject instructions — same guard as
-    # the raw-diff </diff> defuse below (prompt-injection "inj").
-    diff_full="${diff_full//<\/snapshot>/< /snapshot>}"
-    context_label="Code context snapshot (from $(basename "$snapshot_path"), pre-built by repomix-handoff):"
-    context_tag_open="<snapshot>"
-    context_tag_close="</snapshot>"
-    context_intro="Base your review ONLY on the code context snapshot below."
-  else
-    # Defuse a literal </diff> inside untrusted patch content so a malicious
-    # diff can't close the fence early and inject instructions.
-    diff_full="${diff_full//<\/diff>/< /diff>}"
-    context_label="Full diff:"
-    context_tag_open="<diff>"
-    context_tag_close="</diff>"
-    context_intro="Base your review ONLY on the diff below."
-    if [[ "$context_mode" == "files" ]]; then
-      context_intro="Base your review on the diff below, checked against the whole-file contents that follow it."
-    fi
-  fi
-  # Whole changed files after the diff (--context-mode files, the default).
-  # Never alongside a snapshot: a snapshot is already the reviewer's whole
-  # view, and doubling it would blow the budget the snapshot was built to.
-  local files_block="" context_access="diff_only"
-  if [[ "$using_snapshot" == true ]]; then
-    context_access="snapshot"
-  elif [[ "$context_mode" == "files" ]]; then
-    files_block="$(context_files_block)"
-    context_access="file_context"
-  fi
-  local doc_note doc_file_list
-  # Uncapped, rename-clean, and source-path-preserving by construction — see
-  # doc_narrative_risk's comment for why --name-status, not the capped/
-  # brace-compressing --stat display used for the prompt body, nor
-  # --name-only (which drops a rename's source path).
-  doc_file_list="$(git diff --name-status "$base"...HEAD 2>/dev/null || true)"
-  doc_note="$(doc_narrative_note "$doc_file_list")"
-  local full_prompt
-  # Stable text first, per-round text after the diff — same cache reasoning
-  # as run_openrouter_reviewer's prompt block.
-  full_prompt="$review_prompt
-
-Do NOT use any file-reading or shell tools. ${context_intro}
-
-$context_label
-$context_tag_open
-$diff_full
-$context_tag_close${files_block}
-
-Changed files (diff --stat against $base):
-$diff_summary${truncation_note}${doc_note}
-
-Return your findings as prose, organized by severity (Critical / High / Medium / Low). Reference files and line numbers from the diff headers."
-
-  # kimi-k2.5 thinking mode scales hard with diff size: ~84s p50 on small
-  # diffs, but 32-43 min OBSERVED on ~4k-line diffs (2026-07-01, PR #18).
-  # Scale the budget rather than truncate the input — quality first; the
-  # speed-aware roster draw and incremental re-reviews keep big-diff rounds
-  # rare. Empirical rate ≈500s per 1000 diff lines beyond the first 1000.
+  # Model comes from reviewer_profiles.json `.kimi.model` (kimi-k2.7-code),
+  # like every other API-lane seat; the CLI-era `cli_model_alias` is gone.
+  # Big-diff budget scaling is kept: single-turn k2.x still slows with prompt
+  # size (~500s per 1000 diff lines past the first 1000, observed 2026-07-01).
   local kimi_budget="$kimi_timeout"
-  # Scale ONLY when the caller didn't set an explicit cap: --timeout-kimi or
-  # --timeout means a smoke run / CI hard cap and must be honored verbatim
-  # (codex P2, PR #18 pass 3). Ceiling division per north's pass-3 nit.
+  local total_lines
+  total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
   if [[ -z "$timeout_kimi" && -z "$timeout_s" && "${total_lines:-0}" -gt 1000 ]]; then
     kimi_budget=$(( kimi_timeout + 500 * ( (total_lines - 1000 + 999) / 1000 ) ))
     [[ "$kimi_budget" -gt 3000 ]] && kimi_budget=3000
     echo "kimi: ${total_lines}-line diff — budget scaled ${kimi_timeout}s → ${kimi_budget}s" >&2
   fi
-  # WHICH MODEL the kimi baseline runs was, until now, the ONE model id in the
-  # whole fleet that lived outside this repo: the CLI reads ~/.kimi/config.toml,
-  # so reviewer_profiles.json had no `.model` for kimi at all. The baseline's
-  # model was therefore invisible to the repo, unpinned by any test, and
-  # silently different on any other machine -- the same blind spot that left
-  # antigravity on Gemini 3.5 for weeks. `cli_model_alias` pins it here.
-  #
-  # The value is a config KEY from ~/.kimi/config.toml ([models.<alias>]), not
-  # a raw slug -- `kimi -m` resolves aliases, and an unknown one fails fast with
-  # "LLM not set" rather than silently running the default. PORTABILITY: the
-  # alias must exist in that user's config; when it does not, the lane fails and
-  # (with or_fallback enabled) drops to the OpenRouter route for the same model.
-  local kimi_alias kimi_model_args=()
-  kimi_alias="$(profile_get kimi cli_model_alias)"
-  if [[ -n "$kimi_alias" ]]; then
-    kimi_model_args=(-m "$kimi_alias")
-  fi
-  run_with_timeout "$kimi_budget" kimi \
-    "${kimi_model_args[@]}" \
-    --plan \
-    --print \
-    --quiet \
-    >"$out/kimi.stdout" 2>"$out/kimi.stderr" <<<"$full_prompt"
-  rc=$?
-  end=$(date +%s)
-  # truncated is reported in metadata so downstream synthesizers don't treat a
-  # partial review as complete. Convergent finding from both codex and kimi
-  # itself in pass 2 of cross-reviewing this skill.
-  local timed_out="false"
-  [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
-  local bytes
-  bytes=$(output_bytes_of "$out/kimi.stdout")
-  local fk_json="null"
-  if [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/kimi.stdout"; then
-    echo "kimi: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
-    fk_json='"degenerate_output"'
-    rc=5
-  elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_no_verdict "$out/kimi.stdout"; then
-    echo "kimi: output is preamble-only (<512B, no severity or clean-verdict marker) — classifying as failed" >&2
-    fk_json='"no_verdict_output"'
-    rc=5
-  fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "truncated": %s, "total_diff_lines": %d, "diff_line_cap": %d, "attempt": %d, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "%s", "context_files": %d, "context_files_omitted": %d, "context_mode": %s}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$truncated" "${total_lines:-0}" "$diff_line_cap" "${CROSS_REVIEW_ATTEMPT:-1}" "$kimi_budget" "$fk_json" "$(wall_over_budget "$((end - start))" "$kimi_budget")" \
-    "$context_access" "$([[ "$context_access" == file_context ]] && echo "$context_files_included" || echo 0)" "$([[ "$context_access" == file_context ]] && echo "$context_files_omitted" || echo 0)" \
-    "$(context_mode_json "$context_access")" \
-    >"$out/kimi.meta.json"
-  return "$rc"
+  run_openrouter_reviewer kimi "$kimi_model" "$kimi_budget" \
+    "https://api.moonshot.ai/v1/chat/completions" moonshot
 }
 
 pids=()

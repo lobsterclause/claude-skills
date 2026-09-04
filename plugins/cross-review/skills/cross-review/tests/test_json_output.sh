@@ -126,16 +126,25 @@ fi
 printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
 chmod +x "$T/bin/agy"
 
-echo "── RED/GREEN: kimi CLI lane is untouched — stdin prompt has no suffix ──"
+echo "── kimi is a curl lane since 2026-09-03 — the kimi binary is never invoked ──"
+# Until 2026-09-03 this block asserted the kimi CLI's stdin prompt carried no
+# JSON suffix. The CLI lane is gone (its plan mode re-sent every prompt 3-25
+# times, ~$20/day, no cost stamped); kimi now shares run_openrouter_reviewer
+# with the pool, so it gets the JSON contract like every other curl seat. The
+# regression to guard is the wrapper reaching for a `kimi` binary again.
 cat >"$T/bin/kimi" <<'SHIM'
 #!/bin/sh
-cat >"${KIMI_STDIN_CAPTURE:-/dev/null}"
+: >"${KIMI_INVOKED_MARKER:-/dev/null}"
+cat >/dev/null 2>&1 || true
 printf "shim review: no findings\n"
 SHIM
 chmod +x "$T/bin/kimi"
-KIMI_STDIN_CAPTURE="$T/kimi-stdin.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o4" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1 || true
-assert_not_contains "kimi CLI prompt carries no JSON-schema mandate" \
-  "$(cat "$T/kimi-stdin.txt" 2>/dev/null)" "single JSON object"
+KIMI_INVOKED_MARKER="$T/kimi-invoked.txt" MOONSHOT_API_KEY="sk-ms-test-shim" bash "$S/run_reviewers.sh" --base main --out "$T/o4" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1 || true
+if [[ -f "$T/kimi-invoked.txt" ]]; then
+  bad "run_reviewers.sh executed the kimi binary -- the CLI lane is back"
+else
+  ok "run_reviewers.sh did not execute the kimi binary"
+fi
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 chmod +x "$T/bin/kimi"
 

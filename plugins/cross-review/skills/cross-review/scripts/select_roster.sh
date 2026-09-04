@@ -103,7 +103,9 @@ has_moonshot() {
 BASELINES=()
 missing_baselines=()
 if command -v codex >/dev/null 2>&1; then BASELINES+=(codex); else missing_baselines+=(codex); fi
-if command -v kimi  >/dev/null 2>&1; then BASELINES+=(kimi);  else missing_baselines+=(kimi);  fi
+# kimi is an API-lane baseline since 2026-09-03 (direct Moonshot curl, same as
+# kimi27/kimi3): the Moonshot key lights it, not a `kimi` binary on PATH.
+if has_moonshot; then BASELINES+=(kimi); else missing_baselines+=(kimi); fi
 
 # Fail closed, exactly as detect_reviewers.sh does. A missing baseline used to
 # be a stderr WARN plus a silently raised rotation count, which produces a
@@ -183,10 +185,10 @@ fi
 # pattern, added 2026-07-18 — shares has_moonshot's gate and billing rail.
 if has_moonshot; then
   # kimi27 BENCHED 2026-08-22 (per Gabriel: "drop to only 3 and the kimi code
-  # variant"). The kimi BASELINE now runs kimi-k2.7-code itself via
-  # cli_model_alias -- with tools, which the curl seats do not have -- so a
-  # separate diff-only k2.7-code seat is pure redundancy on a provider that
-  # already votes once. Benched rather than deleted: the seat is referenced 122
+  # variant"). The kimi BASELINE runs kimi-k2.7-code itself -- since
+  # 2026-09-03 on this very lane (direct Moonshot curl; the Kimi Code CLI was
+  # dropped after its plan mode drained ~$20/day) -- so a second k2.7-code
+  # seat is pure redundancy on a provider that already votes once. Benched rather than deleted: the seat is referenced 122
   # times across 17 files (65 of them test fixtures) and sits on the fail-closed
   # baseline path, so removing it is a refactor with real regression risk and no
   # coverage gain. Benching is one line and reversible, and it keeps kimi27's
