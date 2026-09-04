@@ -44,6 +44,7 @@ assert_not_contains() {
 # ── PATH shims: fake reviewer binaries so this runs hermetically. ───────────
 mkdir -p "$T/bin"
 export PATH="$T/bin:$PATH"
+export MOONSHOT_API_KEY="sk-ms-test-shim"     # lights the kimi seat (curl lane since 2026-09-03)
 export OPENROUTER_API_KEY="sk-or-test-shim"   # lights the OR pool (glm); never called for real
 # Sandbox HOME: run_reviewers.sh writes the agy shell-gate config under
 # $HOME/.gemini and reads key files under $HOME/.config — never touch the
@@ -130,7 +131,8 @@ write_agy_shim  "$T/agy_prompt_with_flag.txt"
     --timeout-kimi 30 --timeout-antigravity 30 --timeout-glm 30 \
     >"$T/o1.log" 2>&1
 )
-KIMI_PROMPT="$(cat "$T/kimi_stdin_with_flag.txt" 2>/dev/null || echo MISSING_CAPTURE)"
+# kimi is a curl lane since 2026-09-03: read its prompt from the request body.
+KIMI_PROMPT="$(jq -r '.messages[0].content // "MISSING_CAPTURE"' "$T/o1/kimi.request.json" 2>/dev/null || echo MISSING_CAPTURE)"
 AGY_PROMPT="$(cat "$T/agy_prompt_with_flag.txt" 2>/dev/null || echo MISSING_CAPTURE)"
 GLM_REQUEST="$(jq -r '.messages[0].content // "MISSING_CAPTURE"' "$T/o1/glm.request.json" 2>/dev/null || echo MISSING_CAPTURE)"
 
@@ -159,7 +161,7 @@ write_kimi_shim "$T/kimi_stdin_no_flag.txt"
     --reviewers kimi,glm --timeout-kimi 30 --timeout-glm 30 \
     >"$T/o2.log" 2>&1
 )
-KIMI_PROMPT_NOFLAG="$(cat "$T/kimi_stdin_no_flag.txt" 2>/dev/null || echo MISSING_CAPTURE)"
+KIMI_PROMPT_NOFLAG="$(jq -r '.messages[0].content // "MISSING_CAPTURE"' "$T/o2/kimi.request.json" 2>/dev/null || echo MISSING_CAPTURE)"
 GLM_REQUEST_NOFLAG="$(jq -r '.messages[0].content // "MISSING_CAPTURE"' "$T/o2/glm.request.json" 2>/dev/null || echo MISSING_CAPTURE)"
 
 assert_contains "kimi (no flag) still gets the raw diff" \

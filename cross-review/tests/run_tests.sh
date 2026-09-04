@@ -41,13 +41,28 @@ assert_contains() {
 # ── PATH shims: fake reviewer binaries so availability checks pass and the
 # kimi tests run hermetically. Fake agy prints a models list instantly.
 mkdir -p "$T/bin"
+# The kimi baseline is a curl lane since 2026-09-03 (direct Moonshot, same
+# body as the OpenRouter pool). A `kimi` binary shim is kept ONLY so the
+# regression guard below can prove the wrapper never executes it; every kimi
+# round in this suite goes through the curl shim, which answers a canned clean
+# verdict and mirrors the request body to ${CURL_STDIN_CAPTURE} when a test
+# wants the exact prompt (the same text also lands in <out>/kimi.request.json).
+install_default_curl_shim() {
+  cat >"$T/bin/curl" <<'SHIM'
+#!/bin/sh
+cat >"${CURL_STDIN_CAPTURE:-/dev/null}" 2>/dev/null || true
+printf '{"choices":[{"message":{"content":"shim review: no findings"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n'
+SHIM
+  chmod +x "$T/bin/curl"
+}
+install_default_curl_shim
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 printf '#!/bin/sh\nprintf "shim\\n"\n' >"$T/bin/codex"
 printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
-export OPENROUTER_API_KEY="sk-or-test-shim"   # lights the OR pool; never called
-export MOONSHOT_API_KEY="sk-ms-test-shim"     # lights the kimi27 seat; never called
+export OPENROUTER_API_KEY="sk-or-test-shim"   # lights the OR pool; only the curl shim ever sees it
+export MOONSHOT_API_KEY="sk-ms-test-shim"     # lights kimi + kimi27 + kimi3; only the curl shim ever sees it
 # Sandbox HOME: the selector caches `agy models` output under
 # $HOME/.cross-review/cache with a 6h TTL — running tests against the real
 # HOME would poison real roster draws with the shim's list (codex P2, PR #19).
@@ -285,22 +300,28 @@ EXPECT=$(( 600 + 500 * ( (TOTAL_LINES - 1000 + 999) / 1000 ) )); [[ "$EXPECT" -g
 assert_eq "size-scaled kimi budget (ceil, ${TOTAL_LINES}-line diff)" \
   "$(jq -r '.timeout_budget_s' "$T/o2/kimi.meta.json")" "$EXPECT"
 # (c) rc 137 = timed_out, never retried [pin: codex pass-3 P2]
-printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nexit 137\n' >"$T/bin/kimi"
+# (kimi is a curl lane: the shim that dies is curl, exactly as `timeout -k`
+# would kill it mid-request.)
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nexit 137\n' >"$T/bin/curl"
 bash "$S/run_reviewers.sh" --base main --out "$T/o3" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1
 assert_eq "rc 137 classified timed_out" "$(jq -r '.timed_out' "$T/o3/kimi.meta.json")" "true"
 assert_eq "rc 137 not retried" "$(jq -r '.attempt' "$T/o3/kimi.meta.json")" "1"
-printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+install_default_curl_shim
 
 echo "── degenerate-output detection (glm 'wait'-loop class) ──"
 # [pin: PR #25 pass 3 — glm exited 0 with 145KB of repetition; the leaderboard
 # counted it as a reliable run. gzip-ratio detector: degenerate ≈69:1 vs
 # healthy 2-3:1 (calibrated on 2026-07-02 real outputs); threshold 15:1]
-cat >"$T/bin/kimi" <<'SHIM'
+# The degenerate text arrives as the model's message content (kimi is a curl
+# lane); the gzip-ratio gate runs on the extracted kimi.stdout exactly as it
+# did on the CLI's stdout.
+cat >"$T/bin/curl" <<'SHIM'
 #!/bin/sh
 cat >/dev/null 2>&1 || true
-i=0; while [ $i -lt 3000 ]; do printf 'wait wait wait wait wait wait wait wait '; i=$((i+1)); done
+i=0; body=""; while [ $i -lt 3000 ]; do body="${body}wait wait wait wait wait wait wait wait "; i=$((i+1)); done
+printf '{"choices":[{"message":{"content":"%s"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n' "$body"
 SHIM
-chmod +x "$T/bin/kimi"
+chmod +x "$T/bin/curl"
 # NOTE: this suite deliberately runs WITHOUT set -e (naked expected-fail
 # calls throughout) — do not flip it on here; a stray `set -e` mid-file
 # aborted the suite at the next nonzero exit (caught pre-merge, PR #26).
@@ -317,7 +338,7 @@ CROSS_REVIEW_RUNLOG="$DEGLOG" bash "$S/append_runlog.sh" \
 assert_eq "runlog status is degenerate, not ok" \
   "$(tail -1 "$DEGLOG" | jq -r '.reviewers.glm.status')" "degenerate"
 rm -f "$RUN/raw/glm.meta.json"
-printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+install_default_curl_shim
 
 echo "── OpenRouter cost accounting (fugu lesson) ──"
 # [pin: PR #20 follow-up — usage:{include:true} cost lands in meta so the
@@ -336,7 +357,7 @@ assert_eq "OR meta carries cost_usd" "$(jq -r '.cost_usd' "$T/o6/glm.meta.json")
 assert_eq "OR meta carries tokens_prompt" "$(jq -r '.tokens_prompt' "$T/o6/glm.meta.json")" "1000"
 assert_eq "OR request asks for usage accounting" \
   "$(jq -r '.usage.include' "$T/o6/glm.request.json")" "true"
-rm -f "$T/bin/curl"
+install_default_curl_shim
 
 # The bearer token must reach curl without ever touching argv or disk.
 #
@@ -370,7 +391,7 @@ if grep -q 'sk-or-test-shim' "$T/curl_argv.txt" 2>/dev/null; then
 else
   ok "the token never appears in argv"
 fi
-rm -f "$T/bin/curl"
+install_default_curl_shim
 
 # retry accumulates spend: attempt 1 charged but preamble-only (rc=5, retried),
 # attempt 2 charged and good — meta must carry the SUM, not the last attempt
@@ -399,7 +420,7 @@ assert_eq "second attempt recorded" "$(jq -r '.attempt' "$T/o7/glm.meta.json")" 
 assert_eq "retried run sums prompt tokens"     "$(jq -r '.tokens_prompt' "$T/o7/glm.meta.json")" "1800"
 assert_eq "retried run sums completion tokens" "$(jq -r '.tokens_completion' "$T/o7/glm.meta.json")" "49"
 assert_eq "retried run keeps cache null when neither attempt reported it" "$(jq -r '.tokens_cached' "$T/o7/glm.meta.json")" "null"
-rm -f "$T/bin/curl" "$T/curl_calls"
+rm -f "$T/curl_calls"; install_default_curl_shim
 
 # leaderboard: avg_cost_usd aggregates; roster draw halves a $0.50 reviewer
 # NOTE: both seats here MUST have no draw_boost in reviewer_profiles.json, or
@@ -652,13 +673,16 @@ if grep -q 's3cr3tpw' "$CRED2_RUN/context.json"; then bad "one-component remote 
 CROSS_REVIEW_WORKTREE_ROOT="$WTROOT" bash "$S/worktree.sh" end --worktree "$(jq -r '.worktree' "$T/wt-cred2.json")" >/dev/null 2>&1 || true
 
 echo "── run_with_timeout bash-watchdog fallback (issue #7) ──"
-printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nsleep 30\n' >"$T/bin/kimi"
+# run_with_timeout wraps the CLI lanes (codex, agy); the curl lane bounds
+# itself with `curl --max-time` instead. kimi became a curl lane on
+# 2026-09-03, so the watchdog is probed through codex now.
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nsleep 30\n' >"$T/bin/codex"
 WD_START=$(date +%s)
-CROSS_REVIEW_FORCE_NO_TIMEOUT_BIN=1 bash "$S/run_reviewers.sh" --base main --out "$T/o4" --reviewers kimi --timeout-kimi 3 >/dev/null 2>&1
+CROSS_REVIEW_FORCE_NO_TIMEOUT_BIN=1 bash "$S/run_reviewers.sh" --base main --out "$T/o4" --reviewers codex --timeout-codex 3 >/dev/null 2>&1
 WD_ELAPSED=$(( $(date +%s) - WD_START ))
-assert_eq "watchdog classifies timeout (timed_out=true)" "$(jq -r '.timed_out' "$T/o4/kimi.meta.json")" "true"
+assert_eq "watchdog classifies timeout (timed_out=true)" "$(jq -r '.timed_out' "$T/o4/codex.meta.json")" "true"
 if [[ "$WD_ELAPSED" -lt 25 ]]; then ok "watchdog bounded the run (${WD_ELAPSED}s, shim sleeps 30)"; else bad "watchdog did not bound the run (${WD_ELAPSED}s)"; fi
-printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+printf '#!/bin/sh\nprintf "shim\\n"\n' >"$T/bin/codex"
 
 echo "── analyze_runlog.sh degraded-reviewer warnings (jq pipe-context crash) ──"
 # [pin: 2026-07-03 — emit_warning's `["…"] | index(.reviewer)` re-bound `.` to
@@ -928,19 +952,24 @@ echo "── no-verdict (preamble-only) output detection ──"
 # findings and no clean verdict; it logged status ok, silently starving
 # synthesis of the vote while the leaderboard counted a reliable run. The
 # gzip-ratio gate can't catch short non-repetitive text.]
-cat >"$T/bin/kimi" <<'SHIM'
+cat >"$T/bin/curl" <<'SHIM'
 #!/bin/sh
 cat >/dev/null 2>&1 || true
-printf "I will now examine the changes on the current branch against the base and report back with a thorough assessment of the code.\n"
+printf '{"choices":[{"message":{"content":"I will now examine the changes on the current branch against the base and report back with a thorough assessment of the code."}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n'
 SHIM
-chmod +x "$T/bin/kimi"
+chmod +x "$T/bin/curl"
 bash "$S/run_reviewers.sh" --base main --out "$T/o6" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1 || true
 assert_eq "preamble-only output stamps no_verdict_output" \
   "$(jq -r '.failure_kind' "$T/o6/kimi.meta.json")" "no_verdict_output"
 assert_eq "preamble-only output classifies exit 5" \
   "$(jq -r '.exit_code' "$T/o6/kimi.meta.json")" "5"
 # a short but explicit clean verdict must stay ok — brevity alone is not failure
-printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "No findings - the change looks correct.\\n"\n' >"$T/bin/kimi"
+cat >"$T/bin/curl" <<'SHIM'
+#!/bin/sh
+cat >/dev/null 2>&1 || true
+printf '{"choices":[{"message":{"content":"No findings - the change looks correct."}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n'
+SHIM
+chmod +x "$T/bin/curl"
 bash "$S/run_reviewers.sh" --base main --out "$T/o7" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1
 assert_eq "short explicit clean verdict stays ok" \
   "$(jq -r '.exit_code' "$T/o7/kimi.meta.json")" "0"
@@ -952,7 +981,7 @@ CROSS_REVIEW_RUNLOG="$NVLOG" bash "$S/append_runlog.sh" \
 assert_eq "runlog status is no_verdict, not ok" \
   "$(tail -1 "$NVLOG" | jq -r '.reviewers.kimi.status')" "no_verdict"
 rm -f "$RUN/raw/kimi.meta.json"
-printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
+install_default_curl_shim
 
 echo "── reviewer-binary PATH guard (background-shell 127) ──"
 # [pin: 2026-07-03 — background-dispatched rounds ran with a PATH lacking
@@ -960,14 +989,18 @@ echo "── reviewer-binary PATH guard (background-shell 127) ──"
 # and kimi logged failed=6 of 10 runs. detect_reviewers.sh had the ~/.local/bin
 # guard; run_reviewers.sh (the dispatcher) did not — detection said available,
 # dispatch said command-not-found.]
+# kimi no longer needs a binary (curl lane), so the guard is probed with the
+# tool it DOES need: a curl shim that lives only in ~/.local/bin. lib_path.sh
+# prepends that directory, so the shim must win over the system curl; if the
+# guard is gone, the real curl runs against the shim key and the lane fails.
 mkdir -p "$HOME/.local/bin"
-printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$HOME/.local/bin/kimi"
-chmod +x "$HOME/.local/bin/kimi"
+cp "$T/bin/curl" "$HOME/.local/bin/curl"
+chmod +x "$HOME/.local/bin/curl"
 STRIPPED_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$T/bin" | paste -s -d: -)"
 PATH="$STRIPPED_PATH" bash "$S/run_reviewers.sh" --base main --out "$T/o8" --reviewers kimi --timeout-kimi 60 >/dev/null 2>&1
-assert_eq "reviewer binary resolved via ~/.local/bin PATH guard" \
+assert_eq "reviewer tool resolved via ~/.local/bin PATH guard" \
   "$(jq -r '.exit_code' "$T/o8/kimi.meta.json" 2>/dev/null)" "0"
-rm -f "$HOME/.local/bin/kimi"
+rm -f "$HOME/.local/bin/curl"
 
 echo "── agy no-verdict gate: guarded by the rc/bytes if-elif chain ──"
 # [pin: PR #27 pass 1 — mimo+minimax convergent claim that the agy runner's
@@ -1322,13 +1355,13 @@ chmod +x "$T/bin/kimi"
 
 KIMI_STDIN_CAPTURE="$T/kimi-stdin-doc.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o16" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
 assert_contains "kimi prompt warns on doc-narrative risk (.md in diff)" \
-  "$(cat "$T/kimi-stdin-doc.txt" 2>/dev/null)" "documentation/markdown"
+  "$(jq -r '.messages[0].content' "$T/o16/kimi.request.json" 2>/dev/null)" "documentation/markdown"
 
 # negative case: feat's diff (thousands of numbered lines in f.txt) has no
 # doc/markdown file — the caution must NOT fire on an ordinary code diff.
 git checkout -q feat
 KIMI_STDIN_CAPTURE="$T/kimi-stdin-nodoc.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o17" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
-case "$(cat "$T/kimi-stdin-nodoc.txt" 2>/dev/null)" in
+case "$(jq -r '.messages[0].content' "$T/o17/kimi.request.json" 2>/dev/null)" in
   *"documentation/markdown"*) bad "kimi prompt warns even without doc files in the diff" ;;
   *) ok "no doc-narrative note when diff has no doc files" ;;
 esac
@@ -1365,7 +1398,7 @@ git mv f.txt renamed-doc.md 2>/dev/null || git mv f.txt docs.md
 git -c user.email=t@t -c user.name=t commit -qam "rename to markdown"
 KIMI_STDIN_CAPTURE="$T/kimi-stdin-rename.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o19" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
 assert_contains "brace-compressed rename to .md still triggers the caution" \
-  "$(cat "$T/kimi-stdin-rename.txt" 2>/dev/null)" "documentation/markdown"
+  "$(jq -r '.messages[0].content' "$T/o19/kimi.request.json" 2>/dev/null)" "documentation/markdown"
 git checkout -q feat
 git branch -D renamebranch >/dev/null 2>&1
 
@@ -1378,7 +1411,7 @@ echo "doc content" >zzz-late-doc.md
 git add . && git -c user.email=t@t -c user.name=t commit -qm "55 code files + 1 late doc file"
 KIMI_STDIN_CAPTURE="$T/kimi-stdin-cap.txt" bash "$S/run_reviewers.sh" --base capbranch --out "$T/o20" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
 assert_contains "doc file past the 50-file --stat cap still triggers the caution" \
-  "$(cat "$T/kimi-stdin-cap.txt" 2>/dev/null)" "documentation/markdown"
+  "$(jq -r '.messages[0].content' "$T/o20/kimi.request.json" 2>/dev/null)" "documentation/markdown"
 git checkout -q feat
 git branch -D capbranch capbranch2 >/dev/null 2>&1
 
@@ -1401,7 +1434,7 @@ printf 'bug: X used to crash before the fix was applied\nmore prose\nan added li
 git -c user.email=t@t -c user.name=t commit -qam "rename doc to non-doc extension with an edit"
 KIMI_STDIN_CAPTURE="$T/kimi-stdin-revrename.txt" bash "$S/run_reviewers.sh" --base revrename-base --out "$T/o21" --reviewers kimi --timeout-kimi 30 >/dev/null 2>&1
 assert_contains "doc renamed away to a non-doc extension (with edit) still triggers the caution" \
-  "$(cat "$T/kimi-stdin-revrename.txt" 2>/dev/null)" "documentation/markdown"
+  "$(jq -r '.messages[0].content' "$T/o21/kimi.request.json" 2>/dev/null)" "documentation/markdown"
 git checkout -q feat
 git branch -D revrename-base revrename-feat >/dev/null 2>&1
 
@@ -2545,18 +2578,34 @@ fi
 echo "── Moonshot consolidation: K3 + the code variant (2026-08-22) ──"
 
 # The kimi baseline's model was the ONE model id in the fleet living outside
-# this repo -- the CLI reads ~/.kimi/config.toml, so reviewer_profiles.json had
-# no `.model` for it at all. Invisible to the repo, unpinned by any test, and
-# silently different on another machine: the same blind spot that left
-# antigravity on Gemini 3.5 for weeks. cli_model_alias pins it here.
-assert_eq "the kimi baseline's model is pinned in the repo, not just in ~/.kimi" \
-  "$(jq -r '.kimi.cli_model_alias // ""' "$SKILL_DIR/references/reviewer_profiles.json")" \
-  "kimi-k27-code"
-if grep -q 'profile_get kimi cli_model_alias' "$S/run_reviewers.sh"; then
-  ok "run_reviewers.sh passes the pinned alias to the kimi CLI"
+# this repo -- the CLI read ~/.kimi/config.toml. Since 2026-09-03 kimi is an
+# API-lane seat (direct Moonshot curl, like kimi27/kimi3): its model is
+# `.kimi.model` in the profile, resolved by the same model_backed_reviewers
+# loop as every other curl seat, and run_kimi must route through
+# run_openrouter_reviewer with the Moonshot endpoint. The CLI path is gone on
+# purpose -- its plan mode re-sent every prompt 3-25 times (~$20/day) and
+# stamped no cost; a `kimi --plan` reappearing here is the regression.
+assert_eq "the kimi baseline's model is pinned in the repo profile" \
+  "$(jq -r '.kimi.model // ""' "$SKILL_DIR/references/reviewer_profiles.json")" \
+  "kimi-k2.7-code"
+assert_eq "the kimi baseline's cli label is moonshot (direct API, not a CLI)" \
+  "$(jq -r '.kimi.cli // ""' "$SKILL_DIR/references/reviewer_profiles.json")" \
+  "moonshot"
+if grep -q 'run_openrouter_reviewer kimi "\$kimi_model"' "$S/run_reviewers.sh"; then
+  ok "run_kimi routes through the direct-Moonshot curl lane"
 else
-  bad "the kimi CLI no longer reads cli_model_alias -- its model escapes the repo again"
+  bad "run_kimi no longer routes through run_openrouter_reviewer -- kimi's tokens and cost go dark again"
 fi
+# Match an INVOCATION, not the comments that record why it went: the old call
+# was `run_with_timeout "$kimi_budget" kimi \` followed by a `--plan \`
+# continuation line.
+if grep -Eq '^[[:space:]]*(run_with_timeout[[:space:]]+"\$[a-z_]+"[[:space:]]+)?kimi[[:space:]]+\\$|^[[:space:]]*--plan[[:space:]]*\\$' "$S/run_reviewers.sh"; then
+  bad "run_reviewers.sh invokes the Kimi Code CLI again (--plan) -- the 2026-09-03 \$20/day agent loop is back"
+else
+  ok "no Kimi Code CLI invocation left in run_reviewers.sh"
+fi
+assert_eq "kimi is in model_backed_reviewers (its model resolves like every curl seat)" \
+  "$(grep -c 'model_backed_reviewers=(antigravity gemini-pro kimi ' "$S/run_reviewers.sh")" "1"
 
 # kimi27 is benched, not deleted. Its seat, profile and history must all still
 # exist -- deleting it would be a 122-reference refactor across 17 files on the

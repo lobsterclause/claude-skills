@@ -41,17 +41,30 @@ seq 1 20 >f.txt; git add .; git -c user.email=t@t -c user.name=t commit -qm init
 git checkout -qb feat
 seq 1 25 >f.txt; git add .; git -c user.email=t@t -c user.name=t commit -qm "feat: add widget support"
 
-# ── PATH shim dir: fake `kimi` captures the exact stdin (full_prompt) it was
-# handed to a file we can inspect, instead of actually reviewing anything.
+# ── PATH shim dir: kimi is a curl lane (direct Moonshot) since 2026-09-03, so
+# the fake `curl` captures the request body it was handed and writes the prompt
+# (messages[0].content) to a file we can inspect, instead of reviewing anything.
 mkdir -p "$T/bin"
 CAPTURE="$T/captured_prompt.txt"
-cat >"$T/bin/kimi" <<SHIM
+export CAPTURE
+# The lane passes the body as `-d @<file>` (stdin carries only the curl
+# --config with the bearer header), so the shim finds the body file in argv.
+cat >"$T/bin/curl" <<'SHIM'
 #!/bin/sh
-cat >"$CAPTURE" 2>/dev/null || true
-printf "shim review: no findings\\n"
+cat >/dev/null 2>&1 || true
+body=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-d" ]; then body="${a#@}"; fi
+  prev="$a"
+done
+if [ -n "$body" ] && [ -f "$body" ]; then
+  jq -r '.messages[0].content' "$body" >"$CAPTURE" 2>/dev/null || true
+fi
+printf '{"choices":[{"message":{"content":"shim review: no findings"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n'
 SHIM
-chmod +x "$T/bin/kimi"
+chmod +x "$T/bin/curl"
 export PATH="$T/bin:$PATH"
+export MOONSHOT_API_KEY="sk-ms-test-shim"   # lights the kimi seat; only the curl shim sees it
 
 echo "── {{BACKGROUND}} placeholder exists in review_prompt.txt, positioned before the priority list ──"
 PROMPT_FILE="$SKILL_DIR/references/review_prompt.txt"

@@ -41,6 +41,7 @@ command -v jq >/dev/null 2>&1 || { echo "jq required to run these tests" >&2; ex
 mkdir -p "$T/bin"
 export PATH="$T/bin:$PATH"
 export OPENROUTER_API_KEY="sk-or-test-shim"
+export MOONSHOT_API_KEY="sk-ms-test-shim"   # lights the kimi seat (curl lane since 2026-09-03)
 # This suite asserts the SINGLE-SHOT lane contract. The tool loop (default
 # --tool-mode auto, 2026-08-27) is covered by tests/test_tool_loop.sh; pin it
 # off here so a learned `read` arm cannot change the meta/prompt shape under
@@ -117,6 +118,10 @@ run() { # <outdir> <capture> <extra args...>
   write_kimi_shim "$cap"
   ( cd "$REPO" && bash "$S/run_reviewers.sh" --base main --out "$o" --reviewers kimi,glm \
       --timeout-kimi 30 --timeout-glm 30 "$@" >"$o.log" 2>&1 )
+  # kimi is a curl lane since 2026-09-03: its prompt is the request body's
+  # messages[0].content, not the kimi binary's stdin. Mirror it into the
+  # capture path so the assertions below read the real prompt text unchanged.
+  jq -r '.messages[0].content' "$o/kimi.request.json" >"$cap" 2>/dev/null || true
 }
 
 echo "── default (--context-mode files): whole changed files follow the diff ──"

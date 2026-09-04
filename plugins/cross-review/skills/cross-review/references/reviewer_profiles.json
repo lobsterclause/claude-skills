@@ -73,9 +73,10 @@
       "enabled": true,
       "model": "moonshotai/kimi-k2.7-code"
     },
-    "cli_model_alias": "kimi-k27-code",
     "timeout_s": 600,
     "provider": "moonshot",
+    "cli": "moonshot",
+    "model": "kimi-k2.7-code",
     "baseline": true,
     "retry_policy": "retry_on_transient",
     "prompt_style": "diff_only_no_tools",
@@ -86,7 +87,10 @@
       "Low": "skip_unless_convergent"
     },
     "synthesis_weight": 0.85,
-    "pricing": null,
+    "pricing": {
+      "prompt_per_m": 0.95,
+      "completion_per_m": 4.0
+    },
     "specialization": "single-turn correctness, race conditions, defensive guards; reasons on the diff as given without tools",
     "notes": "Strong on the diff-as-given. Frequent Low/nit output is skip-worthy unless convergent. China-origin provider — surface for security-sensitive repos."
   },

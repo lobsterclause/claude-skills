@@ -76,60 +76,25 @@ Subcommands worth knowing: `agy models` (list valid `--model` strings), `agy upd
 
 ## kimi
 
-Binary: `kimi` (Moonshot's Kimi Code CLI, installed via `curl -L code.kimi.com/install.sh | bash`, which `uv tool install`s `kimi-cli`). Verify with `kimi --version`.
+**No CLI since 2026-09-03.** The kimi baseline is a curl lane: the same
+OpenAI-compatible chat-completions body the OpenRouter pool sends, posted to
+`https://api.moonshot.ai/v1/chat/completions` with the Moonshot platform key
+(`MOONSHOT_API_KEY` or `~/.config/moonshot/key`) and model `kimi-k2.7-code`
+from `reviewer_profiles.json` (`.kimi.model`). kimi27 and kimi3 use the identical
+lane. One request per review; `tokens_prompt`/`tokens_completion` come from the
+response `usage`, cost is estimated from the profile `pricing`, and file access
+is the wrapper-owned tool loop (`lib_tool_loop.sh`), budgeted per seat.
 
-Invocation used by this skill:
-
-```bash
-kimi \
-  --plan \
-  --print \
-  --quiet \
-  <<<"<prompt-with-full-diff-inline>"
-```
-
-**Invocation mode: single-turn, no-tools.** Unlike codex and gemini, we do *not* let kimi roam the repo with file-reading tools. Instead, the full `git diff <base>...HEAD` is embedded in the prompt and we instruct the model "do not use any tools." This is a deliberate design choice — see the rationale below.
-
-Why these flags:
-
-- `--plan` — read-only plan mode. Defense in depth; even if kimi decides to call a write tool despite the prompt instruction, it can't edit anything.
-- `--print` — non-interactive mode; exits after the single turn. Without it, kimi launches its TUI and blocks forever in a pipeline. `--print` implicitly sets `--yolo`, harmless under `--plan`.
-- `--quiet` — alias for `--print --output-format text --final-message-only`. Prints only the final assistant message.
-- **stdin** (via here-string) carries the prompt. **Do not** use `-p` — argv has a hard 128KB-per-argument limit on Linux (`MAX_ARG_STRLEN`), which the inlined diff can easily exceed; argv-based prompts also expose the full diff via `ps` to other users on the machine. kimi reads stdin as the prompt when `--print` is set and no `-p` is given. The wrapper caps the diff at 8000 lines (well under k2.5's 256K-token context) and injects a truncation warning into the prompt when exceeded.
-
-Why single-turn no-tools (the real story):
-
-- **The adapter bug.** `kimi-k2.5` + thinking mode + multi-turn tool calls require the `openai_legacy` provider to thread `reasoning_content` between turns. It doesn't — the second tool-call turn fails with `400 — thinking is enabled but reasoning_content is missing in assistant tool call message at index 2`. This is documented in Moonshot's K2.5 tool-use compatibility notes.
-- **Why we don't just disable thinking.** We tried `--no-thinking` to sidestep the bug. It works, but you lose the reasoning quality that's the whole reason to use K2.5 as a reviewer — at that point you may as well run K2-turbo.
-- **Why single-turn is actually fine for review.** Code review is fundamentally a single-turn task: the diff IS the input. codex and gemini already handle the agentic file-roaming niche; kimi's job here is deep reasoning on the diff as given. That's complementary, not duplicative.
-- **If you ever switch to the native `api.kimi.com` provider** (via `kimi login` OAuth + Kimi Coding subscription), kimi-cli's native `type = "kimi"` adapter preserves `reasoning_content` correctly and you can drop the "no tools" instruction and enable agent-style review.
-
-Flags we deliberately do not use:
-
-- `--thinking` / `--no-thinking` — we let the config default win (thinking enabled for k2.5). The inline-diff approach avoids the tool-call bug that would otherwise force `--no-thinking`.
-- `-m/--model` — we set the default model in `~/.kimi/config.toml` once and let every invocation use it. Pin per-call only if you need to A/B between models.
-- `--yolo` (explicitly) — already implied by `--print`; no reason to add it.
-- `--agent okabe` — a specialized "okabe" built-in agent exists; we use the default because reviewer tasks don't benefit from the okabe specialization.
-
-Auth: kimi uses a TOML config file at `~/.kimi/config.toml`. For the Moonshot platform key (from [platform.moonshot.ai](https://platform.moonshot.ai)), configure an `openai_legacy` provider pointing at `https://api.moonshot.ai/v1`:
-
-```toml
-default_model = "kimi-moonshot"
-
-[models.kimi-moonshot]
-provider = "kimi-moonshot"
-model = "kimi-k2.5"
-max_context_size = 262144
-
-[providers.kimi-moonshot]
-type = "openai_legacy"
-base_url = "https://api.moonshot.ai/v1"
-api_key = "sk-..."
-```
-
-Valid model IDs on the Moonshot endpoint (as of 2026-04): `kimi-k2.5`, `kimi-k2-thinking`, `kimi-k2-thinking-turbo`, `kimi-k2-0905-preview`, `kimi-k2-turbo-preview`, `kimi-k2-0711-preview`, `moonshot-v1-{8k,32k,128k}`, `moonshot-v1-auto`, plus `-vision-preview` variants. `kimi-k2.5` (256K ctx, thinking mode default) is the best reviewer.
-
-If the user has a `code.kimi.com/coding/v1` subscription key instead of a Moonshot platform key, run `kimi login` interactively once — kimi-cli handles that provider natively (`type = "kimi"`, no manual config needed).
+Why the Kimi Code CLI (`kimi --plan --print --quiet`) was dropped: it was
+documented here as "single-turn, no-tools" with `--plan` as defense in depth.
+Its own session logs (`~/.kimi/sessions/*/wire.jsonl`) showed plan mode turning
+every review into ≥3 API steps — write plan file, `ExitPlanMode`, answer — and
+up to 25 after context compaction, each step re-sending the whole 40K–200K-token
+prompt at the cache-miss rate. On 2026-09-03 that was 88 reviews, 15.8M tokens
+sent for 4.3M of actual prompt, and ~$20 drained from the shared Moonshot
+balance, with nothing stamped in `runlog.jsonl` because the CLI reports no
+usage. A `kimi` binary on `$PATH` is now irrelevant to the skill; a `--plan`
+reappearing in `run_reviewers.sh` is the regression (guarded in `run_tests.sh`).
 
 ## Known issues and gotchas
 
