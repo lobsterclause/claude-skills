@@ -493,6 +493,16 @@ and the covering suites into the fix step, not into CI.
   issue, reference that instead of filing a redundant one.
 - Working notes → PR comments.
 
+**Editing the checklist body is a read-modify-write on a document another session may
+be editing too, and the race's failure mode is a blank issue, not a conflict.** On
+2026-09-04 a tick script asserted its line was still unticked (a peer had ticked it 13
+seconds earlier), the `$(...)` assignment came back empty, `set -e` did not fire, and
+`gh issue edit --body "$new"` replaced an 11 KB body with nothing. Write the new body
+to a file, `test -s` it and check its line count against the original, then pass
+`--body-file`. Never tick a line another session owns; tell them and wait. If a body
+is ever blank, GraphQL `userContentEdits(first:N).nodes[].diff` holds the last good
+version (`first` is newest; `last` is the OLDEST edits).
+
 **Check every queued PR for an EMPTY diff before reviewing it, and defuse its auto-close
 reference.** `gh pr view <n> --json changedFiles,additions,deletions` plus a tree
 comparison (`git rev-parse <sha>^{tree}` vs `<sha>^^{tree}` — identical trees prove an
