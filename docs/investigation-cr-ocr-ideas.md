@@ -1,11 +1,11 @@
 # Cross-review enhancements lifted from alibaba/open-code-review
 
-**Status:** fact-check gate + snippet-anchor implemented (2026-06-18); rules.json + diff-filter specced, not built.
-**Source:** [alibaba/open-code-review](https://github.com/alibaba/open-code-review) (Apache-2.0, Go), read at commit cloned 2026-06-18 into `/tmp/open-code-review`. Mechanics extracted from `internal/*.go` + `internal/config/template/task_template.json`, not the README.
+**Status:** fact-check gate + snippet-anchor implemented (2026-06-18); rules.json (#76's sibling, lift 3) + diff-filter (#76) specced, not built. Upstream re-read 2026-08-26 — see [Upstream since June](#upstream-since-june-2026-08-26) for what changed and the issues opened off it (#75, #76, #77, #78).
+**Source:** [alibaba/open-code-review](https://github.com/alibaba/open-code-review) (Apache-2.0, Go), read at commit cloned 2026-06-18 into `/tmp/open-code-review`. Mechanics extracted from `internal/*.go` + `internal/config/template/task_template.json`, not the README. The 2026-08-26 re-read was done against GitHub (README, commit log, PR diffs), not a fresh clone — treat its details as less load-bearing than the June source-level findings.
 
 ## Why
 
-`ocr` benchmarks ~85% precision at ~1/9 the tokens of a general agent. Reading the source, that number is earned by **two** real subsystems (a falsify-only fact-check pass and snippet-anchored line resolution) plus a layered rule corpus and an extension/test filter. Several other advertised subsystems (file "bundling," dedup, confidence scoring) **do not exist in the code** — it's per-file fan-out with a bare finding struct. CR is already ahead on the output side (severity, dedup, cross-provider convergence); the wins are on the *input discipline* and *false-positive suppression* side.
+`ocr` benchmarks ~85% precision at ~1/9 the tokens of a general agent. Reading the source, that number is earned by **two** real subsystems (a falsify-only fact-check pass and snippet-anchored line resolution) plus a layered rule corpus and an extension/test filter. Several other advertised subsystems (file "bundling," dedup, confidence scoring) **did not exist in the code as of June 2026** (bundling has since landed upstream — see below) — it's per-file fan-out with a bare finding struct. CR is already ahead on the output side (severity, dedup, cross-provider convergence); the wins are on the *input discipline* and *false-positive suppression* side.
 
 This doc specs the two highest-leverage lifts and sketches the two follow-ups.
 
@@ -97,11 +97,13 @@ CR has only *advisory prose* today: "don't trust the reviewer's line numbers bli
 
 ## 3. Layered `rules.json` corpus — **SPEC ONLY**
 
+> Tracked alongside lift 4 in **#76** (the exclude globs are meant to be driven from the same config block). Upstream keeps growing this corpus — Objective-C rules landed 2026-08-26, and R / MATLAB / Thrift / Cap'n Proto / `.ipynb` support in the same window — so a seed taken today is richer than one taken in June.
+
 `ocr`'s rule system (`internal/config/rules/system_rules.go`) is a clean 4-layer precedence (`--rule` flag > project `.opencodereview/rule.json` > global `~/.opencodereview/rule.json` > embedded `system_rules.json`), first-match-wins, doublestar + brace-expansion path globs, resolved markdown injected into the prompt as `{{system_rule}}`. The embedded corpus is a `path→markdown` map; bodies are per-language checklists (`rule_docs/default.md` covers Correctness/Security/Performance/Maintainability/Test-Coverage; `java.md`, `ts_js_tsx_jsx.md`, etc. add language specifics).
 
 **CR adoption:** replace the half-built `ast-grep` enrichment (SKILL step 2.6) with a `references/rules/` corpus + a `resolve_rules.sh` that walks the same 4 layers and injects the matched rule body into `run_reviewers.sh`'s `$review_prompt` preamble per changed path. The Apache-2.0 license permits seeding CR's corpus from `ocr`'s `rule_docs/*.md` with attribution. Bigger lift; do after 1+2 land and prove out.
 
-## 4. Diff pre-filter — **SPEC ONLY (lift *and improve*)**
+## 4. Diff pre-filter — **SPEC ONLY (lift *and improve*)** — tracked in **#76**
 
 `ocr` filters changed files through (in order): binary check, user exclude globs, user include globs, an **extension whitelist** (`supported_file_types.json`, 69 entries), and **test-file excludes** (`default_exclude_patterns.json`, e.g. `**/*_test.go`, `**/*.{test,spec}.{js,jsx,ts,tsx}`, `**/__tests__/**`). All lowercased.
 
@@ -110,7 +112,7 @@ CR has only *advisory prose* today: "don't trust the reviewer's line numbers bli
 ---
 
 ## What NOT to lift
-- **"File bundling / review units"** — does not exist in `ocr`; it's per-file fan-out + concurrency(8) + an 80%-context token cap (oversized files are dropped, not split). No stem/dir grouping. Nothing to port.
+- **"File bundling / review units"** — ~~does not exist in `ocr`~~ **STALE as of 2026-08-25** (see below); as of the June read it was per-file fan-out + concurrency(8) + an 80%-context token cap (oversized files are dropped, not split), with no stem/dir grouping. It exists now, but is still not worth porting — see [Upstream since June](#upstream-since-june-2026-08-26).
 - **Finding dedup / severity / confidence on the struct** — `LlmComment` is bare (path/content/lines/snippet only); `CommentCollector` is a plain slice with no dedup. CR's synthesis already produces severity-ranked, deduped, convergence-tagged findings. CR is the reference here, not `ocr`.
 
 ## Rollout order
@@ -118,3 +120,36 @@ CR has only *advisory prose* today: "don't trust the reviewer's line numbers bli
 2. ✅ `factcheck_findings.sh` + `factcheck_prompt.txt` + SKILL step 4.5 (fail-safe keep).
 3. ⬜ `rules.json` corpus + resolver (subsumes ast-grep step 2.6).
 4. ⬜ diff pre-filter (driven by the rules.json `exclude` block).
+
+---
+
+## Upstream since June (2026-08-26)
+
+Re-read of the repo after the June investigation. Three things shipped that this doc did not cover, plus one correction.
+
+### Correction — semantic file grouping now exists
+
+[PR #808](https://github.com/alibaba/open-code-review/pull/808) (2026-08-25, "group semantically related files for multi-file review") adds a `grouping.go` module with its own prompt pair (`grouping_task_system.md` / `grouping_task_user.md`), i.e. an **LLM-assisted planning phase** before the detail pass, plus a follow-up commit that classifies coverage **per file, not per group**. A new `effort` flag (low / medium / high) scales the per-round tool-call budget (`MAX_TOOL_REQUEST_TIMES` raised to 100, `minMaxTools` 50).
+
+**Still not worth porting as such.** Grouping solves a problem CR does not have: `ocr` fans out per file, so it needs to re-assemble related files into review units. CR hands each reviewer the whole diff, so the units are already whole. Two adjacent ideas *are* worth noting:
+
+- **Per-file coverage classification** is the same shape as the range-coverage gate on `feat/cross-review-range-coverage`. Convergent independent design; nothing to lift, but it's corroboration that the granularity choice is right.
+- **Effort tiers** are a cleaner knob than our per-seat timeout tuning (`--timeout-<slug>`, the 300-400s Gemini-at-High problem in SKILL step 1). Not filed — noting it as a possible future simplification, not a queued lift.
+
+### New lifts filed
+
+| Idea | Upstream | Issue |
+|---|---|---|
+| Business context in the reviewer prompt (`--background`) | their step 1, marked mandatory in their SKILL | **#75** |
+| SARIF output (`--output`, progress to stderr so stdout stays machine-clean) | added Aug 2026 | **#77** |
+| Compare findings across two review sessions | [PR #922](https://github.com/alibaba/open-code-review/pull/922), 2026-08-27 | **#78** |
+
+On #78 we are ahead on substrate and behind on the read side: `fingerprint_findings.sh` + `finding_events.jsonl` already give stable ids and a per-pass lifecycle; what's missing is a fixed / still-open / newly-introduced view over them.
+
+On #75 the gap is sharper than it looks — `references/review_prompt.txt` asks for semantic drift ("does the change accomplish what its PR title claims?") while never passing the PR title. That bullet is currently unserved.
+
+### Still nothing to lift
+
+- **Finding struct** — `LlmComment` remains bare (path/content/lines/snippet), `CommentCollector` still a plain slice with no dedup. CR remains the reference on the output side.
+- **Positioning / reflection modules** — our `anchor_findings.sh` + `factcheck_findings.sh` are the same two ideas, already fail-safe. No delta.
+- **Provider layer** (Gemini, Bedrock SigV4, GPT-5.6 via Responses API added Aug 2026) — CR's roster/rotation solves a different problem.

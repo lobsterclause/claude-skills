@@ -1134,10 +1134,11 @@ else
   ok "kimi27 is benched: detected but never drawn"
 fi
 # The "retired boost is a no-op at 1.0" mechanism this block was written to pin
-# has moved to seats that are still drawn: `spark` below is the unboosted
-# control, and kimi3 (retired to 1.0 the same day) is asserted at weight=75.0
-# in the kimi3 block further down. kimi27 can no longer carry it -- a benched
-# seat produces no candidate line to measure.
+# now rests entirely on `spark` below, the unboosted control. Neither Moonshot
+# seat can carry it any more: kimi27 was benched 2026-08-22 and kimi3 on
+# 2026-09-01, and a benched seat produces no candidate line to measure. If
+# spark ever takes a draw_boost, repoint this to another unboosted seat rather
+# than editing the expected number.
 # rookie base weight = max(50,15) * (1 + 0.5/sqrt(1)) / (1 + 0/240) = 75.0.
 # The control seat must carry NO draw_boost; nemotron held this role until it
 # took a 2.5 boost on 2026-08-14.
@@ -1241,7 +1242,19 @@ assert_eq "detect still reports kimi27 available (positional coupling check)" \
   "$(jq -r '.kimi27' <<<"$DETECT_OUT3")" "true"
 BOOST_ERR3="$T/boost3.err"
 CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 42 >/dev/null 2>"$BOOST_ERR3"
-assert_contains "selector draws kimi3 as a candidate" "$(cat "$BOOST_ERR3")" "kimi3"
+# BENCHED 2026-09-01 (per Gabriel): kimi3 left the draw pool on the cost read
+# in docs/investigation-cr-model-cost-2026-08-29.md -- same redundancy argument
+# that benched kimi27 (Moonshot votes once regardless), plus ~$5.20 per kept
+# finding against kimi27's ~$0.41. So this assertion is INVERTED, exactly as
+# kimi27's was: it used to pin that the seat is drawn, now it pins that it is
+# not. The seat still exists and still detects (asserted above); only the draw
+# changed. With kimi3 benched too, NO seat rides the has_moonshot pool gate --
+# if you re-add one, restore a positive draw assertion here.
+if grep -q 'kimi3' "$BOOST_ERR3"; then
+  bad "kimi3 is being offered as a candidate again -- it was benched 2026-09-01"
+else
+  ok "kimi3 is benched: detected but never drawn"
+fi
 # What this pins is that draw_boost actually MULTIPLIES the drawn weight --
 # kimi3 was only ever the vehicle, and its boost was retired to 1.0 on
 # 2026-08-22 (per Gabriel: enough data gathered), which broke this assertion.
@@ -1254,9 +1267,11 @@ assert_contains "selector draws kimi3 as a candidate" "$(cat "$BOOST_ERR3")" "ki
 # draw_boost 2.5 → 75.0 * 2.5 = 187.5.
 assert_contains "a boosted rookie seat's weight reflects its draw_boost (inkling, 2.5)" \
   "$(grep 'inkling ' "$BOOST_ERR3")" "weight=187.5"
-# and the retired seat is now drawn at the unboosted rookie weight
-assert_contains "kimi3 draws unboosted after its 2026-08-22 boost retirement" \
-  "$(grep 'kimi3 ' "$BOOST_ERR3")" "weight=75.0"
+# The "retired boost is a no-op at 1.0" half of this block moved out on
+# 2026-09-01 when kimi3 was benched -- a benched seat produces no candidate
+# line to measure, the same way kimi27 stopped being able to carry it. The
+# unboosted-weight control lives on `spark` (weight=75.0) in the kimi27 block
+# above; keep it there.
 # no Moonshot key (env cleared, sandbox HOME has no key file) → honest skip
 MOONSHOT_API_KEY= bash "$S/run_reviewers.sh" --base main --out "$T/o13" --reviewers kimi3 >/dev/null 2>"$T/k3skip.err"
 assert_eq "kimi3 without a key exits 1 (all requested reviewers failed)" "$?" "1"
@@ -2569,9 +2584,14 @@ case "$POOL_TOK" in
   *" kimi27 "*) bad "kimi27 is back in the draw pool -- it duplicates the baseline's model with no tools" ;;
   *)            ok  "kimi27 is benched out of the draw pool" ;;
 esac
+# kimi3 BENCHED 2026-09-01 on cost (per Gabriel), so this case is inverted
+# too -- it used to pin the K3 half of the consolidation as still drawn. Both
+# Moonshot rotation seats are now out of the pool and Moonshot is represented
+# by the kimi baseline alone, which was always the provider's single vote at
+# synthesis. Same reversible bench: seat, profile and history all retained.
 case "$POOL_TOK" in
-  *" kimi3 "*)  ok  "kimi3 is still drawn (the K3 half of the consolidation)" ;;
-  *)            bad "kimi3 fell out of the draw pool" ;;
+  *" kimi3 "*)  bad "kimi3 is back in the draw pool -- it was benched 2026-09-01 on cost" ;;
+  *)            ok  "kimi3 is benched out of the draw pool" ;;
 esac
 assert_eq "kimi27's seat definition is retained, not deleted" \
   "$(jq -r 'has("kimi27")' "$SKILL_DIR/references/reviewer_profiles.json")" "true"

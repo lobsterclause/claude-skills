@@ -175,24 +175,32 @@ fi
 if has_openrouter; then
   POOL+=(glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok longcat inkling)
 fi
-# kimi27 (k2.7-code) rides the DIRECT Moonshot API — a deliberate rotation
-# seat (2026-07-03, per Gabriel), not an OpenRouter fallback for the kimi
-# baseline. Its profile carries a draw_boost so it is drawn frequently while
-# it earns leaderboard data.
-# kimi3 (K3 flagship, released 2026-07-16) is the same direct-Moonshot seat
-# pattern, added 2026-07-18 — shares has_moonshot's gate and billing rail.
-if has_moonshot; then
-  # kimi27 BENCHED 2026-08-22 (per Gabriel: "drop to only 3 and the kimi code
-  # variant"). The kimi BASELINE now runs kimi-k2.7-code itself via
-  # cli_model_alias -- with tools, which the curl seats do not have -- so a
-  # separate diff-only k2.7-code seat is pure redundancy on a provider that
-  # already votes once. Benched rather than deleted: the seat is referenced 122
-  # times across 17 files (65 of them test fixtures) and sits on the fail-closed
-  # baseline path, so removing it is a refactor with real regression risk and no
-  # coverage gain. Benching is one line and reversible, and it keeps kimi27's
-  # leaderboard history readable. Re-add it here to bring the seat back.
-  POOL+=(kimi3)
-fi
+# Both direct-Moonshot rotation seats (kimi27 = k2.7-code, added 2026-07-03;
+# kimi3 = the K3 flagship, added 2026-07-18) are now BENCHED. Neither is an
+# OpenRouter fallback for the kimi baseline -- they rode the platform API on
+# the same billing rail, gated by has_moonshot.
+#
+# kimi27 BENCHED 2026-08-22 (per Gabriel: "drop to only 3 and the kimi code
+# variant"). The kimi BASELINE runs kimi-k2.7-code itself via cli_model_alias
+# -- with tools, which the curl seats do not have -- so a separate diff-only
+# k2.7-code seat was pure redundancy on a provider that already votes once.
+#
+# kimi3 BENCHED 2026-09-01 (per Gabriel: "let's turn off kimi3 for now"), on
+# the cost read in docs/investigation-cr-model-cost-2026-08-29.md. Same
+# redundancy argument as kimi27 -- Moonshot votes once whether one seat
+# answers or three -- plus the price: the seat defaults to think_efforts "max"
+# and cost ~$0.16/run against kimi27's $0.050, for 4 kept findings over 131
+# runs (~$5.20 per kept finding, ~13x kimi27's ~$0.41). Its null `pricing`
+# had been hiding that from the cost divisor in the draw weight below.
+#
+# Benched rather than deleted: both seats are referenced across the wrapper,
+# profiles, and test fixtures, and sit near the fail-closed baseline path, so
+# removal is a refactor with real regression risk and no coverage gain. The
+# seat definitions, detection, and leaderboard history are all retained --
+# only the draw is gone. To bring a seat back, append its name to POOL under a
+# has_moonshot guard here -- write the line, do not paste a seat name into this
+# comment: tests/run_tests.sh detects the bench by scanning every line matching
+# POOL+= for the seat name, so a commented-out example reads as a live entry.
 
 if [[ ${#BASELINES[@]} -eq 0 && ${#POOL[@]} -eq 0 ]]; then
   echo "select_roster: no reviewers available at all" >&2

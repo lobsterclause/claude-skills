@@ -1431,7 +1431,10 @@ run_codex() {
   local start end rc
   start=$(date +%s)
   # codex exec review runs the built-in review prompt against the branch diff.
-  # --full-auto: low-friction sandbox, workspace-write, no approval prompts.
+  # approval_policy=never + sandbox_mode=workspace-write: what --full-auto used
+  # to expand to. codex-cli 0.153.x dropped --full-auto from `exec review`
+  # (2026-09-07: "unexpected argument '--full-auto'"), and the -c form is
+  # accepted by both the old and new CLIs.
   # IMPORTANT: --base and a positional [PROMPT] are mutually exclusive — if you
   # want a custom prompt, you must drop --base and put the base reference inside
   # the prompt itself.
@@ -1468,7 +1471,7 @@ run_codex() {
   fi
   run_with_timeout "$codex_timeout" codex exec review \
     --base "$base" \
-    --full-auto \
+    -c 'approval_policy="never"' -c 'sandbox_mode="workspace-write"' \
     ${codex_model_args[@]+"${codex_model_args[@]}"} \
     ${codex_cfg[@]+"${codex_cfg[@]}"} \
     >"$out/codex.stdout" 2>&1

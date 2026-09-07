@@ -63,7 +63,7 @@ assert_eq "no benched profile exceeds draw_boost 0.3" "$OVER_BOOSTED" ""
 echo "── kimi3.timeout_s bumped to 950 (p95 700s was sitting ON the old budget) ──"
 assert_eq "kimi3.timeout_s == 950" "$(jq -r '.kimi3.timeout_s' "$PROFILES")" "950"
 
-echo "── kimi3.draw_boost RETIRED 2026-08-22 (bring-up complete, per Gabriel) ──"
+echo "── kimi3 BENCHED 2026-09-01 (draw_boost 0, per Gabriel) ──"
 # This asserted 2.5 "unchanged by this bench" while kimi3 was still earning
 # leaderboard data. That condition has now been met, so the assertion is
 # inverted rather than deleted -- the retirement itself is the thing worth
@@ -73,11 +73,20 @@ echo "── kimi3.draw_boost RETIRED 2026-08-22 (bring-up complete, per Gabriel
 # grounds that `jq -r` renders 1.0 as "1" -- falsified here (jq 1.7 preserves
 # the literal, and the suite is green), but it WAS true of jq 1.6, so a string
 # compare is a real cross-version trap even though the reported bug is not.
-if jq -e '.kimi3.draw_boost == 1.0' "$PROFILES" >/dev/null 2>&1; then
-  ok "kimi3.draw_boost == 1.0 (retired after bring-up)"
+# BENCHED 2026-09-01: the boost went 2.5 (bring-up) -> 1.0 (retired
+# 2026-08-22) -> 0 (benched), so this assertion is re-inverted a second time
+# rather than deleted. 0 is not cosmetic: select_roster.sh honours a 0 boost as
+# NEVER DRAWN (the 2026-08-27 `if (boost <= 0) boost = 1` bug), so this is a
+# real second gate behind the POOL removal, and it is what test_profiles' own
+# "no benched profile exceeds draw_boost 0.3" rule above now measures via the
+# bench_note added alongside it.
+if jq -e '.kimi3.draw_boost == 0' "$PROFILES" >/dev/null 2>&1; then
+  ok "kimi3.draw_boost == 0 (benched 2026-09-01)"
 else
-  bad "kimi3.draw_boost is $(jq -r '.kimi3.draw_boost' "$PROFILES"), want 1.0"
+  bad "kimi3.draw_boost is $(jq -r '.kimi3.draw_boost' "$PROFILES"), want 0"
 fi
+assert_eq "kimi3 carries a bench_note explaining the bench" \
+  "$(jq -r '.kimi3.bench_note != null' "$PROFILES")" "true"
 if jq -e '.kimi27.draw_boost == 1.0' "$PROFILES" >/dev/null 2>&1; then
   ok "kimi27.draw_boost == 1.0 (retired 2026-07-12)"
 else
