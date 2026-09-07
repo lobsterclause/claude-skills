@@ -10,4 +10,9 @@ cross-review/finding_events.jsonl
 cross-review/iteration-*/
 cross-review/state/
 cross-review/merge_override_audit.jsonl
+# pr-drain's per-repo state, written into the installed skill dir the same
+# way the files above are. Missing here, it read as dual-copy drift on every
+# developer machine while CI (which ships via git archive) stayed green --
+# the cry-wolf failure tests/check_dual_copy.sh's own header warns about.
+cross-review/.pr-drain/
 **/*.bak-*
