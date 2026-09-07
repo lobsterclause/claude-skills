@@ -295,7 +295,7 @@ runlog="${CROSS_REVIEW_RUNLOG:-$skill_dir/runlog.jsonl}"
 profile_file="${profiles_arg:-$skill_dir/references/reviewer_profiles.json}"
 
 # Full fleet — keep in sync with run_reviewers.sh dispatch and analyze_runlog.sh.
-REVIEWERS=(codex antigravity gemini-pro kimi glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok longcat inkling kimi27 kimi3)
+REVIEWERS=(codex antigravity gemini-pro kimi glm-coding glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok longcat inkling kimi27 kimi3)
 
 # structured_raw is EVERY structured row, not yet windowed: the --recent
 # window is cut AFTER synthetic rows are excluded below, so a planted drill
@@ -501,6 +501,9 @@ provider_of() {
       antigravity|gemini-pro) p="google" ;;
       kimi) p="moonshot" ;;
       glm) p="zhipu" ;;
+      # Same provider as `glm` ON PURPOSE: glm-coding is the same GLM model on
+      # the Coding Plan lane, so the two agreeing is ONE provider vote.
+      glm-coding) p="zhipu" ;;
       deepseek) p="deepseek" ;;
       mimo) p="xiaomi" ;;
       minimax) p="minimax" ;;

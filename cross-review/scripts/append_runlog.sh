@@ -347,7 +347,7 @@ enrich_with_findings() {
   local counts
   counts="$(jq -c --arg r "$name" '
     ({"codex":"openai","antigravity":"google","gemini-pro":"google",
-      "kimi":"moonshot","glm":"zhipu","deepseek":"deepseek","mimo":"xiaomi",
+      "kimi":"moonshot","glm-coding":"zhipu","glm":"zhipu","deepseek":"deepseek","mimo":"xiaomi",
       "minimax":"minimax","qwen":"alibaba","devstral":"mistral",
       "laguna":"poolside","kat":"kuaishou","north":"cohere","nemotron":"nvidia",
       "spark":"meta","seed":"bytedance","grok":"xai",
@@ -466,6 +466,7 @@ seed_json=$(enrich_with_findings seed "$(enrich_with_context_and_profile seed "$
 grok_json=$(enrich_with_findings grok "$(enrich_with_context_and_profile grok "$(reviewer_obj grok)")")
 longcat_json=$(enrich_with_findings longcat "$(enrich_with_context_and_profile longcat "$(reviewer_obj longcat)")")
 inkling_json=$(enrich_with_findings inkling "$(enrich_with_context_and_profile inkling "$(reviewer_obj inkling)")")
+glm_coding_json=$(enrich_with_findings glm-coding "$(enrich_with_context_and_profile glm-coding "$(reviewer_obj glm-coding)")")
 kimi27_json=$(enrich_with_findings kimi27 "$(enrich_with_context_and_profile kimi27 "$(reviewer_obj kimi27)")")
 kimi3_json=$(enrich_with_findings kimi3 "$(enrich_with_context_and_profile kimi3 "$(reviewer_obj kimi3)")")
 
@@ -560,6 +561,7 @@ entry=$(jq -nc \
   --argjson grok "$grok_json" \
   --argjson longcat "$longcat_json" \
   --argjson inkling "$inkling_json" \
+  --argjson glm_coding "$glm_coding_json" \
   --argjson kimi27 "$kimi27_json" \
   --argjson kimi3 "$kimi3_json" \
   --arg run_id "$run_id" \
@@ -571,7 +573,7 @@ entry=$(jq -nc \
   --arg wrapper_sha "$wrapper_sha_val" \
   --arg wrapper_dirty "$wrapper_dirty_val" \
   --arg wrapper_branch "$wrapper_branch_val" \
-  '{codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, glm: $glm,
+  '{codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, "glm-coding": $glm_coding, glm: $glm,
     deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
     devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
     spark: $spark, seed: $seed, grok: $grok,

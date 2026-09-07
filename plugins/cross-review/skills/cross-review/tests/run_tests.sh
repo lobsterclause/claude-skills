@@ -48,6 +48,24 @@ chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export OPENROUTER_API_KEY="sk-or-test-shim"   # lights the OR pool; never called
 export MOONSHOT_API_KEY="sk-ms-test-shim"     # lights the kimi27 seat; never called
+export ZAI_API_KEY="sk-zai-test-shim"         # lights glm-coding; never called
+
+# ── Fleet flags: this suite runs the LEGACY fleet on purpose ────────────────
+# Every case below was written against the pre-2026-09-07 fleet — kimi as the
+# second fixed baseline, the OpenRouter pool as the rotation draw — and that
+# fleet is still fully supported, it is simply no longer the default (see
+# scripts/lib_flags.sh). Pinning the flags here keeps ~40 cases testing the
+# machinery they were written for instead of being rewritten into assertions
+# about an empty pool.
+#
+# The NEW defaults (glm-coding baseline, OpenRouter off) are covered by
+# tests/test_flags.sh, which sets its own flags per case and is picked up by
+# the standalone-test discovery at the bottom of this file. Do not "simplify"
+# by deleting these exports: without them the selector cases assert the old
+# fleet against the new one and fail for the wrong reason.
+export CROSS_REVIEW_KIMI_BASELINE=1
+export CROSS_REVIEW_GLM_BASELINE=0
+export CROSS_REVIEW_OPENROUTER=1
 # Sandbox HOME: the selector caches `agy models` output under
 # $HOME/.cross-review/cache with a 6h TTL — running tests against the real
 # HOME would poison real roster draws with the shim's list (codex P2, PR #19).

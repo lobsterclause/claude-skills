@@ -91,15 +91,21 @@ assert_eq "sourcing twice does not duplicate the PATH entry" "$DUPES" "1"
 
 echo "── select_roster.sh fails closed on a missing baseline ──"
 
-# The pool is deliberately HEALTHY here (OpenRouter key + curl), so a roster
-# could legitimately be drawn if the baselines were not required. Without that,
-# a run with no baselines also has no pool, exits non-zero for that unrelated
-# reason, and this assertion passes whether or not the fail-closed exists --
-# measured: removing `exit 1` left the suite fully green. Isolate the behaviour
-# or the test cannot see it.
+# The pool is deliberately HEALTHY here (OpenRouter key + curl + the lane's
+# feature flag), so a roster could legitimately be drawn if the baselines were
+# not required. Without that, a run with no baselines also has no pool, exits
+# non-zero for that unrelated reason, and this assertion passes whether or not
+# the fail-closed exists -- measured: removing `exit 1` left the suite fully
+# green. Isolate the behaviour or the test cannot see it.
+#
+# CROSS_REVIEW_OPENROUTER=1 is REQUIRED here, not decoration: these cases build
+# their environment with `env -i`, so they inherit no flags at all and get the
+# 2026-09-07 defaults -- under which the OpenRouter pool does not exist and the
+# control could never draw anything. A test that constructs its own environment
+# has to name the fleet it means (scripts/lib_flags.sh).
 JQ_DIR="$(dirname "$(command -v jq)")"   # select_roster.sh needs jq; brew puts it outside /usr/bin (glm)
 CTRL="$(env -i HOME="$T" NVM_DIR="$T/empty" PATH="$JQ_DIR:/usr/bin:/bin" \
-  OPENROUTER_API_KEY=sk-or-test-shim CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 \
+  OPENROUTER_API_KEY=sk-or-test-shim CROSS_REVIEW_OPENROUTER=1 CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 \
   /bin/bash "$S/select_roster.sh" --seed 1 2>/dev/null)"
 CTRL_RC=$?
 assert_eq "control: a roster IS drawable from the pool alone" \
@@ -107,14 +113,14 @@ assert_eq "control: a roster IS drawable from the pool alone" \
 
 # Same inputs, minus the escape hatch: the ONLY difference is the fail-closed.
 OUT="$(env -i HOME="$T" NVM_DIR="$T/empty" PATH="$JQ_DIR:/usr/bin:/bin" \
-  OPENROUTER_API_KEY=sk-or-test-shim \
+  OPENROUTER_API_KEY=sk-or-test-shim CROSS_REVIEW_OPENROUTER=1 \
   /bin/bash "$S/select_roster.sh" --seed 1 2>&1)"
 RC=$?
 assert_eq "exits non-zero when a baseline is missing" "$([[ $RC -ne 0 ]] && echo yes || echo no)" "yes"
 assert_eq "emits no roster on stdout when it fails closed" \
-  "$(env -i HOME="$T" NVM_DIR="$T/empty" PATH=/usr/bin:/bin OPENROUTER_API_KEY=sk-or-test-shim \
+  "$(env -i HOME="$T" NVM_DIR="$T/empty" PATH=/usr/bin:/bin OPENROUTER_API_KEY=sk-or-test-shim CROSS_REVIEW_OPENROUTER=1 \
      /bin/bash "$S/select_roster.sh" --seed 1 2>/dev/null)" ""
-assert_contains "names the missing baselines" "$OUT" "baseline(s) not installed"
+assert_contains "names the missing baselines" "$OUT" "baseline(s) unavailable"
 assert_contains "explains the usual PATH cause" "$OUT" "nvm"
 
 # The escape hatch still works, and is explicit about being used.

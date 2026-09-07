@@ -7,7 +7,23 @@ description: Run external AI code reviewers in parallel against the current bran
 
 Orchestrates a rotating fleet of external AI reviewers to review the current branch's changes, consolidates their findings, applies fixes, and re-runs until the diff is clean or an iteration budget is exhausted. The goal is to catch things a single model would miss — different reviewers have different blind spots, so their overlap is signal and their disagreements are worth reading.
 
-**The fleet (baselines + rotation):** `codex` (OpenAI) and `kimi` (Moonshot) are **fixed baselines — on every round**. The rest of the roster rotates per round via `select_roster.sh`: a weighted random draw over `antigravity` (agy / Gemini 3.7 Flash, fast lap), `gemini-pro` (agy / Gemini 3.1 Pro, deep lap), and the OpenRouter pool — `glm` (GLM 5.3, Zhipu), `deepseek` (DeepSeek V4 Pro), `mimo` (Xiaomi MiMo v2.5), `minimax` (MiniMax M3), `qwen` (Qwen3 Coder Next, Alibaba), `devstral` (Devstral 2, Mistral), `laguna` (Poolside Laguna M.1), `kat` (KAT-Coder-Pro V2.5, Kuaishou), `north` (Cohere North Mini Code, free tier), `nemotron` (NVIDIA Nemotron 3.5 Lightning, free tier), `spark` (Meta Muse Spark 1.2), `seed` (ByteDance Seed 2.0 Code, added 2026-08-14), `grok` (xAI Grok 4.6, added 2026-08-14), `longcat` (Meituan LongCat 2.0, added 2026-08-22), `inkling` (Thinking Machines Inkling, added 2026-08-22) — plus two seats on the **direct Moonshot platform API** (NOT an OpenRouter fallback, same billing rail as the kimi baseline): `kimi27` (Kimi k2.7-code, added 2026-07-03) and `kimi3` (Kimi K3, Moonshot's 2.8T-parameter flagship released 2026-07-16, added as a rotation seat 2026-07-18). Both carried a `draw_boost` while they were new; both are back to 1.0 (kimi27 on 2026-07-12, kimi3 on 2026-08-22). Same provider as the kimi baseline — kimi+kimi27+kimi3 agreement is ONE provider vote. Draw weights come from the `leaderboard.sh` score, with an exploration bonus for under-sampled reviewers and an optional per-reviewer `draw_boost` multiplier from `reviewer_profiles.json`. **Every round has at least 3 reviewers.** See "Leaderboard & rotation" below.
+**Feature flags (2026-09-07).** Three environment flags decide which fleet you get. They live in `scripts/lib_flags.sh`, which `detect_reviewers.sh`, `select_roster.sh` and `run_reviewers.sh` all source, so detection, the draw and dispatch cannot disagree:
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `CROSS_REVIEW_GLM_BASELINE` | `1` (on) | `glm-coding` — GLM 5.3 on Gabriel's **GLM Coding Lite** plan, via Z.ai's coding endpoint — is a fixed baseline. |
+| `CROSS_REVIEW_KIMI_BASELINE` | `0` (off) | The old `kimi` CLI baseline. Set to `1` to bring it back (both baselines can run together). |
+| `CROSS_REVIEW_OPENROUTER` | `0` (off) | The **whole** OpenRouter implementation: the 15-seat rotation pool *and* the per-seat `or_fallback` rescue lane. |
+
+Why: the kimi CLI baseline was metered Moonshot spend (~$20/day at its worst, see `docs/investigation-cr-model-cost-2026-08-29.md`) and the Coding Plan is flat-rate, so `glm-coding` reviews every round at no marginal cost. The OpenRouter lane is off "for now" — paused, not deleted. Restoring the previous fleet exactly:
+
+```bash
+CROSS_REVIEW_KIMI_BASELINE=1 CROSS_REVIEW_GLM_BASELINE=0 CROSS_REVIEW_OPENROUTER=1 <command>
+```
+
+A malformed flag value is a hard error (exit 2), never a silent default — a typo'd kill switch that quietly does nothing is the failure a kill switch exists to prevent.
+
+**The fleet (baselines + rotation):** `codex` (OpenAI) and `glm-coding` (GLM 5.3 on the Z.ai Coding Plan) are **fixed baselines — on every round**; `kimi` (Moonshot) is the same thing behind `CROSS_REVIEW_KIMI_BASELINE=1`. With `CROSS_REVIEW_OPENROUTER=0` (the default) the rotation draw is the two `agy` Gemini laps; the OpenRouter seats described below light up again when the flag is on. The rest of the roster rotates per round via `select_roster.sh`: a weighted random draw over `antigravity` (agy / Gemini 3.7 Flash, fast lap), `gemini-pro` (agy / Gemini 3.1 Pro, deep lap), and the OpenRouter pool — `glm` (GLM 5.3, Zhipu), `deepseek` (DeepSeek V4 Pro), `mimo` (Xiaomi MiMo v2.5), `minimax` (MiniMax M3), `qwen` (Qwen3 Coder Next, Alibaba), `devstral` (Devstral 2, Mistral), `laguna` (Poolside Laguna M.1), `kat` (KAT-Coder-Pro V2.5, Kuaishou), `north` (Cohere North Mini Code, free tier), `nemotron` (NVIDIA Nemotron 3.5 Lightning, free tier), `spark` (Meta Muse Spark 1.2), `seed` (ByteDance Seed 2.0 Code, added 2026-08-14), `grok` (xAI Grok 4.6, added 2026-08-14), `longcat` (Meituan LongCat 2.0, added 2026-08-22), `inkling` (Thinking Machines Inkling, added 2026-08-22) — plus two seats on the **direct Moonshot platform API** (NOT an OpenRouter fallback, same billing rail as the kimi baseline): `kimi27` (Kimi k2.7-code, added 2026-07-03) and `kimi3` (Kimi K3, Moonshot's 2.8T-parameter flagship released 2026-07-16, added as a rotation seat 2026-07-18). Both carried a `draw_boost` while they were new; both are back to 1.0 (kimi27 on 2026-07-12, kimi3 on 2026-08-22). Same provider as the kimi baseline — kimi+kimi27+kimi3 agreement is ONE provider vote. Draw weights come from the `leaderboard.sh` score, with an exploration bonus for under-sampled reviewers and an optional per-reviewer `draw_boost` multiplier from `reviewer_profiles.json`. **Every round has at least 3 reviewers.** See "Leaderboard & rotation" below.
 
 **On the Gemini fleet:** `antigravity` and `gemini-pro` are both Google-Gemini reviewers running through the **same** `agy` (Antigravity) CLI, differing only by `--model` (Flash High vs. Pro High). The `agy` CLI replaced the standalone `gemini` CLI, which stopped serving consumer requests on **2026-06-18**. Because they share a provider, treat Flash↔Pro agreement as **one** provider's vote, not two independent ones. They also **share one Google "Individual quota"** (resets on a ~2-day cadence) — when it's exhausted, agy exits 0 with empty stdout in seconds and only the `.agy.log` says why; the wrapper detects this (`failure_kind: "quota_exhausted"` + an `agy.quota_exhausted` sentinel). The sentinel spares **retries and the fact-check pass** — the concurrently-launched sibling lap usually completes its own doomed ~5s call first, since laps start only 2s apart.
 
@@ -43,11 +59,12 @@ The skill runs in this order. Do not skip steps — each produces state the next
 bash ~/.claude/skills/cross-review/scripts/detect_reviewers.sh
 ```
 
-Prints JSON like `{"codex": true, "antigravity": true, "gemini-pro": true, "kimi": true, "glm": true, "deepseek": true, "mimo": true, "minimax": true, "qwen": true, "devstral": true, "laguna": true, "kat": true, "north": true, "nemotron": true, "spark": true, "seed": true, "grok": true, "longcat": true, "inkling": true, "kimi27": true, "kimi3": true, "openrouter": true}`. Note that `antigravity` and `gemini-pro` both track the **single `agy` binary**, the fifteen OpenRouter-pool reviewers all track the **single `openrouter` condition** (key + curl), and `kimi27`/`kimi3` both track the **single Moonshot platform key**. If none are available, stop and tell the user how to install them:
+Prints JSON like `{"codex": true, "antigravity": true, "gemini-pro": true, "kimi": true, "glm-coding": true, "glm": true, "deepseek": true, "mimo": true, "minimax": true, "qwen": true, "devstral": true, "laguna": true, "kat": true, "north": true, "nemotron": true, "spark": true, "seed": true, "grok": true, "longcat": true, "inkling": true, "kimi27": true, "kimi3": true, "openrouter": true}`. Note that `antigravity` and `gemini-pro` both track the **single `agy` binary**, the fifteen OpenRouter-pool reviewers all track the **single `openrouter` condition** (key + curl), and `kimi27`/`kimi3` both track the **single Moonshot platform key**. If none are available, stop and tell the user how to install them:
 
 - codex: `brew install codex-cli`
 - antigravity + gemini-pro (both via `agy`): `curl -fsSL https://antigravity.google/cli/install.sh | bash`, then `agy login` once
 - kimi: `curl -L code.kimi.com/install.sh | bash`
+- glm-coding (GLM Coding Plan baseline — a key, not a CLI): `export ZAI_API_KEY=...` or `mkdir -p ~/.config/zai && (umask 077; printf '%s\n' '...' > ~/.config/zai/key)`. Endpoint override if the plan moves: `CROSS_REVIEW_ZAI_ENDPOINT`.
 - OpenRouter pool (glm/deepseek/mimo/minimax/qwen/devstral/laguna/kat/north/nemotron/spark/seed/grok/longcat/inkling): create a key at openrouter.ai, then `export OPENROUTER_API_KEY=...` or `mkdir -p ~/.config/openrouter && (umask 077; printf '%s\n' 'sk-or-...' > ~/.config/openrouter/key)`
 - kimi27 + kimi3 (Kimi k2.7-code and Kimi K3, direct Moonshot): `export MOONSHOT_API_KEY=...` or `mkdir -p ~/.config/moonshot && (umask 077; printf '%s\n' 'sk-...' > ~/.config/moonshot/key)` — same platform key the kimi baseline bills against
 
@@ -55,9 +72,17 @@ Do not proceed with zero reviewers. (The standalone `gemini` CLI is no longer us
 
 #### Baselines fail closed
 
-`codex` and `kimi` are **fixed baselines**, not rotating seats. If either is
-unavailable, `detect_reviewers.sh` prints its JSON as usual and then **exits 1**.
-Callers must treat a non-zero exit as "do not run a round."
+`codex` plus whichever baseline the flags select — `glm-coding` by default,
+`kimi` under `CROSS_REVIEW_KIMI_BASELINE=1`, or both — are **fixed baselines**,
+not rotating seats. If any of them is unavailable, `detect_reviewers.sh` prints
+its JSON as usual and then **exits 1**. Callers must treat a non-zero exit as
+"do not run a round."
+
+For `glm-coding`, "unavailable" means **no key**, not a missing binary: put the
+GLM Coding Plan key in `~/.config/zai/key` or export `ZAI_API_KEY`. Until you
+do, every round refuses to start — which is the intended behaviour, not a
+regression: it is the same fail-closed rule that caught nine baseline-less
+rounds in 2026-08.
 
 This used to be advisory — a missing baseline just reported `false` and the round
 proceeded a reviewer short while looking perfectly healthy. On 2026-08-14 `codex`
@@ -208,6 +233,7 @@ if [ -x ~/.claude/skills/repomix-handoff/scripts/detect_repomix.sh ] && \
   for r in $(echo "$roster" | tr ',' ' '); do
     case "$r" in
       codex|kimi) preset="$r" ;;
+      glm-coding) preset=kimi ;;   # 200k-class budget, same diff-only shape as kimi
       antigravity|gemini-pro) preset=gemini ;;
       *) preset=kimi ;;   # OpenRouter pool / kimi27 / kimi3: 160–200k-class budgets
     esac
@@ -299,7 +325,7 @@ rather export it.
 Omit it when reviewing a plain checkout that is on a real branch; the git-derived
 behaviour is unchanged there.
 
-`select_roster.sh --json` picks codex + kimi (fixed baselines) plus a leaderboard-weighted random draw from the rotation pool (default 2 picks, always ≥3 reviewers total), and its stdout carries the full decision record: `roster`, `baselines`, `selected`, `seed`, `policy_version`, and a `candidates` array (every pool member considered, with its score/weight/latest_status). The stderr candidate lines are still printed for the log tail — surface the roster line to the user same as before. Pass `--reviewers <comma-list>` directly to `run_reviewers.sh` (skipping `select_roster.sh` entirely) only when the user asks for specific reviewers or for the full fleet.
+`select_roster.sh --json` picks codex + the flagged baseline (`glm-coding` by default, `kimi` under `CROSS_REVIEW_KIMI_BASELINE=1`) plus a leaderboard-weighted random draw from the rotation pool (default 2 picks, always ≥3 reviewers total), and its stdout carries the full decision record: `roster`, `baselines`, `selected`, `seed`, `policy_version`, and a `candidates` array (every pool member considered, with its score/weight/latest_status). The stderr candidate lines are still printed for the log tail — surface the roster line to the user same as before. Pass `--reviewers <comma-list>` directly to `run_reviewers.sh` (skipping `select_roster.sh` entirely) only when the user asks for specific reviewers or for the full fleet.
 
 The wrapper handles the flag dialects:
 
