@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # select_roster.sh — pick this round's reviewer roster.
 #
-# Contract (2026-07-01, per Gabriel):
-#   - codex and kimi are FIXED BASELINES — always on when installed.
+# Contract (2026-07-01, per Gabriel; baselines re-flagged 2026-09-07):
+#   - codex plus ONE flagged partner are FIXED BASELINES — always on when
+#     available. The partner is glm-coding by default (GLM Coding Plan) and
+#     kimi when CROSS_REVIEW_KIMI_BASELINE=1. See lib_flags.sh.
 #   - Every round has AT LEAST 3 reviewers.
 #   - The rest rotate: a weighted random draw over the available pool
 #     (agy Gemini laps + the OpenRouter fleet), so we're not paying for every
@@ -88,10 +90,29 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 # reported it available. See lib_path.sh.
 # shellcheck source=lib_path.sh
 . "$script_dir/lib_path.sh"
+# Baseline/OpenRouter feature flags — shared with detect_reviewers.sh and
+# run_reviewers.sh so the three cannot disagree about who exists.
+# shellcheck source=lib_flags.sh
+. "$script_dir/lib_flags.sh"
 
 has_openrouter() {
+  # The flag comes FIRST and covers the whole lane: with
+  # CROSS_REVIEW_OPENROUTER off (the default since 2026-09-07) there is no
+  # OpenRouter pool even on a machine with a valid key. Gating here rather
+  # than at the POOL+= line means every caller of has_openrouter -- present
+  # and future -- inherits the switch.
+  cr_openrouter_on || return 1
   command -v curl >/dev/null 2>&1 || return 1
   [[ -n "${OPENROUTER_API_KEY:-}" || -s "$HOME/.config/openrouter/key" ]]
+}
+
+has_zai() {
+  # glm-coding's availability probe: a key, not a binary. Deliberately NOT
+  # routed through has_openrouter -- the Coding Plan endpoint is a different
+  # provider on a different bill, and the OpenRouter kill switch must not take
+  # the baseline down with it.
+  command -v curl >/dev/null 2>&1 || return 1
+  [[ -n "${ZAI_API_KEY:-}" || -n "${Z_AI_API_KEY:-}" || -s "$HOME/.config/zai/key" ]]
 }
 
 has_moonshot() {
@@ -102,8 +123,20 @@ has_moonshot() {
 # --- availability ------------------------------------------------------------
 BASELINES=()
 missing_baselines=()
-if command -v codex >/dev/null 2>&1; then BASELINES+=(codex); else missing_baselines+=(codex); fi
-if command -v kimi  >/dev/null 2>&1; then BASELINES+=(kimi);  else missing_baselines+=(kimi);  fi
+# WHICH seats are baselines comes from lib_flags.sh, so this script and
+# detect_reviewers.sh cannot answer differently. Availability is still checked
+# per seat and in the seat's own currency: a binary on PATH for the CLI lanes,
+# a key for the curl lane.
+for _b in $(cr_baseline_names); do
+  case "$_b" in
+    codex)
+      if command -v codex >/dev/null 2>&1; then BASELINES+=(codex); else missing_baselines+=(codex); fi ;;
+    glm-coding)
+      if has_zai; then BASELINES+=(glm-coding); else missing_baselines+=(glm-coding); fi ;;
+    kimi)
+      if command -v kimi >/dev/null 2>&1; then BASELINES+=(kimi); else missing_baselines+=(kimi); fi ;;
+  esac
+done
 
 # Fail closed, exactly as detect_reviewers.sh does. A missing baseline used to
 # be a stderr WARN plus a silently raised rotation count, which produces a
@@ -118,10 +151,16 @@ if [[ ${#missing_baselines[@]} -gt 0 ]]; then
   if [[ "${CROSS_REVIEW_ALLOW_MISSING_BASELINE:-0}" == "1" ]]; then
     echo "select_roster: WARN baseline(s) not installed: ${missing_baselines[*]} (allowed via CROSS_REVIEW_ALLOW_MISSING_BASELINE)" >&2
   else
-    echo "select_roster: baseline(s) not installed: ${missing_baselines[*]}" >&2
-    echo "  Do not run a round without them. Usually PATH, not a missing install:" >&2
-    echo "  codex and kimi are npm globals under the nvm bin dir, and nvm is a" >&2
-    echo "  shell function that never runs in a non-interactive shell." >&2
+    echo "select_roster: baseline(s) unavailable: ${missing_baselines[*]}" >&2
+    echo "  Do not run a round without them. For the CLI baselines this is usually" >&2
+    echo "  PATH, not a missing install: codex and kimi are npm globals under the" >&2
+    echo "  nvm bin dir, and nvm is a shell function that never runs in a" >&2
+    echo "  non-interactive shell." >&2
+    case " ${missing_baselines[*]} " in
+      *" glm-coding "*)
+        echo "  glm-coding is a KEY, not an install: ~/.config/zai/key or \$ZAI_API_KEY." >&2
+        echo "  Or go back to kimi: CROSS_REVIEW_GLM_BASELINE=0 CROSS_REVIEW_KIMI_BASELINE=1" >&2 ;;
+    esac
     echo "  Check 'command -v codex'; set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1" >&2
     echo "  only for a deliberate degraded spot check." >&2
     exit 3   # dedicated: run_reviewers.sh must not read this as "selector unavailable"

@@ -131,6 +131,25 @@ Valid model IDs on the Moonshot endpoint (as of 2026-04): `kimi-k2.5`, `kimi-k2-
 
 If the user has a `code.kimi.com/coding/v1` subscription key instead of a Moonshot platform key, run `kimi login` interactively once — kimi-cli handles that provider natively (`type = "kimi"`, no manual config needed).
 
+## glm-coding (GLM Coding Plan — no CLI)
+
+The fixed non-codex baseline since 2026-09-07, gated by `CROSS_REVIEW_GLM_BASELINE` (default on). There is **no binary to install**: the lane is `curl` against Z.ai's OpenAI-compatible coding endpoint, driven by the same `run_openrouter_reviewer` body the OpenRouter pool uses, with a different endpoint, key and bill.
+
+```bash
+POST https://api.z.ai/api/coding/paas/v4/chat/completions
+Authorization: Bearer $ZAI_API_KEY        # header reaches curl on stdin, never argv
+{"model": "glm-5.3", "messages": [{"role": "user", "content": "<prompt+diff>"}], "stream": false}
+```
+
+- **Key**: `$ZAI_API_KEY`, else `$Z_AI_API_KEY` (what Z.ai's own docs print), else `~/.config/zai/key` (single line, `chmod 600`). No key → the baseline is unavailable and the round refuses to start (fail-closed, same rule as a missing `codex`).
+- **Endpoint**: overridable with `$CROSS_REVIEW_ZAI_ENDPOINT` — Z.ai serves plan traffic from more than one base depending on region and tier, and a plan change should not need a code change.
+- **Model**: pinned in `reviewer_profiles.json` (`glm-coding.model`, currently `glm-5.3`), like every other model id in the fleet. Note the slug has **no `z-ai/` prefix** — that prefix is OpenRouter's namespacing, not Z.ai's.
+- **No `X-Title` header.** That is OpenRouter-specific attribution metadata; sending it to other endpoints is noise (kimi27's first sampled finding).
+- **Not covered by the OpenRouter kill switch.** `CROSS_REVIEW_OPENROUTER=0` disables the pool and the `or_fallback` rescue lane; `glm-coding` talks to Z.ai directly and keeps running. That separation is the point of the seat.
+- **Same provider as the `glm` rotation seat** (Zhipu, and the same GLM 5.3 weights). If both ever run in one round, their agreement is **one** provider vote, not two.
+- **Cost**: flat-rate subscription, so `pricing` is `0/0` in the profile — genuinely zero marginal cost per round, not "unknown". The API response carries **no `cost` field** (unlike OpenRouter's `usage.include`), so `meta.cost_usd` is `null` and `leaderboard.sh` estimates from `pricing` → $0.
+- **Verified live 2026-09-07**: a real round on this repo returned 4 structured findings in 178s (8,783 prompt / 12,111 completion tokens), `cli: "zai"`, `model: "glm-5.3"`. The endpoint and slug above are measured, not inferred.
+
 ## Known issues and gotchas
 
 - **All CLIs can cold-start slowly** on first run of the day (30–60s). Per-reviewer timeouts default to codex=300s, antigravity=600s, gemini-pro=900s, kimi=600s; if one hits its cap, it's usually auth or network, not actual work.
