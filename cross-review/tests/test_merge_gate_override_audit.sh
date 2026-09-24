@@ -35,6 +35,11 @@ assert_contains() {
 
 [[ -x "$MG_HOOK" ]] || { echo "FATAL: $MG_HOOK missing or not executable"; exit 1; }
 
+# The hook also runs the Codex-review check by default, which calls `gh`
+# against the PR. These cases are about the cross-review override alone, and
+# this file has no gh shim — keep them offline.
+export MERGE_GATE_CHECKS=cross-review
+
 # A throwaway git repo so `git rev-parse HEAD` / `git remote get-url origin`
 # inside the hook resolve to something real, without touching the actual repo
 # this test runs from.

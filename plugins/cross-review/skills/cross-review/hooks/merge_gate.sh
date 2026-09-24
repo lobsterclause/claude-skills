@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 # merge_gate.sh — PreToolUse hook: refuse `gh pr merge` when the PR's newest
-# cross-review record is bound to a commit other than the one being merged.
+# cross-review record is bound to a commit other than the one being merged, or
+# when Codex (the chatgpt-codex-connector app) has an unresolved review thread
+# or a review still running on it (scripts/codex_review_preflight.sh).
+#
+# MERGE_GATE_CHECKS selects the checks: "cross-review", "codex", or both
+# (the default, "cross-review,codex"). CROSS_REVIEW_MERGE_OVERRIDE=1 waives
+# the cross-review check only — a Codex thread clears by being resolved on the
+# PR, which is its own visible record, so there is no env-var bypass for it.
+#
+# The payload shape is the same for Codex CLI's PreToolUse hooks, so the same
+# script gates Codex's merges too — see ~/.codex/config.toml:
+#
+#   [[hooks.PreToolUse]]
+#   matcher = "^Bash$"
+#   [[hooks.PreToolUse.hooks]]
+#   type = "command"
+#   command = "MERGE_GATE_CHECKS=codex /Users/<you>/.claude/skills/cross-review/hooks/merge_gate.sh"
 #
 # Why a hook and not a note in the skill: prose is advisory, and an agent that
 # can forget it will. The harness runs this regardless of what the agent
@@ -55,7 +71,15 @@ cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // ""' 2>/dev/null ||
 
 hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 preflight="$hook_dir/../scripts/merge_preflight.sh"
-[[ -f "$preflight" ]] || pass
+codex_preflight="$hook_dir/../scripts/codex_review_preflight.sh"
+run_cr=0; run_codex=0
+case ",${MERGE_GATE_CHECKS:-cross-review,codex}," in
+  *,cross-review,*) [[ -f "$preflight" ]] && run_cr=1 ;;
+esac
+case ",${MERGE_GATE_CHECKS:-cross-review,codex}," in
+  *,codex,*) [[ -f "$codex_preflight" ]] && run_codex=1 ;;
+esac
+(( run_cr || run_codex )) || pass
 
 # Text that merely *quotes* the command must not trip the gate — a commit
 # message explaining a merge, or a PR body describing this very hook, both
@@ -249,10 +273,14 @@ while IFS= read -r seg; do
   # antigravity, #55 pass 3).
   printf '%s' "$seg" | grep -qE "$OVERRIDE_SEG_RE" && printf '%s' "$seg" | grep -qE "$MERGE_SEG_RE" && n_override=$((n_override + 1))
 done < <(split_segments "$cmd_only")
-if (( n_override > 0 )); then
+# A fully-overridden line skips the cross-review check but NOT the Codex one:
+# the override was approved for trivial deltas after a clean review, and an
+# unanswered Codex finding is not a delta at all.
+if (( n_override > 0 && run_cr )); then
   log_override_audit
-  (( n_override == n_merge )) && pass
+  (( n_override == n_merge )) && run_cr=0
 fi
+(( run_cr || run_codex )) || pass
 
 dequote() {
   local s="$1"
@@ -325,23 +353,41 @@ invocations="$(printf '%s' "$cmd_only" | awk '
 
 verdict_json=""
 unbound_json=""
+codex_json=""
+
+# codex_blocks <pr-ref> [repo] — true (and codex_json set) when Codex has an
+# unresolved thread or a review in flight on that PR. Fails open with the
+# preflight: anything but an explicit `blocked` lets the merge through.
+codex_blocks() {
+  (( run_codex )) || return 1
+  local r
+  if [[ -n "${2:-}" ]]; then
+    r="$(bash "$codex_preflight" --pr "$1" --repo "$2" --json 2>/dev/null || true)"
+  else
+    r="$(bash "$codex_preflight" --pr "$1" --json 2>/dev/null || true)"
+  fi
+  [[ "$(printf '%s' "$r" | jq -r '.status // ""' 2>/dev/null || true)" == "blocked" ]] || return 1
+  codex_json="$r"
+}
 
 # REST merges first: one preflight per repos/O/R/pulls/N/merge in the command.
 while IFS= read -r spec; do
   [[ -n "$spec" ]] || continue
   api_repo="${spec%% *}"; api_pr="${spec##* }"
-  result="$(bash "$preflight" --pr "$api_pr" --repo "$api_repo" --json 2>/dev/null || true)"
-  [[ -n "$result" ]] || continue
-  if [[ "$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)" == "stale" ]]; then
-    verdict_json="$result"
-    break
+  if (( run_cr )); then
+    result="$(bash "$preflight" --pr "$api_pr" --repo "$api_repo" --json 2>/dev/null || true)"
+    if [[ "$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)" == "stale" ]]; then
+      verdict_json="$result"
+      break
+    fi
   fi
+  codex_blocks "$api_pr" "$api_repo" && break
 done <<API
 $(printf '%s' "$cmd_only" | grep -oE "$API_MERGE_RE" \
    | sed -E 's#repos/([^/ ]+/[^/ ]+)/pulls/([0-9]+)/merge#\1 \2#')
 API
 
-[[ -n "$verdict_json" ]] || while IFS= read -r args; do
+[[ -n "$verdict_json" || -n "$codex_json" ]] || while IFS= read -r args; do
   [[ -n "$args" ]] || continue
   args="${args#@}"
   # Arguments end at the next shell separator.
@@ -356,18 +402,22 @@ API
     [[ -n "$pr_ref" && "$pr_ref" != "HEAD" ]] || continue
   fi
 
-  if [[ -n "$INV_REPO" ]]; then
-    result="$(bash "$preflight" --pr "$pr_ref" --repo "$INV_REPO" --json 2>/dev/null || true)"
-  else
-    result="$(bash "$preflight" --pr "$pr_ref" --json 2>/dev/null || true)"
+  result=""; inv_status=""
+  if (( run_cr )); then
+    if [[ -n "$INV_REPO" ]]; then
+      result="$(bash "$preflight" --pr "$pr_ref" --repo "$INV_REPO" --json 2>/dev/null || true)"
+    else
+      result="$(bash "$preflight" --pr "$pr_ref" --json 2>/dev/null || true)"
+    fi
+    inv_status="$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)"
+    if [[ "$inv_status" == "stale" ]]; then
+      verdict_json="$result"
+      break
+    fi
   fi
-  [[ -n "$result" ]] || continue
-
-  inv_status="$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)"
-  if [[ "$inv_status" == "stale" ]]; then
-    verdict_json="$result"
-    break
-  fi
+  # Codex is checked for every merge the cross-review check did not already
+  # refuse — including overridden ones, where run_cr is off.
+  codex_blocks "$pr_ref" "$INV_REPO" && break
   # A `clear` verdict says THIS commit was reviewed. Between that read and
   # GitHub handling the merge, a push can land — and the merge would take the
   # new head. `--match-head-commit` makes GitHub itself refuse in that case,
@@ -391,6 +441,31 @@ deny() {
   }'
   exit 0
 }
+
+if [[ -n "$codex_json" ]]; then
+  c_reason="$(printf '%s' "$codex_json" | jq -r '.reason // ""' 2>/dev/null || true)"
+  c_running="$(printf '%s' "$codex_json" | jq -r '.running | length' 2>/dev/null || echo 0)"
+  c_threads="$(printf '%s' "$codex_json" | jq -r '.unresolved | length' 2>/dev/null || echo 0)"
+  c_steps=""
+  if [[ "${c_running:-0}" -gt 0 ]]; then
+    c_steps+="
+Codex is still reviewing. Wait for its summary comment to show Completed, then handle whatever it posts before merging."
+  fi
+  if [[ "${c_threads:-0}" -gt 0 ]]; then
+    c_steps+="
+For each thread: fix it and push, or reply on the thread with why it does not apply. Then resolve it:
+
+  gh api graphql -f query='mutation(\$id:ID!){resolveReviewThread(input:{threadId:\$id}){thread{isResolved}}}' -f id=<thread>
+
+Resolve only what you actually addressed — the resolution is the record that someone did. If a finding needs the user's call, ask them instead of resolving it."
+  fi
+  deny "Codex review comments are merge-gating, and this PR has open ones.
+
+${c_reason}
+${c_steps}
+
+Do not re-issue this command until the list above is empty."
+fi
 
 if [[ -z "$verdict_json" ]]; then
   [[ -n "$unbound_json" ]] || pass
