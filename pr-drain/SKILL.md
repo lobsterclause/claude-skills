@@ -592,6 +592,11 @@ whole queue for closing keywords once, up front** — one `gh pr view --json bod
 And when you write the explanatory note, do not restate the literal keyword in it: writing
 "the original `Closes #N` was changed" re-arms the parser you just disarmed. Grep the
 final body to confirm zero closing keywords remain rather than trusting the edit.
+**Check first whether the repo re-arms the keyword itself.** kindred-mama-ai's
+`pr-issue-autoclose` workflow prepends `Closes #N` to any `agent/issue-<N>-*` PR, taking
+N from the branch name, and your body edit is the event that triggers it. The keyword is
+back seconds later, after your grep has passed. There, the defusal is not merging: label
+`needs-human` and say in the PR comment that a merge closes #N (#3998, 2026-09-24).
 
 **The same up-front sweep catches the opposite case: a NET-DESTRUCTIVE diff.** Jules'
 #3984 (`+632/−9778`, 130 files) claimed to "extract" a primitive. Its branch deleted
