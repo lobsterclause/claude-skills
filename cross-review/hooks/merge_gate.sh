@@ -78,6 +78,30 @@ esac
 
 command -v jq >/dev/null 2>&1 || pass
 
+# Both harnesses this hook serves (Claude Code, Codex CLI) send the command as
+# one string. An argv ARRAY is refused rather than parsed: two review passes
+# of trying to turn argv back into a command line each opened a new fail-open
+# (a split multi-word --body shifted the PR; rewriting `feature$foo` changed
+# the ref; `env bash -lc …` hid the script) — codex P1s, cross-review
+# passes 2 and 3. Nothing sends this shape today, so refusing it is cheap.
+# It reads text, like everything else here, so it is a guardrail and not a
+# boundary: `["bash","-c","gh${X} pr merge 7"]` still gets past it, exactly
+# as the string `gh${X} pr merge 7` gets past the string path (GLM, pass 5).
+# --disable-auto is not exempted: exempting it by element would let
+# ["sh","-c","gh pr merge 7","--disable-auto"] through (codex P2, declined).
+# It sits above the check selection because it needs neither preflight.
+if [[ "$(printf '%s' "$payload" | jq -r '.tool_input.command | type' 2>/dev/null)" == "array" ]] \
+   && printf '%s' "$payload" | jq -e '
+        (.tool_input.command | map(tostring)) as $a
+        | ($a | join(" ") | test("gh\\s+pr\\s+merge|pulls/[0-9]+/merge"))
+          or ([range(0; ($a | length) - 2) as $i
+               | select(($a[$i] | test("(^|/)gh$")) and $a[$i + 1] == "pr" and $a[$i + 2] == "merge")]
+              | length > 0)' >/dev/null 2>&1; then
+  # Backticks escaped: unescaped, this message RAN `gh pr merge <n>
+  # --disable-auto` as a command substitution every time it fired (GLM, pass 5).
+  deny "This merge command arrived as an argv array, which the merge gate does not parse (see merge_gate.sh). Re-issue it as a single shell command string so the gate can check it — that includes \`gh pr merge <n> --disable-auto\`, which is never gated as a string."
+fi
+
 cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // "" | tostring' 2>/dev/null || true)"
 [[ -n "$cmd" ]] || pass
 
@@ -100,26 +124,6 @@ case ",$checks," in
   *,codex,*) [[ -f "$codex_preflight" ]] && run_codex=1 ;;
 esac
 (( run_cr || run_codex )) || pass
-
-# Both harnesses this hook serves (Claude Code, Codex CLI) send the command as
-# one string. An argv ARRAY is refused rather than parsed: two review passes
-# of trying to turn argv back into a command line each opened a new fail-open
-# (a split multi-word --body shifted the PR; rewriting `feature$foo` changed
-# the ref; `env bash -lc …` hid the script) — codex P1s, cross-review
-# passes 2 and 3.
-# Nothing sends this shape today, so refusing it costs nothing and cannot be
-# argued around by a clever element. That includes --disable-auto: exempting
-# it by element would let ["sh","-c","gh pr merge 7","--disable-auto"]
-# through (codex P2, confirmation pass — declined for that reason).
-if [[ "$(printf '%s' "$payload" | jq -r '.tool_input.command | type' 2>/dev/null)" == "array" ]] \
-   && printf '%s' "$payload" | jq -e '
-        (.tool_input.command | map(tostring)) as $a
-        | ($a | join(" ") | test("gh\\s+pr\\s+merge|pulls/[0-9]+/merge"))
-          or ([range(0; ($a | length) - 2) as $i
-               | select(($a[$i] | test("(^|/)gh$")) and $a[$i + 1] == "pr" and $a[$i + 2] == "merge")]
-              | length > 0)' >/dev/null 2>&1; then
-  deny "This merge command arrived as an argv array, which the merge gate does not parse (see merge_gate.sh). Re-issue it as a single shell command string so the gate can check it — that includes `gh pr merge <n> --disable-auto`, which is never gated as a string."
-fi
 
 # Text that merely *quotes* the command must not trip the gate — a commit
 # message explaining a merge, or a PR body describing this very hook, both
@@ -175,8 +179,13 @@ MERGE_RE='(^|[;&|(]|[[:space:]])[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[
 # that hits the deny below can reach for it in one step, which makes it the
 # most likely bypass in practice rather than the least.
 API_MERGE_RE='repos/[^/ ]+/[^/ ]+/pulls/[0-9]+/merge'
+# The literal form above misses a path the shell completes at run time —
+# `repos/$REPO/pulls/$N/merge` has neither two literal segments nor a number —
+# so detection uses this looser shape, and anything it finds that is not the
+# literal form is refused below rather than waved through (gemini-pro, pass 5).
+API_MERGE_ANY_RE='repos/[^ ]*/pulls/[^/ ]+/merge'
 if ! printf '%s' "$cmd_only" | grep -qE "$MERGE_RE" \
-   && ! printf '%s' "$cmd_only" | grep -qE "$API_MERGE_RE"; then
+   && ! printf '%s' "$cmd_only" | grep -qE "$API_MERGE_ANY_RE"; then
   pass
 fi
 
@@ -410,10 +419,34 @@ codex_blocks() {
   codex_json="$r"
 }
 
+# A target the shell fills in at run time (`gh pr merge "$PR"`, `--repo
+# "$R"`, `repos/$R/pulls/$N/merge`) cannot be looked up: the preflights would
+# query the literal text, fail, and fail OPEN — while the shell merged the real
+# PR. Such a merge is refused with a request for literal values (gemini-pro
+# High, pass 5).
+unresolvable=""
+is_dynamic() { case "$1" in *'$'*|*'`'*) return 0 ;; esac; return 1; }
+
+# GH_REPO=o/r in front of the merge picks the repository exactly as --repo
+# does; the invocation parser only sees what follows `gh pr merge`, so read it
+# here (gemini-pro High, pass 5).
+env_repo="$(printf '%s' "$cmd_only" \
+  | grep -oE "(^|[[:space:];&|(])GH_REPO=(\"[^\"]*\"|'[^']*'|[^[:space:];&|()]+)" \
+  | head -n1 | sed -E 's/^.*GH_REPO=//')"
+env_repo="$(dequote "$env_repo")"
+
 # REST merges first: one preflight per repos/O/R/pulls/N/merge in the command.
 while IFS= read -r spec; do
   [[ -n "$spec" ]] || continue
+  if is_dynamic "$spec" || ! [[ "$spec" =~ ^repos/[^/]+/[^/]+/pulls/[0-9]+/merge$ ]]; then
+    unresolvable="$spec"
+    break
+  fi
+  spec="$(printf '%s' "$spec" | sed -E 's#repos/([^/ ]+/[^/ ]+)/pulls/([0-9]+)/merge#\1 \2#')"
   api_repo="${spec%% *}"; api_pr="${spec##* }"
+  # gh expands {owner}/{repo} from the current checkout; so does a lookup
+  # with no --repo.
+  [[ "$api_repo" == "{owner}/{repo}" ]] && api_repo=""
   if (( run_cr )); then
     result="$(bash "$preflight" --pr "$api_pr" --repo "$api_repo" --json 2>/dev/null || true)"
     if [[ "$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)" == "stale" ]]; then
@@ -423,11 +456,10 @@ while IFS= read -r spec; do
   fi
   codex_blocks "$api_pr" "$api_repo" && break
 done <<API
-$(printf '%s' "$cmd_only" | grep -oE "$API_MERGE_RE" \
-   | sed -E 's#repos/([^/ ]+/[^/ ]+)/pulls/([0-9]+)/merge#\1 \2#')
+$(printf '%s' "$cmd_only" | grep -oE "$API_MERGE_ANY_RE")
 API
 
-[[ -n "$verdict_json" || -n "$codex_json" ]] || while IFS= read -r args; do
+[[ -n "$verdict_json" || -n "$codex_json" || -n "$unresolvable" ]] || while IFS= read -r args; do
   [[ -n "$args" ]] || continue
   args="${args#@}"
   # Arguments end at the next shell separator.
@@ -441,11 +473,16 @@ API
     pr_ref="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     [[ -n "$pr_ref" && "$pr_ref" != "HEAD" ]] || continue
   fi
+  inv_repo="${INV_REPO:-$env_repo}"
+  if is_dynamic "$pr_ref" || is_dynamic "$inv_repo"; then
+    unresolvable="gh pr merge ${pr_ref}${inv_repo:+ --repo $inv_repo}"
+    break
+  fi
 
   result=""; inv_status=""
   if (( run_cr )); then
-    if [[ -n "$INV_REPO" ]]; then
-      result="$(bash "$preflight" --pr "$pr_ref" --repo "$INV_REPO" --json 2>/dev/null || true)"
+    if [[ -n "$inv_repo" ]]; then
+      result="$(bash "$preflight" --pr "$pr_ref" --repo "$inv_repo" --json 2>/dev/null || true)"
     else
       result="$(bash "$preflight" --pr "$pr_ref" --json 2>/dev/null || true)"
     fi
@@ -457,7 +494,7 @@ API
   fi
   # Codex is checked for every merge the cross-review check did not already
   # refuse — including overridden ones, where run_cr is off.
-  codex_blocks "$pr_ref" "$INV_REPO" && break
+  codex_blocks "$pr_ref" "$inv_repo" && break
   # A `clear` verdict says THIS commit was reviewed. Between that read and
   # GitHub handling the merge, a push can land — and the merge would take the
   # new head. `--match-head-commit` makes GitHub itself refuse in that case,
@@ -470,6 +507,12 @@ API
 done <<EOF
 $invocations
 EOF
+
+if [[ -n "$unresolvable" ]]; then
+  deny "The merge target is filled in by the shell at run time (${unresolvable}), so the gate cannot look it up — and a lookup that fails would let the merge through unchecked.
+
+Re-issue the merge with a literal PR number and, if it is not this checkout's repository, a literal --repo owner/name."
+fi
 
 if [[ -n "$codex_json" ]]; then
   c_reason="$(printf '%s' "$codex_json" | jq -r '.reason // ""' 2>/dev/null || true)"

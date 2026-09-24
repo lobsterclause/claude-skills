@@ -270,6 +270,34 @@ pf 7
 assert_contains "owner is passed with -f" "$(cat "$ARGS")" " -f owner=acme "
 assert_contains "number is passed with -F" "$(cat "$ARGS")" " -F number=7 "
 
+echo "── preflight: read order, host, clock skew (pass 5) ──"
+
+# The summary must be read BEFORE the threads: a review finishing between the
+# two reads would otherwise look like "no threads, nothing running" (codex P1).
+: >"$ARGS"
+pf 7
+L_SUMMARY="$(grep -n '/comments' "$ARGS" | head -1 | cut -d: -f1)"
+L_THREADS="$(grep -n ' graphql ' "$ARGS" | head -1 | cut -d: -f1)"
+assert_eq "the summary is read before the threads" \
+  "$([[ -n "$L_SUMMARY" && -n "$L_THREADS" && "$L_SUMMARY" -lt "$L_THREADS" ]] && echo yes || echo "no ($L_SUMMARY vs $L_THREADS)")" "yes"
+assert_contains "comments are paged 100 at a time" "$(cat "$ARGS")" "comments?per_page=100"
+
+# A GitHub Enterprise PR keeps its host for the API calls (codex P2).
+printf '{"number":11,"url":"https://ghe.example.com/acme/widgets/pull/11","state":"OPEN","headRefOid":"%s"}' "$HEAD40" >"$FIX/11.pr.json"
+: >"$ARGS"
+pf 11
+assert_eq "an enterprise host is passed to both API calls" \
+  "$(grep -c -- '--hostname ghe.example.com' "$ARGS")" "2"
+: >"$ARGS"
+pf 7
+assert_not_contains "control: github.com needs no --hostname" "$(cat "$ARGS")" "--hostname"
+
+# A review stamped a few seconds in our future must not read "-1 min ago".
+threads_fixture 7 ""
+comments_fixture 7 "$(bot_comment 2026-09-24T06:00:30Z "$(summary "🔄 **Running** since <relative-time datetime=\\\"2026-09-24T06:00:30Z\\\">x</relative-time>")")"
+pf 7
+assert_contains "clock skew reports 0 min, not a negative age" "$(printf '%s' "$PF_OUT" | jq -r '.reason')" "started 0 min ago"
+
 echo "── hook: merge_gate.sh with the Codex check ──"
 
 # mg <command> [env...] → the hook's decision (deny) or PASS; MG_REASON too.
@@ -349,6 +377,43 @@ assert_eq "control: …and passes a clean PR" \
 assert_eq "cancelling an auto-merge is never gated" \
   "$(mg 'gh pr merge 7 --disable-auto --repo acme/widgets')" "PASS"
 assert_eq "a command that is not a merge is ignored" "$(mg 'gh pr view 7 --repo acme/widgets')" "PASS"
+
+# The argv refusal must print its message, not RUN it: unescaped backticks
+# made it execute `gh pr merge <n> --disable-auto` (GLM High, pass 5).
+ARGV_ERR="$T/argv.err"
+ARGV_REASON="$(printf '%s' '{"tool_input":{"command":["gh","pr","merge","7"]}}' \
+  | bash "$MG_HOOK" 2>"$ARGV_ERR" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""')"
+assert_contains "the argv refusal names the string form it allows" "$ARGV_REASON" "gh pr merge <n> --disable-auto"
+assert_eq "…and runs nothing while saying so (no stderr)" "$(wc -c <"$ARGV_ERR" | tr -d ' ')" "0"
+
+# A target the shell fills in cannot be looked up; failing open on it let the
+# real PR merge unchecked (gemini-pro High, pass 5).
+assert_eq "a PR number in a variable is refused" "$(mg 'gh pr merge "$PR" --repo acme/widgets')" "deny"
+mg 'gh pr merge "$PR" --repo acme/widgets' >/dev/null
+assert_contains "…saying why" "$MG_REASON" "filled in by the shell"
+assert_eq "a repo in a variable is refused" "$(mg 'gh pr merge 5 --repo "$REPO"')" "deny"
+assert_eq "a command substitution as the PR is refused" "$(mg 'gh pr merge `cat pr.txt`')" "deny"
+assert_eq "a REST merge path built from variables is refused" \
+  "$(mg 'gh api -X PUT "repos/$REPO/pulls/$N/merge"')" "deny"
+assert_eq "a REST merge with a variable PR number is refused" \
+  "$(mg 'gh api -X PUT repos/acme/widgets/pulls/$N/merge')" "deny"
+
+# GH_REPO in front of the merge selects the repository, as --repo does.
+: >"$ARGS"
+assert_eq "GH_REPO=… gh pr merge is checked against that repo" \
+  "$(mg 'GH_REPO=acme/widgets gh pr merge 7')" "deny"
+assert_contains "…and the lookup carries it as --repo" "$(cat "$ARGS")" "--repo acme/widgets"
+assert_eq "control: GH_REPO with a Codex-clean PR passes" "$(mg 'GH_REPO=acme/widgets gh pr merge 5')" "PASS"
+
+# gh expands {owner}/{repo} from the checkout; the gate looks up the same PR.
+# The shim ignores --repo, so assert on the lookup: real gh cannot resolve a
+# literal "{owner}/{repo}" and the gate would fail open.
+: >"$ARGS"
+assert_eq "a {owner}/{repo} REST merge is gated" \
+  "$(mg "gh api -X PUT 'repos/{owner}/{repo}/pulls/7/merge'")" "deny"
+assert_not_contains "…looking the PR up in this checkout, not in '{owner}/{repo}'" "$(cat "$ARGS")" "{owner}"
+assert_eq "control: …and passes a clean PR" \
+  "$(mg "gh api -X PUT 'repos/{owner}/{repo}/pulls/5/merge'")" "PASS"
 
 comments_fixture 5 "$(bot_comment 2026-09-24T05:50:00Z "$(summary "$RUNNING_FRESH")")"
 assert_eq "a Codex review in flight denies the merge" "$(mg 'gh pr merge 5 --repo acme/widgets')" "deny"
