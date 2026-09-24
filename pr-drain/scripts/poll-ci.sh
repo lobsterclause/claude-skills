@@ -10,7 +10,7 @@
 #
 # Required checks + the commit-status context are read from env (comma-separated), with
 # defaults matching kindred-mama-ai:
-#   PR_DRAIN_CHECKS="Dagger Pipeline,Semgrep Scan,PR Guards"
+#   PR_DRAIN_CHECKS="Dagger Pipeline,Semgrep Scan,PR Guards,CI definition matches base"
 #   PR_DRAIN_STATUS_CONTEXT="cross-review/current"   (set empty to skip)
 #   PR_DRAIN_DRY_RUN=1  -> report WOULD_MERGE instead of merging
 #
@@ -22,7 +22,7 @@ PR="${2:?pr number required}"
 SHA="${3:?head sha required}"
 INTERVAL="${4:-180}"
 MAX_POLLS="${5:-20}"
-CHECKS="${PR_DRAIN_CHECKS:-Dagger Pipeline,Semgrep Scan,PR Guards}"
+CHECKS="${PR_DRAIN_CHECKS:-Dagger Pipeline,Semgrep Scan,PR Guards,CI definition matches base}"
 STATUS_CTX="${PR_DRAIN_STATUS_CONTEXT-cross-review/current}"
 
 IFS=',' read -r -a REQ <<< "$CHECKS"
@@ -35,8 +35,14 @@ for i in $(seq 1 "$MAX_POLLS"); do
     echo "HEAD_MOVED $head (expected $SHA)"; exit 3
   fi
 
-  runs=$(gh api "repos/$REPO/commits/$SHA/check-runs" \
-    --jq '.check_runs[] | "\(.name)|\(.status)|\(.conclusion)"') || continue
+  # The NEWEST run per check name. One SHA can carry several runs of a check (a
+  # re-run, or a superseded trigger cancelled by a concurrency group), and the
+  # API promises no order, so "first matching row" read a stale cancelled
+  # attempt as TERMINAL_FAIL on #3982 (2026-09-17). Check-run ids increase, so
+  # max id = newest. per_page=100: one docs-only head already carried 29 runs,
+  # and a required check past the default page of 30 read as absent forever.
+  runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+    --jq '.check_runs | group_by(.name) | map(max_by(.id)) | .[] | "\(.name)|\(.status)|\(.conclusion)"') || continue
 
   all_green=1; line=""
   for name in "${REQ[@]}"; do
