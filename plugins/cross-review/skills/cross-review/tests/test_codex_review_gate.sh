@@ -295,6 +295,8 @@ assert_eq "an absolute gh path is refused" \
   "$(argv_hook '["/opt/homebrew/bin/gh","pr","merge","7"]')" "deny"
 assert_eq "argv merges are refused even for a Codex-clean PR (fail closed)" \
   "$(argv_hook '["gh","pr","merge","5","--repo","acme/widgets"]')" "deny"
+assert_eq "a --disable-auto element cannot smuggle a merge past the refusal" \
+  "$(argv_hook '["sh","-c","gh pr merge 7","--disable-auto"]')" "deny"
 assert_eq "control: an argv array that is not a PR merge passes" \
   "$(argv_hook '["git","merge","main"]')" "PASS"
 : >"$ARGS"

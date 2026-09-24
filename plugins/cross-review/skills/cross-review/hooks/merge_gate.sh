@@ -106,7 +106,9 @@ esac
 # the ref; `env bash -lc …` hid the script) — codex P1s, cross-review
 # passes 2 and 3.
 # Nothing sends this shape today, so refusing it costs nothing and cannot be
-# argued around by a clever element.
+# argued around by a clever element. That includes --disable-auto: exempting
+# it by element would let ["sh","-c","gh pr merge 7","--disable-auto"]
+# through (codex P2, confirmation pass — declined for that reason).
 if [[ "$(printf '%s' "$payload" | jq -r '.tool_input.command | type' 2>/dev/null)" == "array" ]] \
    && printf '%s' "$payload" | jq -e '
         (.tool_input.command | map(tostring)) as $a
@@ -114,7 +116,7 @@ if [[ "$(printf '%s' "$payload" | jq -r '.tool_input.command | type' 2>/dev/null
           or ([range(0; ($a | length) - 2) as $i
                | select(($a[$i] | test("(^|/)gh$")) and $a[$i + 1] == "pr" and $a[$i + 2] == "merge")]
               | length > 0)' >/dev/null 2>&1; then
-  deny "This merge command arrived as an argv array, which the merge gate does not parse (see merge_gate.sh). Re-issue it as a single shell command string so the gate can check it."
+  deny "This merge command arrived as an argv array, which the merge gate does not parse (see merge_gate.sh). Re-issue it as a single shell command string so the gate can check it — that includes `gh pr merge <n> --disable-auto`, which is never gated as a string."
 fi
 
 # Text that merely *quotes* the command must not trip the gate — a commit
