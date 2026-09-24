@@ -53,6 +53,16 @@ set -uo pipefail
 payload="$(cat)"
 
 pass() { echo '{}'; exit 0; }
+deny() {
+  jq -n --arg r "$1" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: $r
+    }
+  }'
+  exit 0
+}
 
 # Cheap bail-out first — this hook sits on the Bash matcher, so it runs in
 # front of every shell command in the session. `merge` is the cheapest
@@ -66,29 +76,7 @@ esac
 
 command -v jq >/dev/null 2>&1 || pass
 
-# A harness that passes argv instead of a string would otherwise reach the
-# regexes as pretty-printed JSON, where a quote precedes `gh` and no anchor
-# matches — a silent pass on every merge. Two shapes:
-#  * a shell wrapper (["bash","-lc","gh pr merge 7"]): the script IS the
-#    command, so take it verbatim;
-#  * true argv (["gh","pr","merge","--body","release notes","7"]): each
-#    element must stay one word. A plain join split "release notes" in two,
-#    so `--body` consumed "release" and "notes" was read as the PR (codex P1,
-#    pass 2). Whitespace, quotes and separators inside an element become `_`.
-# A quoted heredoc, because the program matches a literal single quote and
-# would end a single-quoted argument mid-regex.
-read -r -d '' CMD_JQ <<'JQEOF' || true
-  .tool_input.command // ""
-  | if type != "array" then tostring
-    else (map(tostring)) as $a
-    | ([range(1; $a | length) | select($a[.] | test("^-[A-Za-z]*c[A-Za-z]*$"))] | first) as $ci
-    | if ($a[0] | test("(^|/)(ba|z|da|k)?sh$")) and $ci != null and ($ci + 1) < ($a | length)
-      then $a[$ci + 1]
-      else $a | map(gsub("[\\s;&|()<>`$\"'\\\\]"; "_")) | join(" ")
-      end
-    end
-JQEOF
-cmd="$(printf '%s' "$payload" | jq -r "$CMD_JQ" 2>/dev/null || true)"
+cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // "" | tostring' 2>/dev/null || true)"
 [[ -n "$cmd" ]] || pass
 
 hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,6 +98,24 @@ case ",$checks," in
   *,codex,*) [[ -f "$codex_preflight" ]] && run_codex=1 ;;
 esac
 (( run_cr || run_codex )) || pass
+
+# Both harnesses this hook serves (Claude Code, Codex CLI) send the command as
+# one string. An argv ARRAY is refused rather than parsed: two review passes
+# of trying to turn argv back into a command line each opened a new fail-open
+# (a split multi-word --body shifted the PR; rewriting `feature$foo` changed
+# the ref; `env bash -lc …` hid the script) — codex P1s, cross-review
+# passes 2 and 3.
+# Nothing sends this shape today, so refusing it costs nothing and cannot be
+# argued around by a clever element.
+if [[ "$(printf '%s' "$payload" | jq -r '.tool_input.command | type' 2>/dev/null)" == "array" ]] \
+   && printf '%s' "$payload" | jq -e '
+        (.tool_input.command | map(tostring)) as $a
+        | ($a | join(" ") | test("gh\\s+pr\\s+merge|pulls/[0-9]+/merge"))
+          or ([range(0; ($a | length) - 2) as $i
+               | select(($a[$i] | test("(^|/)gh$")) and $a[$i + 1] == "pr" and $a[$i + 2] == "merge")]
+              | length > 0)' >/dev/null 2>&1; then
+  deny "This merge command arrived as an argv array, which the merge gate does not parse (see merge_gate.sh). Re-issue it as a single shell command string so the gate can check it."
+fi
 
 # Text that merely *quotes* the command must not trip the gate — a commit
 # message explaining a merge, or a PR body describing this very hook, both
@@ -460,17 +466,6 @@ API
 done <<EOF
 $invocations
 EOF
-
-deny() {
-  jq -n --arg r "$1" '{
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: $r
-    }
-  }'
-  exit 0
-}
 
 if [[ -n "$codex_json" ]]; then
   c_reason="$(printf '%s' "$codex_json" | jq -r '.reason // ""' 2>/dev/null || true)"

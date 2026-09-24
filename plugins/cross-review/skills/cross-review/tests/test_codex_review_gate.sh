@@ -276,20 +276,27 @@ assert_eq "a misspelt MERGE_GATE_CHECKS runs both checks, not neither" \
 ARGV_OUT="$(printf '%s' '{"tool_input":{"command":["bash","-lc","gh pr merge 7 --repo acme/widgets"]}}' \
   | bash "$MG_HOOK" 2>/dev/null | jq -r '.hookSpecificOutput.permissionDecision // "PASS"')"
 assert_eq "an argv-array command is gated like a string one" "$ARGV_OUT" "deny"
-# True argv keeps element boundaries: a multi-word --body must not shift the
-# PR number (codex P1, pass 2). Assert on the PR looked up, then the verdict.
+# An argv array is refused, never parsed: each attempt to rebuild a command
+# line from argv opened a fail-open (codex P1s, cross-review passes 2 and 3).
+# Every shape below used to reach a merge unchecked.
 argv_hook() {
   printf '{"tool_input":{"command":%s}}' "$1" | bash "$MG_HOOK" 2>/dev/null \
     | jq -r '.hookSpecificOutput.permissionDecision // "PASS"'
 }
-: >"$ARGS"
-assert_eq "true argv with a multi-word --body still gates the right PR" \
+assert_eq "argv with a multi-word --body is refused" \
   "$(argv_hook '["gh","pr","merge","--body","release notes","7"]')" "deny"
-assert_contains "…and looked up PR 7, not a word of the body" "$(cat "$ARGS")" " pr view 7 "
-assert_eq "control: the same shape on a clean PR passes" \
-  "$(argv_hook '["gh","pr","merge","--body","release notes; ok","5"]')" "PASS"
-assert_eq "a shell wrapper with trailing argv still uses the script" \
-  "$(argv_hook '["/bin/zsh","-c","gh pr merge 7 --repo acme/widgets","zsh"]')" "deny"
+assert_eq "argv with a \$ in the branch ref is refused" \
+  "$(argv_hook '["gh","pr","merge","feature$foo"]')" "deny"
+assert_eq "a shell behind env is refused" \
+  "$(argv_hook '["/usr/bin/env","bash","-lc","gh pr merge 7"]')" "deny"
+assert_eq "a shell outside any whitelist is refused" \
+  "$(argv_hook '["ash","-c","gh pr merge 7"]')" "deny"
+assert_eq "an absolute gh path is refused" \
+  "$(argv_hook '["/opt/homebrew/bin/gh","pr","merge","7"]')" "deny"
+assert_eq "argv merges are refused even for a Codex-clean PR (fail closed)" \
+  "$(argv_hook '["gh","pr","merge","5","--repo","acme/widgets"]')" "deny"
+assert_eq "control: an argv array that is not a PR merge passes" \
+  "$(argv_hook '["git","merge","main"]')" "PASS"
 : >"$ARGS"
 assert_eq "MERGE_GATE_CHECKS=cross-review leaves Codex out" \
   "$(mg 'gh pr merge 7 --repo acme/widgets' MERGE_GATE_CHECKS=cross-review)" "PASS"
