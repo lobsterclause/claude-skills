@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # merge_gate.sh — PreToolUse hook: refuse `gh pr merge` when the PR's newest
 # cross-review record is bound to a commit other than the one being merged, or
-# when Codex (the chatgpt-codex-connector app) has an unresolved review thread
-# or a review still running on it (scripts/codex_review_preflight.sh).
+# when Codex (the chatgpt-codex-connector app) has a review thread nobody has
+# cleared — resolved with a reply — or a review still running on it
+# (scripts/codex_review_preflight.sh).
 #
 # MERGE_GATE_CHECKS selects the checks: "cross-review", "codex", or both
 # (the default, "cross-review,codex"). CROSS_REVIEW_MERGE_OVERRIDE=1 waives
-# the cross-review check only — a Codex thread clears by being resolved on the
-# PR, which is its own visible record, so there is no env-var bypass for it.
+# the cross-review check only — a Codex thread clears by a reply plus
+# resolution on the PR, which is its own visible record, so there is no
+# env-var bypass for it.
 #
 # The payload shape is the same for Codex CLI's PreToolUse hooks, so the same
 # script gates Codex's merges too — see ~/.codex/config.toml:
@@ -394,7 +396,7 @@ unbound_json=""
 codex_json=""
 
 # codex_blocks <pr-ref> [repo] — true (and codex_json set) when Codex has an
-# unresolved thread or a review in flight on that PR. Fails open with the
+# uncleared thread or a review in flight on that PR. Fails open with the
 # preflight: anything but an explicit `blocked` lets the merge through.
 codex_blocks() {
   (( run_codex )) || return 1
@@ -472,7 +474,7 @@ EOF
 if [[ -n "$codex_json" ]]; then
   c_reason="$(printf '%s' "$codex_json" | jq -r '.reason // ""' 2>/dev/null || true)"
   c_running="$(printf '%s' "$codex_json" | jq -r '.running | length' 2>/dev/null || echo 0)"
-  c_threads="$(printf '%s' "$codex_json" | jq -r '.unresolved | length' 2>/dev/null || echo 0)"
+  c_threads="$(printf '%s' "$codex_json" | jq -r '.uncleared | length' 2>/dev/null || echo 0)"
   c_steps=""
   if [[ "${c_running:-0}" -gt 0 ]]; then
     c_steps+="
@@ -480,11 +482,12 @@ Codex is still reviewing. Wait for its summary comment to show Completed, then h
   fi
   if [[ "${c_threads:-0}" -gt 0 ]]; then
     c_steps+="
-For each thread: fix it and push, or reply on the thread with why it does not apply. Then resolve it:
+For each thread: fix it and push, or decide it does not apply. Then reply on the thread saying which — the fix commit, or why not — and resolve it. Both are required; a resolved thread with no reply still blocks.
 
+  gh api graphql -f query='mutation(\$id:ID!,\$b:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:\$id,body:\$b}){comment{id}}}' -f id=<thread> -f b='<fix commit, or why not>'
   gh api graphql -f query='mutation(\$id:ID!){resolveReviewThread(input:{threadId:\$id}){thread{isResolved}}}' -f id=<thread>
 
-Resolve only what you actually addressed — the resolution is the record that someone did. If a finding needs the user's call, ask them instead of resolving it."
+The reply is the audit record: write what you actually did. If a finding needs the user's call, ask them instead of replying for them."
   fi
   deny "Codex review comments are merge-gating, and this PR has open ones.
 

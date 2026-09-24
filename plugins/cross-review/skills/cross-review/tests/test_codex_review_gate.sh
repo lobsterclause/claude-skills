@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # test_codex_review_gate.sh — fixture tests for codex_review_preflight.sh and
-# the Codex half of hooks/merge_gate.sh: unresolved Codex review threads and
-# in-flight Codex reviews block a merge; resolving the thread clears it.
+# the Codex half of hooks/merge_gate.sh: uncleared Codex review threads and
+# in-flight Codex reviews block a merge; a thread clears when it is resolved
+# AND someone other than Codex replied on it (or Codex resolved it itself).
 #
 # Pure bash+jq, no network: `gh` is a PATH shim that answers per PR number
 # from fixture files, so a compound merge can be tested PR by PR. Every
@@ -77,11 +78,18 @@ pr_fixture() {
   printf '{"number":%s,"url":"https://github.com/acme/widgets/pull/%s","state":"%s","headRefOid":"%s"}' \
     "$1" "$1" "${2:-OPEN}" "$HEAD40" >"$FIX/$1.pr.json"
 }
-# thread <id> <resolved> <outdated> <author> [body] → one reviewThreads node
+# thread <id> <resolved> <outdated> <author> [body] [reply-nodes] [resolved-by]
+#   → one reviewThreads node. `replies` (the last 50 comments) starts with the
+#   finding itself, as GitHub returns it, so the opener never counts as a reply.
 thread() {
-  printf '{"id":"%s","isResolved":%s,"isOutdated":%s,"path":"game/units/ranged_specialist.gd","line":356,"originalLine":356,"comments":{"nodes":[{"author":{"login":"%s"},"body":"%s","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}]}}' \
-    "$1" "$2" "$3" "$4" "${5:-$BADGE}"
+  local first
+  first="$(printf '{"author":{"login":"%s"},"body":"%s","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}' "$4" "${5:-$BADGE}")"
+  printf '{"id":"%s","isResolved":%s,"isOutdated":%s,"path":"game/units/ranged_specialist.gd","line":356,"originalLine":356,"resolvedBy":%s,"comments":{"nodes":[%s]},"replies":{"nodes":[%s%s]}}' \
+    "$1" "$2" "$3" "$( [[ -n "${7:-}" ]] && printf '{"login":"%s"}' "$7" || printf 'null')" \
+    "$first" "$first" "${6:+,$6}"
 }
+reply() { printf '{"author":{"login":"%s"},"body":"%s"}' "$1" "$2"; }
+DONE="$(reply lobsterclause 'Fixed in 1234abc: specialists now steer back to the lane.')"
 # threads_fixture <n> <page-nodes>... → one slurped page per argument
 threads_fixture() {
   local n="$1"; shift
@@ -116,7 +124,7 @@ pf() {
 }
 pf_status() { printf '%s' "$PF_OUT" | jq -r '.status // ""' 2>/dev/null; }
 
-echo "── preflight: unresolved Codex threads ──"
+echo "── preflight: Codex threads that are not cleared ──"
 
 pr_fixture 7
 threads_fixture 7 "$(thread PRRT_open false false chatgpt-codex-connector)"
@@ -124,17 +132,39 @@ comments_fixture 7 "$(bot_comment 2026-09-24T05:45:00Z "$(summary "$COMPLETED")"
 pf 7
 assert_eq "an unresolved Codex thread blocks (rc 1)" "$PF_RC" "1"
 assert_eq "…and reports status=blocked" "$(pf_status)" "blocked"
-assert_eq "…with the thread id" "$(printf '%s' "$PF_OUT" | jq -r '.unresolved[0].id')" "PRRT_open"
-assert_eq "…its severity parsed from the badge" "$(printf '%s' "$PF_OUT" | jq -r '.unresolved[0].severity')" "P2"
+assert_eq "…with the thread id" "$(printf '%s' "$PF_OUT" | jq -r '.uncleared[0].id')" "PRRT_open"
+assert_eq "…its severity parsed from the badge" "$(printf '%s' "$PF_OUT" | jq -r '.uncleared[0].severity')" "P2"
 assert_eq "…and its title parsed from the bold line" \
-  "$(printf '%s' "$PF_OUT" | jq -r '.unresolved[0].title')" "Steer advancing specialists back toward the lane"
+  "$(printf '%s' "$PF_OUT" | jq -r '.uncleared[0].title')" "Steer advancing specialists back toward the lane"
 assert_contains "the reason names file:line" "$(printf '%s' "$PF_OUT" | jq -r '.reason')" "ranged_specialist.gd:356"
 
-# CONTROL: the same thread, resolved.
-threads_fixture 7 "$(thread PRRT_open true false chatgpt-codex-connector)"
+# CONTROL: the same thread, replied to and resolved.
+threads_fixture 7 "$(thread PRRT_open true false chatgpt-codex-connector "$BADGE" "$DONE")"
 pf 7
-assert_eq "control: a resolved Codex thread clears (rc 0)" "$PF_RC" "0"
+assert_eq "control: a resolved Codex thread with a reply clears (rc 0)" "$PF_RC" "0"
 assert_eq "control: …status=clear" "$(pf_status)" "clear"
+
+# Resolution alone is one click; the reply is the record. Each of these would
+# pass a resolved-only gate.
+threads_fixture 7 "$(thread PRRT_click true false chatgpt-codex-connector)"
+pf 7
+assert_eq "resolved with no reply still blocks" "$(pf_status)" "blocked"
+assert_eq "…and is reported as resolved_no_reply" "$(printf '%s' "$PF_OUT" | jq -r '.uncleared[0].state')" "resolved_no_reply"
+assert_contains "…in words" "$(printf '%s' "$PF_OUT" | jq -r '.reason')" "resolved, but nobody replied"
+threads_fixture 7 "$(thread PRRT_self true false chatgpt-codex-connector "$BADGE" "$(reply chatgpt-codex-connector 'Thanks!')")"
+pf 7
+assert_eq "a reply from Codex itself does not count" "$(pf_status)" "blocked"
+threads_fixture 7 "$(thread PRRT_blank true false chatgpt-codex-connector "$BADGE" "$(reply lobsterclause '  ')")"
+pf 7
+assert_eq "a blank reply does not count" "$(pf_status)" "blocked"
+threads_fixture 7 "$(thread PRRT_talk false false chatgpt-codex-connector "$BADGE" "$DONE")"
+pf 7
+assert_eq "a reply without resolving still blocks" "$(pf_status)" "blocked"
+assert_eq "…as an open thread" "$(printf '%s' "$PF_OUT" | jq -r '.uncleared[0].state')" "open"
+# CONTROL: Codex resolving its own thread is Codex confirming the fix.
+threads_fixture 7 "$(thread PRRT_codexdone true false chatgpt-codex-connector "$BADGE" "" chatgpt-codex-connector)"
+pf 7
+assert_eq "control: a thread Codex resolved itself clears without a reply" "$(pf_status)" "clear"
 
 # Outdated is not addressed: the lines moved, the finding may still stand.
 threads_fixture 7 "$(thread PRRT_old false true chatgpt-codex-connector)"
@@ -148,20 +178,20 @@ pf 7
 assert_eq "an unresolved thread opened by a human does not block" "$(pf_status)" "clear"
 
 # A human reply at the end of a Codex thread does not change who opened it.
-threads_fixture 7 "$(thread PRRT_a true false chatgpt-codex-connector),$(thread PRRT_b false false chatgpt-codex-connector)"
+threads_fixture 7 "$(thread PRRT_a true false chatgpt-codex-connector "$BADGE" "$DONE"),$(thread PRRT_b false false chatgpt-codex-connector)"
 pf 7
-assert_eq "one open thread among resolved ones blocks" "$(printf '%s' "$PF_OUT" | jq -r '.unresolved | map(.id) | join(",")')" "PRRT_b"
+assert_eq "one open thread among resolved ones blocks" "$(printf '%s' "$PF_OUT" | jq -r '.uncleared | map(.id) | join(",")')" "PRRT_b"
 
 # Pagination: the open thread sits on the second page.
-threads_fixture 7 "$(thread PRRT_p1 true false chatgpt-codex-connector)" "$(thread PRRT_p2 false false chatgpt-codex-connector)"
+threads_fixture 7 "$(thread PRRT_p1 true false chatgpt-codex-connector "$BADGE" "$DONE")" "$(thread PRRT_p2 false false chatgpt-codex-connector)"
 pf 7
-assert_eq "a thread on the second GraphQL page is still seen" "$(printf '%s' "$PF_OUT" | jq -r '.unresolved[0].id // ""')" "PRRT_p2"
+assert_eq "a thread on the second GraphQL page is still seen" "$(printf '%s' "$PF_OUT" | jq -r '.uncleared[0].id // ""')" "PRRT_p2"
 
 # Unparseable badge/title must not hide the thread.
 threads_fixture 7 "$(thread PRRT_plain false false chatgpt-codex-connector 'Plain finding with no badge')"
 pf 7
 assert_eq "a thread without Codex's badge markup still blocks" "$(pf_status)" "blocked"
-assert_eq "…falling back to the first body line as its title" "$(printf '%s' "$PF_OUT" | jq -r '.unresolved[0].title')" "Plain finding with no badge"
+assert_eq "…falling back to the first body line as its title" "$(printf '%s' "$PF_OUT" | jq -r '.uncleared[0].title')" "Plain finding with no badge"
 
 echo "── preflight: Codex review in flight ──"
 
@@ -256,13 +286,14 @@ pr_fixture 7
 threads_fixture 7 "$(thread PRRT_open false false chatgpt-codex-connector)"
 comments_fixture 7 "$(bot_comment 2026-09-24T05:45:00Z "$(summary "$COMPLETED")")"
 pr_fixture 5
-threads_fixture 5 "$(thread PRRT_done true false chatgpt-codex-connector)"
+threads_fixture 5 "$(thread PRRT_done true false chatgpt-codex-connector "$BADGE" "$DONE")"
 comments_fixture 5 "$(bot_comment 2026-09-24T05:45:00Z "$(summary "$COMPLETED")")"
 
 assert_eq "an open Codex thread denies the merge" "$(mg 'gh pr merge 7 --squash --repo acme/widgets')" "deny"
 mg 'gh pr merge 7 --squash --repo acme/widgets' >/dev/null
 assert_contains "…the reason names the thread to resolve" "$MG_REASON" "PRRT_open"
 assert_contains "…and says how to resolve it" "$MG_REASON" "resolveReviewThread"
+assert_contains "…and how to reply first" "$MG_REASON" "addPullRequestReviewThreadReply"
 assert_eq "control: all Codex threads resolved → the merge passes" \
   "$(mg 'gh pr merge 5 --squash --repo acme/widgets')" "PASS"
 
