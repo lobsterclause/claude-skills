@@ -66,10 +66,29 @@ esac
 
 command -v jq >/dev/null 2>&1 || pass
 
-# A harness that passes argv (["bash","-lc","gh pr merge 7"]) instead of a
-# string would otherwise reach the regexes as pretty-printed JSON, where a
-# quote precedes `gh` and no anchor matches — a silent pass on every merge.
-cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // "" | if type == "array" then map(tostring) | join(" ") else tostring end' 2>/dev/null || true)"
+# A harness that passes argv instead of a string would otherwise reach the
+# regexes as pretty-printed JSON, where a quote precedes `gh` and no anchor
+# matches — a silent pass on every merge. Two shapes:
+#  * a shell wrapper (["bash","-lc","gh pr merge 7"]): the script IS the
+#    command, so take it verbatim;
+#  * true argv (["gh","pr","merge","--body","release notes","7"]): each
+#    element must stay one word. A plain join split "release notes" in two,
+#    so `--body` consumed "release" and "notes" was read as the PR (codex P1,
+#    pass 2). Whitespace, quotes and separators inside an element become `_`.
+# A quoted heredoc, because the program matches a literal single quote and
+# would end a single-quoted argument mid-regex.
+read -r -d '' CMD_JQ <<'JQEOF' || true
+  .tool_input.command // ""
+  | if type != "array" then tostring
+    else (map(tostring)) as $a
+    | ([range(1; $a | length) | select($a[.] | test("^-[A-Za-z]*c[A-Za-z]*$"))] | first) as $ci
+    | if ($a[0] | test("(^|/)(ba|z|da|k)?sh$")) and $ci != null and ($ci + 1) < ($a | length)
+      then $a[$ci + 1]
+      else $a | map(gsub("[\\s;&|()<>`$\"'\\\\]"; "_")) | join(" ")
+      end
+    end
+JQEOF
+cmd="$(printf '%s' "$payload" | jq -r "$CMD_JQ" 2>/dev/null || true)"
 [[ -n "$cmd" ]] || pass
 
 hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
