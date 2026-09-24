@@ -443,6 +443,26 @@ assert_eq "control: --repo wins over a GH_REPO elsewhere, as in gh" \
 # Brace and glob characters in a ref are rewritten by the shell (gemini-pro).
 assert_eq "a brace-expanded PR ref is refused" "$(mg 'gh pr merge {7,} --repo acme/widgets')" "deny"
 assert_eq "a globbed PR ref is refused" "$(mg 'gh pr merge 7* --repo acme/widgets')" "deny"
+# Pass 7: a redirection is not the PR. `gh pr merge --squash 2>&1` looked up a
+# PR named "2>", failed, and failed open (gemini-pro).
+assert_eq "a redirection before the PR number is skipped" \
+  "$(mg 'gh pr merge 2>/dev/null 7 --repo acme/widgets')" "deny"
+assert_eq "a bare > takes its target with it" \
+  "$(mg 'gh pr merge > /tmp/out 7 --repo acme/widgets')" "deny"
+: >"$ARGS"
+mg 'gh pr merge --squash 2>&1' >/dev/null
+assert_not_contains "2>&1 is never looked up as a PR" "$(cat "$ARGS")" "pr view 2>"
+assert_eq "a backslash inside the PR ref is refused" "$(mg 'gh pr merge \7 --repo acme/widgets')" "deny"
+assert_eq "quotes inside the PR ref are refused" "$(mg 'gh pr merge 7"" --repo acme/widgets')" "deny"
+# Quoting beside GH_REPO can hide a separator or a second assignment.
+assert_eq "a GH_REPO behind a quoted separator is refused" \
+  "$(mg 'FOO="; GH_REPO=other/r" gh pr merge 5')" "deny"
+assert_eq "a GH_REPO inside another assignment's value is refused" \
+  "$(mg 'GH_REPO=acme/widgets NOTE="x GH_REPO=other/r" gh pr merge 5')" "deny"
+assert_eq "control: a lone quoted GH_REPO value is read" \
+  "$(mg 'GH_REPO="acme/widgets" gh pr merge 5')" "PASS"
+assert_eq "control: …and still gates a blocked PR" \
+  "$(mg 'GH_REPO="acme/widgets" gh pr merge 7')" "deny"
 
 # gh expands {owner}/{repo} from the checkout; the gate looks up the same PR.
 # The shim ignores --repo, so assert on the lookup: real gh cannot resolve a

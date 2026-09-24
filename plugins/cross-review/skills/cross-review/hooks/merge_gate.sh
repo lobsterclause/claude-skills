@@ -372,6 +372,12 @@ parse_invocation() {
       --match-head-commit=*) INV_MATCH=1 ;;
       -b|--body|-F|--body-file|-t|--subject|-A|--author-email)
                       expect=skipval ;;
+      # A redirection is not an argument. `gh pr merge --squash 2>&1` — the
+      # most ordinary way an agent runs a command — made `2>` the PR, the
+      # lookup failed, and the gate failed open (gemini-pro, pass 7). A bare
+      # operator (`>`, `2>`, `>>`) takes the next word as its target.
+      *'>'|*'<')      expect=skipval ;;
+      *'>'*|*'<'*)    : ;;
       -*)             : ;;   # boolean flag
       # First positional is the PR reference: a number, a URL, or a branch
       # name — `gh pr view` resolves all three the same way `gh pr merge` does.
@@ -437,7 +443,9 @@ is_dynamic() { case "$1" in *'$'*|*'`'*) return 0 ;; esac; return 1; }
 # A PR ref or repo is a single literal word; brace and glob characters in one
 # mean the shell rewrites it before gh sees it (gemini-pro, pass 6). Not used
 # for REST paths, where gh's own {owner}/{repo} placeholder is legitimate.
-is_dynamic_ref() { is_dynamic "$1" && return 0; case "$1" in *'{'*|*'}'*|*'*'*|*'?'*|*'['*) return 0 ;; esac; return 1; }
+# Quotes or a backslash left INSIDE a word (`1"2"3`, `\7`) are removed by the
+# shell too, so the word gh sees is not the word looked up (gemini-pro, pass 7).
+is_dynamic_ref() { is_dynamic "$1" && return 0; case "$1" in *'{'*|*'}'*|*'*'*|*'?'*|*'['*|*'"'*|*"'"*|*'\'*) return 0 ;; esac; return 1; }
 
 # GH_REPO=o/r selects the repository exactly as --repo does, but only for the
 # command it prefixes — so it is read per merge, from that merge's own segment.
@@ -489,12 +497,25 @@ API
   fi
   inv_repo="$INV_REPO"
   if [[ -z "$inv_repo" ]]; then
-    inv_repo="$(printf '%s' "$seg_pre" \
-      | grep -oE "(^|[[:space:]])GH_REPO=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)" \
-      | tail -n1 | sed -E 's/^[[:space:]]*GH_REPO=//')"
-    inv_repo="$(dequote "$inv_repo")"
+    # Only a whole `GH_REPO=` word counts, and only when nothing else in the
+    # prefix is quoted: quoting can hide a separator or a second GH_REPO=
+    # (`FOO="; GH_REPO=x" gh pr merge 7`, `NOTE="… GH_REPO=x" …`), and then
+    # which repo the shell uses is not what the text says (codex + gemini-pro,
+    # pass 7). Such a prefix is refused below like any other ambiguity.
+    seg_repos="$(printf '%s' "$seg_pre" \
+      | grep -oE "(^|[[:space:]])GH_REPO=(\"[^\"]*\"|'[^']*'|[^[:space:]\"']+)" \
+      | sed -E 's/^[[:space:]]*GH_REPO=//')"
+    seg_rest="$(printf '%s' "$seg_pre" \
+      | sed -E "s/(^|[[:space:]])GH_REPO=(\"[^\"]*\"|'[^']*'|[^[:space:]\"']+)//")"
+    if [[ -n "$seg_repos" ]]; then
+      case "$seg_rest" in
+        *'"'*|*"'"*|*GH_REPO=*) seg_repos="" ;;   # ambiguous: refused below
+      esac
+      [[ "$(printf '%s\n' "$seg_repos" | grep -c .)" -eq 1 ]] || seg_repos=""
+    fi
+    inv_repo="$(dequote "$seg_repos")"
     if [[ -z "$inv_repo" && "$gh_repo_anywhere" -eq 1 ]]; then
-      unresolvable="gh pr merge ${pr_ref} — GH_REPO is set elsewhere in the command, so its repository depends on the shell"
+      unresolvable="gh pr merge ${pr_ref} — GH_REPO is set elsewhere in the command or beside quoted text, so its repository depends on the shell"
       break
     fi
   fi
