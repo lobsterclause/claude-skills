@@ -1,0 +1,9 @@
+{
+  "name": "splitstream",
+  "version": "0.2.0",
+  "description": "Plan and run an explicitly approved batch of independent repository changes as isolated Claude Code agents, then audit, verify, and optionally publish each result as a draft pull request. Use only when the user invokes /splitstream; never invoke automatically.",
+  "author": {
+    "name": "lobsterclause",
+    "url": "https://github.com/lobsterclause"
+  }
+}
