@@ -38,9 +38,11 @@ assert_not_contains() {
 }
 
 # ── gh shim ──────────────────────────────────────────────────────────────────
-# pr view <n>              → $FIX/<n>.pr.json
+# pr view <n>              → $FIX/<n>.pr.json — but, like real gh, nothing
+#                            when --repo names a repo other than acme/widgets
 # api graphql … number=<n> → $FIX/<n>.threads.json
-# api … issues/<n>/comments→ $FIX/<n>.comments.json
+# api … issues/<n>/comments→ $FIX/<n>.comments.<k>.json on the k-th call if
+#                            that file exists, else $FIX/<n>.comments.json
 # A missing fixture prints nothing, which is how "gh failed" looks.
 FIX="$T/fix"
 ARGS="$T/gh-args"
@@ -49,7 +51,11 @@ cat >"$T/bin/gh" <<SH
 #!/bin/sh
 printf ' %s' "\$@" >>"$ARGS"; printf '\n' >>"$ARGS"
 case "\$1 \$2" in
-  "pr view") cat "$FIX/\$3.pr.json" 2>/dev/null; exit 0 ;;
+  "pr view")
+    repo=""; prev=""
+    for a in "\$@"; do [ "\$prev" = "--repo" ] && repo="\$a"; prev="\$a"; done
+    if [ -n "\$repo" ] && [ "\$repo" != "acme/widgets" ]; then exit 1; fi
+    cat "$FIX/\$3.pr.json" 2>/dev/null; exit 0 ;;
 esac
 all=" \$* "
 case "\$all" in
@@ -58,7 +64,9 @@ case "\$all" in
     cat "$FIX/\$n.threads.json" 2>/dev/null ;;
   *"/comments"*)
     n="\$(printf '%s' "\$all" | sed -nE 's#.*/issues/([0-9]+)/comments.*#\1#p')"
-    cat "$FIX/\$n.comments.json" 2>/dev/null ;;
+    c="$FIX/\$n.comments.calls"; k=\$(( \$(cat "\$c" 2>/dev/null || echo 0) + 1 )); echo "\$k" >"\$c"
+    if [ -f "$FIX/\$n.comments.\$k.json" ]; then cat "$FIX/\$n.comments.\$k.json"
+    else cat "$FIX/\$n.comments.json" 2>/dev/null; fi ;;
 esac
 exit 0
 SH
@@ -286,11 +294,27 @@ assert_contains "comments are paged 100 at a time" "$(cat "$ARGS")" "comments?pe
 printf '{"number":11,"url":"https://ghe.example.com/acme/widgets/pull/11","state":"OPEN","headRefOid":"%s"}' "$HEAD40" >"$FIX/11.pr.json"
 : >"$ARGS"
 pf 11
-assert_eq "an enterprise host is passed to both API calls" \
-  "$(grep -c -- '--hostname ghe.example.com' "$ARGS")" "2"
+assert_eq "an enterprise host is passed to every API call" \
+  "$(grep -c -- '--hostname ghe.example.com' "$ARGS")" "$(grep -c ' api ' "$ARGS")"
 : >"$ARGS"
 pf 7
 assert_not_contains "control: github.com needs no --hostname" "$(cat "$ARGS")" "--hostname"
+
+# The summary is read on BOTH sides of the thread query, and a review running
+# in either read blocks (codex P1s, passes 5 and 6).
+threads_fixture 7 ""
+comments_fixture 7 "$(bot_comment 2026-09-24T05:45:00Z "$(summary "$COMPLETED")")"
+printf '[[%s]]' "$(bot_comment 2026-09-24T05:59:00Z "$(summary "$RUNNING_FRESH")")" >"$FIX/7.comments.2.json"
+rm -f "$FIX/7.comments.calls"
+pf 7
+assert_eq "a review that starts between the reads is caught by the second" "$(pf_status)" "blocked"
+rm -f "$FIX/7.comments.2.json" "$FIX/7.comments.calls"
+printf '[[%s]]' "$(bot_comment 2026-09-24T05:59:00Z "$(summary "$RUNNING_FRESH")")" >"$FIX/7.comments.1.json"
+pf 7
+assert_eq "a review running at the first read blocks even if done by the second" "$(pf_status)" "blocked"
+rm -f "$FIX/7.comments.1.json" "$FIX/7.comments.calls"
+pf 7
+assert_eq "control: Completed on both reads with no threads clears" "$(pf_status)" "clear"
 
 # A review stamped a few seconds in our future must not read "-1 min ago".
 threads_fixture 7 ""
@@ -404,6 +428,21 @@ assert_eq "GH_REPO=… gh pr merge is checked against that repo" \
   "$(mg 'GH_REPO=acme/widgets gh pr merge 7')" "deny"
 assert_contains "…and the lookup carries it as --repo" "$(cat "$ARGS")" "--repo acme/widgets"
 assert_eq "control: GH_REPO with a Codex-clean PR passes" "$(mg 'GH_REPO=acme/widgets gh pr merge 5')" "PASS"
+# GH_REPO applies to the command it prefixes only (codex + GLM + antigravity,
+# pass 6): taking the first one in the line sent other merges to a repo that
+# does not hold them, where the lookup failed open.
+assert_eq "each merge in a compound command uses its own GH_REPO" \
+  "$(mg 'GH_REPO=other/r gh pr merge 5 && GH_REPO=acme/widgets gh pr merge 7')" "deny"
+assert_eq "GH_REPO on another command does not retarget the merge — it is refused" \
+  "$(mg 'GH_REPO=other/r gh run list; gh pr merge 7')" "deny"
+mg 'GH_REPO=other/r gh run list; gh pr merge 7' >/dev/null
+assert_contains "…naming the ambiguity" "$MG_REASON" "GH_REPO is set elsewhere"
+assert_eq "an exported GH_REPO is refused the same way" "$(mg 'export GH_REPO=other/r; gh pr merge 5')" "deny"
+assert_eq "control: --repo wins over a GH_REPO elsewhere, as in gh" \
+  "$(mg 'export GH_REPO=other/r; gh pr merge 5 --repo acme/widgets')" "PASS"
+# Brace and glob characters in a ref are rewritten by the shell (gemini-pro).
+assert_eq "a brace-expanded PR ref is refused" "$(mg 'gh pr merge {7,} --repo acme/widgets')" "deny"
+assert_eq "a globbed PR ref is refused" "$(mg 'gh pr merge 7* --repo acme/widgets')" "deny"
 
 # gh expands {owner}/{repo} from the checkout; the gate looks up the same PR.
 # The shim ignores --repo, so assert on the lookup: real gh cannot resolve a

@@ -141,44 +141,54 @@ host="$(printf '%s' "$pr_json" | jq -r '.url // ""' 2>/dev/null | sed -nE 's#^ht
 host_args=()
 [[ -n "$host" && "$host" != "github.com" ]] && host_args=(--hostname "$host")
 
-# ── Sensor 2 (read FIRST): a Codex review still running ─────────────────────
-# Order matters. Codex posts its findings, then marks the review Completed. If
-# threads were read first, a review finishing between the two reads would look
-# like "no threads, nothing running" and clear (codex P1, pass 5). Reading the
-# summary first means a Completed seen here was completed before the threads
-# below are read, so its findings are in them.
+# ── Sensor 2 (read BEFORE and AFTER the threads): a Codex review in flight ──
+# The summary is read on both sides of the thread query, and a review running
+# in EITHER read blocks. Before: Codex posts its findings, then marks the
+# review Completed, so a Completed seen first means its findings are in the
+# threads read next — reading threads first let a review finishing in between
+# look clear (codex P1, pass 5). After: a review that STARTS between the reads
+# has posted nothing yet, and only a second look sees it running (codex P1,
+# pass 6).
 # Codex keeps ONE summary comment per PR, marked with an HTML comment, and
 # rewrites its table as reviews start and finish:
 #   | 📝 **Code Review** | 🔄 **Running** since <relative-time datetime="…"> | `585f205` | PR opened |
 # Statuses seen in the wild: Completed, Failed, Running. Only in-flight ones
 # block; Queued/Pending/In progress are matched in case Codex adds them.
-summary_ok=0
+summary_ok=1
 summary_seen=0
-# The summary is one of the OLDEST comments (Codex edits it in place), so a
-# tail query would miss it on a long PR; page through at 100 a page instead.
-comments_raw="$(gh api ${host_args[@]+"${host_args[@]}"} --paginate --slurp "repos/$owner/$name/issues/$number/comments?per_page=100" 2>/dev/null || true)"
-if [[ "$(printf '%s' "$comments_raw" | jq -r 'type == "array"' 2>/dev/null)" == "true" ]]; then
-  summary_ok=1
-  summary_body="$(printf '%s' "$comments_raw" | jq -r --arg re "$BOT_RE" \
+running_json="[]"
+# read_summary — one read of the summary. Clears summary_ok if unreadable,
+# sets summary_seen if Codex has a summary, and adds in-flight rows to
+# running_json. Called directly (not in $( )) so it can set these.
+read_summary() {
+  local raw body rows
+  # The summary is one of the OLDEST comments (Codex edits it in place), so a
+  # tail query would miss it on a long PR; page through at 100 a page instead.
+  raw="$(gh api ${host_args[@]+"${host_args[@]}"} --paginate --slurp "repos/$owner/$name/issues/$number/comments?per_page=100" 2>/dev/null || true)"
+  if [[ "$(printf '%s' "$raw" | jq -r 'type == "array"' 2>/dev/null)" != "true" ]]; then
+    summary_ok=0
+    return
+  fi
+  body="$(printf '%s' "$raw" | jq -r --arg re "$BOT_RE" \
     '[.[][]? | objects
       | select((.user.login // "") | test($re))
       | select((.body // "") | contains("<!-- codex-pull-request-review-summary -->"))]
      | sort_by(.updated_at // "") | last | .body // ""' 2>/dev/null || true)"
-  if [[ -n "$summary_body" ]]; then
-    summary_seen=1
-    now_arg="${NOW:-null}"
-    running_json="$(printf '%s' "$summary_body" | jq -Rsc --argjson ttl "$TTL" --argjson now "$now_arg" '
-      ($now // now) as $t
-      | [ split("\n")[]
-          | select(test("\\*\\*(Running|Queued|Pending|In progress)\\*\\*"; "i"))
-          | { since: ((capture("datetime=\"(?<d>[^\"]+)\"") | .d) // ""),
-              commit: ((capture("`(?<c>[0-9a-f]{7,40})`") | .c) // "") }
-          | .age = (try (.since | sub("\\.[0-9]+"; "") | fromdateiso8601 | ($t - .) | floor) catch null)
-          # An unparseable start time fails open, like every other sensor.
-          | select(.age != null and .age < $ttl) ]' 2>/dev/null || echo '[]')"
-    [[ -n "$running_json" ]] || running_json="[]"
-  fi
-fi
+  [[ -n "$body" ]] || return
+  summary_seen=1
+  rows="$(printf '%s' "$body" | jq -Rsc --argjson ttl "$TTL" --argjson now "${NOW:-null}" '
+    ($now // now) as $t
+    | [ split("\n")[]
+        | select(test("\\*\\*(Running|Queued|Pending|In progress)\\*\\*"; "i"))
+        | { since: ((capture("datetime=\"(?<d>[^\"]+)\"") | .d) // ""),
+            commit: ((capture("`(?<c>[0-9a-f]{7,40})`") | .c) // "") }
+        | .age = (try (.since | sub("\\.[0-9]+"; "") | fromdateiso8601 | ($t - .) | floor) catch null)
+        # An unparseable start time fails open, like every other sensor.
+        | select(.age != null and .age < $ttl) ]' 2>/dev/null || true)"
+  [[ -n "$rows" ]] || return
+  running_json="$(jq -nc --argjson a "$running_json" --argjson b "$rows" '$a + $b | unique_by(.since, .commit)' 2>/dev/null || printf '%s' "$running_json")"
+}
+read_summary
 
 # ── Sensor 1: Codex review threads not yet cleared ───────────────────────────
 # `gh api graphql --paginate` walks the one connection that carries pageInfo.
@@ -222,6 +232,8 @@ if [[ "$(printf '%s' "$threads_raw" | jq -r '[.[]? | .data.repository.pullReques
                    // ($b | split("\n")[0])) | .[0:140]) }]' 2>/dev/null || echo '[]')"
   [[ -n "$uncleared_json" ]] || uncleared_json="[]"
 fi
+
+read_summary
 
 n_uncleared="$(printf '%s' "$uncleared_json" | jq 'length' 2>/dev/null || echo 0)"
 n_open="$(printf '%s' "$uncleared_json" | jq '[.[] | select(.state == "open")] | length' 2>/dev/null || echo 0)"

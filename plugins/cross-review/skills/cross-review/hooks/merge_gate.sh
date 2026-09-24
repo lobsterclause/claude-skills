@@ -391,12 +391,20 @@ parse_invocation() {
 # because the baseline control went green too). Each line printed here is the
 # command tail starting just after one `gh pr merge`; the leading `@` keeps an
 # argument-less invocation from reading as a blank line.
+#
+# Each line is `<segment prefix>@@<tail>`: the prefix is the text between the
+# previous shell separator and this `gh pr merge`, which is where a
+# per-command `GH_REPO=o/r` lives (codex + GLM + antigravity, pass 6).
 invocations="$(printf '%s' "$cmd_only" | awk '
   {
-    s = $0
+    s = $0; before = ""
     while (match(s, /(^|[;&|(]|[[:space:]])[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)/)) {
+      seg = before substr(s, 1, RSTART)
+      for (i = length(seg); i > 0; i--) if (substr(seg, i, 1) ~ /[;&|(]/) { seg = substr(seg, i + 1); break }
+      gsub(/@@/, "", seg)
+      before = before substr(s, 1, RSTART + RLENGTH - 1)
       s = substr(s, RSTART + RLENGTH)
-      print "@" s
+      print seg "@@" s
     }
   }')"
 
@@ -426,14 +434,19 @@ codex_blocks() {
 # High, pass 5).
 unresolvable=""
 is_dynamic() { case "$1" in *'$'*|*'`'*) return 0 ;; esac; return 1; }
+# A PR ref or repo is a single literal word; brace and glob characters in one
+# mean the shell rewrites it before gh sees it (gemini-pro, pass 6). Not used
+# for REST paths, where gh's own {owner}/{repo} placeholder is legitimate.
+is_dynamic_ref() { is_dynamic "$1" && return 0; case "$1" in *'{'*|*'}'*|*'*'*|*'?'*|*'['*) return 0 ;; esac; return 1; }
 
-# GH_REPO=o/r in front of the merge picks the repository exactly as --repo
-# does; the invocation parser only sees what follows `gh pr merge`, so read it
-# here (gemini-pro High, pass 5).
-env_repo="$(printf '%s' "$cmd_only" \
-  | grep -oE "(^|[[:space:];&|(])GH_REPO=(\"[^\"]*\"|'[^']*'|[^[:space:];&|()]+)" \
-  | head -n1 | sed -E 's/^.*GH_REPO=//')"
-env_repo="$(dequote "$env_repo")"
+# GH_REPO=o/r selects the repository exactly as --repo does, but only for the
+# command it prefixes — so it is read per merge, from that merge's own segment.
+# A GH_REPO set anywhere else (`export GH_REPO=…;`, another command's prefix)
+# makes the target depend on the shell, and such a merge is refused. Taking the
+# first GH_REPO in the whole line pointed other merges at the wrong repo, where
+# the lookup failed open (codex + GLM + antigravity, pass 6).
+gh_repo_anywhere=0
+printf '%s' "$cmd_only" | grep -qE '(^|[^A-Za-z0-9_])GH_REPO=' && gh_repo_anywhere=1
 
 # REST merges first: one preflight per repos/O/R/pulls/N/merge in the command.
 while IFS= read -r spec; do
@@ -461,7 +474,8 @@ API
 
 [[ -n "$verdict_json" || -n "$codex_json" || -n "$unresolvable" ]] || while IFS= read -r args; do
   [[ -n "$args" ]] || continue
-  args="${args#@}"
+  seg_pre="${args%%@@*}"
+  args="${args#*@@}"
   # Arguments end at the next shell separator.
   args="${args%%;*}"; args="${args%%&*}"; args="${args%%|*}"; args="${args%%)*}"
 
@@ -473,8 +487,18 @@ API
     pr_ref="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     [[ -n "$pr_ref" && "$pr_ref" != "HEAD" ]] || continue
   fi
-  inv_repo="${INV_REPO:-$env_repo}"
-  if is_dynamic "$pr_ref" || is_dynamic "$inv_repo"; then
+  inv_repo="$INV_REPO"
+  if [[ -z "$inv_repo" ]]; then
+    inv_repo="$(printf '%s' "$seg_pre" \
+      | grep -oE "(^|[[:space:]])GH_REPO=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)" \
+      | tail -n1 | sed -E 's/^[[:space:]]*GH_REPO=//')"
+    inv_repo="$(dequote "$inv_repo")"
+    if [[ -z "$inv_repo" && "$gh_repo_anywhere" -eq 1 ]]; then
+      unresolvable="gh pr merge ${pr_ref} — GH_REPO is set elsewhere in the command, so its repository depends on the shell"
+      break
+    fi
+  fi
+  if is_dynamic_ref "$pr_ref" || is_dynamic_ref "$inv_repo"; then
     unresolvable="gh pr merge ${pr_ref}${inv_repo:+ --repo $inv_repo}"
     break
   fi
