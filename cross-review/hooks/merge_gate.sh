@@ -66,17 +66,28 @@ esac
 
 command -v jq >/dev/null 2>&1 || pass
 
-cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // ""' 2>/dev/null || true)"
+# A harness that passes argv (["bash","-lc","gh pr merge 7"]) instead of a
+# string would otherwise reach the regexes as pretty-printed JSON, where a
+# quote precedes `gh` and no anchor matches — a silent pass on every merge.
+cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // "" | if type == "array" then map(tostring) | join(" ") else tostring end' 2>/dev/null || true)"
 [[ -n "$cmd" ]] || pass
 
 hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 preflight="$hook_dir/../scripts/merge_preflight.sh"
 codex_preflight="$hook_dir/../scripts/codex_review_preflight.sh"
+# A value naming neither check is a typo, not a request to gate nothing: it
+# runs both, so a misspelt setting errs toward refusing rather than silently
+# switching the gate off.
+checks="$(printf '%s' "${MERGE_GATE_CHECKS:-}" | tr -d '[:space:]')"
+case ",$checks," in
+  *,cross-review,*|*,codex,*) ;;
+  *) checks="cross-review,codex" ;;
+esac
 run_cr=0; run_codex=0
-case ",${MERGE_GATE_CHECKS:-cross-review,codex}," in
+case ",$checks," in
   *,cross-review,*) [[ -f "$preflight" ]] && run_cr=1 ;;
 esac
-case ",${MERGE_GATE_CHECKS:-cross-review,codex}," in
+case ",$checks," in
   *,codex,*) [[ -f "$codex_preflight" ]] && run_codex=1 ;;
 esac
 (( run_cr || run_codex )) || pass

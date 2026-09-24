@@ -27,9 +27,6 @@ jobs:
       - name: Fixture tests (offline — shims, no tokens)
         run: bash cross-review/tests/run_tests.sh
 
-      - name: Codex review merge gate (offline — gh shim)
-        run: bash cross-review/tests/test_codex_review_gate.sh
-
       - name: Dual-copy identity check
         run: |
           # Same script the fixture suite calls — one exclude list, one

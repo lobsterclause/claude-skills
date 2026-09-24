@@ -270,6 +270,12 @@ assert_eq "the Codex check runs under the default MERGE_GATE_CHECKS" \
   "$(mg 'gh pr merge 7 --repo acme/widgets' MERGE_GATE_CHECKS=)" "deny"
 assert_eq "MERGE_GATE_CHECKS=codex runs it alone" \
   "$(mg 'gh pr merge 7 --repo acme/widgets' MERGE_GATE_CHECKS=codex)" "deny"
+assert_eq "a misspelt MERGE_GATE_CHECKS runs both checks, not neither" \
+  "$(mg 'gh pr merge 7 --repo acme/widgets' MERGE_GATE_CHECKS=codx)" "deny"
+# argv-shaped tool input — a quote before `gh` used to defeat every anchor.
+ARGV_OUT="$(printf '%s' '{"tool_input":{"command":["bash","-lc","gh pr merge 7 --repo acme/widgets"]}}' \
+  | bash "$MG_HOOK" 2>/dev/null | jq -r '.hookSpecificOutput.permissionDecision // "PASS"')"
+assert_eq "an argv-array command is gated like a string one" "$ARGV_OUT" "deny"
 : >"$ARGS"
 assert_eq "MERGE_GATE_CHECKS=cross-review leaves Codex out" \
   "$(mg 'gh pr merge 7 --repo acme/widgets' MERGE_GATE_CHECKS=cross-review)" "PASS"
