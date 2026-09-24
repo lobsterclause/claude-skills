@@ -209,6 +209,13 @@ acquired in a one-shot tool call as advisory at best.
    - A test that passes with the thing it tests DELETED — e.g. asserting `/500/` against a
      whole file where "500MB" also appears in a comment, or a whole-file `includes()`
      instead of an assertion about the specific key.
+   - **A gate that passes because it cannot see.** #4013's secrets-binding gate was green
+     on CI and on develop only because its declaration regex could not match the repo's
+     prettier-wrapped `defineSecret(\n  "NAME",\n)` form. Once it could see those
+     declarations it failed develop on a real unbound secret. When a review fixes a
+     gate's blind spot, run the gate against the real tree before pushing. A newly red
+     tree means the gate works, and it makes the PR a decision for its author rather
+     than a merge. (2026-09-24.)
    - A mutation probe that silently matches nothing and reports a clean pass — which is
      indistinguishable from "the gate cannot fail". **Before trusting any mutation result,
      red or green, confirm the mutant landed via `git diff --numstat`.** This bit two
@@ -320,6 +327,14 @@ acquired in a one-shot tool call as advisory at best.
    code. Gate on the exit code, or filter out results carrying `suppressions`. (Counting
    raw results reported 3 blockers where there was 1, and produced a confident, wrong
    theory about why two working suppressions had "stopped working".)
+   **And the scanner's upload error is not its failure.** A Semgrep job whose last error
+   line is `Code Security must be enabled` failed EARLIER, in the scan step (exit 123 =
+   blocking findings). The SARIF upload runs anyway and fails for an unrelated reason.
+   On #3996 Jules read the upload error and called the red check infrastructure for four
+   days while a real `unsafe-formatstring` finding sat in the report. Read the failing
+   STEP's name first (`gh api .../actions/jobs/<id> --jq '.steps[] |
+   select(.conclusion=="failure")'`), then the SARIF, before calling a scanner red
+   "infra".
 6. **Merge** happens via the poller (or manually: `gh pr merge <n> --squash
    --match-head-commit <sha>`). The SHA binding is non-negotiable: it is the only thing
    that prevents merging a head some concurrent process force-pushed under you.
@@ -346,6 +361,15 @@ surviving seats genuinely cover the diff, but **say the round was degraded in
 the stamp** — never let a 2-of-4 round read as a full fleet — and surface the
 billing failure to the user, because it blocks every future round, not just
 this one.
+
+**Flat-rate plans have usage windows, and a drain can burn through one.** On
+2026-09-24, four review rounds of 200-300 KB each within about ninety minutes
+exhausted the Z.ai GLM Coding plan's 5-hour window (`Usage limit reached for 5
+hour`, `failure_kind: provider_error`). The shared agy quota was already gone, so
+the last two rounds ran on codex alone. A single-reviewer round is still worth
+posting, since it is the record, but say so in the stamp. Do not treat it as
+clearance on a data-path PR. Hand those back for a full-fleet pass rather than
+fixing on one opinion.
 
 **A bare worktree has no `node_modules`, so the git hooks abort and you will
 reach for `--no-verify`.** That removes the check, not the requirement. Both CI
@@ -608,6 +632,24 @@ Files present at the merge-base and on the base but missing at the head mean mer
 reverts landed work. Block it the same way as an empty diff (`needs-human`, a PR
 comment with the evidence, never a silent close). Its red CI is a symptom here. Do
 not start a fix loop on it.
+
+**And a CLAIM/DIFF MISMATCH: the body describes work the diff does not contain.** On
+2026-09-24 four of ten queued agent PRs did less than they said:
+- #3998 described edits to `agentReason.ts`, `utils.ts` and `promptBuilder.ts` and
+  contained only test-mock changes.
+- #3997 was "calibrated rubric scores", which its issue defines as a Jev swap, and
+  delivered prompt anchor text.
+- #3989 and #3996 shipped features that could not run: flags that were never
+  registered, and lookups by hashed ids.
+
+All four had green CI, and two carried CLEAN review stamps. A diff can be fine on
+its own terms and still not be the PR. Two cheap checks before any review:
+1. Diff the file paths the body names against `gh pr view <n> --json files`. A named
+   file missing from the diff is a stop.
+2. Read the linked issue's acceptance criteria against the diff. On
+   `agent/issue-<N>-*` branches a merge closes #N no matter what the body says,
+   because the repo re-arms the keyword. So whether the PR delivers #N is a merge
+   question, not a review nicety.
 
 ## Stop conditions (comment the reason on the checklist issue, then stop)
 
