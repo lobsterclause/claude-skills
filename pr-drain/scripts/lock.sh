@@ -4,7 +4,7 @@
 #   lock.sh acquire <name> [timeout_s]   # exit 0 on acquire, 1 on timeout
 #   lock.sh release <name>
 #   lock.sh status
-# Env: PR_DRAIN_WORKDIR (default: .pr-drain in cwd)
+# Env: PR_DRAIN_WORKDIR (REQUIRED, absolute — e.g. $HOME/.pr-drain/<repo>-<issue>)
 #      PR_DRAIN_LOCK_PID — the pid to record as holder (default: $PPID, the
 #      shell that called us). NOT $$: this script exits the moment it acquires,
 #      so recording its own pid made every lock look stale to the next caller,
@@ -13,7 +13,15 @@
 set -euo pipefail
 HOLDER_PID="${PR_DRAIN_LOCK_PID:-$PPID}"
 
-WORKDIR="${PR_DRAIN_WORKDIR:-.pr-drain}"
+# No default. With a cwd-relative `.pr-drain`, two callers in different
+# directories each got a private lock directory, so neither ever saw the
+# other's lock — the lock excluded nothing across exactly the boundary it
+# exists for.
+WORKDIR="${PR_DRAIN_WORKDIR:-}"
+case "$WORKDIR" in
+  /*) ;;
+  *) echo "lock.sh: set PR_DRAIN_WORKDIR to an absolute path, e.g. \$HOME/.pr-drain/<repo>-<issue> (got '$WORKDIR')" >&2; exit 2 ;;
+esac
 LOCKDIR="$WORKDIR/locks"
 mkdir -p "$LOCKDIR"
 

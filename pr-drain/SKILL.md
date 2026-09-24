@@ -46,6 +46,15 @@ Treat the stations file as an archived idea, not an option to weigh each time.
    line to `<workdir>/events.jsonl`. States: `QUEUED REVIEWING FIXING VERIFYING CI
    MERGED BLOCKED`. `queue.sh status` prints each PR's latest state. After a compaction,
    `queue.sh status` + the issue fully reconstruct the pipeline; log every transition.
+   **Every script needs `PR_DRAIN_WORKDIR` set to an absolute path** — use
+   `$HOME/.pr-drain/<repo>-<checklist-issue>` and pass it on every call. The scripts
+   refuse (exit 2) without it. They used to default to a cwd-relative `.pr-drain`, and
+   since each tool call starts in whatever directory it starts in, that gave every call
+   site its own log. The 2026-09-17 drain wrote 1 event to its named workdir and 44 to
+   the repo checkout's `.pr-drain`, so the resume and the retro both read the
+   near-empty one. An 08-19 retro-done stamp ended up in the skill's own directory.
+   Two lock callers in different directories never saw each other's locks.
+   (`pr-drain/tests/workdir-required.test.sh` pins this.)
 3. **GitHub artifacts** — stamped review comments and PR comments hold the working notes.
    The checklist issue stays a bare checklist; notes go on the PR, never the issue.
 
@@ -66,6 +75,17 @@ lock. Two `pnpm verify` runs overlapped and one went red on a test that writes a
 prevent. It now records `$PPID`; acquire and release in the SAME shell invocation so
 that pid stays alive across the critical section, and `grep HOLDER_PID lock.sh` before
 trusting a lock in a fresh session.
+
+**In an agent harness where each tool call is its own shell, that instruction cannot
+be followed** — `$PPID` dies the moment the acquiring call returns, so the next
+caller's stale-pid reaper removes the lock and it protects nothing. Observed
+2026-09-19: locks were acquired and released across separate calls all drain, i.e.
+decoratively. Do not let a held lock substitute for the real guarantee, which is
+sequencing your OWN calls: run one verify and one review round at a time because you
+chose to, not because a file says you may. The lock earns its place only between
+separate processes (a backgrounded chain, a peer session) — pass
+`PR_DRAIN_LOCK_PID=$$` from inside the long-running script there, and treat a lock
+acquired in a one-shot tool call as advisory at best.
 
 ## Per-PR sequence (stop at the first failing step)
 
@@ -119,6 +139,13 @@ trusting a lock in a fresh session.
      settles it. Four of one reviewer's seven claims on one PR were this shape, and
      it is the dominant failure mode of the low-precision seats — see
      `claims.sh prior`.
+   - **A panic predicted in a consumer that does not exist** — "this span is a
+     char count, so slicing it panics on multi-byte UTF-8", where nothing in the
+     repo slices by that span. Both of 2026-09-19's refutations had this shape
+     (the other: a NaN panic in `f32::clamp`, which panics only when *min/max* is
+     NaN). The claim is always about a downstream consumer, so **grep for the
+     consumer before reasoning about the semantics** — if nothing calls it that
+     way, the argument is moot however correct its language lawyering.
    - **Claim that would invalidate a passing suite** — "the quoted pattern makes this
      comparison literal, so staleness is NEVER detected". If true, a dozen existing
      tests would be lying. A finding that implies the whole suite is vacuous is
@@ -234,6 +261,13 @@ trusting a lock in a fresh session.
    after launching, and re-check each turn: a `nohup ... &` inside a backgrounded shell
    dies with its wrapper, and a poller you believe is armed but isn't leaves PRs sitting
    CLEAN and unmerged indefinitely. Polling by hand each turn beats a dead daemon.
+   **A poller cannot outlive the session that launched it.** On 2026-09-17 the last
+   events for #3924, #3949 and #3951 read "poller watching" at 22:32. The session then
+   ended and all three sat CLEAN until someone found the dead pollers at 14:24 the next
+   day: about 16 hours for three merges that needed nothing. Before a turn that may be
+   the session's last, name the armed PRs and say plainly that they will NOT merge
+   once the session closes, so the user can decide to keep it open or merge them by
+   hand.
 
    **An empty OR SUSPICIOUSLY SHORT check list is a mergeability question, not a CI
    one.** A CONFLICTING PR cannot build `refs/pull/N/merge`, so every
@@ -259,6 +293,26 @@ trusting a lock in a fresh session.
    cancel + rerun, which reschedules across runners. (2026-08-20: a Dagger run sat
    IN_PROGRESS 5 hours on a light runner while 20 heavy runners idled; the rerun landed
    on a heavy box and went green in 12 minutes.)
+
+   **Your own re-pushes multiply CI load unless the repo cancels superseded runs.**
+   Check once, early, for a `concurrency` group in the workflows
+   (`grep -rn concurrency .github/workflows/`). Without one, every fix push leaves
+   the previous SHA's entire job set running to completion on a commit nobody will
+   merge — and a drain that pushes fixes is the worst case for this. On 2026-09-19
+   a 3-runner pool had one runner burning a 13-minute `contracts` job on a SHA two
+   pushes stale while the live SHA's jobs queued behind it. **After any second push
+   to a PR, cancel the prior SHA's runs yourself** (`gh run cancel`), because the
+   SHA-pinned merge rule already makes their results unusable to you. **`gh run
+   cancel` is a GitHub mutation — never in dry-run**, where it is reported like any
+   other. Recommending the `concurrency` group is a repo change and belongs in its
+   own PR, not in the drain.
+
+   **A short required job queues behind long ones in an undifferentiated pool.**
+   Where every job carries the same labels, a 53-second check sits behind
+   13-minute ones with no way to jump; a PR one trivial job from CLEAN can wait
+   half an hour. That is saturation, not breakage — confirm by reading the job's
+   `status` (`queued`, not `in_progress`) before suspecting a wedged runner, and
+   do not "fix" it by re-running, which only adds load.
 
    **A security-scanner artifact's result COUNT is not its blocking count.** Semgrep SARIF
    keeps `nosemgrep`-suppressed findings in `runs[0].results`, annotated
@@ -426,6 +480,16 @@ and the covering suites into the fix step, not into CI.
    checked out at the right SHAs, one was being written 6 seconds before the fixer looked,
    and 3 PR heads moved mid-drain. The step-0 check is the only thing that prevented a
    race.)
+1b. **Create every worktree with `--detach <sha>`, never by branch name.** A local
+   branch sharing the PR's name can be stale — `git worktree add <wt> <branch>`
+   then checks out that stale ref, and step 0's SHA assertion reports a MISMATCH
+   that reads exactly like "the head moved under me". On 2026-09-19 a local
+   `worktree-worktree-issue-212-pdf-inspector` sat 3 commits behind the PR head
+   and nearly sent the drain hunting a concurrent writer that did not exist. The
+   PR's `headRefOid` is the only ref that means anything; `git fetch` then
+   `git worktree add --detach <that sha>`. When a SHA assertion fails, check
+   whether the LOCAL ref is stale before concluding anything about the remote.
+
 2. **Force-pushes use `--force-with-lease=<branch>:<expected-sha>`**, and before any
    force-push, diff the old and new commit lists (`git log --oneline old..new` + patch-id
    compare). A replay that emits fewer commits than it consumed dropped work — the lease
@@ -493,6 +557,15 @@ and the covering suites into the fix step, not into CI.
   issue, reference that instead of filing a redundant one.
 - Working notes → PR comments.
 
+**A blocked line has no wake signal, so a resume starts by re-probing every blocker.**
+#3983 was blocked on a human applying `agent-ci-approved`. The human applied it and
+Dagger went green on 2026-09-20 at 14:12, then the PR sat mergeable for 3.6 days
+because nothing watches for a label. On resume, before touching any unticked
+unblocked line, re-read each BLOCKED line's PR (`labels`, `mergeStateStatus`, required
+checks and review currency at the current head). The human may have acted days ago.
+When you block a PR on a human action, the PR comment should also say that the drain
+will not notice the action by itself.
+
 **Editing the checklist body is a read-modify-write on a document another session may
 be editing too, and the race's failure mode is a blank issue, not a conflict.** On
 2026-09-04 a tick script asserted its line was still unticked (a peer had ticked it 13
@@ -519,6 +592,17 @@ whole queue for closing keywords once, up front** — one `gh pr view --json bod
 And when you write the explanatory note, do not restate the literal keyword in it: writing
 "the original `Closes #N` was changed" re-arms the parser you just disarmed. Grep the
 final body to confirm zero closing keywords remain rather than trusting the edit.
+
+**The same up-front sweep catches the opposite case: a NET-DESTRUCTIVE diff.** Jules'
+#3984 (`+632/−9778`, 130 files) claimed to "extract" a primitive. Its branch deleted
+tests, docs and 250 lines of `dagger.yml` that had landed on develop through the
+stacked PR #3982 while #3984 was open. A PR whose deletions dwarf its additions, and
+which does not say it removes anything, gets one check before any review:
+`git ls-tree --name-only <merge-base> <paths>` against `<head>` and `origin/<base>`.
+Files present at the merge-base and on the base but missing at the head mean merging
+reverts landed work. Block it the same way as an empty diff (`needs-human`, a PR
+comment with the evidence, never a silent close). Its red CI is a symptom here. Do
+not start a fix loop on it.
 
 ## Stop conditions (comment the reason on the checklist issue, then stop)
 
@@ -562,8 +646,8 @@ The retro exists because the improvement loop ran exactly once by luck (a user a
 ## Dry-run mode
 
 With `PR_DRAIN_DRY_RUN=1`: all reads run normally (issue body, PR state, check runs,
-diffs); every GITHUB mutation (push, merge, issue edit, comment, label, review dispatch)
-is printed as `DRY-RUN: would <command>` instead of executed. Local state still writes:
+diffs); every GITHUB mutation (push, merge, issue edit, comment, label, review dispatch,
+**run cancel**) is printed as `DRY-RUN: would <command>` instead of executed. Local state still writes:
 the event log and claims ledger are the dry-run's own deliverables, not mutations. The deliverable is a per-PR
 plan: current state, what step it's at, what would happen next, and expected wall time.
 `poll-ci.sh` honors the same variable (reports instead of merging).

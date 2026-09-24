@@ -13,11 +13,20 @@
 #   claims.sh log <reviewer> <severity> <verdict> <pr> "<claim summary>" ["<evidence>"]
 #   claims.sh stats [reviewer]     # survival rate per reviewer (P0/P1 focus)
 #   claims.sh prior <reviewer>     # one-line prior for triage prompts
-# Env: PR_DRAIN_WORKDIR (default .pr-drain) for per-drain ledger;
+# Env: PR_DRAIN_WORKDIR (REQUIRED for log/stats, absolute) for the per-drain
+#      ledger; `prior` reads only the global ledger and does not need it.
 #      PR_DRAIN_CLAIMS_GLOBAL=~/.pr-drain/claims.jsonl accumulates across drains.
 set -euo pipefail
 
-WORKDIR="${PR_DRAIN_WORKDIR:-.pr-drain}"
+# No default: a cwd-relative `.pr-drain` scattered drain state across
+# checkouts (see queue.sh). `prior` is exempt because it never touches it.
+WORKDIR="${PR_DRAIN_WORKDIR:-}"
+if [ "${1:-}" != "prior" ]; then
+  case "$WORKDIR" in
+    /*) ;;
+    *) echo "claims.sh: set PR_DRAIN_WORKDIR to an absolute path, e.g. \$HOME/.pr-drain/<repo>-<issue> (got '$WORKDIR')" >&2; exit 2 ;;
+  esac
+fi
 LOCAL="$WORKDIR/claims.jsonl"
 GLOBAL="${PR_DRAIN_CLAIMS_GLOBAL:-$HOME/.pr-drain/claims.jsonl}"
 VALID_VERDICTS="APPLIED REFUTED OUT_OF_DIFF NOTED"

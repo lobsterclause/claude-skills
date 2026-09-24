@@ -11,10 +11,17 @@
 #   (no flag)    compute + print the retro template
 #   --mark-done  stamp $WORKDIR/retro-done after the orchestrator has ANSWERED
 #                the questions and applied/queued the skill edits — not before.
-# Env: PR_DRAIN_WORKDIR (default .pr-drain)
+# Env: PR_DRAIN_WORKDIR (REQUIRED, absolute — e.g. $HOME/.pr-drain/<repo>-<issue>)
 set -euo pipefail
 
-WORKDIR="${PR_DRAIN_WORKDIR:-.pr-drain}"
+# No default. With a cwd-relative `.pr-drain`, an 08-19 retro-done stamp
+# landed in the skill's own directory, where no close-gate would ever find it,
+# and the 09-17 drain's events split across two logs (see queue.sh).
+WORKDIR="${PR_DRAIN_WORKDIR:-}"
+case "$WORKDIR" in
+  /*) ;;
+  *) echo "retro.sh: set PR_DRAIN_WORKDIR to an absolute path, e.g. \$HOME/.pr-drain/<repo>-<issue> (got '$WORKDIR')" >&2; exit 2 ;;
+esac
 EVENTS="$WORKDIR/events.jsonl"
 # claims.sh writes the cross-drain ledger at ~/.pr-drain/claims.jsonl (see
 # SKILL.md step 3); a per-workdir claims.jsonl only exists if someone copied
@@ -26,7 +33,11 @@ EVENTS="$WORKDIR/events.jsonl"
 # workdir copy" then hid 47 logged claims behind 2 (2026-09-03). Merge them;
 # the since-filter below scopes to this drain either way.
 CLAIMS="$(mktemp)"
-cat "$HOME/.pr-drain/claims.jsonl" "$WORKDIR/claims.jsonl" 2>/dev/null | sort -u > "$CLAIMS"
+# `|| true`: a MISSING per-workdir claims.jsonl is the normal case, but under
+# `set -o pipefail` cat's non-zero status propagated and `set -e` killed the
+# retro outright — so this script died precisely when nothing was wrong
+# (2026-09-19). The 2>/dev/null hid the message, not the exit code.
+{ cat "$HOME/.pr-drain/claims.jsonl" "$WORKDIR/claims.jsonl" 2>/dev/null || true; } | sort -u > "$CLAIMS"
 
 if [ "${1:-}" = "--mark-done" ]; then
   mkdir -p "$WORKDIR"

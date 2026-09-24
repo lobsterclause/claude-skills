@@ -4,10 +4,19 @@
 #   queue.sh append <pr> <state> <sha> [note]   # record a transition
 #   queue.sh status                             # latest state per PR
 #   queue.sh log <pr>                           # full history for one PR
-# Env: PR_DRAIN_WORKDIR (default: .pr-drain in cwd), PR_DRAIN_DRY_RUN (append prints only)
+# Env: PR_DRAIN_WORKDIR (REQUIRED, absolute — e.g. $HOME/.pr-drain/<repo>-<issue>),
+#      PR_DRAIN_DRY_RUN (append prints only)
 set -euo pipefail
 
-WORKDIR="${PR_DRAIN_WORKDIR:-.pr-drain}"
+# No default. A cwd-relative `.pr-drain` gave every call site its own log: the
+# 2026-09-17 drain wrote 1 event to its named workdir and 44 to the repo
+# checkout's `.pr-drain`, so the resume read the near-empty one and the retro
+# computed stats for a drain that looked like it never happened.
+WORKDIR="${PR_DRAIN_WORKDIR:-}"
+case "$WORKDIR" in
+  /*) ;;
+  *) echo "queue.sh: set PR_DRAIN_WORKDIR to an absolute path, e.g. \$HOME/.pr-drain/<repo>-<issue> (got '$WORKDIR')" >&2; exit 2 ;;
+esac
 LOG="$WORKDIR/events.jsonl"
 VALID_STATES="QUEUED REVIEWING FIXING VERIFYING CI MERGED BLOCKED"
 
