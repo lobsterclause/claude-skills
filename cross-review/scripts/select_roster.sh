@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # select_roster.sh — pick this round's reviewer roster.
 #
-# Contract (2026-07-01, per Gabriel):
-#   - codex and kimi are FIXED BASELINES — always on when installed.
+# Contract (2026-07-01, per Gabriel; baselines re-flagged 2026-09-07):
+#   - codex plus ONE flagged partner are FIXED BASELINES — always on when
+#     available. The partner is glm-coding by default (GLM Coding Plan) and
+#     kimi when CROSS_REVIEW_KIMI_BASELINE=1. See lib_flags.sh.
 #   - Every round has AT LEAST 3 reviewers.
 #   - The rest rotate: a weighted random draw over the available pool
 #     (agy Gemini laps + the OpenRouter fleet), so we're not paying for every
@@ -88,10 +90,29 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 # reported it available. See lib_path.sh.
 # shellcheck source=lib_path.sh
 . "$script_dir/lib_path.sh"
+# Baseline/OpenRouter feature flags — shared with detect_reviewers.sh and
+# run_reviewers.sh so the three cannot disagree about who exists.
+# shellcheck source=lib_flags.sh
+. "$script_dir/lib_flags.sh"
 
 has_openrouter() {
+  # The flag comes FIRST and covers the whole lane: with
+  # CROSS_REVIEW_OPENROUTER off (the default since 2026-09-07) there is no
+  # OpenRouter pool even on a machine with a valid key. Gating here rather
+  # than at the POOL+= line means every caller of has_openrouter -- present
+  # and future -- inherits the switch.
+  cr_openrouter_on || return 1
   command -v curl >/dev/null 2>&1 || return 1
   [[ -n "${OPENROUTER_API_KEY:-}" || -s "$HOME/.config/openrouter/key" ]]
+}
+
+has_zai() {
+  # glm-coding's availability probe: a key, not a binary. Deliberately NOT
+  # routed through has_openrouter -- the Coding Plan endpoint is a different
+  # provider on a different bill, and the OpenRouter kill switch must not take
+  # the baseline down with it.
+  command -v curl >/dev/null 2>&1 || return 1
+  [[ -n "${ZAI_API_KEY:-}" || -n "${Z_AI_API_KEY:-}" || -s "$HOME/.config/zai/key" ]]
 }
 
 has_moonshot() {
@@ -102,8 +123,20 @@ has_moonshot() {
 # --- availability ------------------------------------------------------------
 BASELINES=()
 missing_baselines=()
-if command -v codex >/dev/null 2>&1; then BASELINES+=(codex); else missing_baselines+=(codex); fi
-if command -v kimi  >/dev/null 2>&1; then BASELINES+=(kimi);  else missing_baselines+=(kimi);  fi
+# WHICH seats are baselines comes from lib_flags.sh, so this script and
+# detect_reviewers.sh cannot answer differently. Availability is still checked
+# per seat and in the seat's own currency: a binary on PATH for the CLI lanes,
+# a key for the curl lane.
+for _b in $(cr_baseline_names); do
+  case "$_b" in
+    codex)
+      if command -v codex >/dev/null 2>&1; then BASELINES+=(codex); else missing_baselines+=(codex); fi ;;
+    glm-coding)
+      if has_zai; then BASELINES+=(glm-coding); else missing_baselines+=(glm-coding); fi ;;
+    kimi)
+      if command -v kimi >/dev/null 2>&1; then BASELINES+=(kimi); else missing_baselines+=(kimi); fi ;;
+  esac
+done
 
 # Fail closed, exactly as detect_reviewers.sh does. A missing baseline used to
 # be a stderr WARN plus a silently raised rotation count, which produces a
@@ -118,10 +151,16 @@ if [[ ${#missing_baselines[@]} -gt 0 ]]; then
   if [[ "${CROSS_REVIEW_ALLOW_MISSING_BASELINE:-0}" == "1" ]]; then
     echo "select_roster: WARN baseline(s) not installed: ${missing_baselines[*]} (allowed via CROSS_REVIEW_ALLOW_MISSING_BASELINE)" >&2
   else
-    echo "select_roster: baseline(s) not installed: ${missing_baselines[*]}" >&2
-    echo "  Do not run a round without them. Usually PATH, not a missing install:" >&2
-    echo "  codex and kimi are npm globals under the nvm bin dir, and nvm is a" >&2
-    echo "  shell function that never runs in a non-interactive shell." >&2
+    echo "select_roster: baseline(s) unavailable: ${missing_baselines[*]}" >&2
+    echo "  Do not run a round without them. For the CLI baselines this is usually" >&2
+    echo "  PATH, not a missing install: codex and kimi are npm globals under the" >&2
+    echo "  nvm bin dir, and nvm is a shell function that never runs in a" >&2
+    echo "  non-interactive shell." >&2
+    case " ${missing_baselines[*]} " in
+      *" glm-coding "*)
+        echo "  glm-coding is a KEY, not an install: ~/.config/zai/key or \$ZAI_API_KEY." >&2
+        echo "  Or go back to kimi: CROSS_REVIEW_GLM_BASELINE=0 CROSS_REVIEW_KIMI_BASELINE=1" >&2 ;;
+    esac
     echo "  Check 'command -v codex'; set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1" >&2
     echo "  only for a deliberate degraded spot check." >&2
     exit 3   # dedicated: run_reviewers.sh must not read this as "selector unavailable"
@@ -175,24 +214,32 @@ fi
 if has_openrouter; then
   POOL+=(glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok longcat inkling)
 fi
-# kimi27 (k2.7-code) rides the DIRECT Moonshot API — a deliberate rotation
-# seat (2026-07-03, per Gabriel), not an OpenRouter fallback for the kimi
-# baseline. Its profile carries a draw_boost so it is drawn frequently while
-# it earns leaderboard data.
-# kimi3 (K3 flagship, released 2026-07-16) is the same direct-Moonshot seat
-# pattern, added 2026-07-18 — shares has_moonshot's gate and billing rail.
-if has_moonshot; then
-  # kimi27 BENCHED 2026-08-22 (per Gabriel: "drop to only 3 and the kimi code
-  # variant"). The kimi BASELINE now runs kimi-k2.7-code itself via
-  # cli_model_alias -- with tools, which the curl seats do not have -- so a
-  # separate diff-only k2.7-code seat is pure redundancy on a provider that
-  # already votes once. Benched rather than deleted: the seat is referenced 122
-  # times across 17 files (65 of them test fixtures) and sits on the fail-closed
-  # baseline path, so removing it is a refactor with real regression risk and no
-  # coverage gain. Benching is one line and reversible, and it keeps kimi27's
-  # leaderboard history readable. Re-add it here to bring the seat back.
-  POOL+=(kimi3)
-fi
+# Both direct-Moonshot rotation seats (kimi27 = k2.7-code, added 2026-07-03;
+# kimi3 = the K3 flagship, added 2026-07-18) are now BENCHED. Neither is an
+# OpenRouter fallback for the kimi baseline -- they rode the platform API on
+# the same billing rail, gated by has_moonshot.
+#
+# kimi27 BENCHED 2026-08-22 (per Gabriel: "drop to only 3 and the kimi code
+# variant"). The kimi BASELINE runs kimi-k2.7-code itself via cli_model_alias
+# -- with tools, which the curl seats do not have -- so a separate diff-only
+# k2.7-code seat was pure redundancy on a provider that already votes once.
+#
+# kimi3 BENCHED 2026-09-01 (per Gabriel: "let's turn off kimi3 for now"), on
+# the cost read in docs/investigation-cr-model-cost-2026-08-29.md. Same
+# redundancy argument as kimi27 -- Moonshot votes once whether one seat
+# answers or three -- plus the price: the seat defaults to think_efforts "max"
+# and cost ~$0.16/run against kimi27's $0.050, for 4 kept findings over 131
+# runs (~$5.20 per kept finding, ~13x kimi27's ~$0.41). Its null `pricing`
+# had been hiding that from the cost divisor in the draw weight below.
+#
+# Benched rather than deleted: both seats are referenced across the wrapper,
+# profiles, and test fixtures, and sit near the fail-closed baseline path, so
+# removal is a refactor with real regression risk and no coverage gain. The
+# seat definitions, detection, and leaderboard history are all retained --
+# only the draw is gone. To bring a seat back, append its name to POOL under a
+# has_moonshot guard here -- write the line, do not paste a seat name into this
+# comment: tests/run_tests.sh detects the bench by scanning every line matching
+# POOL+= for the seat name, so a commented-out example reads as a live entry.
 
 if [[ ${#BASELINES[@]} -eq 0 && ${#POOL[@]} -eq 0 ]]; then
   echo "select_roster: no reviewers available at all" >&2

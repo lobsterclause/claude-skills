@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# run_reviewers.sh — run codex, antigravity, gemini-pro, kimi, and/or glm in parallel against the current diff.
+# run_reviewers.sh — run codex, glm-coding, antigravity, gemini-pro, kimi and/or
+# the OpenRouter pool in parallel against the current diff.
+#
+# FEATURE FLAGS (lib_flags.sh — read that file, not this paragraph, for the
+# authoritative contract):
+#   CROSS_REVIEW_GLM_BASELINE=1   glm-coding (GLM Coding Plan) is a baseline
+#   CROSS_REVIEW_KIMI_BASELINE=0  the kimi CLI baseline, off since 2026-09-07
+#   CROSS_REVIEW_OPENROUTER=0     the whole OpenRouter lane, pool AND the
+#                                 or_fallback rescue, off since 2026-09-07
 #
 # Gemini-family reviewers (both via Google's `agy` Antigravity CLI as of the
 # 2026-06-18 Gemini-CLI consumer sunset):
@@ -35,8 +43,18 @@
 #   failure_kind=quota_exhausted and drops out of the round. Roster rotation
 #   (select_roster.sh) compensates by drawing other providers.
 #
-#   Typical rounds run codex + kimi (fixed baselines) plus 2 rotation picks —
-#   see select_roster.sh, which weights picks by the leaderboard.sh score.
+#   Typical rounds run codex + glm-coding (fixed baselines) plus 2 rotation
+#   picks — see select_roster.sh, which weights picks by the leaderboard.sh
+#   score. Before 2026-09-07 the second baseline was kimi and the rotation pool
+#   was mostly OpenRouter; both moved behind flags (see the top of this file),
+#   so with the defaults the picks come from the agy Gemini laps.
+#
+# glm-coding (the GLM Coding Plan baseline, added 2026-09-07):
+#   Single-turn diff-inline review on GLM 5.3 over Z.ai's OpenAI-compatible
+#   coding endpoint — the same runner as the OpenRouter pool, a different
+#   endpoint, key and bill. Key: $ZAI_API_KEY / $Z_AI_API_KEY / ~/.config/zai/key.
+#   It does NOT route through OpenRouter, so CROSS_REVIEW_OPENROUTER=0 leaves it
+#   running; that is the point of it.
 #
 # GOTCHA: `agy --model` takes the EXACT display-name string `agy models` prints
 # (e.g. "Gemini 3.1 Pro (High)"). On an unrecognized string agy does NOT error —
@@ -46,17 +64,17 @@
 #
 # Usage:
 #   run_reviewers.sh --base <branch> --out <dir>
-#                    [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling]
+#                    [--reviewers codex,glm-coding,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling]
 #                    [--timeout <sec>]
 #                    [--timeout-codex <sec>] [--timeout-antigravity <sec>]
 #                    [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>]
-#                    [--timeout-glm <sec>]
+#                    [--timeout-glm <sec>] [--timeout-glm-coding <sec>]
 #                    [--snapshot-dir <dir>]
 #                    [--context-mode files|diff]
 #                    [--tool-mode auto|off|read|check]
 #
-# No --reviewers → select_roster.sh chooses the round's roster (codex + kimi
-# baselines, ≥3 total, leaderboard-weighted rotation picks). Explicit
+# No --reviewers → select_roster.sh chooses the round's roster (codex + the
+# flagged baseline, ≥3 total, leaderboard-weighted rotation picks). Explicit
 # --reviewers bypasses rotation entirely.
 #
 # Per-reviewer timeouts override the global --timeout. antigravity/gemini-pro/
@@ -140,6 +158,9 @@
 #                              grok, longcat, inkling) writes
 #                                stdout/stderr/meta plus request.json and
 #                                response.json for audit
+#   <out>/glm-coding.*         — the GLM Coding Plan baseline (same
+#                                request/response/meta shape as the OR pool,
+#                                Z.ai endpoint, cli "zai" in meta.json)
 #   <out>/kimi27.*, kimi3.*    — direct-Moonshot rotation seats (same
 #                                request/response/meta shape as the OR pool,
 #                                different endpoint — see run_openrouter_reviewer)
@@ -243,6 +264,7 @@ timeout_antigravity=""
 timeout_gemini_pro=""
 timeout_kimi=""
 timeout_glm=""
+timeout_glm_coding=""
 
 # MODEL IDS LIVE IN EXACTLY ONE PLACE: references/reviewer_profiles.json
 # `.model`. This script deliberately keeps NO fallback copy. It used to carry a
@@ -256,7 +278,8 @@ timeout_glm=""
 #
 # The names below are the API-lane reviewers whose model comes from the profile.
 # Resolution happens after profile_get is defined, further down.
-model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
+model_backed_reviewers=(antigravity gemini-pro glm-coding glm deepseek mimo
+                        minimax qwen
                         devstral laguna kat north nemotron spark seed grok
                         longcat inkling kimi27 kimi3)
 
@@ -268,6 +291,11 @@ model_backed_reviewers=(antigravity gemini-pro glm deepseek mimo minimax qwen
 # lib_path.sh.
 # shellcheck source=lib_path.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib_path.sh"
+# Baseline / OpenRouter feature flags. Same reasoning as lib_path.sh: the three
+# scripts that decide who reviews must read one file, or detection advertises a
+# fleet the runner will not dispatch. See lib_flags.sh for each flag.
+# shellcheck source=lib_flags.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_flags.sh"
 
 need_val() {
   local flag="$1"
@@ -296,6 +324,7 @@ while [[ $# -gt 0 ]]; do
     --timeout-gemini-pro) need_val --timeout-gemini-pro "$#"; timeout_gemini_pro="$2"; shift 2 ;;
     --timeout-kimi)       need_val --timeout-kimi       "$#"; timeout_kimi="$2";       shift 2 ;;
     --timeout-glm)        need_val --timeout-glm        "$#"; timeout_glm="$2";        shift 2 ;;
+    --timeout-glm-coding) need_val --timeout-glm-coding "$#"; timeout_glm_coding="$2"; shift 2 ;;
     --snapshot-dir)       need_val --snapshot-dir       "$#"; snapshot_dir="$2";       shift 2 ;;
     --context-mode)       need_val --context-mode       "$#"; context_mode="$2";       shift 2 ;;
     --tool-mode)          need_val --tool-mode          "$#"; tool_mode="$2";          shift 2 ;;
@@ -304,7 +333,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--snapshot-dir <dir>] [--context-mode files|diff]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,glm-coding,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff]" >&2
   exit 2
 fi
 case "$context_mode" in
@@ -320,9 +349,19 @@ case "$context_budget_bytes" in
 esac
 
 # Roster resolution: no --reviewers → ask select_roster.sh (weighted rotation,
-# codex+kimi baselines). The selector prints a comma list on stdout and its
-# reasoning on stderr (passed through so the user sees why the roster is what
-# it is). Missing/failed selector → classic fixed fleet.
+# codex + the flagged baseline). The selector prints a comma list on stdout and
+# its reasoning on stderr (passed through so the user sees why the roster is
+# what it is). Missing/failed selector → classic fixed fleet.
+#
+# The fallback fleet is DERIVED from the flags rather than written out: a
+# hardcoded "codex,antigravity,gemini-pro,kimi,glm" would quietly resurrect
+# both the retired kimi baseline and an OpenRouter seat on exactly the path
+# taken when the selector is broken -- i.e. it would spend on a lane the
+# operator switched off, at the moment nobody is watching.
+fallback_fleet="codex,antigravity,gemini-pro"
+cr_glm_baseline_on  && fallback_fleet="$fallback_fleet,glm-coding"
+cr_kimi_baseline_on && fallback_fleet="$fallback_fleet,kimi"
+cr_openrouter_on    && fallback_fleet="$fallback_fleet,glm"
 if [[ -z "$reviewers" ]]; then
   selector="$(cd "$(dirname "$0")" && pwd)/select_roster.sh"
   if [[ -x "$selector" ]]; then
@@ -339,11 +378,11 @@ if [[ -z "$reviewers" ]]; then
     if [[ $sel_rc -eq 0 && -n "$reviewers" ]]; then
       echo "roster (select_roster.sh): $reviewers" >&2
     else
-      reviewers="codex,antigravity,gemini-pro,kimi,glm"
+      reviewers="$fallback_fleet"
       echo "roster: selector failed (rc=$sel_rc) — using fixed fallback fleet: $reviewers" >&2
     fi
   else
-    reviewers="codex,antigravity,gemini-pro,kimi,glm"
+    reviewers="$fallback_fleet"
     echo "roster: selector unavailable — using fixed fallback fleet: $reviewers" >&2
   fi
 fi
@@ -429,6 +468,7 @@ antigravity_profile="$(profile_timeout antigravity)"
 gemini_pro_profile="$(profile_timeout gemini-pro)"
 kimi_profile="$(profile_timeout kimi)"
 glm_profile="$(profile_timeout glm)"
+glm_coding_profile="$(profile_timeout glm-coding)"
 deepseek_profile="$(profile_timeout deepseek)"
 mimo_profile="$(profile_timeout mimo)"
 minimax_profile="$(profile_timeout minimax)"
@@ -452,6 +492,7 @@ antigravity_timeout="${timeout_antigravity:-${timeout_s:-${antigravity_profile:-
 gemini_pro_timeout="${timeout_gemini_pro:-${timeout_s:-${gemini_pro_profile:-900}}}"
 kimi_timeout="${timeout_kimi:-${timeout_s:-${kimi_profile:-$timeout_s_default}}}"
 glm_timeout="${timeout_glm:-${timeout_s:-${glm_profile:-$timeout_s_default}}}"
+glm_coding_timeout="${timeout_glm_coding:-${timeout_s:-${glm_coding_profile:-900}}}"
 # The other OpenRouter reviewers share the glm flag-less pattern: global
 # --timeout, else profile timeout_s, else the 600s default. Per-reviewer
 # tuning belongs in reviewer_profiles.json, not new CLI flags.
@@ -879,6 +920,11 @@ maybe_or_fallback() {
   # $1 = reviewer name, $2 = final rc. Echoes the new rc on stdout.
   local name="$1" rc="$2"
   local enabled fb_model reason
+  # The or_fallback rescue lane IS the OpenRouter implementation, so the kill
+  # switch covers it too. Checked before the profile is even read: a profile
+  # that still says or_fallback.enabled=true is not a request to spend on a
+  # disabled provider, it is the seat's standing config for when the lane is on.
+  if ! cr_openrouter_on; then echo "$rc"; return; fi
   enabled="$(profile_path "$name" '.or_fallback.enabled')"
   fb_model="$(profile_path "$name" '.or_fallback.model')"
   [[ "$enabled" == "true" && -n "$fb_model" ]] || { echo "$rc"; return; }
@@ -1431,7 +1477,10 @@ run_codex() {
   local start end rc
   start=$(date +%s)
   # codex exec review runs the built-in review prompt against the branch diff.
-  # --full-auto: low-friction sandbox, workspace-write, no approval prompts.
+  # approval_policy=never + sandbox_mode=workspace-write: what --full-auto used
+  # to expand to. codex-cli 0.153.x dropped --full-auto from `exec review`
+  # (2026-09-07: "unexpected argument '--full-auto'"), and the -c form is
+  # accepted by both the old and new CLIs.
   # IMPORTANT: --base and a positional [PROMPT] are mutually exclusive — if you
   # want a custom prompt, you must drop --base and put the base reference inside
   # the prompt itself.
@@ -1468,7 +1517,7 @@ run_codex() {
   fi
   run_with_timeout "$codex_timeout" codex exec review \
     --base "$base" \
-    --full-auto \
+    -c 'approval_policy="never"' -c 'sandbox_mode="workspace-write"' \
     ${codex_model_args[@]+"${codex_model_args[@]}"} \
     ${codex_cfg[@]+"${codex_cfg[@]}"} \
     >"$out/codex.stdout" 2>&1
@@ -1530,6 +1579,13 @@ run_codex() {
 # Prints the key and returns 0, or returns 1 when neither source exists —
 # callers use it both as a getter and as an availability probe.
 openrouter_key() {
+  # CROSS_REVIEW_OPENROUTER off (the default since 2026-09-07) means the lane
+  # does not exist for this run, key or no key. Enforced in the KEY GETTER
+  # rather than at the dispatch case because every OpenRouter path -- the
+  # rotation pool, the or_fallback rescue, a hand-passed --reviewers glm --
+  # goes through here, and a switch that only covered the roster would still
+  # let an explicit or a fallback dispatch spend money on it.
+  cr_openrouter_on || return 1
   if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
     printf '%s' "$OPENROUTER_API_KEY"
     return 0
@@ -1558,6 +1614,33 @@ moonshot_key() {
   fi
   return 1
 }
+
+# zai_key: same getter/probe contract again, for the Z.ai Coding Plan lane that
+# serves the glm-coding baseline. $ZAI_API_KEY (or $Z_AI_API_KEY, which is what
+# Z.ai's own docs print) wins; ~/.config/zai/key (single line, chmod 600) is the
+# persistent home. Deliberately NOT gated on CROSS_REVIEW_OPENROUTER: this lane
+# talks to Z.ai directly, and killing OpenRouter must not kill the baseline.
+zai_key() {
+  if [[ -n "${ZAI_API_KEY:-}" ]]; then
+    printf '%s' "$ZAI_API_KEY"
+    return 0
+  fi
+  if [[ -n "${Z_AI_API_KEY:-}" ]]; then
+    printf '%s' "$Z_AI_API_KEY"
+    return 0
+  fi
+  local f="$HOME/.config/zai/key"
+  if [[ -s "$f" ]]; then
+    tr -d '[:space:]' <"$f"
+    return 0
+  fi
+  return 1
+}
+
+# The Coding Plan's OpenAI-compatible chat-completions endpoint. Overridable
+# because Z.ai serves plan traffic from more than one base (region and tier),
+# and a plan change must not require a code change to follow it.
+zai_endpoint="${CROSS_REVIEW_ZAI_ENDPOINT:-https://api.z.ai/api/coding/paas/v4/chat/completions}"
 
 # run_openrouter_reviewer: single-turn, diff-inline review via the OpenRouter
 # chat-completions API. No agentic tools — the diff IS the input (same niche
@@ -1599,8 +1682,17 @@ run_openrouter_reviewer() {
       echo "$slug: no Moonshot key (set MOONSHOT_API_KEY or ~/.config/moonshot/key)" >&2
       return 5
     fi
+  elif [[ "$cli" == "zai" ]]; then
+    if ! key="$(zai_key)"; then
+      echo "$slug: no Z.ai Coding Plan key (set ZAI_API_KEY or ~/.config/zai/key)" >&2
+      return 5
+    fi
   elif ! key="$(openrouter_key)"; then
-    echo "$slug: no OpenRouter key (set OPENROUTER_API_KEY or ~/.config/openrouter/key)" >&2
+    if ! cr_openrouter_on; then
+      echo "$slug: OpenRouter is disabled (CROSS_REVIEW_OPENROUTER=0) — set CROSS_REVIEW_OPENROUTER=1 to re-enable the lane" >&2
+    else
+      echo "$slug: no OpenRouter key (set OPENROUTER_API_KEY or ~/.config/openrouter/key)" >&2
+    fi
     return 5
   fi
   local start end rc
@@ -2368,6 +2460,12 @@ run_seed()     { run_openrouter_reviewer seed     "$seed_model"     "$seed_timeo
 run_grok()     { run_openrouter_reviewer grok     "$grok_model"     "$grok_timeout"; }
 run_longcat()  { run_openrouter_reviewer longcat  "$longcat_model"  "$longcat_timeout"; }
 run_inkling()  { run_openrouter_reviewer inkling  "$inkling_model"  "$inkling_timeout"; }
+# glm-coding: the GLM Coding Plan baseline. Same OpenAI-compatible single-turn
+# body as the pool, pointed at Z.ai's coding endpoint with cli label "zai" (which
+# selects zai_key and is recorded verbatim in meta.json, so a round's cost
+# analysis can tell the flat-rate lane apart from the metered `glm` seat).
+run_glm_coding() { run_openrouter_reviewer glm-coding "$glm_coding_model" "$glm_coding_timeout" \
+                     "$zai_endpoint" zai; }
 # kimi27: same OpenAI-compatible single-turn body, direct Moonshot endpoint +
 # key. cli label "moonshot" selects the key source and lands in meta.json.
 run_kimi27()   { run_openrouter_reviewer kimi27   "$kimi27_model"   "$kimi27_timeout" \
@@ -2908,6 +3006,21 @@ for r in "${requested[@]}"; do
         echo "kimi not installed — skipping" >&2
       fi
       ;;
+    glm-coding)
+      # The GLM Coding Plan baseline. Skipped loudly on a missing key rather
+      # than silently: this is a BASELINE, and a round that quietly runs
+      # without one is the failure detect_reviewers.sh fails closed to prevent.
+      if ! command -v curl >/dev/null 2>&1; then
+        echo "glm-coding: curl not available — skipping" >&2
+      elif zai_key >/dev/null 2>&1; then
+        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
+        retry_reviewer run_glm_coding glm-coding &
+        pids+=($!)
+        ran+=("glm-coding")
+      else
+        echo "glm-coding (GLM Coding Plan baseline) unavailable — set ZAI_API_KEY or put the key in ~/.config/zai/key. Skipping." >&2
+      fi
+      ;;
     glm|deepseek|mimo|minimax|qwen|devstral|laguna|kat|north|nemotron|spark|seed|grok|longcat|inkling)
       if ! command -v curl >/dev/null 2>&1; then
         echo "$r: curl not available — skipping" >&2
@@ -2916,6 +3029,8 @@ for r in "${requested[@]}"; do
         retry_reviewer "run_$r" "$r" &
         pids+=($!)
         ran+=("$r")
+      elif ! cr_openrouter_on; then
+        echo "$r (OpenRouter reviewer) skipped — the OpenRouter lane is disabled (CROSS_REVIEW_OPENROUTER=0). Set CROSS_REVIEW_OPENROUTER=1 to re-enable it." >&2
       else
         echo "$r (OpenRouter reviewer) unavailable — set OPENROUTER_API_KEY or put the key in ~/.config/openrouter/key. Skipping." >&2
       fi

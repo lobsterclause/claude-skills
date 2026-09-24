@@ -2,7 +2,7 @@
 # detect_reviewers.sh — report which review CLIs are available.
 # Prints JSON to stdout:
 #   {"codex": bool, "antigravity": bool, "gemini-pro": bool, "kimi": bool,
-#    "glm": bool, "deepseek": bool, "mimo": bool, "minimax": bool, "qwen": bool,
+#    "glm-coding": bool, "glm": bool, "deepseek": bool, "mimo": bool, "minimax": bool, "qwen": bool,
 #    "devstral": bool, "laguna": bool, "kat": bool,
 #    "north": bool, "nemotron": bool, "spark": bool,
 #    "seed": bool, "grok": bool, "longcat": bool, "inkling": bool,
@@ -39,6 +39,13 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib_path.sh"
 nvm_bin="$CROSS_REVIEW_NVM_BIN"
 
+# Feature flags (which baseline is fixed, whether OpenRouter exists at all)
+# live in lib_flags.sh for the same reason the PATH fixups live in lib_path.sh:
+# detection, selection and execution have to answer identically or the fleet
+# reports one roster and runs another. See lib_flags.sh for each flag.
+# shellcheck source=lib_flags.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_flags.sh"
+
 has() {
   command -v "$1" >/dev/null 2>&1 && return 0
   # Antigravity's installer drops `agy` in $HOME/.local/bin, which is often not
@@ -54,6 +61,7 @@ codex=false
 antigravity=false
 gemini_pro=false
 kimi=false
+glm_coding=false
 openrouter=false
 kimi27=false
 kimi3=false
@@ -100,11 +108,35 @@ if has agy; then
 fi
 has kimi && kimi=true
 
+# glm-coding: the GLM Coding Plan baseline. No CLI — it is a curl lane against
+# Z.ai's coding endpoint — so availability is "curl + a key", exactly like the
+# OpenRouter seats, and NOT gated on $OPENROUTER_API_KEY: this lane bypasses
+# OpenRouter entirely, which is why the OpenRouter kill switch leaves it up.
+# Reported false when CROSS_REVIEW_GLM_BASELINE=0, so the flag and the
+# availability report agree (a seat that will not be dispatched must not be
+# advertised as available).
+if command -v curl >/dev/null 2>&1 && cr_glm_baseline_on; then
+  if [[ -n "${ZAI_API_KEY:-}" || -n "${Z_AI_API_KEY:-}" || -s "$HOME/.config/zai/key" ]]; then
+    glm_coding=true
+  fi
+fi
+
 # OpenRouter key + curl → the whole OpenRouter reviewer pool lights up.
-if command -v curl >/dev/null 2>&1; then
+# ...unless CROSS_REVIEW_OPENROUTER is off (the default since 2026-09-07), in
+# which case the pool does not exist for this run no matter what key is on
+# disk. Reported here rather than only at dispatch so `detect_reviewers.sh`
+# stays the honest answer to "who can review right now".
+if command -v curl >/dev/null 2>&1 && cr_openrouter_on; then
   if [[ -n "${OPENROUTER_API_KEY:-}" || -s "$HOME/.config/openrouter/key" ]]; then
     openrouter=true
   fi
+fi
+
+# The direct-Moonshot seats are deliberately OUTSIDE the OpenRouter gate above:
+# they ride Moonshot's own platform API on their own key and their own bill, so
+# turning OpenRouter off must not silently take them with it. (Both are benched
+# in select_roster.sh regardless — this reports availability, not the draw.)
+if command -v curl >/dev/null 2>&1; then
   # kimi27 (k2.7-code rotation seat) rides the DIRECT Moonshot API — its own
   # key, independent of both the kimi CLI baseline and the OpenRouter pool.
   if [[ -n "${MOONSHOT_API_KEY:-}" || -s "$HOME/.config/moonshot/key" ]]; then
@@ -118,14 +150,22 @@ fi
 # WARNING: the format-string keys and the positional args below are coupled
 # by POSITION ONLY — inserting a reviewer in one without the other silently
 # shifts every later value (kimi+kat convergent nit, PR #29 pass 1). Keep the
-# order: 4 named CLIs, 15x $openrouter for the OR pool, $kimi27, $kimi3, $openrouter.
-printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "spark": %s, "seed": %s, "grok": %s, "longcat": %s, "inkling": %s, "kimi27": %s, "kimi3": %s, "openrouter": %s}\n' \
-  "$codex" "$antigravity" "$gemini_pro" "$kimi" \
+# order: 4 named CLIs, $glm_coding, 15x $openrouter for the OR pool, $kimi27,
+# $kimi3, $openrouter.
+printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm-coding": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "spark": %s, "seed": %s, "grok": %s, "longcat": %s, "inkling": %s, "kimi27": %s, "kimi3": %s, "openrouter": %s}\n' \
+  "$codex" "$antigravity" "$gemini_pro" "$kimi" "$glm_coding" \
   "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" \
   "$kimi27" "$kimi3" "$openrouter"
 
 # --- baseline enforcement ---------------------------------------------------
-# codex and kimi are FIXED BASELINES, not rotating reviewers: every round is
+# WHICH seats are baselines is now flag-driven (lib_flags.sh): codex always,
+# plus glm-coding (default) and/or kimi. The enforcement below is unchanged in
+# kind -- a missing baseline still fails CLOSED -- it just asks
+# cr_baseline_names what the baselines are instead of hardcoding the pair. The
+# hazard the flags introduce is a fleet that reports "healthy" while reviewing
+# with one seat, and that is precisely what this block exists to stop.
+#
+# codex and the flagged baseline are FIXED BASELINES, not rotating reviewers: every round is
 # supposed to include both. Before 2026-08-14 a missing baseline simply reported
 # `false` and the round proceeded a reviewer short while looking healthy — a
 # missing verifier was indistinguishable from a passing verification. Nine
@@ -138,8 +178,13 @@ printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm": %s
 #   CROSS_REVIEW_ALLOW_MISSING_BASELINE=1
 # which makes it a visible choice at the call site instead of a silent default.
 missing_baselines=""
-[[ "$codex" == true ]] || missing_baselines="$missing_baselines codex"
-[[ "$kimi"  == true ]] || missing_baselines="$missing_baselines kimi"
+for _b in $(cr_baseline_names); do
+  case "$_b" in
+    codex)      [[ "$codex" == true ]]      || missing_baselines="$missing_baselines codex" ;;
+    glm-coding) [[ "$glm_coding" == true ]] || missing_baselines="$missing_baselines glm-coding" ;;
+    kimi)       [[ "$kimi" == true ]]       || missing_baselines="$missing_baselines kimi" ;;
+  esac
+done
 missing_baselines="${missing_baselines# }"
 
 if [[ -n "$missing_baselines" ]]; then
@@ -151,6 +196,14 @@ if [[ -n "$missing_baselines" ]]; then
     printf '  These are fixed baselines. A round without them is not a cross-review.\n' >&2
     printf '  Searched $PATH plus %s and %s\n' \
       "$HOME/.local/bin" "${nvm_bin:-<no nvm bin found>}" >&2
+    case " $missing_baselines " in
+      *" glm-coding "*)
+        # glm-coding is a curl lane, not a binary: PATH is never its problem.
+        printf '  glm-coding is a KEY, not an install: put the GLM Coding Plan key in\n' >&2
+        printf '  ~/.config/zai/key (chmod 600) or export ZAI_API_KEY.\n' >&2
+        printf '  To go back to the kimi baseline instead:\n' >&2
+        printf '    CROSS_REVIEW_GLM_BASELINE=0 CROSS_REVIEW_KIMI_BASELINE=1\n' >&2 ;;
+    esac
     printf '  Fix the install or PATH, or set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1\n' >&2
     printf '  to run degraded on purpose.\n' >&2
     exit 1
