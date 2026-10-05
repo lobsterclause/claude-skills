@@ -575,7 +575,7 @@ After committing, re-run steps 3–5 — but **incrementally**: pass the *previo
 Keep iterating until any of:
 
 - No Critical or High findings remain.
-- **Iteration cap: 3 passes.** If the reviewers are still finding Critical/High on pass 3, stop and hand to the user — something structural is wrong and more passes won't fix it.
+- **Iteration cap: 3 passes.** If the reviewers are still finding Critical/High on pass 3, stop and hand to the user — something structural is wrong and more passes won't fix it. **The same cap covers the GitHub Codex loop** (`@codex review` → fix → `@codex review` on the new head): at most 3 Codex reviews per PR. After the third, fix or answer the open findings, reply on and resolve each thread, and merge on green CI pinned to the head — never a fourth request. `hooks/codex_round_cap.sh` enforces it (see "The Codex round cap" below).
 - The same finding recurs across passes (reviewer doesn't accept the fix). Stop and ask the user.
 
 Each pass's artifacts go in a new `run-<timestamp>/` so the record is preserved.
@@ -711,6 +711,30 @@ green-when-absent would quietly become a review mandate.
 `gh api ... repos/O/R/pulls/N/merge` is gated the same way. It merges a PR
 without ever saying `gh pr merge`, which makes it the first thing a blocked
 agent would reach for rather than an exotic edge case.
+
+### The Codex round cap
+
+`merge_gate.sh` holds a merge until every Codex thread is cleared, so each fix
+invites another `@codex review`, and each round finds one narrower real issue.
+Uncapped, that never converges: on 2026-10-04 firebird-minecraft #44 ran 19
+rounds (24 findings, about 9.5 hours) and #78 ran 10 while the features waited.
+The rule is the iteration cap above, **3 Codex reviews per PR**, and
+`hooks/codex_round_cap.sh` makes it binding: a command that posts
+`@codex review` on a PR (`gh pr comment …`, or `gh api …/issues/N/comments`) is
+refused once the PR has 3 reviews by the Codex app. The denial says what to do
+instead: clear the open threads and merge on green with `--match-head-commit`.
+Wire it next to the merge gate:
+
+```json
+{ "matcher": "Bash", "hooks": [
+    { "type": "command",
+      "command": "/Users/<you>/.claude/skills/cross-review/hooks/codex_round_cap.sh" } ] }
+```
+
+`CODEX_ROUND_CAP=N` in the hook's environment changes the cap; there is no
+per-command bypass, because a fourth round is the user's call. Like the merge
+gate it fails open (no `gh`, API error, unresolvable PR) and reads only the
+command text. Tests: `tests/test_codex_round_cap.sh`.
 
 ### The hook is only half of it — see `ci/`
 
