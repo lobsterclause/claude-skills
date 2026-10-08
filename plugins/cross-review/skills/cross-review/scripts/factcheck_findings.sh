@@ -27,13 +27,12 @@
 # identical to today.
 #
 # When the agy pass fails or produces empty output (quota exhaustion, panic,
-# expired auth — see run_reviewers.sh for the taxonomy) and an OpenRouter key
-# is available ($OPENROUTER_API_KEY or ~/.config/openrouter/key), the check
-# retries once via deepseek/deepseek-v4-flash on OpenRouter before falling
-# back to keep-all. (Policy 2026-07-01: first-party models — Gemini, codex,
-# claude — are never routed through OpenRouter; DeepSeek Flash is the
-# designated cheap fact-check substitute. The falsify-only contract is
-# model-agnostic, so the swap is safe.)
+# expired auth — see run_reviewers.sh for the taxonomy), the check retries once
+# via deepseek/deepseek-v4-flash only when CROSS_REVIEW_OPENROUTER enables the
+# OpenRouter lane. The direct --reviewer openrouter route uses the same gate.
+# (Policy 2026-07-01: first-party models — Gemini, codex, claude — are never
+# routed through OpenRouter; DeepSeek Flash is the designated cheap fact-check
+# substitute. The falsify-only contract is model-agnostic, so the swap is safe.)
 #
 # Exit: 0 ok (incl. fail-safe keep-all), 2 usage, 1 io error.
 
@@ -76,6 +75,11 @@ done
 [[ -z "$findings" || -z "$out" ]] && { echo "usage: $0 --findings <json> --out <json> (--base <ref> [--repo <dir>] | --diff <file>) [--reviewer agy|kimi|openrouter] [--model <name>] [--timeout <sec>] [--emit-events <run_id>]" >&2; exit 2; }
 [[ -f "$findings" ]] || { echo "factcheck: findings file not found: $findings" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "factcheck: jq required" >&2; exit 1; }
+
+_fc_script_dir="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib_flags.sh
+. "$_fc_script_dir/lib_flags.sh"
+if cr_openrouter_on; then openrouter_enabled=1; else openrouter_enabled=0; fi
 
 if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then PATH="$HOME/.local/bin:$PATH"; fi
 
@@ -185,6 +189,8 @@ openrouter_key() {
 # transport/API failure — caller decides between fallback and keep_all.
 openrouter_factcheck() {
   local or_model="$1" key
+  # Gate before resolving any key or preparing a request body.
+  [[ "$openrouter_enabled" == 1 ]] || return 1
   key="$(openrouter_key)" || return 1
   command -v curl >/dev/null 2>&1 || return 1
   local body="$tmp_dir/or_body.json" resp="$tmp_dir/or_resp.json" auth="$tmp_dir/curl-auth"
@@ -222,6 +228,7 @@ case "$reviewer" in
     # on DeepSeek Flash, NOT OR-hosted Gemini (policy) — before the keep-all
     # fail-safe keeps the veto alive through agy outages.
     if [[ ! -s "$raw" ]]; then
+      [[ "$openrouter_enabled" == 1 ]] || keep_all "agy factcheck failed/empty and OpenRouter is disabled (set CROSS_REVIEW_OPENROUTER=1 to enable; fail-safe)"
       if openrouter_factcheck "$or_fallback_model"; then
         model="$or_fallback_model (openrouter fallback)"
         echo "factcheck: agy failed/empty — used OpenRouter fallback ($or_fallback_model)" >&2
@@ -236,8 +243,11 @@ case "$reviewer" in
     run_to "$timeout_s" kimi --plan --print --quiet >"$raw" 2>"$tmp_dir/err.txt" <"$prompt" || keep_all "kimi factcheck failed/timed out (fail-safe)"
     ;;
   openrouter)
-    # Direct OpenRouter lane (no agy involved). --model here means an
-    # OpenRouter model id; the agy default display-name is not valid — swap it.
+    # Direct OpenRouter lane (no agy involved); it shares the same feature gate
+    # as the automatic agy fallback.
+    [[ "$openrouter_enabled" == 1 ]] || keep_all "OpenRouter reviewer disabled (set CROSS_REVIEW_OPENROUTER=1 to enable; fail-safe)"
+    # --model here means an OpenRouter model id; the agy default display-name
+    # is not valid — swap it.
     [[ "$model" == "$agy_default_model" ]] && model="$or_fallback_model"
     openrouter_factcheck "$model" || keep_all "openrouter factcheck failed (fail-safe)"
     ;;
