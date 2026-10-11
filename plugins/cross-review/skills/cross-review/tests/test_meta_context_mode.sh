@@ -146,8 +146,9 @@ CODEX_KEYS_BEFORE='["attempt","context_access","duration_s","exit_code","failure
 # OR rows also carry tokens_cached/tokens_cache_write/upstream_provider and
 # tool_policy/tool_stats since feat/cross-review-tool-loop (prompt-caching
 # telemetry + the learned tool arms); those pre-date context_mode on that
-# branch, so they belong in the "before" set.
-OR_KEYS_BEFORE='["attempt","cli","context_access","context_files","context_files_omitted","cost_usd","duration_s","exit_code","failure_kind","model","output_bytes","timed_out","timeout_budget_s","tokens_cache_write","tokens_cached","tokens_completion","tokens_prompt","tool_policy","tool_stats","total_diff_lines","truncated","upstream_provider","wall_over_budget"]'
+# branch, so they belong in the "before" set. tokens_cache_prompt joins them
+# for the same reason (#151/#152: the cache-hit denominator).
+OR_KEYS_BEFORE='["attempt","cli","context_access","context_files","context_files_omitted","cost_usd","duration_s","exit_code","failure_kind","model","output_bytes","timed_out","timeout_budget_s","tokens_cache_prompt","tokens_cache_write","tokens_cached","tokens_completion","tokens_prompt","tool_policy","tool_stats","total_diff_lines","truncated","upstream_provider","wall_over_budget"]'
 KIMI_KEYS_BEFORE='["attempt","context_access","context_files","context_files_omitted","diff_line_cap","duration_s","exit_code","failure_kind","output_bytes","timed_out","timeout_budget_s","total_diff_lines","truncated","wall_over_budget"]'
 AGY_KEYS_BEFORE='["attempt","cli","context_access","duration_s","exit_code","failure_kind","model","model_resolved","output_bytes","quota_resets_in","timed_out","timeout_budget_s","wall_over_budget"]'
 

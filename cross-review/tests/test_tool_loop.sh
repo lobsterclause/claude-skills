@@ -44,6 +44,8 @@ export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"; : >"$CROSS_REVIEW_FINDING_
 #   err400   — every request 400s with a tools complaint (survives the rf-drop retry)
 #   nocache  — normal flow, but usage carries NO prompt_tokens_details (the
 #              Moonshot-direct shape: a host that reports no cache counters)
+#   mixedcache — turn 1 omits prompt_tokens_details, turn 2 reports them (the
+#              mid-loop re-route: one loop, two hosts, only one reporting)
 cat >"$HOME/.local/bin/curl" <<'SHIM'
 #!/bin/sh
 cat >/dev/null   # the --config stdin (bearer header)
@@ -85,6 +87,7 @@ one='{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","co
 case "${SHIM_MODE:-default}" in
   always) if [ "$tool_choice" = "none" ]; then printf '%s' "$final"; else printf '%s' "$one"; fi ;;
   nocache) if [ "$have_tool_msgs" = "0" ]; then printf '%s' "$calls" | jq -c 'del(.usage.prompt_tokens_details)'; else printf '%s' "$final" | jq -c 'del(.usage.prompt_tokens_details)'; fi ;;
+  mixedcache) if [ "$have_tool_msgs" = "0" ]; then printf '%s' "$calls" | jq -c 'del(.usage.prompt_tokens_details)'; else printf '%s' "$final"; fi ;;
   *)      if [ "$have_tool_msgs" = "0" ]; then printf '%s' "$calls"; else printf '%s' "$final"; fi ;;
 esac
 exit 0
@@ -261,6 +264,18 @@ assert_eq "no cache counters reported → tokens_cached null" "$(jq -r .tokens_c
 assert_eq "…and tokens_cache_write null too"                "$(jq -r .tokens_cache_write "$T/o6c/glm.meta.json")" "null"
 assert_eq "cost/tokens still recorded"                      "$(jq -r .tokens_prompt "$T/o6c/glm.meta.json")" "150"
 assert_eq "provider still recorded"                         "$(jq -r .upstream_provider "$T/o6c/glm.meta.json")" "Shimco"
+
+echo "── mixed reporting in one loop: the denominator covers only the reporting turns ──"
+# The re-route case PR #150 exists to measure. Turn 1 (50 prompt tokens) lands on
+# a host that omits prompt_tokens_details; turn 2 (100 prompt tokens) reports 40
+# cached. tokens_prompt is still 150 — that is what the loop cost — but dividing
+# 40 by 150 understates the hit rate of the only turn that was ever measured.
+# tokens_cache_prompt is that turn's 100, so the ratio reads 40% not 26% (#151).
+run_lane "$T/o6d" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=mixedcache --
+assert_eq "prompt tokens still cover every turn"        "$(jq -r .tokens_prompt "$T/o6d/glm.meta.json")" "150"
+assert_eq "cached tokens come from the reporting turn"  "$(jq -r .tokens_cached "$T/o6d/glm.meta.json")" "40"
+assert_eq "cache denominator excludes the silent turn"  "$(jq -r .tokens_cache_prompt "$T/o6d/glm.meta.json")" "100"
+assert_eq "…and a fully silent loop reports no denominator" "$(jq -r .tokens_cache_prompt "$T/o6c/glm.meta.json")" "null"
 
 echo "── response_format rejected alongside tools → dropped and retried ──"
 run_lane "$T/o7" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=rf400 --

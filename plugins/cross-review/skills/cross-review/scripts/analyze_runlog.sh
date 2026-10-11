@@ -128,8 +128,16 @@ analyze_reviewer() {
     # Prompt-cache hit rate: cached / prompt tokens over the attempts that
     # report both (rows before 2026-08-28 carry neither → excluded, not 0).
     # This is the number "are we maximizing caching" is answered from.
-    | ($attempts | map(select((.tokens_prompt | type) == "number" and (.tokens_cached | type) == "number"))) as $cachable
-    | ($cachable | map(.tokens_prompt) | add // 0) as $cache_prompt
+    # tokens_cache_prompt is the denominator restricted to the turns/attempts
+    # that actually reported cache counters; tokens_prompt counts every one of
+    # them, so dividing by it understates a run whose reporting was mixed
+    # (#151/#152). Rows written before that field existed fall back to
+    # tokens_prompt, which is what they were always measured with.
+    | ($attempts | map(select((.tokens_cached | type) == "number"
+                              and (((.tokens_cache_prompt | type) == "number")
+                                   or ((.tokens_prompt | type) == "number"))))) as $cachable
+    | ($cachable | map(if (.tokens_cache_prompt | type) == "number"
+                       then .tokens_cache_prompt else .tokens_prompt end) | add // 0) as $cache_prompt
     | ($cachable | map(.tokens_cached) | add // 0) as $cache_hit
     | {
         reviewer: $r,
