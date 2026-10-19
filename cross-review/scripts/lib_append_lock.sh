@@ -17,57 +17,39 @@
 # same primitive run_reviewers.sh uses for the agy gate — which also means the
 # path the tests exercise is the path every machine runs.
 #
-# Two rules it keeps, because a ledger write sits at the end of a round:
-#   - a crashed holder's lock is reclaimed once it is a minute old (an append
-#     takes milliseconds, so nothing live holds it that long);
+# Rules it keeps, because a ledger write sits at the end of a round:
+#   - a lock is stale once it is a minute old. The critical section is one
+#     printf, so nothing live holds it that long; age is measured in seconds
+#     with stat, not asked of `find -mmin`, which compares rounded minutes.
 #   - past the wait cap the row is written anyway, with a WARN. Losing the row
 #     outright, or stalling the round, is worse than the small risk of a tear.
+#   - release removes only the caller's own lock (its pid is recorded in
+#     <lockdir>/owner), so a holder stalled past the minute, whose lock was
+#     reclaimed, cannot then delete the next holder's.
+#
+# WHY STALENESS IS AGE, NOT THE OWNER'S LIVENESS
+#
+# Judging staleness by "is the recorded owner still running" was tried and
+# is racy in ordinary use: a waiter reads owner H0, H0 releases and exits —
+# which every writer does right after its append — a new holder takes the
+# lock, and the waiter then finds H0 dead and reclaims the NEW holder's live
+# lock. Twenty-five concurrent appends tore rows that way. Age has no such
+# turnover race: a fresh lock is never a minute old.
 #
 # CROSS_REVIEW_LOCK_WAIT_S overrides the cap (default 75s, longer than the
 # one-minute stale age so a dead holder is reclaimed inside the wait). It
 # exists for the fixture tests.
-#
-# STALE MEANS THE OWNER IS DEAD, NOT THAT THE LOCK IS OLD
-#
-# Every acquire records its pid in <lockdir>/owner, and a waiter reclaims the
-# lock only when that process no longer exists. An age rule alone reclaims a
-# holder that is merely slow, and any fixed age is a guess about how long the
-# slowest legitimate holder takes. Age is only the fallback for a lock with no
-# owner record (its holder died between mkdir and writing it, or it predates
-# this file). Release likewise removes only a lock whose owner is the caller,
-# so a holder whose lock was taken over cannot delete the next holder's.
-#
-# Known limit: a holder that is alive but wedged forever is never reclaimed;
-# waiters reach the cap instead. And between a waiter's stale check and its
-# rename, another waiter can reclaim and re-take the lock. The rename is then
-# checked against the owner that was judged dead and undone on a mismatch,
-# which narrows that window to the undo itself.
 
-# Age in whole seconds, or empty if it cannot be read. The age is measured,
-# not asked of `find -mmin`, which compares rounded MINUTES and so is only an
-# approximation of "older than 60 seconds". GNU stat first: BSD stat rejects
-# -c, while GNU `stat -f` means something else.
+# Age in whole seconds, or empty if it cannot be read. GNU stat first: BSD
+# stat rejects -c, while GNU `stat -f` means something else.
 _append_lock_age_s() {
   local mtime
   mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null)" || return 0
   [[ "$mtime" =~ ^[0-9]+$ ]] && echo $(( $(date +%s) - mtime ))
 }
 
-# _append_lock_is_stale <lockdir> — 0 if reclaimable. Leaves the owner it
-# judged in _append_lock_seen_owner, so the reclaim can check it renamed the
-# same lock.
 _append_lock_is_stale() {
   local age
-  _append_lock_seen_owner="$(cat "$1/owner" 2>/dev/null || true)"
-  if [[ "$_append_lock_seen_owner" =~ ^[0-9]+$ ]]; then
-    kill -0 "$_append_lock_seen_owner" 2>/dev/null && return 1
-    # kill -0 also fails for a live process we may not signal (EPERM), and
-    # its message is localized, so ask ps whether the pid exists at all.
-    # Without ps the two cannot be told apart: treat the owner as alive.
-    command -v ps >/dev/null 2>&1 || return 1
-    ! ps -p "$_append_lock_seen_owner" >/dev/null 2>&1
-    return
-  fi
   age="$(_append_lock_age_s "$1")"
   [[ -n "$age" && "$age" -ge 60 ]]
 }
@@ -75,7 +57,7 @@ _append_lock_is_stale() {
 # append_lock_acquire <ledger> — 0 locked, 1 gave up at the cap,
 # 2 the ledger's directory is missing or not writable.
 append_lock_acquire() {
-  local lockdir="$1.lock.d" n=0 cap="${CROSS_REVIEW_LOCK_WAIT_S:-75}" staledir age
+  local lockdir="$1.lock.d" n=0 cap="${CROSS_REVIEW_LOCK_WAIT_S:-75}" staledir
   [[ "$cap" =~ ^[0-9]+$ ]] || cap=75
   # A directory the lock cannot be made in would otherwise read as a lock
   # that never comes free: a 75-second wait for an error the write will hit
@@ -84,18 +66,19 @@ append_lock_acquire() {
   until mkdir "$lockdir" 2>/dev/null; do
     if _append_lock_is_stale "$lockdir"; then
       # Rename, then delete: of two runs that see the same stale lock exactly
-      # one wins the rename, so neither deletes a lock the other just re-took.
+      # one wins the rename. The loser's rename can still land on the lock the
+      # winner just re-took, so what was renamed is checked again: only a
+      # still-stale lock is deleted; a fresh one is put back.
       staledir="$lockdir.stale.${BASHPID:-$$}.$RANDOM"
       if mv "$lockdir" "$staledir" 2>/dev/null; then
-        age="$(_append_lock_age_s "$staledir")"
-        if [[ "$(cat "$staledir/owner" 2>/dev/null || true)" == "$_append_lock_seen_owner" ]] &&
-           { [[ -n "$_append_lock_seen_owner" ]] || [[ -n "$age" && "$age" -ge 60 ]]; }; then
+        if _append_lock_is_stale "$staledir"; then
           rm -rf "$staledir" 2>/dev/null || true
           continue
         fi
-        # Re-taken since the check: this is a live lock. Put it back — but
-        # never onto a lockdir that exists again, where mv would nest it
-        # inside and wedge both.
+        # Never put it back onto a lockdir that exists again: mv would nest
+        # it inside and wedge both. That narrow three-way case loses the
+        # fresh lock instead — a known, documented limit shared with the
+        # agy gate lock.
         if [[ -e "$lockdir" ]] || ! mv "$staledir" "$lockdir" 2>/dev/null; then
           rm -rf "$staledir" 2>/dev/null || true
         fi
@@ -132,7 +115,15 @@ append_line_locked() {
     *) locked=0
        echo "WARN: could not lock $ledger within the wait cap; appending unlocked" >&2 ;;
   esac
-  printf '%s\n' "$line" >>"$ledger"
+  # Where flock exists, ALSO queue on master's "<ledger>.lock" flock:
+  # import_runlog.sh still takes only that one (until #184) and replaces the
+  # whole file, so an append it cannot see is deleted by its rename. The
+  # importer never takes the mkdir lock, so the two cannot deadlock.
+  if command -v flock >/dev/null 2>&1; then
+    ( flock -x 200 && printf '%s\n' "$line" >>"$ledger" ) 200>"$ledger.lock"
+  else
+    printf '%s\n' "$line" >>"$ledger"
+  fi
   rc=$?
   if [[ $locked -eq 1 ]]; then append_lock_release "$ledger"; fi
   return $rc

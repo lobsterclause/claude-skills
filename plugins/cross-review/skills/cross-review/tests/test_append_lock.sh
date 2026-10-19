@@ -76,6 +76,29 @@ append_event() {
 echo "── append_finding_event.sh ──"
 held_lock "append_finding_event" "$FE" append_event
 
+# Until import_runlog.sh moves onto the shared lock (#184) it takes flock on
+# "<ledger>.lock" and replaces the whole file. Where flock exists the
+# appenders must still queue on that same flock, or an append landing inside
+# an import is deleted by its rename.
+echo "── flock compatibility with import_runlog.sh ──"
+if command -v flock >/dev/null 2>&1; then
+  FL="$T/flock-compat.jsonl"; : >"$FL"
+  flock -x "$FL.lock" sleep 3 &
+  holder=$!
+  sleep 0.5
+  CROSS_REVIEW_RUNLOG="$FL" bash "$S/append_runlog.sh" --run-dir "$RUN" --project test --base main \
+    --pr - --pass 1 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1 &
+  writer=$!
+  sleep 1.5
+  during="$(lines "$FL")"
+  wait "$holder"; wait "$writer"
+  if [[ "$during" -eq 0 && "$(lines "$FL")" -eq 1 ]]; then
+    ok "append_runlog queues on import's flock while it is held"
+  else bad "append_runlog wrote through import's flock (during=$during after=$(lines "$FL"))"; fi
+else
+  echo "  skip flock compatibility (no flock here; CI runs it on Linux)"
+fi
+
 # A shim mv that always fails, for the unrenameable-stale-lock case below.
 SHIM="$T/failing-mv"; mkdir -p "$SHIM"
 printf '#!/bin/sh\nexit 1\n' >"$SHIM/mv"; chmod +x "$SHIM/mv"
@@ -162,46 +185,18 @@ else
     bad "python3 needed to age a lock precisely"
   fi
 
-  # Staleness is the OWNER's liveness, not the lock's age: a slow holder can
-  # keep the lock past a minute. A lock recorded as owned by a live process is
-  # live however old; one owned by a dead process is stale however new.
-  L="$T/owned-live.jsonl"; mkdir "$L.lock.d"; echo "$$" >"$L.lock.d/owner"
-  touch -t 202001010000 "$L.lock.d"
-  CROSS_REVIEW_LOCK_WAIT_S=1 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/owned-live.err"
-  if grep -q WARN "$T/owned-live.err" && [[ "$(cat "$L.lock.d/owner" 2>/dev/null)" == "$$" ]]; then
-    ok "an old lock owned by a live process is not reclaimed"
-  else bad "a live owner's old lock was reclaimed"; fi
-
+  # Staleness is AGE, never the recorded owner's liveness. Owner-liveness
+  # was tried and races in ordinary use: a waiter reads owner H0, H0 releases
+  # and exits, a new holder takes the lock, and the waiter finds H0 dead and
+  # reclaims the NEW holder's live lock. So a fresh lock whose recorded owner
+  # is dead must still be waited on — this is that race, made deterministic.
   bash -c 'exit 0' & dead=$!; wait "$dead"
-  L="$T/owned-dead.jsonl"; mkdir "$L.lock.d"; echo "$dead" >"$L.lock.d/owner"
-  start=$SECONDS
-  CROSS_REVIEW_LOCK_WAIT_S=5 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/owned-dead.err"
-  if [[ "$(lines "$L")" -eq 1 && $((SECONDS - start)) -lt 3 && ! -e "$L.lock.d" ]] && ! grep -q WARN "$T/owned-dead.err"; then
-    ok "a fresh lock whose owner is dead is reclaimed at once"
-  else bad "dead owner's lock (took=$((SECONDS - start))s): $(cat "$T/owned-dead.err")"; fi
-
-  # Death must not be read from an error MESSAGE: strerror is localized, so a
-  # check for "No such process" never fires under a German or French locale
-  # and a dead holder's lock is never reclaimed. Override kill with one that
-  # fails the way a dead pid does but answers in German.
-  bash -c 'exit 0' & dead=$!; wait "$dead"
-  L="$T/owned-dead-de.jsonl"; mkdir "$L.lock.d"; echo "$dead" >"$L.lock.d/owner"
-  CROSS_REVIEW_LOCK_WAIT_S=3 bash -c '
-    kill() { if [[ "$1" == -0 ]]; then echo "bash: kill: ($2) - Kein passender Prozess gefunden" >&2; return 1; fi; builtin kill "$@"; }
-    . "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/owned-dead-de.err"
-  if [[ "$(lines "$L")" -eq 1 && ! -e "$L.lock.d" ]] && ! grep -q WARN "$T/owned-dead-de.err"; then
-    ok "a dead owner is recognised without reading English error text"
-  else bad "dead owner under a non-English kill message: $(cat "$T/owned-dead-de.err")"; fi
-
-  # A live process we may not signal (EPERM — pid 1 for a non-root user) is
-  # alive, not dead.
-  if [[ "$(id -u)" -ne 0 ]]; then
-    L="$T/owned-pid1.jsonl"; mkdir "$L.lock.d"; echo 1 >"$L.lock.d/owner"
-    CROSS_REVIEW_LOCK_WAIT_S=1 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/pid1.err"
-    if grep -q WARN "$T/pid1.err" && [[ "$(cat "$L.lock.d/owner" 2>/dev/null)" == 1 ]]; then
-      ok "a live owner we cannot signal (EPERM) is not reclaimed"
-    else bad "an EPERM owner's lock was reclaimed"; fi
-  fi
+  L="$T/fresh-dead-owner.jsonl"; mkdir "$L.lock.d"; echo "$dead" >"$L.lock.d/owner"
+  CROSS_REVIEW_LOCK_WAIT_S=1 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/fresh-dead.err"
+  if grep -q WARN "$T/fresh-dead.err" && [[ "$(cat "$L.lock.d/owner" 2>/dev/null)" == "$dead" ]]; then
+    ok "a fresh lock is never reclaimed, even when its recorded owner has exited"
+  else bad "a fresh lock was reclaimed because its owner had exited"; fi
+  rm -rf "$L.lock.d"
 
   # Release removes only the caller's own lock — a holder whose lock was taken
   # over must not delete the new holder's.
@@ -259,15 +254,21 @@ else
                        || bad "past-cap write removed a lock it never held"
 
   # The failure this file exists for: many concurrent rows far over PIPE_BUF.
-  L="$T/concurrent.jsonl"
+  # Three rounds: a lock race that tears rows only some of the time passed a
+  # single round by luck four times running.
   pad="$(printf 'x%.0s' $(seq 1 8000))"
-  for i in $(seq 1 25); do
-    bash -c '. "$1"; append_line_locked "$2" "$3"' _ "$LIB" "$L" "{\"id\":$i,\"pad\":\"$pad\"}" &
+  torn=""
+  for round in 1 2 3; do
+    L="$T/concurrent$round.jsonl"
+    for i in $(seq 1 25); do
+      bash -c '. "$1"; append_line_locked "$2" "$3"' _ "$LIB" "$L" "{\"id\":$i,\"pad\":\"$pad\"}" 2>>"$T/concurrent.err" &
+    done
+    wait
+    parsed="$(jq -R 'fromjson? | .id' "$L" 2>/dev/null | sort -un | wc -l | tr -d ' ')"
+    [[ "$(lines "$L")" -eq 25 && "$parsed" -eq 25 ]] || torn="$torn round$round:lines=$(lines "$L"),whole=$parsed"
   done
-  wait
-  parsed="$(jq -R 'fromjson? | .id' "$L" 2>/dev/null | sort -un | wc -l | tr -d ' ')"
-  if [[ "$(lines "$L")" -eq 25 && "$parsed" -eq 25 ]]; then ok "25 concurrent 8KB appends land as 25 whole rows"
-  else bad "concurrent appends (lines=$(lines "$L") whole=$parsed)"; fi
+  if [[ -z "$torn" && ! -s "$T/concurrent.err" ]]; then ok "3 rounds of 25 concurrent 8KB appends land whole, with no lock warnings"
+  else bad "concurrent appends:$torn $(head -2 "$T/concurrent.err")"; fi
 fi
 
 echo
