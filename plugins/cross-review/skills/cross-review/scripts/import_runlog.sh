@@ -162,13 +162,15 @@ if [[ "$dry_run" -eq 1 ]]; then
 fi
 
 # Atomic publish: temp lives in dest_dir, so mv is a same-filesystem rename.
-# flock guards against a concurrent append_runlog/splitstream writer.
-if command -v flock >/dev/null 2>&1; then
-  (
-    flock -x 200
-    mv -f "$merged_tmp" "$into"
-  ) 200>"$into.lock"
+# The rename queues on the same lock append_runlog.sh appends under, so it
+# never lands between the halves of a row (lib_append_lock.sh).
+. "$(dirname "$0")/lib_append_lock.sh" || {
+  echo "FATAL: lib_append_lock.sh missing beside $0 -- nothing written" >&2; exit 1; }
+if append_lock_acquire "$into"; then
+  mv -f "$merged_tmp" "$into"
+  append_lock_release "$into"
 else
+  echo "WARN: could not lock $into within the wait cap; publishing unlocked" >&2
   mv -f "$merged_tmp" "$into"
 fi
 trap - EXIT

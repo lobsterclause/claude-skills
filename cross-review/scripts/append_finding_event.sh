@@ -96,16 +96,9 @@ entry=$(jq -nc \
   --argjson schema_version "$SCHEMA_VERSION" \
   '$fields + {event: $event, ts: $ts, finding_id: $finding_id, run_id: $run_id, schema_version: $schema_version}')
 
-# Same flock-with-fallback append pattern as append_runlog.sh (mirrored, not
-# reimplemented): POSIX write() atomicity below PIPE_BUF makes concurrent
-# appends safe without a lock on most platforms; flock removes the risk
-# entirely where available. Falls back to bare append when missing.
-if command -v flock >/dev/null 2>&1; then
-  (
-    flock -x 200
-    printf '%s\n' "$entry" >>"$ledger"
-  ) 200>"$ledger.lock"
-else
-  printf '%s\n' "$entry" >>"$ledger"
-fi
+# Same shared ledger lock as append_runlog.sh — see lib_append_lock.sh for why
+# a bare append is not a safe fallback.
+. "$(dirname "$0")/lib_append_lock.sh" || {
+  echo "FATAL: lib_append_lock.sh missing beside $0 -- nothing written" >&2; exit 1; }
+append_line_locked "$ledger" "$entry"
 echo "appended finding event: event=$event finding_id=$finding_id run_id=$run_id" >&2

@@ -71,7 +71,22 @@ LADDER_LIVE="2026-09-01"
 # script gets wrong is a check that silently never fires.
 # Overridable ONLY so the tests can exercise the due path — a check first
 # exercised on the day it fires is a check nobody has ever seen work.
-REVIEW_DUE="${CROSS_REVIEW_EFFORT_REVIEW_DUE:-2026-09-08}"
+# Reviewed 2026-09-09 (351 after-runs vs 1545 before): KEPT. acct_limit fell
+# 4%→1% (pass 1), 6%→0% (pass 2), 9%→0% (pass 3+); findings/run rose on every
+# pass (0.52→1.07, 0.46→0.66, 0.65→0.72) and pass-3+ CLEAN% fell 43%→33%, so
+# the "stopped looking" shape did not appear. Median wall time rose, which is
+# consistent with the after window's larger split-tooling diffs, not with less
+# effort. Second look a month on, when the pass-1 cell has settled.
+# Reviewed 2026-10-18 (1102 after-runs): KEPT. acct_limit is 0% on every pass.
+# The aggregate pass-3+ row did take the suspicious shape (findings/run 0.65→
+# 0.57, CLEAN% 43%→49%), but it is project mix, not effort: aperture-trading
+# joined after 09-09 and codex finds little there on ANY pass (64% zero-finding
+# runs even on pass 1, which the ladder does not touch). Held to one project
+# (kindred-mama-ai, codex status ok), pass-3+ findings/run ROSE 0.42→0.77 and
+# codex zero-finding runs fell 78%→54%. CLEAN% rose on every project, but it is
+# the round's verdict, not codex's. Split by project before reading this table
+# again. If the next look agrees, delete the --if-due call in SKILL.md.
+REVIEW_DUE="${CROSS_REVIEW_EFFORT_REVIEW_DUE:-2026-11-18}"
 
 since="$LADDER_LIVE"
 if_due=0
@@ -117,9 +132,21 @@ if [[ "$if_due" == 1 ]]; then
 BANNER
 fi
 
+# Parse row by row, not with a bare slurp: one torn row (two concurrent appends
+# spliced together, 2026-10-08) used to be a parse error that took down the
+# whole report and, under --if-due, the round in front of it. A line that is
+# not a JSON object is not evidence either way — it is marked, counted, and
+# reported, never silently dropped. Blank lines are not rows.
+#
 # ISO-8601 Z timestamps sort lexicographically, so a plain string compare is
 # the whole date filter. Rows without a codex entry are not evidence either way.
+jq -cR 'select(length > 0)
+        | ((fromjson? // null) as $r
+           | if ($r | type) == "object" then $r else {__unparseable: true} end)' "$runlog" |
 jq -rs --arg since "$since" '
+  (map(select(.__unparseable == true)) | length) as $unparseable
+  | map(select(.__unparseable != true))
+  |
   def med($xs): ($xs | sort) as $s
     | if ($s | length) == 0 then null
       else $s[(($s | length) / 2 | floor)] end;
@@ -164,6 +191,9 @@ jq -rs --arg since "$since" '
   "codex reasoning-effort ladder — before/after \(.since)",
   "",
   "  before: \(.before.total) codex runs      after: \(.after.total) codex runs",
+  (if $unparseable > 0
+   then "  skipped \($unparseable) unparseable runlog row(s) — torn or partial appends,\n  not counted in either window."
+   else empty end),
   "",
   (
   "  pass | window |    n  | acct_limit  | median_s | findings/run | CLEAN%",
@@ -200,4 +230,12 @@ jq -rs --arg since "$since" '
   "  the date the code was written. Any round that ran after the cutover but",
   "  before the change landed is a pre-ladder round wearing an after label, and",
   "  it will make the after rows look like whatever else was happening that day."
-' "$runlog"
+'
+rc=$?
+# --if-due runs ahead of real rounds and must never be what stops one — not
+# even when the report itself breaks in a way nobody has seen yet.
+if [[ $rc -ne 0 && "$if_due" == 1 ]]; then
+  echo "measure_codex_effort: report failed (jq exit $rc); run it without --if-due to see why" >&2
+  exit 0
+fi
+exit "$rc"

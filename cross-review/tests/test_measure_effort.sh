@@ -136,6 +136,28 @@ CROSS_REVIEW_EFFORT_REVIEW_DUE=2026-01-01 bash "$M" --if-due --runlog "$TMP/nope
 [[ $? -eq 0 ]] && ok "--if-due with no runlog stays quiet instead of failing the round" \
                || bad "--if-due must never break a round"
 
+# ── a torn runlog ──
+#
+# One spliced row (two concurrent appends interleaved, 2026-10-08) used to be
+# a jq parse error that killed the whole report — and, under --if-due, the
+# round in front of it, which --if-due promises never to do. A row that is not
+# a JSON object is not evidence either way: skip it, and say how many.
+: > "$RL"
+for i in $(seq 1 3); do row "2026-09-0${i}T00:00:00Z" 1 CLEAN 5 1 0; done
+printf '{"ts":"2026-09-04T00:00:00Z","pass":1,"reviewers":{"codex":{"output_{"ts":"2026-09-04T00:00:01Z"\n' >> "$RL"
+printf 'timed_out":false}}}\n' >> "$RL"
+printf '\n' >> "$RL"
+printf '42\n' >> "$RL"
+torn_out="$(bash "$M" --runlog "$RL" --since "$CUT" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && ok "a torn runlog still reports (exit 0)" || bad "torn runlog exit (rc=$rc): ${torn_out:0:120}"
+grep -q "after: 3 codex runs" <<<"$torn_out" && ok "only the whole rows are counted" \
+                                          || bad "torn-row counts"
+grep -q "skipped 3 unparseable" <<<"$torn_out" && ok "the skipped rows are counted out loud (blank lines are not rows)" \
+                                            || bad "skipped-row note"
+CROSS_REVIEW_EFFORT_REVIEW_DUE=2026-01-01 bash "$M" --if-due --runlog "$RL" >/dev/null 2>&1
+[[ $? -eq 0 ]] && ok "--if-due on a torn runlog does not fail the round" \
+               || bad "--if-due must never break a round, torn runlog included"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

@@ -610,20 +610,10 @@ entry=$(jq -nc \
   + (if $wrapper_dirty == "" then {} else {wrapper_dirty: ($wrapper_dirty == "true")} end)
   + (if $wrapper_branch == "" then {} else {wrapper_branch: $wrapper_branch} end)')
 
-# JSONL — one line, append-only. Wrap in flock to make it splitstream-safe:
-# POSIX guarantees write() atomicity below PIPE_BUF (4KB Linux, 512B macOS).
-# Our entries are ~500-800B and growing; on macOS they're already at the
-# atomicity boundary, and concurrent splitstream rounds writing simultaneously
-# could interleave. flock costs ~5 lines and removes the risk.
-# `flock` is GNU/Linux native; macOS Homebrew users get it via `brew install
-# util-linux` (or use `shlock`/`lockfile`). Fall back to bare append if flock
-# is missing — preserves correctness on platforms without it.
-if command -v flock >/dev/null 2>&1; then
-  (
-    flock -x 200
-    printf '%s\n' "$entry" >>"$runlog"
-  ) 200>"$runlog.lock"
-else
-  printf '%s\n' "$entry" >>"$runlog"
-fi
+# JSONL — one line, append-only, under the shared ledger lock. Rows are ~7KB,
+# far past PIPE_BUF, and an unlocked append on macOS (no flock) spliced two
+# rows together on 2026-10-08. See lib_append_lock.sh.
+. "$(dirname "$0")/lib_append_lock.sh" || {
+  echo "FATAL: lib_append_lock.sh missing beside $0 -- nothing written" >&2; exit 1; }
+append_line_locked "$runlog" "$entry"
 echo "appended runlog entry: ts=$ts pr=$pr pass=$pass verdict=$verdict" >&2
