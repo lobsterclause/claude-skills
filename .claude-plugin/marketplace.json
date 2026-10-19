@@ -201,6 +201,11 @@
       "source": "./plugins/seldon-protocol"
     },
     {
+      "name": "splitstream",
+      "description": "Plan and run an explicitly approved batch of independent repository changes as isolated Claude Code agents, then audit, verify, and optionally publish each result as a draft pull request. Use only when the user invokes /splitstream; never invoke automatically.",
+      "source": "./plugins/splitstream"
+    },
+    {
       "name": "video-media-accessibility",
       "description": "Audit and improve accessibility of video, audio, and media content \u2014 including captions, audio descriptions, transcripts, accessible media players, and WCAG 1.2.x compliance. Use this skill whenever the user is working with video, audio, podcasts, webinars, live streaming, animations with narration, or any time-based media. Trigger on phrases like \"video accessibility\", \"caption\", \"captions\", \"subtitle\", \"audio description\", \"transcript\", \"media player\", \"accessible video\", \"WCAG 1.2\", \"closed captions\", \"open captions\", \"CC\", \"video audit\", \"audio accessibility\", \"podcast accessibility\", \"webinar accessibility\", \"live caption\", \"CART\", \"sign language interpretation\", or any request involving making video or audio content accessible.",
       "source": "./plugins/video-media-accessibility"
