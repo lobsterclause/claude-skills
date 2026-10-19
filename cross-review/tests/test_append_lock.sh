@@ -102,6 +102,28 @@ if grep -q '"appended-meanwhile"' "$IMP2" && grep -q '"imp"' "$IMP2" && grep -q 
   ok "import_runlog keeps a row appended while it waited for the lock"
 else bad "import_runlog lost a concurrent append: $(tr '\n' ' ' <"$IMP2")"; cat "$T/race.err"; fi
 
+# An import replaces the whole file, so unlike a one-row append it must never
+# proceed without the lock: an unlocked rename deletes every row appended
+# while it ran. It aborts and leaves the destination alone.
+IMP3="$T/import-nolock.jsonl"; : >"$IMP3"; mkdir "$IMP3.lock.d"
+CROSS_REVIEW_LOCK_WAIT_S=1 bash "$S/import_runlog.sh" --from "$SRC" --into "$IMP3" >"$T/nolock.out" 2>&1
+rc=$?
+if [[ $rc -ne 0 && ! -s "$IMP3" ]] && ! grep -q 'wrote [0-9]' "$T/nolock.out"; then
+  ok "import_runlog aborts instead of importing without the lock"
+else bad "import_runlog without the lock (rc=$rc, dest=$(wc -c <"$IMP3")B): $(tail -1 "$T/nolock.out")"; fi
+rmdir "$IMP3.lock.d"
+
+# A publish that fails must not be reported as written, nor leave its temp.
+SHIM="$T/failing-mv"; mkdir -p "$SHIM"
+printf '#!/bin/sh\nexit 1\n' >"$SHIM/mv"; chmod +x "$SHIM/mv"
+IMP4D="$T/imp4"; mkdir -p "$IMP4D"; IMP4="$IMP4D/runlog.jsonl"; : >"$IMP4"
+PATH="$SHIM:$PATH" bash "$S/import_runlog.sh" --from "$SRC" --into "$IMP4" >"$T/mvfail.out" 2>&1
+rc=$?
+leaked="$(ls -A "$IMP4D" | grep -c '^\.runlog\.import\.' || true)"
+if [[ $rc -ne 0 && "$leaked" -eq 0 ]] && ! grep -q 'wrote [0-9]' "$T/mvfail.out" && [[ ! -e "$IMP4.lock.d" ]]; then
+  ok "a failed import publish exits non-zero, leaves no temp file and no lock"
+else bad "failed publish (rc=$rc leaked=$leaked lock=$([[ -e "$IMP4.lock.d" ]] && echo left || echo gone)): $(tail -1 "$T/mvfail.out")"; fi
+
 # A write that fails must not be reported as written.
 echo "── a failed append is not reported as success ──"
 RO="$T/readonly.jsonl"; : >"$RO"; chmod 444 "$RO"
@@ -187,20 +209,60 @@ else
     bad "python3 needed to age a lock precisely"
   fi
 
-  # A stale lock that cannot be renamed away (here: its parent is read-only)
-  # must count toward the cap, not spin at 100% CPU forever.
-  D="$T/rodir"; mkdir -p "$D/x.jsonl.lock.d"; : >"$D/x.jsonl"; touch -t 202001010000 "$D/x.jsonl.lock.d"
-  chmod 555 "$D"
-  if [[ -w "$D" ]]; then echo "  skip unrenameable-stale-lock case (running as root)"
+  # Staleness is the OWNER's liveness, not the lock's age: an import can hold
+  # the lock well past a minute. A lock recorded as owned by a live process is
+  # live however old; one owned by a dead process is stale however new.
+  L="$T/owned-live.jsonl"; mkdir "$L.lock.d"; echo "$$" >"$L.lock.d/owner"
+  touch -t 202001010000 "$L.lock.d"
+  CROSS_REVIEW_LOCK_WAIT_S=1 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/owned-live.err"
+  if grep -q WARN "$T/owned-live.err" && [[ "$(cat "$L.lock.d/owner" 2>/dev/null)" == "$$" ]]; then
+    ok "an old lock owned by a live process is not reclaimed"
+  else bad "a live owner's old lock was reclaimed"; fi
+
+  bash -c 'exit 0' & dead=$!; wait "$dead"
+  L="$T/owned-dead.jsonl"; mkdir "$L.lock.d"; echo "$dead" >"$L.lock.d/owner"
+  start=$SECONDS
+  CROSS_REVIEW_LOCK_WAIT_S=5 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/owned-dead.err"
+  if [[ "$(lines "$L")" -eq 1 && $((SECONDS - start)) -lt 3 && ! -e "$L.lock.d" ]] && ! grep -q WARN "$T/owned-dead.err"; then
+    ok "a fresh lock whose owner is dead is reclaimed at once"
+  else bad "dead owner's lock (took=$((SECONDS - start))s): $(cat "$T/owned-dead.err")"; fi
+
+  # Release removes only the caller's own lock — a holder whose lock was taken
+  # over must not delete the new holder's.
+  L="$T/not-mine.jsonl"; mkdir "$L.lock.d"; echo "$$" >"$L.lock.d/owner"
+  bash -c '. "$1"; append_lock_release "$2"' _ "$LIB" "$L"
+  [[ -d "$L.lock.d" ]] && ok "release leaves a lock owned by another process alone" \
+                       || bad "release removed someone else's lock"
+
+  # Every successful acquire records its owner.
+  L="$T/records.jsonl"
+  bash -c '. "$1"; append_lock_acquire "$2" && cat "$2.lock.d/owner" && echo "self=$$"' _ "$LIB" "$L" >"$T/records.out"
+  if [[ "$(sed -n 1p "$T/records.out")" == "$(sed -n 2p "$T/records.out" | sed 's/self=//')" ]]; then
+    ok "acquire records the holder's pid as owner"
+  else bad "owner record: $(tr '\n' ' ' <"$T/records.out")"; fi
+
+  # A stale lock that cannot be renamed away (here: mv itself fails) must
+  # count toward the cap, not spin at 100% CPU forever.
+  D="$T/unrenameable"; mkdir -p "$D/x.jsonl.lock.d"; : >"$D/x.jsonl"; touch -t 202001010000 "$D/x.jsonl.lock.d"
+  PATH="$SHIM:$PATH" CROSS_REVIEW_LOCK_WAIT_S=1 \
+    bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$D/x.jsonl" 2>/dev/null &
+  pid=$!; waited=0
+  while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 20 ]]; do sleep 0.5; waited=$((waited + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    bad "an unrenameable stale lock spins past the wait cap"
+  else wait "$pid"; ok "an unrenameable stale lock still ends at the wait cap"; fi
+
+  # An unwritable directory is reported at once, not waited on for the cap.
+  RD="$T/rodir"; mkdir -p "$RD"; : >"$RD/x.jsonl"; chmod 555 "$RD"
+  if [[ -w "$RD" ]]; then echo "  skip unwritable-dir case (running as root)"
   else
-    CROSS_REVIEW_LOCK_WAIT_S=1 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$D/x.jsonl" 2>/dev/null &
-    pid=$!; waited=0
-    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 20 ]]; do sleep 0.5; waited=$((waited + 1)); done
-    if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-      bad "an unrenameable stale lock spins past the wait cap"
-    else wait "$pid"; ok "an unrenameable stale lock still ends at the wait cap"; fi
+    start=$SECONDS
+    bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$RD/x.jsonl" 2>"$T/rodir.err"
+    if [[ $((SECONDS - start)) -lt 3 ]] && grep -q "not writable" "$T/rodir.err"; then
+      ok "an unwritable ledger directory is reported at once"
+    else bad "unwritable dir (took=$((SECONDS - start))s): $(cat "$T/rodir.err")"; fi
   fi
-  chmod 755 "$D"
+  chmod 755 "$RD"
 
   # A missing directory is not a lock that was waited on.
   bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$T/no/such/dir/x.jsonl" 2>"$T/nodir.err"

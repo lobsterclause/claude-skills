@@ -128,14 +128,9 @@ cleanup() {
   return 0
 }
 trap cleanup EXIT
-if [[ "$dry_run" -eq 0 ]]; then
-  mkdir -p "$dest_dir"
-  if append_lock_acquire "$into"; then locked=1
-  else echo "WARN: could not lock $into within the wait cap; importing unlocked" >&2; fi
-fi
 
-existing_valid=0
-[[ -f "$into" ]] && existing_valid="$(count_valid "$into")"
+# Validate the sources before taking the destination's lock: they are not
+# what the lock protects, and every second spent here blocks real rounds.
 incoming_valid="$(count_valid "${sources[@]}")"
 incoming_raw="$(count_raw "${sources[@]}")"
 incoming_invalid=$(( incoming_raw - incoming_valid ))
@@ -146,10 +141,27 @@ if [[ "$incoming_valid" -eq 0 ]]; then
   exit 1
 fi
 
+# Unlike a one-row append, an import replaces the whole file, so it never
+# proceeds unlocked: an unlocked rename deletes every row appended while it
+# ran. No lock, no import.
+if [[ "$dry_run" -eq 0 ]]; then
+  mkdir -p "$dest_dir"
+  append_lock_acquire "$into"
+  case $? in
+    0) locked=1 ;;
+    2) echo "FATAL: destination directory $dest_dir is missing or not writable -- nothing imported" >&2; exit 1 ;;
+    *) echo "FATAL: could not lock $into within the wait cap -- nothing imported" >&2; exit 1 ;;
+  esac
+fi
+
+existing_valid=0
+[[ -f "$into" ]] && existing_valid="$(count_valid "$into")"
+
 # Build the merged result: existing + all sources, parse-filtered, exact-object
 # deduped, sorted by ts (entries without ts sort first as oldest).
 mkdir -p "$dest_dir"
-merged_tmp="$(mktemp "$dest_dir/.runlog.import.XXXXXX")"
+merged_tmp="$(mktemp "$dest_dir/.runlog.import.XXXXXX")" || {
+  merged_tmp=""; echo "FATAL: could not create a temp file in $dest_dir -- nothing imported" >&2; exit 1; }
 
 merge_inputs=()
 [[ -f "$into" ]] && merge_inputs+=("$into")
@@ -181,6 +193,7 @@ fi
 
 # Atomic publish: temp lives in dest_dir, so mv is a same-filesystem rename,
 # still under the lock taken before the destination was read.
-mv -f "$merged_tmp" "$into"
+mv -f "$merged_tmp" "$into" || {
+  echo "FATAL: could not publish to $into -- nothing imported" >&2; exit 1; }
 merged_tmp=""
 log "  wrote $final_count entries to $into"

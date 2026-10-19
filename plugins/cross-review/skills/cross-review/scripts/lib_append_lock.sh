@@ -27,52 +27,97 @@
 # one-minute stale age so a dead holder is reclaimed inside the wait). It
 # exists for the fixture tests.
 #
-# Known limit, shared with the agy gate lock: a holder stalled for more than a
-# minute INSIDE the critical section (a SIGSTOP, a hung disk) has its lock
-# reclaimed, and its later release removes the next holder's lock. The
-# critical section is one printf or one rename, so this needs a stall four
-# orders of magnitude longer than the work.
+# STALE MEANS THE OWNER IS DEAD, NOT THAT THE LOCK IS OLD
+#
+# Every acquire records its pid in <lockdir>/owner, and a waiter reclaims the
+# lock only when that process no longer exists. An age rule alone assumed a
+# millisecond critical section; import_runlog.sh holds the lock across a whole
+# read-merge-publish, which can outlive any fixed age, and reclaiming a live
+# import lets its rename delete the rows appended meanwhile. Age is only the
+# fallback for a lock with no owner record (its holder died between mkdir and
+# writing it, or it predates this file). Release likewise removes only a lock
+# whose owner is the caller, so a holder whose lock was taken over cannot
+# delete the next holder's.
+#
+# Known limit: a holder that is alive but wedged forever is never reclaimed;
+# waiters reach the cap instead. And between a waiter's stale check and its
+# rename, another waiter can reclaim and re-take the lock. The rename is then
+# checked against the owner that was judged dead and undone on a mismatch,
+# which narrows that window to the undo itself.
 
 # Age in whole seconds, or empty if it cannot be read. The age is measured,
 # not asked of `find -mmin`, which compares rounded MINUTES and so is only an
-# approximation of "older than 60 seconds" — and a stale age that drifted past
-# the 75s cap would mean a dead holder is never reclaimed in time. GNU stat
-# first: BSD stat rejects -c, while GNU `stat -f` means something else.
+# approximation of "older than 60 seconds". GNU stat first: BSD stat rejects
+# -c, while GNU `stat -f` means something else.
 _append_lock_age_s() {
   local mtime
   mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null)" || return 0
   [[ "$mtime" =~ ^[0-9]+$ ]] && echo $(( $(date +%s) - mtime ))
 }
 
+# _append_lock_is_stale <lockdir> — 0 if reclaimable. Leaves the owner it
+# judged in _append_lock_seen_owner, so the reclaim can check it renamed the
+# same lock.
+_append_lock_is_stale() {
+  local age
+  _append_lock_seen_owner="$(cat "$1/owner" 2>/dev/null || true)"
+  if [[ "$_append_lock_seen_owner" =~ ^[0-9]+$ ]]; then
+    kill -0 "$_append_lock_seen_owner" 2>/dev/null && return 1
+    # EPERM is a live process we may not signal; only ESRCH is dead.
+    [[ "$(kill -0 "$_append_lock_seen_owner" 2>&1)" == *"No such process"* ]]
+    return
+  fi
+  age="$(_append_lock_age_s "$1")"
+  [[ -n "$age" && "$age" -ge 60 ]]
+}
+
 # append_lock_acquire <ledger> — 0 locked, 1 gave up at the cap,
-# 2 the ledger's directory does not exist.
+# 2 the ledger's directory is missing or not writable.
 append_lock_acquire() {
-  local lockdir="$1.lock.d" n=0 cap="${CROSS_REVIEW_LOCK_WAIT_S:-75}" age staledir
+  local lockdir="$1.lock.d" n=0 cap="${CROSS_REVIEW_LOCK_WAIT_S:-75}" staledir age
   [[ "$cap" =~ ^[0-9]+$ ]] || cap=75
-  # No directory to lock in means the write itself is about to fail with a
-  # clearer error than a 75-second wait would give.
-  [[ -d "$(dirname "$1")" ]] || return 2
+  # A directory the lock cannot be made in would otherwise read as a lock
+  # that never comes free: a 75-second wait for an error the write will hit
+  # anyway.
+  [[ -d "$(dirname "$1")" && -w "$(dirname "$1")" ]] || return 2
   until mkdir "$lockdir" 2>/dev/null; do
-    age="$(_append_lock_age_s "$lockdir")"
-    if [[ -n "$age" && "$age" -ge 60 ]]; then
+    if _append_lock_is_stale "$lockdir"; then
       # Rename, then delete: of two runs that see the same stale lock exactly
       # one wins the rename, so neither deletes a lock the other just re-took.
       staledir="$lockdir.stale.${BASHPID:-$$}.$RANDOM"
       if mv "$lockdir" "$staledir" 2>/dev/null; then
-        rm -rf "$staledir" 2>/dev/null || true
-        continue
+        age="$(_append_lock_age_s "$staledir")"
+        if [[ "$(cat "$staledir/owner" 2>/dev/null || true)" == "$_append_lock_seen_owner" ]] &&
+           { [[ -n "$_append_lock_seen_owner" ]] || [[ -n "$age" && "$age" -ge 60 ]]; }; then
+          rm -rf "$staledir" 2>/dev/null || true
+          continue
+        fi
+        # Re-taken since the check: this is a live lock. Put it back — but
+        # never onto a lockdir that exists again, where mv would nest it
+        # inside and wedge both.
+        if [[ -e "$lockdir" ]] || ! mv "$staledir" "$lockdir" 2>/dev/null; then
+          rm -rf "$staledir" 2>/dev/null || true
+        fi
       fi
-      # A rename that fails (unwritable parent, a foreign-owned lock) falls
-      # through and counts toward the cap; retrying it at once would spin.
+      # A rename that fails falls through and counts toward the cap;
+      # retrying it at once would spin.
     fi
     if [[ $n -ge $((cap * 5)) ]]; then return 1; fi
     sleep 0.2
     n=$((n + 1))
   done
+  # Inline, never $(...): a command substitution is a subshell, where
+  # BASHPID is the subshell's pid and would never match at release.
+  echo "${BASHPID:-$$}" >"$lockdir/owner" 2>/dev/null || true
   return 0
 }
 
-append_lock_release() { rmdir "$1.lock.d" 2>/dev/null || true; }
+append_lock_release() {
+  local lockdir="$1.lock.d"
+  [[ "$(cat "$lockdir/owner" 2>/dev/null || true)" == "${BASHPID:-$$}" ]] || return 0
+  rm -f "$lockdir/owner"
+  rmdir "$lockdir" 2>/dev/null || true
+}
 
 # append_line_locked <ledger> <line> — appends <line> plus a newline.
 # Returns the append's own status; callers must check it.
@@ -81,7 +126,7 @@ append_line_locked() {
   append_lock_acquire "$ledger"
   case $? in
     0) ;;
-    2) echo "ERROR: ledger directory $(dirname "$ledger") does not exist" >&2
+    2) echo "ERROR: ledger directory $(dirname "$ledger") does not exist or is not writable" >&2
        return 1 ;;
     *) locked=0
        echo "WARN: could not lock $ledger within the wait cap; appending unlocked" >&2 ;;
