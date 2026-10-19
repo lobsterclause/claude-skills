@@ -115,12 +115,24 @@ append_line_locked() {
     *) locked=0
        echo "WARN: could not lock $ledger within the wait cap; appending unlocked" >&2 ;;
   esac
-  # Where flock exists, ALSO queue on master's "<ledger>.lock" flock:
-  # import_runlog.sh still takes only that one (until #184) and replaces the
-  # whole file, so an append it cannot see is deleted by its rename. The
-  # importer never takes the mkdir lock, so the two cannot deadlock.
+  # Where flock exists, ALSO queue on master's "<ledger>.lock" flock, which
+  # import_runlog.sh still takes around its rename (until #184). That is
+  # master's behaviour restored, no more: the importer reads and merges the
+  # ledger BEFORE taking that flock, so a row appended during its merge is
+  # still lost to its rename — a window master had too, tracked in #184.
+  # The importer never takes the mkdir lock, so the two cannot deadlock.
+  #
+  # The wait is bounded, and kept under the 60s stale age: this runs while
+  # holding the mkdir lock, which must never age into looking dead. Past the
+  # bound the row is written anyway, like the mkdir lock's cap.
   if command -v flock >/dev/null 2>&1; then
-    ( flock -x 200 && printf '%s\n' "$line" >>"$ledger" ) 200>"$ledger.lock"
+    local fwait="${CROSS_REVIEW_LOCK_WAIT_S:-30}"
+    [[ "$fwait" =~ ^[0-9]+$ && "$fwait" -le 30 ]] || fwait=30
+    (
+      flock -x -w "$fwait" 200 ||
+        echo "WARN: could not take $ledger.lock within ${fwait}s; appending anyway" >&2
+      printf '%s\n' "$line" >>"$ledger"
+    ) 200>"$ledger.lock"
   else
     printf '%s\n' "$line" >>"$ledger"
   fi

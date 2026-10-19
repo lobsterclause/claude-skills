@@ -20,6 +20,7 @@ set -uo pipefail
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 S="$SKILL_DIR/scripts"
+LIB_PATH="$S/lib_append_lock.sh"
 
 PASS=0; FAIL=0
 ok()  { echo "  ok   $1"; PASS=$((PASS + 1)); }
@@ -77,27 +78,67 @@ echo "── append_finding_event.sh ──"
 held_lock "append_finding_event" "$FE" append_event
 
 # Until import_runlog.sh moves onto the shared lock (#184) it takes flock on
-# "<ledger>.lock" and replaces the whole file. Where flock exists the
-# appenders must still queue on that same flock, or an append landing inside
-# an import is deleted by its rename.
+# "<ledger>.lock" around its rename. Where flock exists the appenders queue
+# on that same flock too — master's behaviour, restored — so an append never
+# lands between the importer's lock and its rename.
+#
+# Where flock is missing (macOS), a perl stand-in supplies the two forms the
+# lib and these tests use, so the cases run — and can fail — on every host,
+# not only in CI. perl's flock() locks the open file description like
+# util-linux flock(1) does, so the fd form holds for the caller's subshell.
 echo "── flock compatibility with import_runlog.sh ──"
-if command -v flock >/dev/null 2>&1; then
-  FL="$T/flock-compat.jsonl"; : >"$FL"
-  flock -x "$FL.lock" sleep 3 &
-  holder=$!
-  sleep 0.5
-  CROSS_REVIEW_RUNLOG="$FL" bash "$S/append_runlog.sh" --run-dir "$RUN" --project test --base main \
-    --pr - --pass 1 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1 &
-  writer=$!
-  sleep 1.5
-  during="$(lines "$FL")"
-  wait "$holder"; wait "$writer"
-  if [[ "$during" -eq 0 && "$(lines "$FL")" -eq 1 ]]; then
-    ok "append_runlog queues on import's flock while it is held"
-  else bad "append_runlog wrote through import's flock (during=$during after=$(lines "$FL"))"; fi
-else
-  echo "  skip flock compatibility (no flock here; CI runs it on Linux)"
+FLOCK_PATH="$PATH"
+if ! command -v flock >/dev/null 2>&1; then
+  FSHIM="$T/flock-shim"; mkdir -p "$FSHIM"
+  cat >"$FSHIM/flock" <<'PERL'
+#!/usr/bin/env perl
+# flock -x [-w secs] <fd> | flock -x [-w secs] <file> <cmd...>
+use strict; use Fcntl qw(:flock); use Time::HiRes qw(sleep time);
+my $w;
+while (@ARGV && $ARGV[0] =~ /^-/) { my $o = shift; $w = shift if $o eq '-w'; }
+my $t = shift; my $fh;
+if ($t =~ /^\d+$/) { open($fh, ">&=", $t) or exit 1 } else { open($fh, ">>", $t) or exit 1 }
+my $end = defined $w ? time + $w : undef;
+until (flock($fh, LOCK_EX | LOCK_NB)) { exit 1 if defined $end && time >= $end; sleep 0.05 }
+if (@ARGV) { system(@ARGV); exit($? >> 8) }
+exit 0;
+PERL
+  chmod +x "$FSHIM/flock"
+  FLOCK_PATH="$FSHIM:$PATH"
 fi
+
+# Driven through the lib directly: append_runlog.sh runs ~25 jq calls before
+# it reaches the lock, and a writer still short of the lock when the check
+# runs would pass vacuously.
+FL="$T/flock-compat.jsonl"; : >"$FL"
+PATH="$FLOCK_PATH" flock -x "$FL.lock" sleep 3 &
+holder=$!
+sleep 0.5
+PATH="$FLOCK_PATH" bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB_PATH" "$FL" 2>"$T/flock-compat.err" &
+writer=$!
+sleep 1.5
+during="$(lines "$FL")"
+wait "$holder"; wait "$writer"
+if [[ "$during" -eq 0 && "$(lines "$FL")" -eq 1 ]] && ! grep -q WARN "$T/flock-compat.err"; then
+  ok "appends queue on import's flock while it is held"
+else bad "append wrote through import's flock (during=$during after=$(lines "$FL")) $(cat "$T/flock-compat.err")"; fi
+
+# The flock wait is bounded like the mkdir lock's, and well under the 60s
+# stale age: waiting on it while holding the mkdir lock must never age that
+# lock into looking dead. Past the bound the row is still written, with a
+# WARN — never dropped, never a stall.
+FL2="$T/flock-wedged.jsonl"; : >"$FL2"
+PATH="$FLOCK_PATH" flock -x "$FL2.lock" sleep 12 &
+holder=$!
+sleep 0.5
+start=$SECONDS
+PATH="$FLOCK_PATH" CROSS_REVIEW_LOCK_WAIT_S=1 \
+  bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB_PATH" "$FL2" 2>"$T/flock-wedged.err"
+rc=$?; took=$((SECONDS - start))
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+if [[ $rc -eq 0 && $took -lt 6 && "$(lines "$FL2")" -eq 1 ]] && grep -q WARN "$T/flock-wedged.err"; then
+  ok "a wedged flock holder costs a bounded wait and a WARN, not the row"
+else bad "wedged flock (rc=$rc took=${took}s rows=$(lines "$FL2")): $(cat "$T/flock-wedged.err")"; fi
 
 # A shim mv that always fails, for the unrenameable-stale-lock case below.
 SHIM="$T/failing-mv"; mkdir -p "$SHIM"
