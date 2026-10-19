@@ -615,5 +615,6 @@ entry=$(jq -nc \
 # rows together on 2026-10-08. See lib_append_lock.sh.
 . "$(dirname "$0")/lib_append_lock.sh" || {
   echo "FATAL: lib_append_lock.sh missing beside $0 -- nothing written" >&2; exit 1; }
-append_line_locked "$runlog" "$entry"
+append_line_locked "$runlog" "$entry" || {
+  echo "FATAL: could not write to $runlog -- entry not recorded" >&2; exit 1; }
 echo "appended runlog entry: ts=$ts pr=$pr pass=$pass verdict=$verdict" >&2

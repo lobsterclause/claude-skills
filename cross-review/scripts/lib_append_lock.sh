@@ -26,22 +26,44 @@
 # CROSS_REVIEW_LOCK_WAIT_S overrides the cap (default 75s, longer than the
 # one-minute stale age so a dead holder is reclaimed inside the wait). It
 # exists for the fixture tests.
+#
+# Known limit, shared with the agy gate lock: a holder stalled for more than a
+# minute INSIDE the critical section (a SIGSTOP, a hung disk) has its lock
+# reclaimed, and its later release removes the next holder's lock. The
+# critical section is one printf or one rename, so this needs a stall four
+# orders of magnitude longer than the work.
 
-# append_lock_acquire <ledger> — 0 locked, 1 gave up at the cap.
+# Age in whole seconds, or empty if it cannot be read. The age is measured,
+# not asked of `find -mmin`, which compares rounded MINUTES and so is only an
+# approximation of "older than 60 seconds" — and a stale age that drifted past
+# the 75s cap would mean a dead holder is never reclaimed in time. GNU stat
+# first: BSD stat rejects -c, while GNU `stat -f` means something else.
+_append_lock_age_s() {
+  local mtime
+  mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null)" || return 0
+  [[ "$mtime" =~ ^[0-9]+$ ]] && echo $(( $(date +%s) - mtime ))
+}
+
+# append_lock_acquire <ledger> — 0 locked, 1 gave up at the cap,
+# 2 the ledger's directory does not exist.
 append_lock_acquire() {
-  local lockdir="$1.lock.d" n=0 cap="${CROSS_REVIEW_LOCK_WAIT_S:-75}"
+  local lockdir="$1.lock.d" n=0 cap="${CROSS_REVIEW_LOCK_WAIT_S:-75}" age staledir
   [[ "$cap" =~ ^[0-9]+$ ]] || cap=75
   # No directory to lock in means the write itself is about to fail with a
   # clearer error than a 75-second wait would give.
-  [[ -d "$(dirname "$1")" ]] || return 1
+  [[ -d "$(dirname "$1")" ]] || return 2
   until mkdir "$lockdir" 2>/dev/null; do
-    if [[ -n "$(find "$lockdir" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+    age="$(_append_lock_age_s "$lockdir")"
+    if [[ -n "$age" && "$age" -ge 60 ]]; then
       # Rename, then delete: of two runs that see the same stale lock exactly
       # one wins the rename, so neither deletes a lock the other just re-took.
-      if mv "$lockdir" "$lockdir.stale.$$" 2>/dev/null; then
-        rm -rf "$lockdir.stale.$$" 2>/dev/null || true
+      staledir="$lockdir.stale.${BASHPID:-$$}.$RANDOM"
+      if mv "$lockdir" "$staledir" 2>/dev/null; then
+        rm -rf "$staledir" 2>/dev/null || true
+        continue
       fi
-      continue
+      # A rename that fails (unwritable parent, a foreign-owned lock) falls
+      # through and counts toward the cap; retrying it at once would spin.
     fi
     if [[ $n -ge $((cap * 5)) ]]; then return 1; fi
     sleep 0.2
@@ -53,13 +75,17 @@ append_lock_acquire() {
 append_lock_release() { rmdir "$1.lock.d" 2>/dev/null || true; }
 
 # append_line_locked <ledger> <line> — appends <line> plus a newline.
-# Returns the append's own status.
+# Returns the append's own status; callers must check it.
 append_line_locked() {
   local ledger="$1" line="$2" locked=1 rc
-  if ! append_lock_acquire "$ledger"; then
-    locked=0
-    echo "WARN: could not lock $ledger within the wait cap; appending unlocked" >&2
-  fi
+  append_lock_acquire "$ledger"
+  case $? in
+    0) ;;
+    2) echo "ERROR: ledger directory $(dirname "$ledger") does not exist" >&2
+       return 1 ;;
+    *) locked=0
+       echo "WARN: could not lock $ledger within the wait cap; appending unlocked" >&2 ;;
+  esac
   printf '%s\n' "$line" >>"$ledger"
   rc=$?
   if [[ $locked -eq 1 ]]; then append_lock_release "$ledger"; fi

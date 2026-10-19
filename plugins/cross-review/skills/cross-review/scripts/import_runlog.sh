@@ -113,6 +113,27 @@ count_raw() { # count_raw <file...> -> number of non-blank lines
   cat -- "$@" 2>/dev/null | grep -c '[^[:space:]]' || true
 }
 
+# The lock covers the whole read-merge-publish, not just the rename: an import
+# that read the destination unlocked would publish a snapshot older than any
+# row appended meanwhile, and the rename would delete that row. A dry run
+# writes nothing and takes no lock. See lib_append_lock.sh.
+. "$(dirname "$0")/lib_append_lock.sh" || {
+  echo "FATAL: lib_append_lock.sh missing beside $0 -- nothing written" >&2; exit 1; }
+dest_dir="$(dirname "$into")"
+merged_tmp=""
+locked=0
+cleanup() {
+  [[ -n "$merged_tmp" ]] && rm -f "$merged_tmp"
+  [[ $locked -eq 1 ]] && append_lock_release "$into"
+  return 0
+}
+trap cleanup EXIT
+if [[ "$dry_run" -eq 0 ]]; then
+  mkdir -p "$dest_dir"
+  if append_lock_acquire "$into"; then locked=1
+  else echo "WARN: could not lock $into within the wait cap; importing unlocked" >&2; fi
+fi
+
 existing_valid=0
 [[ -f "$into" ]] && existing_valid="$(count_valid "$into")"
 incoming_valid="$(count_valid "${sources[@]}")"
@@ -127,11 +148,8 @@ fi
 
 # Build the merged result: existing + all sources, parse-filtered, exact-object
 # deduped, sorted by ts (entries without ts sort first as oldest).
-dest_dir="$(dirname "$into")"
 mkdir -p "$dest_dir"
 merged_tmp="$(mktemp "$dest_dir/.runlog.import.XXXXXX")"
-# shellcheck disable=SC2064
-trap "rm -f '$merged_tmp'" EXIT
 
 merge_inputs=()
 [[ -f "$into" ]] && merge_inputs+=("$into")
@@ -161,17 +179,8 @@ if [[ "$dry_run" -eq 1 ]]; then
   exit 0
 fi
 
-# Atomic publish: temp lives in dest_dir, so mv is a same-filesystem rename.
-# The rename queues on the same lock append_runlog.sh appends under, so it
-# never lands between the halves of a row (lib_append_lock.sh).
-. "$(dirname "$0")/lib_append_lock.sh" || {
-  echo "FATAL: lib_append_lock.sh missing beside $0 -- nothing written" >&2; exit 1; }
-if append_lock_acquire "$into"; then
-  mv -f "$merged_tmp" "$into"
-  append_lock_release "$into"
-else
-  echo "WARN: could not lock $into within the wait cap; publishing unlocked" >&2
-  mv -f "$merged_tmp" "$into"
-fi
-trap - EXIT
+# Atomic publish: temp lives in dest_dir, so mv is a same-filesystem rename,
+# still under the lock taken before the destination was read.
+mv -f "$merged_tmp" "$into"
+merged_tmp=""
 log "  wrote $final_count entries to $into"

@@ -100,5 +100,6 @@ entry=$(jq -nc \
 # a bare append is not a safe fallback.
 . "$(dirname "$0")/lib_append_lock.sh" || {
   echo "FATAL: lib_append_lock.sh missing beside $0 -- nothing written" >&2; exit 1; }
-append_line_locked "$ledger" "$entry"
+append_line_locked "$ledger" "$entry" || {
+  echo "FATAL: could not write to $ledger -- entry not recorded" >&2; exit 1; }
 echo "appended finding event: event=$event finding_id=$finding_id run_id=$run_id" >&2

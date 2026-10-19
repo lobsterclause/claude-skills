@@ -147,6 +147,8 @@ for i in $(seq 1 3); do row "2026-09-0${i}T00:00:00Z" 1 CLEAN 5 1 0; done
 printf '{"ts":"2026-09-04T00:00:00Z","pass":1,"reviewers":{"codex":{"output_{"ts":"2026-09-04T00:00:01Z"\n' >> "$RL"
 printf 'timed_out":false}}}\n' >> "$RL"
 printf '\n' >> "$RL"
+printf '   \n' >> "$RL"
+printf '\r\n' >> "$RL"
 printf '42\n' >> "$RL"
 torn_out="$(bash "$M" --runlog "$RL" --since "$CUT" 2>&1)"; rc=$?
 [[ $rc -eq 0 ]] && ok "a torn runlog still reports (exit 0)" || bad "torn runlog exit (rc=$rc): ${torn_out:0:120}"

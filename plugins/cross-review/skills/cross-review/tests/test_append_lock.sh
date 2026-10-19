@@ -42,7 +42,9 @@ held_lock() {
   mkdir "$ledger.lock.d"
   "$@" >/dev/null 2>"$T/held.err" &
   local pid=$!
-  sleep 1
+  # Long enough for the slowest writer (append_runlog runs ~25 jq calls first)
+  # to reach the lock; a writer still short of it would pass vacuously.
+  sleep 2
   local during; during="$(lines "$ledger")"
   rmdir "$ledger.lock.d"
   wait "$pid"
@@ -81,6 +83,45 @@ printf '{"ts":"2026-10-01T00:00:00Z","schema_version":1,"project":"imp","pass":1
 IMP="$T/import-into.jsonl"; : >"$IMP"
 echo "── import_runlog.sh ──"
 held_lock "import_runlog" "$IMP" bash "$S/import_runlog.sh" --from "$SRC" --into "$IMP" --quiet
+
+# Queuing only the rename is not enough: an import that READ the destination
+# before the lock publishes a snapshot older than a row appended meanwhile,
+# and the rename deletes that row. So: hold the lock as an appender would,
+# start the import, append a row as that holder, release — the row must
+# survive the import's publish.
+IMP2="$T/import-race.jsonl"
+printf '{"ts":"2026-09-01T00:00:00Z","schema_version":1,"project":"old","pass":1,"verdict":"CLEAN","reviewers":{}}\n' >"$IMP2"
+mkdir "$IMP2.lock.d"
+bash "$S/import_runlog.sh" --from "$SRC" --into "$IMP2" --quiet >/dev/null 2>"$T/race.err" &
+pid=$!
+sleep 2
+printf '{"ts":"2026-10-02T00:00:00Z","schema_version":1,"project":"appended-meanwhile","pass":1,"verdict":"CLEAN","reviewers":{}}\n' >>"$IMP2"
+rmdir "$IMP2.lock.d"
+wait "$pid"
+if grep -q '"appended-meanwhile"' "$IMP2" && grep -q '"imp"' "$IMP2" && grep -q '"old"' "$IMP2"; then
+  ok "import_runlog keeps a row appended while it waited for the lock"
+else bad "import_runlog lost a concurrent append: $(tr '\n' ' ' <"$IMP2")"; cat "$T/race.err"; fi
+
+# A write that fails must not be reported as written.
+echo "── a failed append is not reported as success ──"
+RO="$T/readonly.jsonl"; : >"$RO"; chmod 444 "$RO"
+if [[ -w "$RO" ]]; then
+  echo "  skip read-only ledger cases (running as root)"
+else
+  for w in append_runlog append_event; do
+    if [[ $w == append_runlog ]]; then
+      CROSS_REVIEW_RUNLOG="$RO" bash "$S/append_runlog.sh" --run-dir "$RUN" --project test --base main \
+        --pr - --pass 1 --verdict CLEAN --convergent 0 --top "-" >"$T/ro.out" 2>&1
+    else
+      CROSS_REVIEW_FINDING_EVENTS="$RO" bash "$S/append_finding_event.sh" \
+        --event proposed --finding-id f-abc --run-id r1 >"$T/ro.out" 2>&1
+    fi
+    rc=$?
+    if [[ $rc -ne 0 ]] && ! grep -q '^appended ' "$T/ro.out"; then ok "$w: a failed write exits non-zero (rc=$rc)"
+    else bad "$w reported a failed write as success (rc=$rc): $(tail -1 "$T/ro.out")"; fi
+  done
+fi
+chmod 644 "$RO"
 
 # A writer copied somewhere without its lib (a partial sync, a fixture that
 # copies only the scripts it names) used to drop the row and still print
@@ -121,6 +162,52 @@ else
   if [[ "$(lines "$L")" -eq 1 && $((SECONDS - start)) -lt 10 ]]; then ok "a stale lock is reclaimed promptly"
   else bad "stale lock (rows=$(lines "$L") took=$((SECONDS - start))s)"; cat "$T/stale.err"; fi
   [[ ! -e "$L.lock.d" ]] && ok "the reclaimed lock is released afterwards" || bad "stale lock left behind"
+
+  # The stale age must be the documented minute, measured in seconds. `find
+  # -mmin +1` only matches past ~120s on BSD AND GNU (it compares rounded
+  # minutes), which is longer than the 75s wait cap — so a crashed writer's
+  # lock was never reclaimed in time and every waiter appended unlocked. A
+  # 2020 timestamp cannot see that; 90 seconds can.
+  set_age() { python3 -c 'import os,sys,time; t=time.time()-int(sys.argv[2]); os.utime(sys.argv[1],(t,t))' "$1" "$2"; }
+  if command -v python3 >/dev/null 2>&1; then
+    L="$T/stale90.jsonl"; mkdir "$L.lock.d"; set_age "$L.lock.d" 90
+    start=$SECONDS
+    CROSS_REVIEW_LOCK_WAIT_S=5 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/stale90.err"
+    if [[ "$(lines "$L")" -eq 1 ]] && ! grep -q WARN "$T/stale90.err" && [[ $((SECONDS - start)) -lt 4 ]]; then
+      ok "a 90-second-old lock is stale (age measured in seconds, not rounded minutes)"
+    else bad "90s-old lock not reclaimed: took=$((SECONDS - start))s $(cat "$T/stale90.err")"; fi
+
+    # A 30-second-old lock is live: it must be waited on, not stolen.
+    L="$T/live30.jsonl"; mkdir "$L.lock.d"; set_age "$L.lock.d" 30
+    CROSS_REVIEW_LOCK_WAIT_S=1 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/live30.err"
+    grep -q WARN "$T/live30.err" && [[ -d "$L.lock.d" ]] && ok "a 30-second-old lock is still treated as live" \
+                                                     || bad "a live 30s lock was reclaimed"
+    rmdir "$L.lock.d" 2>/dev/null
+  else
+    bad "python3 needed to age a lock precisely"
+  fi
+
+  # A stale lock that cannot be renamed away (here: its parent is read-only)
+  # must count toward the cap, not spin at 100% CPU forever.
+  D="$T/rodir"; mkdir -p "$D/x.jsonl.lock.d"; : >"$D/x.jsonl"; touch -t 202001010000 "$D/x.jsonl.lock.d"
+  chmod 555 "$D"
+  if [[ -w "$D" ]]; then echo "  skip unrenameable-stale-lock case (running as root)"
+  else
+    CROSS_REVIEW_LOCK_WAIT_S=1 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$D/x.jsonl" 2>/dev/null &
+    pid=$!; waited=0
+    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 20 ]]; do sleep 0.5; waited=$((waited + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      bad "an unrenameable stale lock spins past the wait cap"
+    else wait "$pid"; ok "an unrenameable stale lock still ends at the wait cap"; fi
+  fi
+  chmod 755 "$D"
+
+  # A missing directory is not a lock that was waited on.
+  bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$T/no/such/dir/x.jsonl" 2>"$T/nodir.err"
+  rc=$?
+  if [[ $rc -ne 0 ]] && grep -q "does not exist" "$T/nodir.err" && ! grep -q "wait cap" "$T/nodir.err"; then
+    ok "a missing ledger directory is reported as missing, not as a lock timeout"
+  else bad "missing-dir diagnostic (rc=$rc): $(cat "$T/nodir.err")"; fi
 
   # A live-looking lock that never clears must not stall the round forever or
   # cost it the row: wait out the cap, then write anyway and say so.

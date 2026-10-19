@@ -136,11 +136,12 @@ fi
 # spliced together, 2026-10-08) used to be a parse error that took down the
 # whole report and, under --if-due, the round in front of it. A line that is
 # not a JSON object is not evidence either way — it is marked, counted, and
-# reported, never silently dropped. Blank lines are not rows.
+# reported, never silently dropped. Blank lines — including whitespace-only
+# and a CRLF's lone "\r" — are not rows.
 #
 # ISO-8601 Z timestamps sort lexicographically, so a plain string compare is
 # the whole date filter. Rows without a codex entry are not evidence either way.
-jq -cR 'select(length > 0)
+jq -cR 'select(test("^\\s*$") | not)
         | ((fromjson? // null) as $r
            | if ($r | type) == "object" then $r else {__unparseable: true} end)' "$runlog" |
 jq -rs --arg since "$since" '
