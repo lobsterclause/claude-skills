@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lib_append_lock.sh — the one lock every JSONL ledger writer takes.
 #
-# Sourced by append_runlog.sh, append_finding_event.sh and import_runlog.sh.
+# Sourced by append_runlog.sh and append_finding_event.sh.
 #
 # WHY NOT flock, AND WHY NOT A BARE >>
 #
@@ -30,14 +30,12 @@
 # STALE MEANS THE OWNER IS DEAD, NOT THAT THE LOCK IS OLD
 #
 # Every acquire records its pid in <lockdir>/owner, and a waiter reclaims the
-# lock only when that process no longer exists. An age rule alone assumed a
-# millisecond critical section; import_runlog.sh holds the lock across a whole
-# read-merge-publish, which can outlive any fixed age, and reclaiming a live
-# import lets its rename delete the rows appended meanwhile. Age is only the
-# fallback for a lock with no owner record (its holder died between mkdir and
-# writing it, or it predates this file). Release likewise removes only a lock
-# whose owner is the caller, so a holder whose lock was taken over cannot
-# delete the next holder's.
+# lock only when that process no longer exists. An age rule alone reclaims a
+# holder that is merely slow, and any fixed age is a guess about how long the
+# slowest legitimate holder takes. Age is only the fallback for a lock with no
+# owner record (its holder died between mkdir and writing it, or it predates
+# this file). Release likewise removes only a lock whose owner is the caller,
+# so a holder whose lock was taken over cannot delete the next holder's.
 #
 # Known limit: a holder that is alive but wedged forever is never reclaimed;
 # waiters reach the cap instead. And between a waiter's stale check and its
@@ -63,8 +61,11 @@ _append_lock_is_stale() {
   _append_lock_seen_owner="$(cat "$1/owner" 2>/dev/null || true)"
   if [[ "$_append_lock_seen_owner" =~ ^[0-9]+$ ]]; then
     kill -0 "$_append_lock_seen_owner" 2>/dev/null && return 1
-    # EPERM is a live process we may not signal; only ESRCH is dead.
-    [[ "$(kill -0 "$_append_lock_seen_owner" 2>&1)" == *"No such process"* ]]
+    # kill -0 also fails for a live process we may not signal (EPERM), and
+    # its message is localized, so ask ps whether the pid exists at all.
+    # Without ps the two cannot be told apart: treat the owner as alive.
+    command -v ps >/dev/null 2>&1 || return 1
+    ! ps -p "$_append_lock_seen_owner" >/dev/null 2>&1
     return
   fi
   age="$(_append_lock_age_s "$1")"

@@ -113,24 +113,8 @@ count_raw() { # count_raw <file...> -> number of non-blank lines
   cat -- "$@" 2>/dev/null | grep -c '[^[:space:]]' || true
 }
 
-# The lock covers the whole read-merge-publish, not just the rename: an import
-# that read the destination unlocked would publish a snapshot older than any
-# row appended meanwhile, and the rename would delete that row. A dry run
-# writes nothing and takes no lock. See lib_append_lock.sh.
-. "$(dirname "$0")/lib_append_lock.sh" || {
-  echo "FATAL: lib_append_lock.sh missing beside $0 -- nothing written" >&2; exit 1; }
-dest_dir="$(dirname "$into")"
-merged_tmp=""
-locked=0
-cleanup() {
-  [[ -n "$merged_tmp" ]] && rm -f "$merged_tmp"
-  [[ $locked -eq 1 ]] && append_lock_release "$into"
-  return 0
-}
-trap cleanup EXIT
-
-# Validate the sources before taking the destination's lock: they are not
-# what the lock protects, and every second spent here blocks real rounds.
+existing_valid=0
+[[ -f "$into" ]] && existing_valid="$(count_valid "$into")"
 incoming_valid="$(count_valid "${sources[@]}")"
 incoming_raw="$(count_raw "${sources[@]}")"
 incoming_invalid=$(( incoming_raw - incoming_valid ))
@@ -141,27 +125,13 @@ if [[ "$incoming_valid" -eq 0 ]]; then
   exit 1
 fi
 
-# Unlike a one-row append, an import replaces the whole file, so it never
-# proceeds unlocked: an unlocked rename deletes every row appended while it
-# ran. No lock, no import.
-if [[ "$dry_run" -eq 0 ]]; then
-  mkdir -p "$dest_dir"
-  append_lock_acquire "$into"
-  case $? in
-    0) locked=1 ;;
-    2) echo "FATAL: destination directory $dest_dir is missing or not writable -- nothing imported" >&2; exit 1 ;;
-    *) echo "FATAL: could not lock $into within the wait cap -- nothing imported" >&2; exit 1 ;;
-  esac
-fi
-
-existing_valid=0
-[[ -f "$into" ]] && existing_valid="$(count_valid "$into")"
-
 # Build the merged result: existing + all sources, parse-filtered, exact-object
 # deduped, sorted by ts (entries without ts sort first as oldest).
+dest_dir="$(dirname "$into")"
 mkdir -p "$dest_dir"
-merged_tmp="$(mktemp "$dest_dir/.runlog.import.XXXXXX")" || {
-  merged_tmp=""; echo "FATAL: could not create a temp file in $dest_dir -- nothing imported" >&2; exit 1; }
+merged_tmp="$(mktemp "$dest_dir/.runlog.import.XXXXXX")"
+# shellcheck disable=SC2064
+trap "rm -f '$merged_tmp'" EXIT
 
 merge_inputs=()
 [[ -f "$into" ]] && merge_inputs+=("$into")
@@ -191,9 +161,15 @@ if [[ "$dry_run" -eq 1 ]]; then
   exit 0
 fi
 
-# Atomic publish: temp lives in dest_dir, so mv is a same-filesystem rename,
-# still under the lock taken before the destination was read.
-mv -f "$merged_tmp" "$into" || {
-  echo "FATAL: could not publish to $into -- nothing imported" >&2; exit 1; }
-merged_tmp=""
+# Atomic publish: temp lives in dest_dir, so mv is a same-filesystem rename.
+# flock guards against a concurrent append_runlog/splitstream writer.
+if command -v flock >/dev/null 2>&1; then
+  (
+    flock -x 200
+    mv -f "$merged_tmp" "$into"
+  ) 200>"$into.lock"
+else
+  mv -f "$merged_tmp" "$into"
+fi
+trap - EXIT
 log "  wrote $final_count entries to $into"

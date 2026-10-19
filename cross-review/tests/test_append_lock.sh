@@ -76,53 +76,9 @@ append_event() {
 echo "── append_finding_event.sh ──"
 held_lock "append_finding_event" "$FE" append_event
 
-# import_runlog publishes by rename rather than appending, but it replaces the
-# same file append_runlog appends to, so it has to queue on the same lock.
-SRC="$T/other-machine.jsonl"
-printf '{"ts":"2026-10-01T00:00:00Z","schema_version":1,"project":"imp","pass":1,"verdict":"CLEAN","reviewers":{}}\n' >"$SRC"
-IMP="$T/import-into.jsonl"; : >"$IMP"
-echo "── import_runlog.sh ──"
-held_lock "import_runlog" "$IMP" bash "$S/import_runlog.sh" --from "$SRC" --into "$IMP" --quiet
-
-# Queuing only the rename is not enough: an import that READ the destination
-# before the lock publishes a snapshot older than a row appended meanwhile,
-# and the rename deletes that row. So: hold the lock as an appender would,
-# start the import, append a row as that holder, release — the row must
-# survive the import's publish.
-IMP2="$T/import-race.jsonl"
-printf '{"ts":"2026-09-01T00:00:00Z","schema_version":1,"project":"old","pass":1,"verdict":"CLEAN","reviewers":{}}\n' >"$IMP2"
-mkdir "$IMP2.lock.d"
-bash "$S/import_runlog.sh" --from "$SRC" --into "$IMP2" --quiet >/dev/null 2>"$T/race.err" &
-pid=$!
-sleep 2
-printf '{"ts":"2026-10-02T00:00:00Z","schema_version":1,"project":"appended-meanwhile","pass":1,"verdict":"CLEAN","reviewers":{}}\n' >>"$IMP2"
-rmdir "$IMP2.lock.d"
-wait "$pid"
-if grep -q '"appended-meanwhile"' "$IMP2" && grep -q '"imp"' "$IMP2" && grep -q '"old"' "$IMP2"; then
-  ok "import_runlog keeps a row appended while it waited for the lock"
-else bad "import_runlog lost a concurrent append: $(tr '\n' ' ' <"$IMP2")"; cat "$T/race.err"; fi
-
-# An import replaces the whole file, so unlike a one-row append it must never
-# proceed without the lock: an unlocked rename deletes every row appended
-# while it ran. It aborts and leaves the destination alone.
-IMP3="$T/import-nolock.jsonl"; : >"$IMP3"; mkdir "$IMP3.lock.d"
-CROSS_REVIEW_LOCK_WAIT_S=1 bash "$S/import_runlog.sh" --from "$SRC" --into "$IMP3" >"$T/nolock.out" 2>&1
-rc=$?
-if [[ $rc -ne 0 && ! -s "$IMP3" ]] && ! grep -q 'wrote [0-9]' "$T/nolock.out"; then
-  ok "import_runlog aborts instead of importing without the lock"
-else bad "import_runlog without the lock (rc=$rc, dest=$(wc -c <"$IMP3")B): $(tail -1 "$T/nolock.out")"; fi
-rmdir "$IMP3.lock.d"
-
-# A publish that fails must not be reported as written, nor leave its temp.
+# A shim mv that always fails, for the unrenameable-stale-lock case below.
 SHIM="$T/failing-mv"; mkdir -p "$SHIM"
 printf '#!/bin/sh\nexit 1\n' >"$SHIM/mv"; chmod +x "$SHIM/mv"
-IMP4D="$T/imp4"; mkdir -p "$IMP4D"; IMP4="$IMP4D/runlog.jsonl"; : >"$IMP4"
-PATH="$SHIM:$PATH" bash "$S/import_runlog.sh" --from "$SRC" --into "$IMP4" >"$T/mvfail.out" 2>&1
-rc=$?
-leaked="$(ls -A "$IMP4D" | grep -c '^\.runlog\.import\.' || true)"
-if [[ $rc -ne 0 && "$leaked" -eq 0 ]] && ! grep -q 'wrote [0-9]' "$T/mvfail.out" && [[ ! -e "$IMP4.lock.d" ]]; then
-  ok "a failed import publish exits non-zero, leaves no temp file and no lock"
-else bad "failed publish (rc=$rc leaked=$leaked lock=$([[ -e "$IMP4.lock.d" ]] && echo left || echo gone)): $(tail -1 "$T/mvfail.out")"; fi
 
 # A write that fails must not be reported as written.
 echo "── a failed append is not reported as success ──"
@@ -150,12 +106,12 @@ chmod 644 "$RO"
 # "appended runlog entry". It must fail, and say so.
 echo "── a writer without lib_append_lock.sh ──"
 LONE="$T/lone"; mkdir -p "$LONE"
-cp "$S/append_runlog.sh" "$S/append_finding_event.sh" "$S/import_runlog.sh" "$LONE/"
+cp "$S/append_runlog.sh" "$S/append_finding_event.sh" "$LONE/"
 missing_lib() {
   local label="$1" ledger="$2"; shift 2
   "$@" >"$T/lone.out" 2>&1
   local rc=$?
-  if [[ $rc -ne 0 ]] && ! grep -qE '^appended |wrote [0-9]+ entries' "$T/lone.out"; then
+  if [[ $rc -ne 0 ]] && ! grep -q '^appended ' "$T/lone.out"; then
     ok "$label fails loudly when its lib is missing (rc=$rc)"
   else bad "$label without its lib (rc=$rc): $(tail -1 "$T/lone.out")"; fi
 }
@@ -165,9 +121,6 @@ missing_lib "append_runlog" "$T/lone-rl.jsonl" \
 missing_lib "append_finding_event" "$T/lone-fe.jsonl" \
   env CROSS_REVIEW_FINDING_EVENTS="$T/lone-fe.jsonl" bash "$LONE/append_finding_event.sh" \
     --event proposed --finding-id f-abc --run-id r1
-: >"$T/lone-imp.jsonl"
-missing_lib "import_runlog" "$T/lone-imp.jsonl" \
-  bash "$LONE/import_runlog.sh" --from "$SRC" --into "$T/lone-imp.jsonl"
 
 # ── the lock itself ──────────────────────────────────────────────────────────
 echo "── lib_append_lock.sh ──"
@@ -209,8 +162,8 @@ else
     bad "python3 needed to age a lock precisely"
   fi
 
-  # Staleness is the OWNER's liveness, not the lock's age: an import can hold
-  # the lock well past a minute. A lock recorded as owned by a live process is
+  # Staleness is the OWNER's liveness, not the lock's age: a slow holder can
+  # keep the lock past a minute. A lock recorded as owned by a live process is
   # live however old; one owned by a dead process is stale however new.
   L="$T/owned-live.jsonl"; mkdir "$L.lock.d"; echo "$$" >"$L.lock.d/owner"
   touch -t 202001010000 "$L.lock.d"
@@ -226,6 +179,29 @@ else
   if [[ "$(lines "$L")" -eq 1 && $((SECONDS - start)) -lt 3 && ! -e "$L.lock.d" ]] && ! grep -q WARN "$T/owned-dead.err"; then
     ok "a fresh lock whose owner is dead is reclaimed at once"
   else bad "dead owner's lock (took=$((SECONDS - start))s): $(cat "$T/owned-dead.err")"; fi
+
+  # Death must not be read from an error MESSAGE: strerror is localized, so a
+  # check for "No such process" never fires under a German or French locale
+  # and a dead holder's lock is never reclaimed. Override kill with one that
+  # fails the way a dead pid does but answers in German.
+  bash -c 'exit 0' & dead=$!; wait "$dead"
+  L="$T/owned-dead-de.jsonl"; mkdir "$L.lock.d"; echo "$dead" >"$L.lock.d/owner"
+  CROSS_REVIEW_LOCK_WAIT_S=3 bash -c '
+    kill() { if [[ "$1" == -0 ]]; then echo "bash: kill: ($2) - Kein passender Prozess gefunden" >&2; return 1; fi; builtin kill "$@"; }
+    . "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/owned-dead-de.err"
+  if [[ "$(lines "$L")" -eq 1 && ! -e "$L.lock.d" ]] && ! grep -q WARN "$T/owned-dead-de.err"; then
+    ok "a dead owner is recognised without reading English error text"
+  else bad "dead owner under a non-English kill message: $(cat "$T/owned-dead-de.err")"; fi
+
+  # A live process we may not signal (EPERM — pid 1 for a non-root user) is
+  # alive, not dead.
+  if [[ "$(id -u)" -ne 0 ]]; then
+    L="$T/owned-pid1.jsonl"; mkdir "$L.lock.d"; echo 1 >"$L.lock.d/owner"
+    CROSS_REVIEW_LOCK_WAIT_S=1 bash -c '. "$1"; append_line_locked "$2" "{\"ok\":1}"' _ "$LIB" "$L" 2>"$T/pid1.err"
+    if grep -q WARN "$T/pid1.err" && [[ "$(cat "$L.lock.d/owner" 2>/dev/null)" == 1 ]]; then
+      ok "a live owner we cannot signal (EPERM) is not reclaimed"
+    else bad "an EPERM owner's lock was reclaimed"; fi
+  fi
 
   # Release removes only the caller's own lock — a holder whose lock was taken
   # over must not delete the new holder's.

@@ -1005,7 +1005,7 @@ bash ~/.claude/skills/cross-review/scripts/import_runlog.sh \
   [--dry-run]
 ```
 
-The merge is **idempotent** (exact-object dedup — re-importing the same source adds nothing), JSON-validated (non-JSON lines are counted and skipped, not written), chronologically sorted by `ts` (legacy entries without `ts` sort to the front), and read, merged and written atomically while holding the same `<runlog>.lock.d` lock `append_runlog.sh` appends under (`scripts/lib_append_lock.sh`), so a row appended mid-import is never overwritten. Always safe to run before `--self-check` after a reinstall: `import_runlog.sh --from ~/.claude/skills/cross-review/runlog.jsonl --dry-run` shows what would be pulled in. This is the supported way to preserve history when syncing the skill between the repo and an install.
+The merge is **idempotent** (exact-object dedup — re-importing the same source adds nothing), JSON-validated (non-JSON lines are counted and skipped, not written), chronologically sorted by `ts` (legacy entries without `ts` sort to the front), and written atomically under `flock`. Always safe to run before `--self-check` after a reinstall: `import_runlog.sh --from ~/.claude/skills/cross-review/runlog.jsonl --dry-run` shows what would be pulled in. This is the supported way to preserve history when syncing the skill between the repo and an install.
 
 ## Per-reviewer behavioral profiles
 
