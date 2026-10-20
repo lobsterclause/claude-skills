@@ -514,6 +514,10 @@ kimi27_timeout="${timeout_s:-${kimi27_profile:-$timeout_s_default}}"
 kimi3_timeout="${timeout_s:-${kimi3_profile:-$timeout_s_default}}"
 
 mkdir -p "$out"
+# A quota sentinel left by an earlier run in a reused dir is not this run's
+# evidence. Cleared once, here, before any lane starts: clearing per seat
+# inside retry_reviewer would race the sibling Gemini lap (#191 pass 3).
+rm -f "$out"/*.quota_exhausted
 
 # Validate the base ref up front. Without this, `git diff --quiet` below
 # would return 128 on a missing ref — which bash treats as non-zero (same as
@@ -1039,6 +1043,22 @@ retry_reviewer() {
   # out of the round only when that seat has no or_fallback configured.
   if [[ $rc -eq 3 ]]; then
     echo "$name: agy quota exhausted — not retrying (the shared quota resets on a ~2-day cadence)" >&2
+    rc="$(maybe_or_fallback "$name" "$rc")"
+    unset CROSS_REVIEW_ATTEMPT
+    return "$rc"
+  fi
+  # Any other lane that hit a plan/usage wall says so with a
+  # <name>.quota_exhausted sentinel (codex's usage cap, Z.ai's 1308/1310 for
+  # glm-coding). Those reset hours or days later, so attempt 2 is a doomed
+  # call 5-15s on — go straight to the fallback offer instead (codex +
+  # antigravity, #191 pass 1).
+  if [[ $rc -ne 0 && -f "$out/$name.quota_exhausted" ]]; then
+    local q_info; q_info="$(cat "$out/$name.quota_exhausted" 2>/dev/null)"
+    if [[ -z "$q_info" || "$q_info" == "reset time not reported" ]]; then
+      echo "$name: plan/usage limit — not retrying (reset time not reported)" >&2
+    else
+      echo "$name: plan/usage limit — not retrying (resets $q_info)" >&2
+    fi
     rc="$(maybe_or_fallback "$name" "$rc")"
     unset CROSS_REVIEW_ATTEMPT
     return "$rc"
@@ -1991,6 +2011,20 @@ $json_findings_suffix"
     rc=5
   elif [[ $rc -ne 0 && "$timed_out" == false && -n "$api_failure_kind" ]]; then
     fk_json="\"$api_failure_kind\""
+    # A plan wall (Z.ai 1308/1310 for glm-coding, a fixed baseline) is said
+    # out loud, with its reset time, exactly like codex's — otherwise a round
+    # that lost a baseline reads as a quiet one. The message is read from the
+    # tool loop's TL_API_ERROR or the single-shot response, whichever ran.
+    if [[ "$api_failure_kind" == "quota_exhausted" ]]; then
+      local q_msg="" q_reset
+      # TL_API_ERROR is global and never cleared on the single-shot arm, so
+      # it is read only when the tool loop actually ran this call.
+      [[ "$tl_used" == true ]] && q_msg="${TL_API_ERROR:-}"
+      [[ -n "$q_msg" ]] || q_msg="$(jq -r '.error.message // empty' "$resp_file" 2>/dev/null)"
+      q_reset="$(printf '%s' "$q_msg" | grep -oiE 'resets? at [^."]+' | head -1 | sed -E 's/^[Rr][Ee][Ss][Ee][Tt][Ss]? [Aa][Tt] //')"
+      printf '%s\n' "${q_reset:-reset time not reported}" >"$out/${slug}.quota_exhausted"
+      echo "$slug: plan limit reached — drops out of this round (resets ${q_reset:-at an unreported time})" >&2
+    fi
   fi
   # Cost accounting (fugu lesson, PR #20): usage:{include:true} makes OR
   # return authoritative per-call cost; recording it in meta → runlog lets

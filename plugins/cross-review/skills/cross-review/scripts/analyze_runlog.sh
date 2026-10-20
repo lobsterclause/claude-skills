@@ -372,6 +372,11 @@ emit_warning() {
     | if (.fallback // 0) > 0 then
       "  WARN: \($rv) served \(.fallback) of last \(.total) runs through its OpenRouter FALLBACK — its own provider lane failed. THE PRIMARY PROVIDER NEEDS ATTENTION (billing/quota/auth); the rescue is a stopgap, not a healthy seat."
     elif .total < 3 then empty   # not enough data
+    elif (.quota // 0) > 0 and ($rv | IN("antigravity", "gemini-pro") | not) then
+      # Every other seat that reports quota is on its own plan: the codex
+      # usage cap, the Z.ai 5-hour/weekly limits for glm-coding (#191).
+      # Naming Gemini there sent the reader to agy files that do not exist.
+      "  WARN: \($rv) hit its plan quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the seat drops out until the limit resets (ETA in the latest run \($rv).quota_exhausted)." + (if ($rv | IN("codex", "glm-coding", "kimi")) then " A baseline that drops out leaves its rounds a reviewer short." else "" end)
     elif (.quota // 0) > 0 then
       "  WARN: \($rv) hit the shared Gemini Individual quota in \(.quota) of last \(.total) runs — not a timeout/auth issue; the lap drops out until the quota resets (ETA in the latest run agy.quota_exhausted / .agy.log). If the seat has or_fallback configured it is re-run over OpenRouter and recorded as status \"fallback\" (never \"ok\"); otherwise rotation covers the gap"
     # Gate the timeout WARN on the sleep-CLEAN rate, matching
