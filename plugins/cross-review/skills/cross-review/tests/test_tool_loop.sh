@@ -453,6 +453,12 @@ assert_eq "glm-coding: a Z.ai plan wall → quota_exhausted" "$(jq -r .failure_k
 assert_eq "…its sentinel carries the reset time"           "$(cat "$T/ozc/glm-coding.quota_exhausted" 2>/dev/null)" "2026-10-27 09:00:00"
 assert_not_contains "…and it is NOT retried"               "$(cat "$T/ozc.log")" "attempt 1 failed"
 assert_eq "…meta records a single attempt"                 "$(jq -r .attempt "$T/ozc/glm-coding.meta.json")" "1"
+# A sentinel left in a REUSED output dir is not this attempt's evidence: a
+# transient failure must still get its retry (#191 pass 2).
+mkdir -p "$T/ostale" && printf '%s\n' "2026-10-27 09:00:00" >"$T/ostale/glm-coding.quota_exhausted"
+( cd "$REPO" && env CROSS_REVIEW_TOOL_MODE=off SHIM_MODE=err400 ZAI_API_KEY=sk-zai-test \
+    bash "$S/run_reviewers.sh" --base main --out "$T/ostale" --reviewers glm-coding --timeout-glm-coding 60 >"$T/ostale.log" 2>&1 )
+assert_contains "…a stale sentinel does not suppress a transient failure's retry" "$(cat "$T/ostale.log")" "attempt 1 failed"
 # The health check must name the right provider: a glm-coding quota row is
 # not "the shared Gemini Individual quota" (codex P2, #191 pass 1).
 QRL="$T/quota-runlog.jsonl"
@@ -460,6 +466,13 @@ for i in 1 2 3; do printf '{"reviewers":{"glm-coding":{"status":"quota","exit_co
 QWARN="$(CROSS_REVIEW_RUNLOG="$QRL" bash "$S/analyze_runlog.sh" --recent 10 --mode warn 2>&1)"
 assert_contains "health check flags glm-coding's quota" "$QWARN" "glm-coding hit its plan quota"
 assert_not_contains "…without calling it Gemini's"      "$QWARN" "Gemini Individual quota"
+# The Gemini seats keep their own branch: the shared Individual quota, not a
+# plan quota (#191 pass 2 — the split must not have dropped the agy wording).
+QRL_AGY="$T/quota-agy-runlog.jsonl"
+for i in 1 2 3; do printf '{"reviewers":{"antigravity":{"status":"quota","exit_code":3,"duration_s":2,"timeout_budget_s":600}}}\n' >>"$QRL_AGY"; done
+QWARN_AGY="$(CROSS_REVIEW_RUNLOG="$QRL_AGY" bash "$S/analyze_runlog.sh" --recent 10 --mode warn 2>&1)"
+assert_contains "health check flags antigravity's Gemini quota" "$QWARN_AGY" "Gemini Individual quota"
+assert_not_contains "…without calling it plan quota"            "$QWARN_AGY" "hit its plan quota"
 run_lane "$T/ob4" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=bill402 --
 # The learner must now ignore these: feed ob1's meta shape into the fixture ledger.
 printf '{"run_id":"x","reviewers":{"glm":%s}}\n' "$(jq -c '. + {status:"failed"}' "$T/ob1/glm.meta.json")" >>"$CROSS_REVIEW_RUNLOG"

@@ -1029,6 +1029,10 @@ fallback_only() {
 retry_reviewer() {
   local fn="$1"
   local name="$2"
+  # A sentinel left by an earlier run in a reused output dir is not this
+  # attempt's evidence; clear it before attempt 1 so a transient failure is
+  # not misread as a quota wall (#191 pass 2).
+  rm -f "$out/$name.quota_exhausted"
   export CROSS_REVIEW_ATTEMPT=1
   "$fn"
   local rc=$?
@@ -1049,7 +1053,12 @@ retry_reviewer() {
   # call 5-15s on — go straight to the fallback offer instead (codex +
   # antigravity, #191 pass 1).
   if [[ $rc -ne 0 && -f "$out/$name.quota_exhausted" ]]; then
-    echo "$name: plan/usage limit — not retrying (resets $(cat "$out/$name.quota_exhausted" 2>/dev/null))" >&2
+    local q_info; q_info="$(cat "$out/$name.quota_exhausted" 2>/dev/null)"
+    if [[ -z "$q_info" || "$q_info" == "reset time not reported" ]]; then
+      echo "$name: plan/usage limit — not retrying (reset time not reported)" >&2
+    else
+      echo "$name: plan/usage limit — not retrying (resets $q_info)" >&2
+    fi
     rc="$(maybe_or_fallback "$name" "$rc")"
     unset CROSS_REVIEW_ATTEMPT
     return "$rc"
@@ -2012,7 +2021,7 @@ $json_findings_suffix"
       # it is read only when the tool loop actually ran this call.
       [[ "$tl_used" == true ]] && q_msg="${TL_API_ERROR:-}"
       [[ -n "$q_msg" ]] || q_msg="$(jq -r '.error.message // empty' "$resp_file" 2>/dev/null)"
-      q_reset="$(printf '%s' "$q_msg" | grep -oiE 'resets? at [^."]+' | head -1 | sed -E 's/^[Rr]esets? at //')"
+      q_reset="$(printf '%s' "$q_msg" | grep -oiE 'resets? at [^."]+' | head -1 | sed -E 's/^[Rr][Ee][Ss][Ee][Tt][Ss]? [Aa][Tt] //')"
       printf '%s\n' "${q_reset:-reset time not reported}" >"$out/${slug}.quota_exhausted"
       echo "$slug: plan limit reached — drops out of this round (resets ${q_reset:-at an unreported time})" >&2
     fi
