@@ -590,8 +590,22 @@ bash ~/.claude/skills/cross-review/scripts/post_comment.sh \
   --mode <summary|file|none> \
   --findings "$run_dir/findings.md" \
   --head-sha "$(jq -r .head_sha "$run_dir/context.json")" \
-  --repo "$(jq -r .repo "$run_dir/context.json")"
+  --repo "$(jq -r .repo "$run_dir/context.json")" \
+  --verdict "<CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED>"
 ```
+
+**`--verdict` is optional** and takes the same value step 9 below computes for
+`report_block.sh --verdict` and `append_runlog.sh --verdict` — pass whichever
+one this pass actually settled on once it is known, rather than tracking a
+second copy of it. It is the fix for a real gap (kindred-mama-ai#3736): the
+marker used to carry only the reviewed sha, so a record posted with
+FIXES_APPLIED — fixes written *in response to* findings, not yet themselves
+reviewed — read as an unconditional clearance to any consumer that only
+checked "is the sha current". `scripts/cross-review-currency.sh` in
+kindred-mama-ai now reads this field and reports a distinct `pending` status
+for a matched sha whose verdict is not `CLEAN`, rather than `success`. Omitting
+it, or passing an unrecognised value, changes nothing — `post_comment.sh`
+drops it from the marker and posts exactly as it always has.
 
 **`--head-sha` is required in `summary` mode, and the script now enforces it.**
 It used to be optional with this paragraph asking nicely, which meant the stamp
