@@ -160,9 +160,11 @@ write_posted() {  # <true|false> <reason> [comment_url]
     echo "WARN: cannot write $run_dir/posted.json — this run's posting outcome will not be recorded" >&2
     return 0
   fi
-  printf '{"posted": %s, "reason": "%s", "pr": "%s", "repo": "%s", "pass": "%s", "head_sha": "%s", "mode": "%s", "comment_url": "%s", "posted_at": "%s"}\n' \
+  # verdict rides along so reconcile.sh can re-post a failed record WITH it;
+  # without it a recovered FIXES_APPLIED record reads as clean. (codex P2, #185.)
+  printf '{"posted": %s, "reason": "%s", "pr": "%s", "repo": "%s", "pass": "%s", "head_sha": "%s", "mode": "%s", "comment_url": "%s", "verdict": "%s", "posted_at": "%s"}\n' \
     "$1" "$(jsonesc "$2")" "$(jsonesc "$pr")" "$(jsonesc "$repo")" "$(jsonesc "$pass")" "$(jsonesc "$head_sha")" \
-    "$(jsonesc "$mode")" "$(jsonesc "${3:-}")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(jsonesc "$mode")" "$(jsonesc "${3:-}")" "$(jsonesc "$verdict")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >"$run_dir/posted.json" 2>/dev/null || true
 }
 

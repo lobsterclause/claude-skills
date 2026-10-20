@@ -43,6 +43,7 @@ case "$1 $2" in
   "auth status") exit 0 ;;
   "pr view") printf '%s\n' '{"headRefOid":"b6d36bd1ed33bd8162d1a03bd856ef32305c0933","state":"OPEN"}'; exit 0 ;;
   "pr comment")
+      [ "${CR_TEST_COMMENT_FAIL:-0}" = 1 ] && exit 1
       while [ $# -gt 0 ]; do
         if [ "$1" = "--body-file" ]; then cp "$2" "$CR_TEST_CAPTURE"; fi
         shift
@@ -100,6 +101,25 @@ assert_not_contains "…with no verdict field" "$(marker)" "verdict="
 # A flag with no value is a usage error, like every other valued flag.
 bash "$S/post_comment.sh" --pr 183 --mode summary --findings "$FIND" --verdict >/dev/null 2>&1
 assert_eq "--verdict with no value is a usage error (exit 2)" "$?" "2"
+
+# ── a failed post keeps its verdict through reconcile.sh --post ──
+#
+# reconcile.sh re-posts a record whose `gh pr comment` failed. If the verdict
+# is not saved with the posting outcome and forwarded, the recovered record
+# goes up without it and a FIXES_APPLIED review reads as a clean one again.
+# (codex P2, #185.)
+RD="$T/runs/r1"; mkdir -p "$RD/raw"
+printf 'reviewer said things\n' >"$RD/raw/codex.stdout"
+printf '# findings\n\nnothing to report\n' >"$RD/findings.md"
+: >"$CR_TEST_CAPTURE"
+CR_TEST_COMMENT_FAIL=1 bash "$S/post_comment.sh" --pr 183 --mode summary \
+  --findings "$RD/findings.md" --head-sha "$SHA" --repo o/r --verdict FIXES_APPLIED >/dev/null 2>&1
+assert_eq "a failed post is recorded as not posted" \
+  "$(jq -r '.posted' "$RD/posted.json" 2>/dev/null)" "false"
+assert_eq "…and keeps the verdict it was given" \
+  "$(jq -r '.verdict // empty' "$RD/posted.json" 2>/dev/null)" "FIXES_APPLIED"
+CROSS_REVIEW_RUN_ROOT="$T/runs" bash "$S/reconcile.sh" --post >/dev/null 2>&1
+assert_contains "the reconciled repost carries the verdict" "$(marker)" " verdict=FIXES_APPLIED -->"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"
