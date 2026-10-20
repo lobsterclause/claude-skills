@@ -147,6 +147,65 @@ if command -v curl >/dev/null 2>&1; then
   fi
 fi
 
+# Baseline-CLI hang detection (#3587; the OpenRouter balance half is parked in #190). A baseline CLI can be
+# present, executable, and authenticated and STILL not be capable of
+# serving a round: kimi's CLI was observed hanging 600-900s wall three
+# times running, present-and-installed the whole time, which no install/
+# PATH/key probe above can see. A live probe here is not worth it (the
+# whole failure mode IS "does not return in reasonable time" — a bounded
+# probe just reproduces the hang inside detection instead of inside the
+# round). Reuse the signal the fleet already has instead: runlog.jsonl,
+# via analyze_runlog.sh's --mode streak. A baseline-eligible reviewer
+# (codex, kimi, glm-coding — the only three cr_baseline_names ever names)
+# that timed out on each of its last BASELINE_HANG_STREAK_N attempts —
+# where the streak is stale once its MOST RECENT attempt is older than
+# CROSS_REVIEW_HANG_WINDOW_H hours (default 24), not counting machine-sleep
+# timeouts — is
+# downgraded to unavailable HERE, before the printf, so both the JSON this
+# script reports and the fail-closed enforcement below see the honest
+# state — CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 becomes the deliberate way
+# to run on a known-flaky baseline instead of it silently looking healthy.
+#
+# FAILS SAFE: no runlog, no jq, an unreadable analyze_runlog.sh, or any
+# non-numeric output leaves the reviewer's presence-checked value
+# untouched (see recent_consecutive_timeouts below) — this can only
+# downgrade a seat presence checks already called available, never
+# fabricate availability they did not grant.
+BASELINE_HANG_STREAK_N=3
+recent_consecutive_timeouts() {
+  local r="$1" n="$2" script_dir out
+  script_dir="$(dirname "${BASH_SOURCE[0]}")"
+  [[ -f "$script_dir/analyze_runlog.sh" ]] || { echo 0; return; }
+  command -v jq >/dev/null 2>&1 || { echo 0; return; }
+  out="$(bash "$script_dir/analyze_runlog.sh" --mode streak --reviewer "$r" --streak-n "$n" 2>/dev/null)"
+  [[ "$out" =~ ^[0-9]+$ ]] && echo "$out" || echo 0
+}
+for _bl in codex kimi glm-coding; do
+  _streak="$(recent_consecutive_timeouts "$_bl" "$BASELINE_HANG_STREAK_N")"
+  if [[ "$_streak" -ge "$BASELINE_HANG_STREAK_N" ]]; then
+    case "$_bl" in
+      codex)
+        if [[ "$codex" == true ]]; then
+          codex=false
+          printf 'WARNING: codex reported unavailable — timed out on its last %s consecutive attempts per runlog.jsonl (present on PATH, but not currently completing reviews). Set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 to proceed on the degraded baseline anyway.\n' "$_streak" >&2
+        fi
+        ;;
+      kimi)
+        if [[ "$kimi" == true ]]; then
+          kimi=false
+          printf 'WARNING: kimi reported unavailable — timed out on its last %s consecutive attempts per runlog.jsonl (present on PATH, but not currently completing reviews). Set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 to proceed on the degraded baseline anyway.\n' "$_streak" >&2
+        fi
+        ;;
+      glm-coding)
+        if [[ "$glm_coding" == true ]]; then
+          glm_coding=false
+          printf 'WARNING: glm-coding reported unavailable — timed out on its last %s consecutive attempts per runlog.jsonl (key present, but not currently completing reviews). Set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 to proceed on the degraded baseline anyway.\n' "$_streak" >&2
+        fi
+        ;;
+    esac
+  fi
+done
+
 # WARNING: the format-string keys and the positional args below are coupled
 # by POSITION ONLY — inserting a reviewer in one without the other silently
 # shifts every later value (kimi+kat convergent nit, PR #29 pass 1). Keep the

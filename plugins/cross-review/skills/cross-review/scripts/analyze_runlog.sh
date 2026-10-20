@@ -12,7 +12,7 @@
 # for its pre-flight table.
 #
 # Usage:
-#   analyze_runlog.sh [--recent <n>] [--mode warn|report] [--quiet]
+#   analyze_runlog.sh [--recent <n>] [--mode warn|report|streak] [--quiet]
 #
 #   --recent <n>      window (default 20). Older entries ignored.
 #   --mode warn       emit one-line warnings when a reviewer is degraded
@@ -20,6 +20,21 @@
 #                     reliability <60% over the window). Default.
 #   --mode report     emit the full report (reliability %, p50/p95 duration,
 #                     timeout rate, empty rate, suggested timeout edits).
+#   --mode streak     requires --reviewer <name>. Prints a single bare
+#                     integer: the number of the reviewer's most recent
+#                     non-skipped attempts (most recent last) that are ALL
+#                     status "timed_out", up to
+#                     --streak-n (default 3). 0 means the most recent
+#                     attempt was not a timeout, or there is no data.
+#                     Machine-consumed by detect_reviewers.sh's
+#                     baseline-fail-closed check (#3587) — a baseline CLI
+#                     that is present on PATH but hangs every call (kimi,
+#                     observed 600-900s) never fails an install/PATH probe,
+#                     so this reuses the runlog's own timeout history
+#                     instead of a live probe.
+#   --reviewer <name> which seat to check (streak mode only).
+#   --streak-n <n>    consecutive-timeout threshold for streak mode
+#                     (default 3).
 #   --quiet           silence informational lines; warnings/report still print.
 #
 # Reads only the structured Phase-2 entries (those with a `reviewers` field).
@@ -31,6 +46,8 @@ set -uo pipefail
 recent=20
 mode="warn"
 quiet=0
+reviewer_arg=""
+streak_n=3
 
 need_val() {
   # set -u + missing flag value crashes with raw "$2: unbound variable" instead
@@ -45,8 +62,10 @@ need_val() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --recent) need_val --recent "$#"; recent="$2"; shift 2 ;;
-    --mode)   need_val --mode   "$#"; mode="$2";   shift 2 ;;
+    --recent)   need_val --recent "$#";   recent="$2";      shift 2 ;;
+    --mode)     need_val --mode   "$#";   mode="$2";        shift 2 ;;
+    --reviewer) need_val --reviewer "$#"; reviewer_arg="$2"; shift 2 ;;
+    --streak-n) need_val --streak-n "$#"; streak_n="$2";    shift 2 ;;
     --quiet)  quiet=1;     shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -63,6 +82,59 @@ profile_file="$skill_dir/references/reviewer_profiles.json"
 
 if [[ ! -f "$runlog" ]]; then
   [[ "$quiet" -eq 0 ]] && echo "no runlog at $runlog" >&2
+  [[ "$mode" == "streak" ]] && echo 0   # no history: no streak, said explicitly
+  exit 0
+fi
+
+# --mode streak answers here, before the fleet report and before the
+# fleet-wide --recent cut: detect_reviewers.sh calls it once per baseline on
+# every round, and the question is about ONE reviewer's own recent attempts —
+# other reviewers' rounds must not push a benched baseline's timeouts out of
+# view (antigravity, #189 pass 2).
+#
+# What counts (#189):
+#   - sleep-suspect attempts (wall_over_budget) are skipped entirely — the
+#     timer froze, the CLI did not hang — so they neither make nor break a
+#     streak;
+#   - the streak is its last $streak_n counted attempts, all timed out, and
+#     it ages out on its MOST RECENT one: older than CROSS_REVIEW_HANG_WINDOW_H
+#     hours (default 24) and it no longer counts. Once detection benches a
+#     baseline no new rounds run, so without this nothing could ever clear it.
+#     The window is not applied per attempt: that dropped the start of a live
+#     streak, and dropped successes with an unparseable ts that should break
+#     one (antigravity, #189 pass 2).
+if [[ "$mode" == "streak" ]]; then
+  if [[ -z "$reviewer_arg" ]]; then
+    echo "streak mode requires --reviewer <name>" >&2
+    exit 2
+  fi
+  if ! [[ "$streak_n" =~ ^[0-9]+$ ]] || [[ "$streak_n" -eq 0 ]]; then
+    echo "--streak-n must be a positive integer" >&2
+    exit 2
+  fi
+  hang_window_h="${CROSS_REVIEW_HANG_WINDOW_H:-24}"
+  [[ "$hang_window_h" =~ ^[0-9]+$ ]] || hang_window_h=24
+  # Most-recent-last, matching the runlog's own append order. One streaming
+  # pass keeps only this reviewer's counted attempts; the tail is exactly
+  # the last $streak_n of them, the only ones ever read.
+  jq -c --arg r "$reviewer_arg" '
+      select(type == "object" and (.reviewers | type) == "object")
+      | (.reviewers[$r] // null) as $a
+      | select($a != null and ($a | type) == "object"
+               and ($a.status // "skipped") != "skipped"
+               and (($a.wall_over_budget // false) != true))
+      | {status: $a.status, _t: ((.ts // "") | try fromdateiso8601 catch null)}' \
+      "$runlog" 2>/dev/null | tail -n "$streak_n" \
+    | jq -s --argjson n "$streak_n" --argjson win "$((hang_window_h * 3600))" '
+        (now - $win) as $since
+        | length as $total
+        | if $total < $n then 0
+          else
+            .[($total - $n):] as $tail
+            | if ($tail | all(.status == "timed_out"))
+                 and ($tail[-1]._t != null and $tail[-1]._t >= $since)
+              then $n else 0 end
+          end'
   exit 0
 fi
 
@@ -75,6 +147,7 @@ if [[ "$n_entries" -eq 0 ]]; then
   [[ "$quiet" -eq 0 ]] && echo "analyze_runlog: no structured entries yet (need at least 1 Phase-2 run)" >&2
   exit 0
 fi
+
 
 # Per-reviewer aggregation.
 # For each reviewer in {codex, antigravity, gemini-pro, kimi}, compute:
@@ -481,7 +554,7 @@ case "$mode" in
     roster_audit_out
     ;;
   *)
-    echo "unknown mode: $mode (use warn|report)" >&2
+    echo "unknown mode: $mode (use warn|report|streak)" >&2
     exit 2
     ;;
 esac
