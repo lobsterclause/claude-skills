@@ -86,6 +86,11 @@ assert_eq "…nor break one: it is skipped, and the real attempts around it deci
 assert_eq "a streak older than the 24h window has cleared" "$(streak kimi)" "0"
 assert_eq "…and the window is configurable" \
   "$(CROSS_REVIEW_HANG_WINDOW_H=72 bash "$S/analyze_runlog.sh" --mode streak --reviewer kimi --streak-n 3 2>/dev/null)" "3"
+# --streak-n is not capped: a streak longer than 200 must still count in full
+# (#189 pass 3 — a fixed tail -n 200 read 0 for any threshold above 200).
+: >"$FIXLOG"; for i in $(seq 250 -1 1); do row "$i" kimi timed_out; done
+assert_eq "a streak longer than 200 is counted in full" \
+  "$(bash "$S/analyze_runlog.sh" --mode streak --reviewer kimi --streak-n 250 2>/dev/null)" "250"
 
 # The window ages out the STREAK, keyed on its most recent attempt — not each
 # attempt separately. A live streak that began more than 24h ago is still a

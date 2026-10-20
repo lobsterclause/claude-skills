@@ -22,8 +22,8 @@
 #                     timeout rate, empty rate, suggested timeout edits).
 #   --mode streak     requires --reviewer <name>. Prints a single bare
 #                     integer: the number of the reviewer's most recent
-#                     non-skipped attempts (within --recent, most recent
-#                     last) that are ALL status "timed_out", up to
+#                     non-skipped attempts (most recent last) that are ALL
+#                     status "timed_out", up to
 #                     --streak-n (default 3). 0 means the most recent
 #                     attempt was not a timeout, or there is no data.
 #                     Machine-consumed by detect_reviewers.sh's
@@ -115,8 +115,8 @@ if [[ "$mode" == "streak" ]]; then
   hang_window_h="${CROSS_REVIEW_HANG_WINDOW_H:-24}"
   [[ "$hang_window_h" =~ ^[0-9]+$ ]] || hang_window_h=24
   # Most-recent-last, matching the runlog's own append order. One streaming
-  # pass keeps only this reviewer's counted attempts; the tail is generous
-  # because only the last $streak_n of them are ever read.
+  # pass keeps only this reviewer's counted attempts; the tail is exactly
+  # the last $streak_n of them, the only ones ever read.
   jq -c --arg r "$reviewer_arg" '
       select(type == "object" and (.reviewers | type) == "object")
       | (.reviewers[$r] // null) as $a
@@ -124,7 +124,7 @@ if [[ "$mode" == "streak" ]]; then
                and ($a.status // "skipped") != "skipped"
                and (($a.wall_over_budget // false) != true))
       | {status: $a.status, _t: ((.ts // "") | try fromdateiso8601 catch null)}' \
-      "$runlog" 2>/dev/null | tail -n 200 \
+      "$runlog" 2>/dev/null | tail -n "$streak_n" \
     | jq -s --argjson n "$streak_n" --argjson win "$((hang_window_h * 3600))" '
         (now - $win) as $since
         | length as $total
@@ -145,7 +145,6 @@ n_entries=$(printf '%s\n' "$structured" | grep -c '^.' || true)
 
 if [[ "$n_entries" -eq 0 ]]; then
   [[ "$quiet" -eq 0 ]] && echo "analyze_runlog: no structured entries yet (need at least 1 Phase-2 run)" >&2
-  [[ "$mode" == "streak" ]] && echo 0   # no history: no streak, said explicitly
   exit 0
 fi
 

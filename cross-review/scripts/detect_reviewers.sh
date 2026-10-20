@@ -158,8 +158,9 @@ fi
 # via analyze_runlog.sh's --mode streak. A baseline-eligible reviewer
 # (codex, kimi, glm-coding — the only three cr_baseline_names ever names)
 # that timed out on each of its last BASELINE_HANG_STREAK_N attempts —
-# within the last CROSS_REVIEW_HANG_WINDOW_H hours (default 24), not
-# counting machine-sleep timeouts — is
+# where the streak is stale once its MOST RECENT attempt is older than
+# CROSS_REVIEW_HANG_WINDOW_H hours (default 24), not counting machine-sleep
+# timeouts — is
 # downgraded to unavailable HERE, before the printf, so both the JSON this
 # script reports and the fail-closed enforcement below see the honest
 # state — CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 becomes the deliberate way
