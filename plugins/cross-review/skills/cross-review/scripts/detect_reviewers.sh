@@ -11,7 +11,7 @@
 #
 # As of the 2026-06-18 Gemini-CLI consumer sunset, BOTH Gemini-family reviewers
 # run on Google's `agy` (Antigravity) CLI:
-#   - antigravity → agy --model "Gemini 3.7 Flash (High)"   (fast lap)
+#   - antigravity → agy --model "Gemini 3.8 Flash (High)"   (fast lap)
 #   - gemini-pro  → agy --model "Gemini 3.1 Pro (High)"     (deep lap)
 # So their availability both track the single `agy` binary. The standalone
 # `gemini` CLI is no longer used (it stopped serving consumer requests on

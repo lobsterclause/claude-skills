@@ -53,7 +53,7 @@ agy_default_model=""
 if command -v jq >/dev/null 2>&1 && [[ -f "$_fc_profile" ]]; then
   agy_default_model="$(jq -r '.antigravity.model // empty' "$_fc_profile" 2>/dev/null)"
 fi
-: "${agy_default_model:=Gemini 3.7 Flash (High)}"
+: "${agy_default_model:=Gemini 3.8 Flash (High)}"
 reviewer="agy" ; model="$agy_default_model" ; timeout_s=300
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
