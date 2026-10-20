@@ -26,12 +26,12 @@
   "antigravity": {
     "or_fallback": {
       "enabled": true,
-      "model": "google/gemini-3.7-flash"
+      "model": "google/gemini-3.8-flash"
     },
     "timeout_s": 600,
     "provider": "google",
     "cli": "agy",
-    "model": "Gemini 3.7 Flash (High)",
+    "model": "Gemini 3.8 Flash (High)",
     "retry_policy": "retry_on_transient",
     "prompt_style": "custom_with_tools",
     "severity_priors": {
@@ -42,8 +42,8 @@
     },
     "synthesis_weight": 0.85,
     "pricing": null,
-    "specialization": "architecture, side-effects, cross-file reasoning; agentic file-reading via Google's `agy` CLI on Gemini 3.7 Flash. Fast lap of the Gemini fleet. Rotation-pool member (not a baseline).",
-    "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.7 Flash (High)\"` — must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones — weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing — quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. FALLBACK POLICY REVISED 2026-08-22 (supersedes the 2026-07-01 no-fallback rule): on an ACCOUNT wall (quota/auth/suspension) or an agy panic this lap is re-run over OpenRouter against the same Gemini model, loudly — see or_fallback above. It is recorded as status \"fallback\", never \"ok\", so the leaderboard still down-weights the sick lane. On any other failure the lap still drops out and rotation covers the gap. MODEL BUMPED 2026-08-22: Gemini 3.5 Flash (High) → 3.7 Flash (High). agy had been listing 3.6 and 3.7 Flash for weeks while this seat stayed pinned to 3.5 — detection never noticed because detect_reviewers.sh only greps the models list for a 3.1 Pro entry, and the 6h agy_models.txt cache hid the rest. No draw_boost: a Flash point-release is the same seat, not a new identity (contrast deepseek/nemotron in #59, which changed tier and model outright)."
+    "specialization": "architecture, side-effects, cross-file reasoning; agentic file-reading via Google's `agy` CLI on Gemini 3.8 Flash. Fast lap of the Gemini fleet. Rotation-pool member (not a baseline).",
+    "notes": "Replaces the prior `gemini` (Gemini CLI Flash) reviewer slot, retired in the 2026-06-18 Gemini-CLI consumer sunset. Binary: `agy` (install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`, lands in ~/.local/bin; auth: `agy login` once). Model is pinned via `--model \"Gemini 3.8 Flash (High)\"` — must match an `agy models` display name exactly or agy silently uses its default. Solo findings have lower precision than convergent ones — weight accordingly. EMPTY OUTPUT: check meta.json failure_kind + the .agy.log tail before diagnosing — quota_exhausted (shared 'Individual quota', 429, resets on a ~2-day cadence; observed 2026-07-01: agy exits 0 with empty stdout in ~5s) is at least as common as expired `agy login` auth. FALLBACK POLICY REVISED 2026-08-22 (supersedes the 2026-07-01 no-fallback rule): on an ACCOUNT wall (quota/auth/suspension) or an agy panic this lap is re-run over OpenRouter against the same Gemini model, loudly — see or_fallback above. It is recorded as status \"fallback\", never \"ok\", so the leaderboard still down-weights the sick lane. On any other failure the lap still drops out and rotation covers the gap. MODEL BUMPED 2026-08-22: Gemini 3.5 Flash (High) → 3.7 Flash (High). agy had been listing 3.6 and 3.7 Flash for weeks while this seat stayed pinned to 3.5 — detection never noticed because detect_reviewers.sh only greps the models list for a 3.1 Pro entry, and the 6h agy_models.txt cache hid the rest. No draw_boost: a Flash point-release is the same seat, not a new identity (contrast deepseek/nemotron in #59, which changed tier and model outright). MODEL BUMPED 2026-10-15: 3.7 Flash (High) → 3.8 Flash (High), after agy stopped listing 3.7 Flash and every lap failed with \"model ... is not recognized\"; the or_fallback slug moved with it (google/gemini-3.8-flash) so the fallback still re-runs the same model. tests/test_agy_model_pin.sh keeps the fallback literals in factcheck_findings.sh and grade_planted.sh on this pin."
   },
   "gemini-pro": {
     "draw_boost": 2.5,

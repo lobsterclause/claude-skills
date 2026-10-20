@@ -234,9 +234,14 @@ main() {
       # resolves against whatever repository the caller is standing in, and this
       # scan spans every repo under the runs root. --pass keeps a recovered
       # pass-2 comment from being relabelled pass 1. (codex P1 + P2, #53.)
+      # --verdict likewise: the failed attempt saved it in posted.json, and a
+      # repost without it would turn a FIXES_APPLIED record into a clean-looking
+      # one. post_comment.sh re-validates it. (codex P2, #185.)
+      local verdict
+      verdict="$(jqr "$dir/posted.json" '.verdict')"
       bash "$(dirname "${BASH_SOURCE[0]}")/post_comment.sh" \
         --pr "$pr" --mode summary --findings "$dir/findings.md" --head-sha "$sha" \
-        ${repo:+--repo "$repo"} ${pass:+--pass "$pass"} >&2
+        ${repo:+--repo "$repo"} ${pass:+--pass "$pass"} ${verdict:+--verdict "$verdict"} >&2
     done
   fi
 

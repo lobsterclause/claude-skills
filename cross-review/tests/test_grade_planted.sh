@@ -236,7 +236,7 @@ assert_eq "line_range of numeric strings exits 2" "$?" "2"
 mkdir -p "$T/bin"
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.7 Flash (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.8 Flash (High)\n"; exit 0; fi
 case "$FAKE_JUDGE_ANSWER" in
   yes) printf "Yes. This matches the planted nullish-coalescing weakening exactly.\n" ;;
   no)  printf "No. This does not describe the planted defect.\n" ;;

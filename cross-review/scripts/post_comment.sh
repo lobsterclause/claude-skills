@@ -3,7 +3,20 @@
 #
 # Usage:
 #   post_comment.sh --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>]
-#                   [--head-sha <sha>]
+#                   [--head-sha <sha>] [--verdict <CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED>]
+#
+# --verdict is OPTIONAL and additive (kindred-mama-ai#3736). It carries the
+# same value SKILL.md's step 9 already computes for report_block.sh and
+# append_runlog.sh, so nothing extra has to be tracked to pass it here. When
+# given and valid it is appended to the marker as `verdict=<VALUE>`, exactly
+# like `wrapper=`/`base=`/`digest=` below — an unknown or absent value simply
+# omits the field, so every existing caller keeps working unchanged. Consumers
+# such as kindred-mama-ai's scripts/cross-review-currency.sh can then tell "this
+# exact commit was reviewed and found CLEAN" apart from "this exact commit was
+# reviewed and the answer was not yet" (FIXES_APPLIED/NEEDS_DECISION/BLOCKED) —
+# a distinction the sha-only marker could not make, and the gap that let a
+# FIXES_APPLIED record at a matching sha read as a clean review on PR #3362
+# pass 5.
 #
 # --head-sha stamps the record with the commit that was actually reviewed, and
 # compares it against the PR's live head at post time. Without it a review
@@ -31,6 +44,7 @@ pass_explicit=0
 head_sha=""
 base_sha=""
 digest=""
+verdict=""
 
 need_val() {
   local flag="$1"
@@ -51,12 +65,26 @@ while [[ $# -gt 0 ]]; do
     --head-sha) need_val --head-sha "$#"; head_sha="$2"; shift 2 ;;
     --base-sha) need_val --base-sha "$#"; base_sha="$2"; shift 2 ;;
     --digest)   need_val --digest   "$#"; digest="$2";   shift 2 ;;
+    --verdict)  need_val --verdict  "$#"; verdict="$2";  shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
+# Validate against the skill's own vocabulary (SKILL.md step 9). An unknown
+# value is not an error — this flag is additive and best-effort — it just
+# doesn't reach the marker, the same tolerance an unparseable --digest gets a
+# few lines below. A caller passing a typo'd verdict still gets its comment
+# posted; it just posts without the field, same as if it had never passed one.
+if [[ -n "$verdict" ]]; then
+  case "$verdict" in
+    CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED) ;;
+    *) echo "WARN: --verdict '$verdict' is not one of CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED — omitting it from the marker" >&2
+       verdict="" ;;
+  esac
+fi
+
 if [[ -z "$findings" ]]; then
-  echo "usage: $0 --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>] [--head-sha <sha>] [--repo owner/name]" >&2
+  echo "usage: $0 --pr <n> --mode <summary|file|none> --findings <path> [--pass <n>] [--head-sha <sha>] [--repo owner/name] [--verdict <CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED>]" >&2
   exit 2
 fi
 
@@ -132,9 +160,11 @@ write_posted() {  # <true|false> <reason> [comment_url]
     echo "WARN: cannot write $run_dir/posted.json — this run's posting outcome will not be recorded" >&2
     return 0
   fi
-  printf '{"posted": %s, "reason": "%s", "pr": "%s", "repo": "%s", "pass": "%s", "head_sha": "%s", "mode": "%s", "comment_url": "%s", "posted_at": "%s"}\n' \
+  # verdict rides along so reconcile.sh can re-post a failed record WITH it;
+  # without it a recovered FIXES_APPLIED record reads as clean. (codex P2, #185.)
+  printf '{"posted": %s, "reason": "%s", "pr": "%s", "repo": "%s", "pass": "%s", "head_sha": "%s", "mode": "%s", "comment_url": "%s", "verdict": "%s", "posted_at": "%s"}\n' \
     "$1" "$(jsonesc "$2")" "$(jsonesc "$pr")" "$(jsonesc "$repo")" "$(jsonesc "$pass")" "$(jsonesc "$head_sha")" \
-    "$(jsonesc "$mode")" "$(jsonesc "${3:-}")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(jsonesc "$mode")" "$(jsonesc "${3:-}")" "$(jsonesc "$verdict")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >"$run_dir/posted.json" 2>/dev/null || true
 }
 
@@ -355,15 +385,20 @@ case "$mode" in
       [[ "$wrapper_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || wrapper_sha=""
     fi
     marker=""
-    # Field order is `sha= pass= [wrapper=] [base=] [digest=]`: the
+    # Field order is `sha= pass= [wrapper=] [base=] [digest=] [verdict=]`: the
     # `sha=<40> pass=<n>` prefix is byte-stable (pinned by #148's
     # test_wrapper_sha and CR_MARKER_RE); every parser (read_stamp.sh,
     # post_comment's pass capture, the currency CI) matches fields by name.
+    # `verdict=` (kindred-mama-ai#3736) follows the same rule as the three
+    # before it: appended only when known, never required, and the currency
+    # gate's extraction is field-name-based so this can ride anywhere in the
+    # line without touching CR_MARKER_RE's sha/pass prefix match.
     if [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
       marker="<!-- cross-review: sha=${head_sha} pass=${pass}"
       [[ -n "$wrapper_sha" ]] && marker+=" wrapper=${wrapper_sha}"
       [[ -n "$base_sha" ]] && marker+=" base=${base_sha}"
       [[ -n "$digest" ]] && marker+=" digest=${digest}"
+      [[ -n "$verdict" ]] && marker+=" verdict=${verdict}"
       marker+=" -->"
     fi
 
