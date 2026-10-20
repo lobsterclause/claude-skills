@@ -70,6 +70,19 @@ run "$REPO" "$T/argv-main"
 assert_eq "an ordinary checkout gets only its root (its .git is already inside)" \
   "$(add_dirs "$T/argv-main")" "$REPO_P"
 
+echo "── agy add-dir with a separate git dir ──"
+# `git init --separate-git-dir` puts the WHOLE repository's metadata outside
+# the checkout. That is the common dir, not a worktree's private one, and must
+# never be mounted. (codex P2, #187.)
+SEP="$T/sep"; SEPGIT="$T/sep.git"
+( mkdir -p "$SEP" && cd "$SEP" && { git init -q -b master --separate-git-dir "$SEPGIT" 2>/dev/null || git init -q --separate-git-dir "$SEPGIT"; } \
+  && git config user.email t@t && git config user.name t \
+  && printf 'a\n' >f.txt && git add -A && git commit -qm init && git checkout -qb feat \
+  && printf 'a\nb\n' >f.txt && git commit -qam change ) >/dev/null 2>&1
+run "$SEP" "$T/argv-sep"
+assert_eq "a separate git dir is not mounted (it is the common dir)" \
+  "$(add_dirs "$T/argv-sep")" "$(cd "$SEP" && pwd -P)"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

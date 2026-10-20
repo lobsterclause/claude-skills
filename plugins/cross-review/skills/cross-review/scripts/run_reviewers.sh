@@ -2307,11 +2307,16 @@ $context_intro HARD CONSTRAINT: you are running headless with no interactive per
   # wants HEAD reads that pointer and follows it, and headless agy auto-denies
   # the read and kills the lap at 0 bytes (#185 pass 1). Add only this
   # worktree's own gitdir — never the common .git — so the workspace stays
-  # narrow. In an ordinary checkout the gitdir is already inside repo_root.
+  # narrow. "Linked worktree" is "the gitdir is not the common dir": an
+  # ordinary checkout's gitdir is the common dir (inside repo_root, or
+  # outside it under --separate-git-dir, where mounting it would expose the
+  # whole repository's metadata — codex P2, #187).
   local -a agy_dirs=(--add-dir "$repo_root")
-  local wt_gitdir
+  local wt_gitdir wt_common
   wt_gitdir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
-  if [[ -n "$wt_gitdir" && -d "$wt_gitdir" && "$wt_gitdir" != "$repo_root"/* ]]; then
+  wt_common="$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)" 2>/dev/null && pwd -P || true)"
+  if [[ -n "$wt_gitdir" && -d "$wt_gitdir" && -n "$wt_common" \
+        && "$(cd "$wt_gitdir" && pwd -P)" != "$wt_common" ]]; then
     agy_dirs+=(--add-dir "$wt_gitdir")
   fi
   run_with_timeout "$timeout_budget" agy \
