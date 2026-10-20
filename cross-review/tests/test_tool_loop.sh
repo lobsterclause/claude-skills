@@ -443,6 +443,23 @@ assert_contains "…and the dispatch log says it dropped out" "$(cat "$T/oz.log"
 run_lane "$T/oz2" CROSS_REVIEW_TOOL_MODE=off SHIM_MODE=zai1310 --
 assert_eq "…on the single-shot arm too" "$(jq -r .failure_kind "$T/oz2/glm.meta.json")" "quota_exhausted"
 assert_eq "…with its sentinel too" "$(cat "$T/oz2/glm.quota_exhausted" 2>/dev/null)" "2026-10-27 09:00:00"
+# The seat that motivated this: glm-coding, the Z.ai baseline (cli=zai), not
+# the OpenRouter `glm` seat above. A plan wall resets hours or days later, so
+# a retry 5-15s on is a doomed call — it must not happen (codex + antigravity,
+# #191 pass 1).
+( cd "$REPO" && env CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=zai1310 ZAI_API_KEY=sk-zai-test \
+    bash "$S/run_reviewers.sh" --base main --out "$T/ozc" --reviewers glm-coding --timeout-glm-coding 60 >"$T/ozc.log" 2>&1 )
+assert_eq "glm-coding: a Z.ai plan wall → quota_exhausted" "$(jq -r .failure_kind "$T/ozc/glm-coding.meta.json")" "quota_exhausted"
+assert_eq "…its sentinel carries the reset time"           "$(cat "$T/ozc/glm-coding.quota_exhausted" 2>/dev/null)" "2026-10-27 09:00:00"
+assert_not_contains "…and it is NOT retried"               "$(cat "$T/ozc.log")" "attempt 1 failed"
+assert_eq "…meta records a single attempt"                 "$(jq -r .attempt "$T/ozc/glm-coding.meta.json")" "1"
+# The health check must name the right provider: a glm-coding quota row is
+# not "the shared Gemini Individual quota" (codex P2, #191 pass 1).
+QRL="$T/quota-runlog.jsonl"
+for i in 1 2 3; do printf '{"reviewers":{"glm-coding":{"status":"quota","exit_code":1,"duration_s":2,"timeout_budget_s":900}}}\n' >>"$QRL"; done
+QWARN="$(CROSS_REVIEW_RUNLOG="$QRL" bash "$S/analyze_runlog.sh" --recent 10 --mode warn 2>&1)"
+assert_contains "health check flags glm-coding's quota" "$QWARN" "glm-coding hit its plan quota"
+assert_not_contains "…without calling it Gemini's"      "$QWARN" "Gemini Individual quota"
 run_lane "$T/ob4" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=bill402 --
 # The learner must now ignore these: feed ob1's meta shape into the fixture ledger.
 printf '{"run_id":"x","reviewers":{"glm":%s}}\n' "$(jq -c '. + {status:"failed"}' "$T/ob1/glm.meta.json")" >>"$CROSS_REVIEW_RUNLOG"

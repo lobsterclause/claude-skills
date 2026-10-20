@@ -1043,6 +1043,17 @@ retry_reviewer() {
     unset CROSS_REVIEW_ATTEMPT
     return "$rc"
   fi
+  # Any other lane that hit a plan/usage wall says so with a
+  # <name>.quota_exhausted sentinel (codex's usage cap, Z.ai's 1308/1310 for
+  # glm-coding). Those reset hours or days later, so attempt 2 is a doomed
+  # call 5-15s on — go straight to the fallback offer instead (codex +
+  # antigravity, #191 pass 1).
+  if [[ $rc -ne 0 && -f "$out/$name.quota_exhausted" ]]; then
+    echo "$name: plan/usage limit — not retrying (resets $(cat "$out/$name.quota_exhausted" 2>/dev/null))" >&2
+    rc="$(maybe_or_fallback "$name" "$rc")"
+    unset CROSS_REVIEW_ATTEMPT
+    return "$rc"
+  fi
   if [[ $rc -ne 0 && $rc -ne 124 && $rc -ne 137 ]]; then
     local backoff=$((5 + RANDOM % 11))
     echo "$name: attempt 1 failed (rc=$rc), retrying in ${backoff}s" >&2
@@ -1996,10 +2007,12 @@ $json_findings_suffix"
     # that lost a baseline reads as a quiet one. The message is read from the
     # tool loop's TL_API_ERROR or the single-shot response, whichever ran.
     if [[ "$api_failure_kind" == "quota_exhausted" ]]; then
-      local q_msg q_reset
-      q_msg="${TL_API_ERROR:-}"
+      local q_msg="" q_reset
+      # TL_API_ERROR is global and never cleared on the single-shot arm, so
+      # it is read only when the tool loop actually ran this call.
+      [[ "$tl_used" == true ]] && q_msg="${TL_API_ERROR:-}"
       [[ -n "$q_msg" ]] || q_msg="$(jq -r '.error.message // empty' "$resp_file" 2>/dev/null)"
-      q_reset="$(printf '%s' "$q_msg" | grep -oE 'reset at .+' | head -1 | sed 's/^reset at //')"
+      q_reset="$(printf '%s' "$q_msg" | grep -oiE 'resets? at [^."]+' | head -1 | sed -E 's/^[Rr]esets? at //')"
       printf '%s\n' "${q_reset:-reset time not reported}" >"$out/${slug}.quota_exhausted"
       echo "$slug: plan limit reached — drops out of this round (resets ${q_reset:-at an unreported time})" >&2
     fi
