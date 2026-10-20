@@ -1991,6 +1991,18 @@ $json_findings_suffix"
     rc=5
   elif [[ $rc -ne 0 && "$timed_out" == false && -n "$api_failure_kind" ]]; then
     fk_json="\"$api_failure_kind\""
+    # A plan wall (Z.ai 1308/1310 for glm-coding, a fixed baseline) is said
+    # out loud, with its reset time, exactly like codex's — otherwise a round
+    # that lost a baseline reads as a quiet one. The message is read from the
+    # tool loop's TL_API_ERROR or the single-shot response, whichever ran.
+    if [[ "$api_failure_kind" == "quota_exhausted" ]]; then
+      local q_msg q_reset
+      q_msg="${TL_API_ERROR:-}"
+      [[ -n "$q_msg" ]] || q_msg="$(jq -r '.error.message // empty' "$resp_file" 2>/dev/null)"
+      q_reset="$(printf '%s' "$q_msg" | grep -oE 'reset at .+' | head -1 | sed 's/^reset at //')"
+      printf '%s\n' "${q_reset:-reset time not reported}" >"$out/${slug}.quota_exhausted"
+      echo "$slug: plan limit reached — drops out of this round (resets ${q_reset:-at an unreported time})" >&2
+    fi
   fi
   # Cost accounting (fugu lesson, PR #20): usage:{include:true} makes OR
   # return authoritative per-call cost; recording it in meta → runlog lets

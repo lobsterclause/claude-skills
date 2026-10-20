@@ -42,6 +42,8 @@ export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"; : >"$CROSS_REVIEW_FINDING_
 #   rf400    — first request WITH response_format 400s; retried request without it succeeds
 #   bill402  — every request 402s (OpenRouter "Insufficient credits" shape)
 #   err400   — every request 400s with a tools complaint (survives the rf-drop retry)
+#   zai1310  — every request hits Z.ai's weekly/monthly Coding Plan limit
+#              (code "1310" as a STRING, the shape Z.ai actually sends)
 #   nocache  — normal flow, but usage carries NO prompt_tokens_details (the
 #              Moonshot-direct shape: a host that reports no cache counters)
 cat >"$HOME/.local/bin/curl" <<'SHIM'
@@ -62,6 +64,10 @@ mkdir -p "$SHIM_LOG_DIR" 2>/dev/null
 echo "turn tool_msgs=$have_tool_msgs rf=$has_rf tool_choice=$tool_choice tools=$n_tools" >>"$SHIM_LOG_DIR/shim.log"
 if [ "${SHIM_MODE:-default}" = "bill402" ]; then
   printf '%s' '{"error":{"message":"Insufficient credits. Add more using https://openrouter.ai/settings/credits","code":402}}'
+  exit 0
+fi
+if [ "${SHIM_MODE:-default}" = "zai1310" ]; then
+  printf '%s' '{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-10-27 09:00:00"}}'
   exit 0
 fi
 if [ "${SHIM_MODE:-default}" = "err400" ]; then
@@ -427,6 +433,16 @@ run_lane "$T/ob3" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=err400 --
 META="$T/ob3/glm.meta.json"
 assert_eq "read arm generic 400 → provider_error"         "$(jq -r .failure_kind "$META")" "provider_error"
 assert_eq "…rf was dropped and retried first"             "$(jq -r .tool_stats.rf_dropped "$META")" "true"
+run_lane "$T/oz" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=zai1310 --
+assert_eq "a Z.ai plan limit in the lane → failure_kind quota_exhausted" "$(jq -r .failure_kind "$T/oz/glm.meta.json")" "quota_exhausted"
+# Like codex's wall: a sentinel carrying the reset time, and a line in the
+# dispatch log, so a lost baseline is said out loud rather than left to read
+# as a quiet round.
+assert_eq "…a sentinel carries the reset time" "$(cat "$T/oz/glm.quota_exhausted" 2>/dev/null)" "2026-10-27 09:00:00"
+assert_contains "…and the dispatch log says it dropped out" "$(cat "$T/oz.log")" "glm: plan limit reached"
+run_lane "$T/oz2" CROSS_REVIEW_TOOL_MODE=off SHIM_MODE=zai1310 --
+assert_eq "…on the single-shot arm too" "$(jq -r .failure_kind "$T/oz2/glm.meta.json")" "quota_exhausted"
+assert_eq "…with its sentinel too" "$(cat "$T/oz2/glm.quota_exhausted" 2>/dev/null)" "2026-10-27 09:00:00"
 run_lane "$T/ob4" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=bill402 --
 # The learner must now ignore these: feed ob1's meta shape into the fixture ledger.
 printf '{"run_id":"x","reviewers":{"glm":%s}}\n' "$(jq -c '. + {status:"failed"}' "$T/ob1/glm.meta.json")" >>"$CROSS_REVIEW_RUNLOG"
@@ -442,6 +458,17 @@ assert_eq "429 → provider_rate_limited"       "$(tl_classify_api_error "$T/e1.
 assert_eq "balance message → provider_billing" "$(tl_classify_api_error "$T/e2.json")" "provider_billing"
 assert_eq "401 → provider_auth"                "$(tl_classify_api_error "$T/e3.json")" "provider_auth"
 assert_eq "anything else → provider_error"     "$(tl_classify_api_error "$T/e4.json")" "provider_error"
+# Z.ai (the glm-coding baseline) sends its own codes, as STRINGS. Its plan
+# limits used to fall through to provider_error, hiding a 26% wall rate on a
+# fixed baseline from every quota query (2026-10-20).
+printf '{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-10-27 09:00:00"}}' >"$T/z1.json"
+printf '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-10-20 14:00:00"}}' >"$T/z2.json"
+printf '{"error":{"code":"1302","message":"Rate limit reached for requests"}}' >"$T/z3.json"
+printf '{"error":{"code":"1214","message":"Invalid parameter"}}' >"$T/z4.json"
+assert_eq "Z.ai 1310 weekly/monthly limit → quota_exhausted" "$(tl_classify_api_error "$T/z1.json")" "quota_exhausted"
+assert_eq "Z.ai 1308 5-hour limit → quota_exhausted"        "$(tl_classify_api_error "$T/z2.json")" "quota_exhausted"
+assert_eq "Z.ai 1302 → provider_rate_limited (unchanged)"   "$(tl_classify_api_error "$T/z3.json")" "provider_rate_limited"
+assert_eq "control: another Z.ai code → provider_error"     "$(tl_classify_api_error "$T/z4.json")" "provider_error"
 
 # ── a dead provider catalog is fetched once, not once per turn ──
 # The production caller is pin_slug="$(tl_provider_slug …)" — a command
