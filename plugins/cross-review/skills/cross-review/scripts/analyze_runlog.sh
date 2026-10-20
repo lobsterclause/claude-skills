@@ -82,6 +82,7 @@ profile_file="$skill_dir/references/reviewer_profiles.json"
 
 if [[ ! -f "$runlog" ]]; then
   [[ "$quiet" -eq 0 ]] && echo "no runlog at $runlog" >&2
+  [[ "$mode" == "streak" ]] && echo 0   # no history: no streak, said explicitly
   exit 0
 fi
 
@@ -92,6 +93,52 @@ n_entries=$(printf '%s\n' "$structured" | grep -c '^.' || true)
 
 if [[ "$n_entries" -eq 0 ]]; then
   [[ "$quiet" -eq 0 ]] && echo "analyze_runlog: no structured entries yet (need at least 1 Phase-2 run)" >&2
+  [[ "$mode" == "streak" ]] && echo 0   # no history: no streak, said explicitly
+  exit 0
+fi
+
+# --mode streak answers here, before the fleet report: detect_reviewers.sh
+# calls it once per baseline on every round, and none of the per-reviewer,
+# wall-clock or wrapper-ancestry work below bears on the answer.
+#
+# What counts (#189 pass 1):
+#   - sleep-suspect attempts (wall_over_budget) are skipped entirely — the
+#     timer froze, the CLI did not hang — so they neither make nor break a
+#     streak;
+#   - only attempts inside CROSS_REVIEW_HANG_WINDOW_H hours (default 24) count.
+#     Once detection benches a baseline, no new rounds run and nothing could
+#     ever break the streak; aging it out means the baseline is tried again
+#     instead of staying benched until someone sets the escape hatch. A row
+#     with no parseable ts is outside the window.
+if [[ "$mode" == "streak" ]]; then
+  if [[ -z "$reviewer_arg" ]]; then
+    echo "streak mode requires --reviewer <name>" >&2
+    exit 2
+  fi
+  if ! [[ "$streak_n" =~ ^[0-9]+$ ]] || [[ "$streak_n" -eq 0 ]]; then
+    echo "--streak-n must be a positive integer" >&2
+    exit 2
+  fi
+  hang_window_h="${CROSS_REVIEW_HANG_WINDOW_H:-24}"
+  [[ "$hang_window_h" =~ ^[0-9]+$ ]] || hang_window_h=24
+  # Most-recent-last ordering matches the runlog's own append order. A seat
+  # with fewer than $streak_n counted attempts cannot have a full streak, so
+  # it prints 0 rather than a partial count.
+  printf '%s\n' "$structured" | jq -s --arg r "$reviewer_arg" --argjson n "$streak_n" \
+      --argjson win "$((hang_window_h * 3600))" '
+    (now - $win) as $since
+    | map(. as $row | (.reviewers[$r] // {status:"skipped"})
+          + {_t: (($row.ts // "") | try fromdateiso8601 catch null)})
+    | map(select(.status != "skipped"
+                 and ((.wall_over_budget // false) != true)
+                 and (._t != null and ._t >= $since))) as $attempts
+    | ($attempts | length) as $total
+    | if $total < $n then 0
+      else
+        ($attempts[($total - $n):]) as $tail
+        | if ($tail | all(.status == "timed_out")) then $n else 0 end
+      end
+  '
   exit 0
 fi
 
@@ -390,29 +437,6 @@ if [[ "$wrapper_n" -gt 0 ]]; then
 fi
 
 case "$mode" in
-  streak)
-    if [[ -z "$reviewer_arg" ]]; then
-      echo "streak mode requires --reviewer <name>" >&2
-      exit 2
-    fi
-    if ! [[ "$streak_n" =~ ^[0-9]+$ ]] || [[ "$streak_n" -eq 0 ]]; then
-      echo "--streak-n must be a positive integer" >&2
-      exit 2
-    fi
-    # Most-recent-last ordering matches the runlog's own append order.
-    # A seat with fewer than $streak_n non-skipped attempts in the window
-    # cannot have a full streak, so it prints 0 rather than a partial count
-    # — a partial streak is not the signal this mode exists to surface.
-    printf '%s\n' "$structured" | jq -s --arg r "$reviewer_arg" --argjson n "$streak_n" '
-      (map(.reviewers[$r] // {status:"skipped"}) | map(select(.status != "skipped"))) as $attempts
-      | ($attempts | length) as $total
-      | if $total < $n then 0
-        else
-          ($attempts[($total - $n):]) as $tail
-          | if ($tail | all(.status == "timed_out")) then $n else 0 end
-        end
-    '
-    ;;
   warn)
     out=$(for stats in "${reviewer_stats[@]}"; do emit_warning "$stats"; done)
     # Telemetry completeness (#89): fires only below the 80% run_id threshold,
