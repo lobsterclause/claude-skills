@@ -147,7 +147,7 @@ if command -v curl >/dev/null 2>&1; then
   fi
 fi
 
-# Baseline-CLI hang detection (#3587, case 2). A baseline CLI can be
+# Baseline-CLI hang detection (#3587; the OpenRouter balance half is parked in #190). A baseline CLI can be
 # present, executable, and authenticated and STILL not be capable of
 # serving a round: kimi's CLI was observed hanging 600-900s wall three
 # times running, present-and-installed the whole time, which no install/

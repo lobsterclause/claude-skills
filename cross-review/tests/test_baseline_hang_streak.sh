@@ -87,6 +87,22 @@ assert_eq "a streak older than the 24h window has cleared" "$(streak kimi)" "0"
 assert_eq "…and the window is configurable" \
   "$(CROSS_REVIEW_HANG_WINDOW_H=72 bash "$S/analyze_runlog.sh" --mode streak --reviewer kimi --streak-n 3 2>/dev/null)" "3"
 
+# The window ages out the STREAK, keyed on its most recent attempt — not each
+# attempt separately. A live streak that began more than 24h ago is still a
+# live streak (antigravity, #189 pass 2).
+: >"$FIXLOG"; row 1500 kimi timed_out; row 720 kimi timed_out; row 10 kimi timed_out
+assert_eq "a live streak whose first timeout is outside the window still counts" "$(streak kimi)" "3"
+# Other reviewers' rounds must not push a benched baseline's own attempts out
+# of view: the streak is about that reviewer's history, not the fleet's.
+: >"$FIXLOG"; row 60 kimi timed_out; row 55 kimi timed_out; row 50 kimi timed_out
+for i in $(seq 25 -1 1); do row "$i" codex ok; done
+assert_eq "25 later rounds of another reviewer do not hide a streak" "$(streak kimi)" "3"
+# A success breaks a streak whatever its timestamp looks like.
+: >"$FIXLOG"; row 40 kimi timed_out; row 30 kimi timed_out
+printf '%s\n' '{"ts":"not-a-time","reviewers":{"kimi":{"status":"ok"}}}' >>"$FIXLOG"
+row 10 kimi timed_out
+assert_eq "an ok with an unparseable ts still breaks the streak" "$(streak kimi)" "0"
+
 # Hot path: streak mode must answer from the runlog alone. The full report
 # also walks wrapper ancestry with git; a git shim records any call.
 : >"$FIXLOG"; row 30 kimi timed_out; row 20 kimi timed_out; row 10 kimi timed_out
