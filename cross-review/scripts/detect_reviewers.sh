@@ -126,9 +126,113 @@ fi
 # which case the pool does not exist for this run no matter what key is on
 # disk. Reported here rather than only at dispatch so `detect_reviewers.sh`
 # stays the honest answer to "who can review right now".
+openrouter_key_value=""
 if command -v curl >/dev/null 2>&1 && cr_openrouter_on; then
-  if [[ -n "${OPENROUTER_API_KEY:-}" || -s "$HOME/.config/openrouter/key" ]]; then
+  if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
     openrouter=true
+    openrouter_key_value="$OPENROUTER_API_KEY"
+  elif [[ -s "$HOME/.config/openrouter/key" ]]; then
+    openrouter=true
+    openrouter_key_value="$(cat "$HOME/.config/openrouter/key" 2>/dev/null || true)"
+  fi
+fi
+
+# Per-seat OpenRouter availability (#3587). The block above answers "is
+# there a valid key" — it does NOT answer "can that key actually afford a
+# review right now". OpenRouter reserves against a request's DECLARED
+# max_tokens, not against what the reviewer will actually use, so an
+# account with a few cents left passes any naive reachability probe and
+# then hard-402s the instant a reviewer with a real max_tokens draws: a
+# seat asking for 65536 tokens was refused ("You requested up to 65536
+# tokens, but can only afford 62058") while a 16-token probe on the same
+# key returned 200. The pool then degrades progressively and silently as
+# the balance falls — reading as intermittent reviewer flakiness rather
+# than one account running dry. GET /api/v1/credits (total_credits minus
+# total_usage) is the fix; GET /api/v1/key is NOT usable here — it reports
+# "limit": null with no derivable balance on an exhausted account, so a
+# probe built on it would read this exact broke account as healthy.
+#
+# Seat-level, not pool-level: different seats declare different
+# max_tokens (reviewer_profiles.json `.max_tokens_reserve`, paired with
+# `.pricing.completion_per_m`), so only the seats a thin balance can't
+# cover are downgraded — the rest of the pool still runs.
+#
+# FAILS SAFE: any problem with this probe (no jq, no key, curl error,
+# timeout, unparseable response, a seat with no pricing/max_tokens_reserve
+# on file) leaves every seat's availability exactly as computed above.
+# This block can only turn a seat FALSE that presence checks called TRUE;
+# it never invents availability presence checks did not already grant.
+or_pool_seats="glm deepseek mimo minimax qwen devstral laguna kat north nemotron spark seed grok longcat inkling"
+# shellcheck disable=SC2034  # each is read via the case in downgrade_or_seat below
+glm=$openrouter; deepseek=$openrouter; mimo=$openrouter; minimax=$openrouter; qwen=$openrouter
+devstral=$openrouter; laguna=$openrouter; kat=$openrouter; north=$openrouter; nemotron=$openrouter
+spark=$openrouter; seed=$openrouter; grok=$openrouter; longcat=$openrouter; inkling=$openrouter
+
+downgrade_or_seat() {
+  # Bash 3.2 (macOS default) has no namerefs — a case statement over a
+  # fixed, reviewed seat list is the portable way to assign-by-name.
+  case "$1" in
+    glm) glm=false ;;
+    deepseek) deepseek=false ;;
+    mimo) mimo=false ;;
+    minimax) minimax=false ;;
+    qwen) qwen=false ;;
+    devstral) devstral=false ;;
+    laguna) laguna=false ;;
+    kat) kat=false ;;
+    north) north=false ;;
+    nemotron) nemotron=false ;;
+    spark) spark=false ;;
+    seed) seed=false ;;
+    grok) grok=false ;;
+    longcat) longcat=false ;;
+    inkling) inkling=false ;;
+  esac
+}
+
+if [[ "$openrouter" == true && -n "$openrouter_key_value" ]] && command -v jq >/dev/null 2>&1; then
+  or_profiles_file="${CROSS_REVIEW_PROFILES_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/references/reviewer_profiles.json}"
+  OR_TIMEOUT_BIN=""
+  command -v timeout  >/dev/null 2>&1 && OR_TIMEOUT_BIN="timeout"
+  if [[ -z "$OR_TIMEOUT_BIN" ]] && command -v gtimeout >/dev/null 2>&1; then OR_TIMEOUT_BIN="gtimeout"; fi
+  if [[ -z "$OR_TIMEOUT_BIN" ]]; then
+    for _otb in /opt/homebrew/bin/gtimeout /usr/local/bin/gtimeout; do
+      if [[ -x "$_otb" ]]; then OR_TIMEOUT_BIN="$_otb"; break; fi
+    done
+  fi
+  or_credits_json=""
+  if [[ -n "$OR_TIMEOUT_BIN" ]]; then
+    or_credits_json="$("$OR_TIMEOUT_BIN" -k 3 10 curl -sS -m 8 \
+      -H "Authorization: Bearer $openrouter_key_value" \
+      "https://openrouter.ai/api/v1/credits" 2>/dev/null || true)"
+  else
+    # No bounded-timeout binary available at all — same posture as the agy
+    # models probe above: skip rather than risk an unbounded hang on a sick
+    # network, and leave every seat at its presence-checked value.
+    or_credits_json=""
+  fi
+  or_balance_usd=""
+  if [[ -n "$or_credits_json" ]] && jq -e '(.data // .) | (.total_credits != null and .total_usage != null)' \
+       <<<"$or_credits_json" >/dev/null 2>&1; then
+    or_balance_usd="$(jq -r '(.data // .) | ((.total_credits // 0) - (.total_usage // 0))' \
+      <<<"$or_credits_json" 2>/dev/null || true)"
+    # Guard against a malformed-but-truthy parse (e.g. a string field) —
+    # only trust a bare number.
+    [[ "$or_balance_usd" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || or_balance_usd=""
+  fi
+  if [[ -n "$or_balance_usd" ]]; then
+    for _seat in $or_pool_seats; do
+      _needed="$(jq -r --arg s "$_seat" '
+        (.[$s].max_tokens_reserve // empty) as $mt
+        | (.[$s].pricing.completion_per_m // empty) as $cpm
+        | if ($mt == null or $cpm == null) then empty else ($mt * $cpm / 1000000) end
+      ' "$or_profiles_file" 2>/dev/null || true)"
+      if [[ -n "$_needed" ]] && awk -v a="$or_balance_usd" -v b="$_needed" 'BEGIN{exit !(a<b)}' 2>/dev/null; then
+        downgrade_or_seat "$_seat"
+        printf 'WARNING: OpenRouter seat "%s" reported unavailable — remaining balance $%s cannot cover its configured max_tokens reserve (needs ~$%s at %s'\''s completion rate). Top up the account or wait for balance to be checked again.\n' \
+          "$_seat" "$or_balance_usd" "$_needed" "$_seat" >&2
+      fi
+    done
   fi
 fi
 
@@ -147,14 +251,70 @@ if command -v curl >/dev/null 2>&1; then
   fi
 fi
 
+# Baseline-CLI hang detection (#3587, case 2). A baseline CLI can be
+# present, executable, and authenticated and STILL not be capable of
+# serving a round: kimi's CLI was observed hanging 600-900s wall three
+# times running, present-and-installed the whole time, which no install/
+# PATH/key probe above can see. A live probe here is not worth it (the
+# whole failure mode IS "does not return in reasonable time" — a bounded
+# probe just reproduces the hang inside detection instead of inside the
+# round). Reuse the signal the fleet already has instead: runlog.jsonl,
+# via analyze_runlog.sh's --mode streak. A baseline-eligible reviewer
+# (codex, kimi, glm-coding — the only three cr_baseline_names ever names)
+# that timed out on each of its last BASELINE_HANG_STREAK_N attempts is
+# downgraded to unavailable HERE, before the printf, so both the JSON this
+# script reports and the fail-closed enforcement below see the honest
+# state — CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 becomes the deliberate way
+# to run on a known-flaky baseline instead of it silently looking healthy.
+#
+# FAILS SAFE: no runlog, no jq, an unreadable analyze_runlog.sh, or any
+# non-numeric output leaves the reviewer's presence-checked value
+# untouched (see recent_consecutive_timeouts below) — this can only
+# downgrade a seat presence checks already called available, never
+# fabricate availability they did not grant.
+BASELINE_HANG_STREAK_N=3
+recent_consecutive_timeouts() {
+  local r="$1" n="$2" script_dir out
+  script_dir="$(dirname "${BASH_SOURCE[0]}")"
+  [[ -f "$script_dir/analyze_runlog.sh" ]] || { echo 0; return; }
+  command -v jq >/dev/null 2>&1 || { echo 0; return; }
+  out="$(bash "$script_dir/analyze_runlog.sh" --mode streak --reviewer "$r" --streak-n "$n" 2>/dev/null)"
+  [[ "$out" =~ ^[0-9]+$ ]] && echo "$out" || echo 0
+}
+for _bl in codex kimi glm-coding; do
+  _streak="$(recent_consecutive_timeouts "$_bl" "$BASELINE_HANG_STREAK_N")"
+  if [[ "$_streak" -ge "$BASELINE_HANG_STREAK_N" ]]; then
+    case "$_bl" in
+      codex)
+        if [[ "$codex" == true ]]; then
+          codex=false
+          printf 'WARNING: codex reported unavailable — timed out on its last %s consecutive attempts per runlog.jsonl (present on PATH, but not currently completing reviews). Set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 to proceed on the degraded baseline anyway.\n' "$_streak" >&2
+        fi
+        ;;
+      kimi)
+        if [[ "$kimi" == true ]]; then
+          kimi=false
+          printf 'WARNING: kimi reported unavailable — timed out on its last %s consecutive attempts per runlog.jsonl (present on PATH, but not currently completing reviews). Set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 to proceed on the degraded baseline anyway.\n' "$_streak" >&2
+        fi
+        ;;
+      glm-coding)
+        if [[ "$glm_coding" == true ]]; then
+          glm_coding=false
+          printf 'WARNING: glm-coding reported unavailable — timed out on its last %s consecutive attempts per runlog.jsonl (key present, but not currently completing reviews). Set CROSS_REVIEW_ALLOW_MISSING_BASELINE=1 to proceed on the degraded baseline anyway.\n' "$_streak" >&2
+        fi
+        ;;
+    esac
+  fi
+done
+
 # WARNING: the format-string keys and the positional args below are coupled
 # by POSITION ONLY — inserting a reviewer in one without the other silently
 # shifts every later value (kimi+kat convergent nit, PR #29 pass 1). Keep the
-# order: 4 named CLIs, $glm_coding, 15x $openrouter for the OR pool, $kimi27,
-# $kimi3, $openrouter.
+# order: 4 named CLIs, $glm_coding, then each OR-pool seat by its OWN
+# (possibly balance-downgraded, #3587) variable, $kimi27, $kimi3, $openrouter.
 printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm-coding": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "spark": %s, "seed": %s, "grok": %s, "longcat": %s, "inkling": %s, "kimi27": %s, "kimi3": %s, "openrouter": %s}\n' \
   "$codex" "$antigravity" "$gemini_pro" "$kimi" "$glm_coding" \
-  "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" \
+  "$glm" "$deepseek" "$mimo" "$minimax" "$qwen" "$devstral" "$laguna" "$kat" "$north" "$nemotron" "$spark" "$seed" "$grok" "$longcat" "$inkling" \
   "$kimi27" "$kimi3" "$openrouter"
 
 # --- baseline enforcement ---------------------------------------------------

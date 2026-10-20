@@ -12,7 +12,7 @@
 # for its pre-flight table.
 #
 # Usage:
-#   analyze_runlog.sh [--recent <n>] [--mode warn|report] [--quiet]
+#   analyze_runlog.sh [--recent <n>] [--mode warn|report|streak] [--quiet]
 #
 #   --recent <n>      window (default 20). Older entries ignored.
 #   --mode warn       emit one-line warnings when a reviewer is degraded
@@ -20,6 +20,21 @@
 #                     reliability <60% over the window). Default.
 #   --mode report     emit the full report (reliability %, p50/p95 duration,
 #                     timeout rate, empty rate, suggested timeout edits).
+#   --mode streak     requires --reviewer <name>. Prints a single bare
+#                     integer: the number of the reviewer's most recent
+#                     non-skipped attempts (within --recent, most recent
+#                     last) that are ALL status "timed_out", up to
+#                     --streak-n (default 3). 0 means the most recent
+#                     attempt was not a timeout, or there is no data.
+#                     Machine-consumed by detect_reviewers.sh's
+#                     baseline-fail-closed check (#3587) — a baseline CLI
+#                     that is present on PATH but hangs every call (kimi,
+#                     observed 600-900s) never fails an install/PATH probe,
+#                     so this reuses the runlog's own timeout history
+#                     instead of a live probe.
+#   --reviewer <name> which seat to check (streak mode only).
+#   --streak-n <n>    consecutive-timeout threshold for streak mode
+#                     (default 3).
 #   --quiet           silence informational lines; warnings/report still print.
 #
 # Reads only the structured Phase-2 entries (those with a `reviewers` field).
@@ -31,6 +46,8 @@ set -uo pipefail
 recent=20
 mode="warn"
 quiet=0
+reviewer_arg=""
+streak_n=3
 
 need_val() {
   # set -u + missing flag value crashes with raw "$2: unbound variable" instead
@@ -45,8 +62,10 @@ need_val() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --recent) need_val --recent "$#"; recent="$2"; shift 2 ;;
-    --mode)   need_val --mode   "$#"; mode="$2";   shift 2 ;;
+    --recent)   need_val --recent "$#";   recent="$2";      shift 2 ;;
+    --mode)     need_val --mode   "$#";   mode="$2";        shift 2 ;;
+    --reviewer) need_val --reviewer "$#"; reviewer_arg="$2"; shift 2 ;;
+    --streak-n) need_val --streak-n "$#"; streak_n="$2";    shift 2 ;;
     --quiet)  quiet=1;     shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -371,6 +390,29 @@ if [[ "$wrapper_n" -gt 0 ]]; then
 fi
 
 case "$mode" in
+  streak)
+    if [[ -z "$reviewer_arg" ]]; then
+      echo "streak mode requires --reviewer <name>" >&2
+      exit 2
+    fi
+    if ! [[ "$streak_n" =~ ^[0-9]+$ ]] || [[ "$streak_n" -eq 0 ]]; then
+      echo "--streak-n must be a positive integer" >&2
+      exit 2
+    fi
+    # Most-recent-last ordering matches the runlog's own append order.
+    # A seat with fewer than $streak_n non-skipped attempts in the window
+    # cannot have a full streak, so it prints 0 rather than a partial count
+    # — a partial streak is not the signal this mode exists to surface.
+    printf '%s\n' "$structured" | jq -s --arg r "$reviewer_arg" --argjson n "$streak_n" '
+      (map(.reviewers[$r] // {status:"skipped"}) | map(select(.status != "skipped"))) as $attempts
+      | ($attempts | length) as $total
+      | if $total < $n then 0
+        else
+          ($attempts[($total - $n):]) as $tail
+          | if ($tail | all(.status == "timed_out")) then $n else 0 end
+        end
+    '
+    ;;
   warn)
     out=$(for stats in "${reviewer_stats[@]}"; do emit_warning "$stats"; done)
     # Telemetry completeness (#89): fires only below the 80% run_id threshold,
@@ -481,7 +523,7 @@ case "$mode" in
     roster_audit_out
     ;;
   *)
-    echo "unknown mode: $mode (use warn|report)" >&2
+    echo "unknown mode: $mode (use warn|report|streak)" >&2
     exit 2
     ;;
 esac
