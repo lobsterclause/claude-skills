@@ -514,6 +514,10 @@ kimi27_timeout="${timeout_s:-${kimi27_profile:-$timeout_s_default}}"
 kimi3_timeout="${timeout_s:-${kimi3_profile:-$timeout_s_default}}"
 
 mkdir -p "$out"
+# A quota sentinel left by an earlier run in a reused dir is not this run's
+# evidence. Cleared once, here, before any lane starts: clearing per seat
+# inside retry_reviewer would race the sibling Gemini lap (#191 pass 3).
+rm -f "$out"/*.quota_exhausted
 
 # Validate the base ref up front. Without this, `git diff --quiet` below
 # would return 128 on a missing ref — which bash treats as non-zero (same as
@@ -1029,10 +1033,6 @@ fallback_only() {
 retry_reviewer() {
   local fn="$1"
   local name="$2"
-  # A sentinel left by an earlier run in a reused output dir is not this
-  # attempt's evidence; clear it before attempt 1 so a transient failure is
-  # not misread as a quota wall (#191 pass 2).
-  rm -f "$out/$name.quota_exhausted"
   export CROSS_REVIEW_ATTEMPT=1
   "$fn"
   local rc=$?
