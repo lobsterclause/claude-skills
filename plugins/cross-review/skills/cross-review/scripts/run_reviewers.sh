@@ -2302,10 +2302,27 @@ $context_intro HARD CONSTRAINT: you are running headless with no interactive per
   # the classifier below greps.
   local attempt_n="${CROSS_REVIEW_ATTEMPT:-1}"
   local agy_log_path="$out/${slug}.attempt${attempt_n}.agy.log"
+  # A linked worktree's .git is a pointer to <repo>/.git/worktrees/<name>/,
+  # OUTSIDE --add-dir "$repo_root". With the shell gated to echo, a model that
+  # wants HEAD reads that pointer and follows it, and headless agy auto-denies
+  # the read and kills the lap at 0 bytes (#185 pass 1). Add only this
+  # worktree's own gitdir — never the common .git — so the workspace stays
+  # narrow. "Linked worktree" is "the gitdir is not the common dir": an
+  # ordinary checkout's gitdir is the common dir (inside repo_root, or
+  # outside it under --separate-git-dir, where mounting it would expose the
+  # whole repository's metadata — codex P2, #187).
+  local -a agy_dirs=(--add-dir "$repo_root")
+  local wt_gitdir wt_common
+  wt_gitdir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+  wt_common="$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)" 2>/dev/null && pwd -P || true)"
+  if [[ -n "$wt_gitdir" && -d "$wt_gitdir" && -n "$wt_common" \
+        && "$(cd "$wt_gitdir" && pwd -P)" != "$wt_common" ]]; then
+    agy_dirs+=(--add-dir "$wt_gitdir")
+  fi
   run_with_timeout "$timeout_budget" agy \
     --model "$model" \
     --sandbox \
-    --add-dir "$repo_root" \
+    "${agy_dirs[@]}" \
     --print-timeout "$agy_internal_timeout" \
     --log-file "$agy_log_path" \
     -p "$full_prompt" \
