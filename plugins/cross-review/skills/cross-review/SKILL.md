@@ -688,7 +688,15 @@ A stamp nothing reads is a sensor with nothing wired to it. Two readers exist:
 bash ~/.claude/skills/cross-review/scripts/merge_preflight.sh --pr <n> [--json]
 #   exit 0  clear · reviewed at head, or no record, or the check couldn't run
 #   exit 1  STALE · a record exists and covers a different commit
+#           PENDING · the record is at head but its verdict= is not CLEAN
 ```
+
+The marker's `verdict=` (from `post_comment.sh --verdict`) is read by both
+readers (#186): a FIXES_APPLIED, NEEDS_DECISION or BLOCKED record at the head
+is `pending`, not a clearance, and the merge hook refuses it. A record with no
+verdict predates the field and clears as before. In range coverage a
+FIXES_APPLIED record still counts — its fixes land in later commits that later
+records must cover — but a BLOCKED or NEEDS_DECISION record covers nothing.
 
 `hooks/merge_gate.sh` makes that binding on the agent. Wire it once in
 `~/.claude/settings.json` and `gh pr merge` is refused whenever the newest

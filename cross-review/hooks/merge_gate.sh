@@ -470,10 +470,11 @@ while IFS= read -r spec; do
   [[ "$api_repo" == "{owner}/{repo}" ]] && api_repo=""
   if (( run_cr )); then
     result="$(bash "$preflight" --pr "$api_pr" --repo "$api_repo" --json 2>/dev/null || true)"
-    if [[ "$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)" == "stale" ]]; then
+    # `pending` (#186): the record is at the head but its review was not clean.
+    case "$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)" in stale|pending)
       verdict_json="$result"
-      break
-    fi
+      break ;;
+    esac
   fi
   codex_blocks "$api_pr" "$api_repo" && break
 done <<API
@@ -532,7 +533,7 @@ API
       result="$(bash "$preflight" --pr "$pr_ref" --json 2>/dev/null || true)"
     fi
     inv_status="$(printf '%s' "$result" | jq -r '.status // ""' 2>/dev/null || true)"
-    if [[ "$inv_status" == "stale" ]]; then
+    if [[ "$inv_status" == "stale" || "$inv_status" == "pending" ]]; then
       verdict_json="$result"
       break
     fi
@@ -604,6 +605,19 @@ fi
 reviewed="$(printf '%s' "$verdict_json" | jq -r '.reviewed // ""' 2>/dev/null || true)"
 head="$(printf '%s' "$verdict_json" | jq -r '.head // ""' 2>/dev/null || true)"
 which_pr="$(printf '%s' "$verdict_json" | jq -r '.pr // ""' 2>/dev/null || true)"
+
+if [[ "$(printf '%s' "$verdict_json" | jq -r '.status // ""' 2>/dev/null || true)" == "pending" ]]; then
+  rv="$(printf '%s' "$verdict_json" | jq -r '.verdict // ""' 2>/dev/null || true)"
+  deny "Cross-review of PR ${which_pr} is at the current head ${head:0:9}, but that review ended ${rv:-not clean} — not a clean pass (#186).
+
+FIXES_APPLIED means fixes were written in response to findings and have not themselves been reviewed; NEEDS_DECISION and BLOCKED mean findings are still open.
+
+Do one of:
+  1. Run another cross-review pass on the current head, then merge once it is CLEAN.
+  2. If the user has decided to merge anyway (e.g. a finding deferred to an issue), say so, and merge only once they agree by prefixing the command with CROSS_REVIEW_MERGE_OVERRIDE=1 — which leaves the bypass visible in what they approve.
+
+Do not re-issue this command unchanged."
+fi
 
 reason="Cross-review is stale for PR ${which_pr}.
 
