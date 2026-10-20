@@ -121,6 +121,27 @@ assert_eq "a quoted marker's BLOCKED does not downgrade a clean record" "$(cv "$
 assert_eq "a non-CLEAN record is not a clearance (non-zero return)" \
   "$(cv "$(rec $H FIXES_APPLIED)" >/dev/null; echo $?)" "1"
 
+# A CI install can update this script while an OLDER read_stamp.sh — one with
+# no verdict field — still sits beside it. Its sha must not stand in for a
+# verdict it never read. (codex P1, #188 pass 1.)
+OLD_TREE="$T/old-install"; mkdir -p "$OLD_TREE/ci" "$OLD_TREE/scripts"
+cp "$SKILL_DIR/ci/cross-review-currency.sh" "$OLD_TREE/ci/"
+cat >"$OLD_TREE/scripts/read_stamp.sh" <<'OLD'
+#!/usr/bin/env bash
+# read_stamp.sh as it was before #186: a marker sha, and no verdict key at all.
+body="$(cat)"
+sha="$(grep -oE '<!-- cross-review: sha=[0-9a-f]{40}' <<<"$body" | head -1 | sed 's/.*sha=//')"
+jq -cn --arg s "$sha" '{stamped:true, sha:$s, base:"", pass:0, digest:"", source:"marker", abbrev:40, disagreement:null}'
+OLD
+chmod +x "$OLD_TREE/scripts/read_stamp.sh"
+old_cv() {
+  ( source "$OLD_TREE/ci/cross-review-currency.sh"
+    currency_verdict "$(jq -nc --arg b "$1" '[{body:$b, user:"o", assoc:"OWNER"}]')" "$H" "" ) | cut -f1
+}
+assert_eq "beside a pre-verdict read_stamp.sh, BLOCKED at the head is still pending" \
+  "$(old_cv "$(rec $H BLOCKED)")" "pending"
+assert_eq "…and CLEAN beside it is still success" "$(old_cv "$(rec $H CLEAN)")" "success"
+
 # ── hooks/merge_gate.sh ─────────────────────────────────────────────────────
 echo "── merge_gate.sh: a pending preflight is refused ──"
 hook() {  # hook <fixture> <command> → permission decision, or PASS; reason in $T/reason

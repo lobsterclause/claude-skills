@@ -538,15 +538,20 @@ currency_verdict() {
   # marker (kindred-mama-ai's port of this check hit both shapes).
   _rs="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" 2>/dev/null && pwd)/read_stamp.sh"
   reviewed=""
-  local verdict="" _stamp="" _marker=""
+  local verdict="" _stamp="" _marker="" _has_verdict="false"
   if [[ -x "$_rs" ]]; then
     _stamp="$(printf '%s' "$record" | bash "$_rs" --body-stdin 2>/dev/null || true)"
     reviewed="$(printf '%s' "$_stamp" | jq -r 'select(.source == "marker") | .sha' 2>/dev/null || true)"
     verdict="$(printf '%s' "$_stamp" | jq -r 'select(.source == "marker") | .verdict // ""' 2>/dev/null || true)"
+    _has_verdict="$(printf '%s' "$_stamp" | jq -r 'has("verdict")' 2>/dev/null || echo false)"
   fi
-  if [[ -z "$reviewed" ]]; then
+  # Parse the marker inline when the parser gave no sha, OR when it is an
+  # older read_stamp.sh with no verdict key at all: a CI install can update
+  # this file while that one stays behind, and its sha must not stand in for
+  # a verdict it never read. (codex P1, #188 pass 1.)
+  if [[ -z "$reviewed" || "$_has_verdict" != "true" ]]; then
     _marker="$(printf '%s' "$record" | grep -oE '<!-- cross-review: sha=[0-9a-f]{40}[^>]*-->' | head -1)"
-    reviewed="$(printf '%s' "$_marker" | sed -nE 's/.*sha=([0-9a-f]{40}).*/\1/p')"
+    [[ -n "$reviewed" ]] || reviewed="$(printf '%s' "$_marker" | sed -nE 's/.*sha=([0-9a-f]{40}).*/\1/p')"
     verdict="$(printf '%s' "$_marker" | sed -nE 's/.*[[:space:]]verdict=([A-Z_]+)([[:space:]]|-->).*/\1/p')"
     case "$verdict" in CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED) ;; *) verdict="" ;; esac
   fi
