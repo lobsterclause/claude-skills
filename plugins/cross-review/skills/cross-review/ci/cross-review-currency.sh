@@ -423,7 +423,10 @@ exemption_verdict() {
 }
 
 # currency_verdict <comments-json-array> <head-sha> [<exemption-json>]
-# Prints "<state>\t<description>". State is success|failure. Description is
+# Prints "<state>\t<description>". State is success|failure|pending. `pending`
+# means the record IS at the head but its verdict= says the review was not
+# clean (FIXES_APPLIED, NEEDS_DECISION, BLOCKED — #186); GitHub shows it as a
+# yellow, unmerged-able required status, and main() exits 1. Description is
 # kept under 140 chars because that is the GitHub commit-status limit.
 currency_verdict() {
   local comments="$1" head_sha="$2" exemption="${3:-}"
@@ -528,14 +531,25 @@ currency_verdict() {
   # sed below stays as a fallback for the CI checkout layouts where scripts/
   # is not shipped alongside ci/ -- same regex, one source of truth when both
   # are present.
+  #
+  # The verdict (#186) is read from that SAME marker — by read_stamp.sh, or by
+  # the fallback below from the one marker it extracts — never by searching
+  # the whole comment, where the first verdict= can belong to a quoted older
+  # marker (kindred-mama-ai's port of this check hit both shapes).
   _rs="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" 2>/dev/null && pwd)/read_stamp.sh"
   reviewed=""
+  local verdict="" _stamp="" _marker=""
   if [[ -x "$_rs" ]]; then
-    reviewed="$(printf '%s' "$record" | bash "$_rs" --body-stdin 2>/dev/null \
-                 | jq -r 'select(.source == "marker") | .sha' 2>/dev/null || true)"
+    _stamp="$(printf '%s' "$record" | bash "$_rs" --body-stdin 2>/dev/null || true)"
+    reviewed="$(printf '%s' "$_stamp" | jq -r 'select(.source == "marker") | .sha' 2>/dev/null || true)"
+    verdict="$(printf '%s' "$_stamp" | jq -r 'select(.source == "marker") | .verdict // ""' 2>/dev/null || true)"
   fi
-  [[ -n "$reviewed" ]] || reviewed="$(printf '%s' "$record" \
-    | sed -nE 's/.*<!-- cross-review: sha=([0-9a-f]{40})[^>]*-->.*/\1/p' | head -1)"
+  if [[ -z "$reviewed" ]]; then
+    _marker="$(printf '%s' "$record" | grep -oE '<!-- cross-review: sha=[0-9a-f]{40}[^>]*-->' | head -1)"
+    reviewed="$(printf '%s' "$_marker" | sed -nE 's/.*sha=([0-9a-f]{40}).*/\1/p')"
+    verdict="$(printf '%s' "$_marker" | sed -nE 's/.*[[:space:]]verdict=([A-Z_]+)([[:space:]]|-->).*/\1/p')"
+    case "$verdict" in CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED) ;; *) verdict="" ;; esac
+  fi
   # Fall back to prose. `(at )?` is the whole of the widening: the abbreviation
   # is captured in group 2 because group 1 is the optional word.
   [[ -n "$reviewed" ]] || reviewed="$(printf '%s' "$record" \
@@ -562,6 +576,14 @@ currency_verdict() {
   # Compare on the stamp's own width: the record abbreviates, the head does not.
   local n="${#reviewed}"
   if [[ "${head_sha:0:$n}" == "$reviewed" ]]; then
+    # An explicit non-CLEAN verdict is proof this commit was looked at and
+    # found NOT YET clean, so it is not a clearance. Absence is not
+    # downgraded: every record before #185 has no verdict, and forcing those
+    # to pending would turn every quietly-reviewed PR yellow. (#186)
+    if [[ -n "$verdict" && "$verdict" != "CLEAN" ]]; then
+      printf 'pending\t%s\n' "reviewed at ${head_sha:0:9}, verdict ${verdict} — awaiting a clean pass${unverified}"
+      return 1
+    fi
     printf 'success\t%s\n' "reviewed at ${head_sha:0:9}${unverified}"
     return 0
   fi
