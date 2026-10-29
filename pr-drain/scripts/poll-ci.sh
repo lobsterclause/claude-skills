@@ -50,7 +50,9 @@ for i in $(seq 1 "$MAX_POLLS"); do
     st="${row#*|}"
     line="$line ${name}:${st:-absent}"
     case "$st" in
-      completed\|success) ;;
+      # skipped/neutral satisfy a required check on GitHub too (a docs-only PR
+      # skips the Dagger job); cancelled/failure/timed_out stay terminal.
+      completed\|success|completed\|skipped|completed\|neutral) ;;
       completed\|*) echo "POLL $i:$line"; echo "TERMINAL_FAIL ($name: $st)"; exit 2 ;;
       *) all_green=0 ;;
     esac

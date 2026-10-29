@@ -63,6 +63,17 @@ run_case "older success listed first, newest failure" 2 \
   "{\"check_runs\":[$base,$(ok 20 "$CI" success),$(ok 21 "$CI" failure)]}"
 run_case "newest failure listed first" 2 \
   "{\"check_runs\":[$base,$(ok 21 "$CI" failure),$(ok 20 "$CI" success)]}"
+# A docs-only PR skips the Dagger job. GitHub counts skipped/neutral as satisfying
+# a required check, so the poller must too (it read this as TERMINAL_FAIL on
+# #4445, 2026-10-28). Cancelled and timed_out stay terminal.
+run_case "skipped required check is satisfied" 0 \
+  "{\"check_runs\":[$(ok 10 'Dagger Pipeline' skipped),$(ok 11 'Semgrep Scan' success),$(ok 12 'PR Guards' success),$(ok 13 "$CI" success)]}"
+run_case "neutral required check is satisfied" 0 \
+  "{\"check_runs\":[$(ok 10 'Dagger Pipeline' success),$(ok 11 'Semgrep Scan' neutral),$(ok 12 'PR Guards' success),$(ok 13 "$CI" success)]}"
+run_case "cancelled required check is still terminal" 2 \
+  "{\"check_runs\":[$(ok 10 'Dagger Pipeline' cancelled),$(ok 11 'Semgrep Scan' success),$(ok 12 'PR Guards' success),$(ok 13 "$CI" success)]}"
+run_case "timed_out required check is still terminal" 2 \
+  "{\"check_runs\":[$(ok 10 'Dagger Pipeline' timed_out),$(ok 11 'Semgrep Scan' success),$(ok 12 'PR Guards' success),$(ok 13 "$CI" success)]}"
 # A required check that has not reported yet keeps polling (times out here, rc=5).
 run_case "required check absent" 5 "{\"check_runs\":[$base]}"
 

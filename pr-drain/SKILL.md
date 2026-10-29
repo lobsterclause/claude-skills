@@ -236,6 +236,12 @@ acquired in a one-shot tool call as advisory at best.
      still outside the loop, and the file now documents behaviour it does not have.
      Prose is not a check. If a fix is worth a comment claiming it, it is worth an
      assertion that fails when the comment stops being true.
+   - **A stale base read as a missing dependency.** "The callable strips `attribution`"
+     was true of the PR branch and false of `origin/develop`, where the dependency had
+     already merged (#4341 vs #4343, 2026-10-28; #4342 had the same shape). When a
+     finding says a producer/consumer/field does not exist, check it on
+     `origin/develop` before the branch: a branch 80+ commits behind develop makes
+     every merged neighbour look absent. The fix is a develop merge, not a code change.
    When a fix claims to make a gate binding, require a control: break it, watch it go red,
    restore it, watch it go green. "The tests pass" is not evidence that a gate works.
 
@@ -261,9 +267,22 @@ acquired in a one-shot tool call as advisory at best.
    explaining exactly what changed since the reviewed SHA.
 4. **Verify**: repo's verify entrypoint green in the PR's worktree (under the `verify`
    lock) before any push. Fresh-worktree runs are cold-cache — budget 3-4× the warm time.
+   **Do not verify on a loaded laptop.** On 2026-10-28 a Mac at load 50-60 turned real
+   suites into "Timeout waiting for worker" reds for hours, each retry another 15 minutes.
+   `scripts/remote-verify.sh <worktree> <name> <firebird|thunderbird>` runs the same
+   `pnpm verify` in a Docker container on a homelab box (~8-15 min, results as
+   `rv-<name>.out`). Its traps are in the script header (user mapping, `TMPDIR` on the
+   same mount, tool-complete image). Only a verify of the exact commit you push counts;
+   when the local pre-push hook fails in an unbuilt worktree, `SKIP_PREPUSH=1` is
+   justified by a green remote verify at that SHA, and nothing weaker.
 5. **Push and watch CI**: launch `scripts/poll-ci.sh <repo> <pr> <sha>` as a background
    task — it watches required checks and auto-merges on all-green with
-   `--match-head-commit`. Before reading ANY check result, confirm its SHA equals the PR's
+   `--match-head-commit`. **A poller's merge does NOT go through the Codex-thread merge
+   gate** (the hook only guards your own `gh pr merge` calls), so before arming one list
+   unresolved review threads (`reviewThreads` where `isResolved=false`), check each
+   against the current head, reply with the fix or the reason, and resolve. On 2026-10-28
+   twelve poller merges landed with eleven open threads between them; most were stale-fixed,
+   a few were real and had to become a follow-up issue. Before reading ANY check result, confirm its SHA equals the PR's
    current `headRefOid`. **Verify the poller is actually alive** (`pgrep -f poll-ci.sh`)
    after launching, and re-check each turn: a `nohup ... &` inside a backgrounded shell
    dies with its wrapper, and a poller you believe is armed but isn't leaves PRs sitting
