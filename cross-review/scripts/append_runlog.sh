@@ -323,6 +323,7 @@ reviewer_obj() {
                        elif .failure_kind == "headless_permission_denied" then "permission_denied"
                        elif .failure_kind == "degenerate_output" then "degenerate"
                        elif .failure_kind == "no_verdict_output" then "no_verdict"
+                       elif .failure_kind == "empty_result" then "empty_result"
                        elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
                        elif .exit_code == 0 then "empty"
                        else "failed" end)}' "$meta" 2>/dev/null \
