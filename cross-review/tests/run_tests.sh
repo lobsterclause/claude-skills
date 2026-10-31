@@ -356,6 +356,67 @@ assert_eq "OR request asks for usage accounting" \
   "$(jq -r '.usage.include' "$T/o6/glm.request.json")" "true"
 rm -f "$T/bin/curl"
 
+echo "── empty-result seats are failures, not clean votes (glm-coding class) ──"
+# [pin: nem-contracts #9 / nem-village #52 #53 #55, 2026-10-30 — glm-coding
+# returned {"findings": []} or {} after 1 turn / 0 tool calls (once with the
+# note "Analysis pending tool verification") and counted as an ok seat, so a
+# "3-seat clean" round was really one or two reviewers.]
+# Function-level: pull output_empty_result out of the wrapper and drive it.
+eval "$(awk '/^output_empty_result\(\) \{/,/^\}/' "$S/run_reviewers.sh")"
+er() { # er <body> [tool_calls] -> "degenerate" | "real"
+  printf '%s' "$1" >"$T/er.out"
+  if output_empty_result "$T/er.out" "${2:-}"; then echo degenerate; else echo real; fi
+}
+REASON='Walked every hunk of the diff: the new guard in parseInput is exercised by the added test, the retry path keeps its original timeout, and the migration is idempotent because it keys on the row id. I found no defect worth reporting; the remaining risk is limited to the pre-existing flaky snapshot which this change does not touch at all.'
+STUB='{"findings": [], "note": "Analysis pending tool verification"}'
+assert_eq "{} body is degenerate"                       "$(er '{}')" degenerate
+assert_eq "{} body is degenerate with telemetry"        "$(er '{}' 4)" degenerate
+assert_eq "stub note + empty findings is degenerate"    "$(er "$STUB")" degenerate
+assert_eq "stub note is degenerate even if calls>0"     "$(er "$STUB" 3)" degenerate
+assert_eq "fenced stub is degenerate"                   "$(er "$(printf '```json\n%s\n```' "$STUB")")" degenerate
+assert_eq "bare empty findings + 0 calls is degenerate" "$(er '{"findings": []}' 0)" degenerate
+assert_eq "bare empty findings + calls is a real clean" "$(er '{"findings": []}' 5)" real
+assert_eq "bare empty findings, NO telemetry is real"   "$(er '{"findings": []}')" real
+assert_eq "empty findings + reasoning + 0 calls is real" \
+  "$(er "$(jq -nc --arg r "$REASON" '{findings: [], summary: $r}')" 0)" real
+assert_eq "empty findings + reasoning, no telemetry is real" \
+  "$(er "$(jq -nc --arg r "$REASON" '{findings: [], summary: $r}')")" real
+assert_eq "non-empty findings are never degenerate" \
+  "$(er '{"findings": [{"severity":"High","title":"x"}], "note":"pending"}' 0)" real
+assert_eq "object without .findings but other keys is real" "$(er '{"verdict":"ok"}' 0)" real
+assert_eq "prose reply is out of scope"                 "$(er 'Looks good, no findings.' 0)" real
+# Lane-level: the single-shot OR lane (tool arm off => no telemetry, so only
+# the {} and stub rules can fire; the 0-calls rule needs the tool loop).
+run_empty_lane() { # run_empty_lane <outdir> <content-json-string>
+  jq -nc --arg c "$2" '{choices:[{message:{content:$c}}],usage:{prompt_tokens:100,completion_tokens:5,cost:0.001}}' >"$T/canned_or_response.json"
+  cat >"$T/bin/curl" <<SHIM
+#!/bin/sh
+cat "$T/canned_or_response.json"
+SHIM
+  chmod +x "$T/bin/curl"
+  bash "$S/run_reviewers.sh" --base main --out "$1" --reviewers glm >/dev/null 2>&1 || true
+  rm -f "$T/bin/curl"
+}
+run_empty_lane "$T/oe1" "$STUB"
+assert_eq "stub lane stamps failure_kind empty_result" "$(jq -r '.failure_kind' "$T/oe1/glm.meta.json")" "empty_result"
+assert_eq "stub lane classifies exit 5"                "$(jq -r '.exit_code' "$T/oe1/glm.meta.json")" "5"
+run_empty_lane "$T/oe2" '{}'
+assert_eq "{} lane stamps failure_kind empty_result"   "$(jq -r '.failure_kind' "$T/oe2/glm.meta.json")" "empty_result"
+run_empty_lane "$T/oe3" "$(jq -nc --arg r "$REASON" '{findings: [], summary: $r}')"
+assert_eq "legit empty lane keeps failure_kind null"   "$(jq -r '.failure_kind' "$T/oe3/glm.meta.json")" "null"
+assert_eq "legit empty lane stays exit 0"              "$(jq -r '.exit_code' "$T/oe3/glm.meta.json")" "0"
+run_empty_lane "$T/oe4" '{"findings": []}'
+assert_eq "bare clean, tool arm off, is NOT penalised" "$(jq -r '.failure_kind' "$T/oe4/glm.meta.json")" "null"
+# Runlog + leaderboard: the status is distinct, and not "ok".
+printf '{"exit_code": 5, "duration_s": 9, "timed_out": false, "output_bytes": 16, "attempt": 2, "timeout_budget_s": 600, "failure_kind": "empty_result"}\n' >"$RUN/raw/glm.meta.json"
+ERLOG="$T/empty-result-runlog.jsonl"
+CROSS_REVIEW_RUNLOG="$ERLOG" bash "$S/append_runlog.sh" \
+  --run-dir "$RUN" --project test --base main --pr - --pass 1 \
+  --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+assert_eq "runlog status is empty_result, not ok" \
+  "$(tail -1 "$ERLOG" | jq -r '.reviewers.glm.status')" "empty_result"
+rm -f "$RUN/raw/glm.meta.json"
+
 # The bearer token must reach curl without ever touching argv or disk.
 #
 # Disk: it used to go through a 0600 `--config` file removed right after curl

@@ -1120,6 +1120,48 @@ output_degenerate() {
   [[ $(( comp * 15 )) -lt "$raw" ]]
 }
 
+# output_empty_result <file> [tool_calls] — detect a "clean" verdict nobody
+# earned: a structured reply whose findings list is empty AND which shows no
+# sign of work. glm-coding returned {"findings": []} / {} after 1 turn and 0
+# tool calls on nem-contracts #9 and nem-village #52/#53/#55 (2026-10-30),
+# sometimes with a stub note ("Analysis pending tool verification"), and the
+# round counted it as an `ok` seat — a "3-seat clean" round was really one or
+# two reviewers. Exit 0 = degenerate (caller classifies it failed).
+#
+# The exact rule (conservative; anything not matching stays a real verdict).
+# The body must parse as a JSON object (a ```json fence is tolerated); prose
+# replies are out of scope (output_no_verdict owns those). Then, with
+# `text` = all string values in the object outside `.findings`, joined:
+#   1. `{}` — an object with no keys at all                      -> degenerate
+#   2. .findings is an empty array AND `text` matches a stub marker
+#      (pending|awaiting|not yet|to be verified/confirmed/determined|
+#      unable to (verify|complete)|incomplete|placeholder|tool verification)
+#      AND is under 400 chars                                    -> degenerate
+#   3. .findings is an empty array AND tool-call telemetry exists
+#      (tool_calls given, i.e. a tool-arm run) AND tool_calls == 0
+#      AND `text` is under 200 chars                             -> degenerate
+# Never degenerate: a non-empty findings array; an object with other keys but
+# no .findings; an empty-findings reply with >=200 chars of reasoning; and an
+# empty-findings reply with NO telemetry (tool arm off, CLI lanes) and no stub
+# marker — a short "no findings" there is a legitimate verdict. Telemetry is
+# absent (arg omitted/empty) whenever the tool loop did not run, so an
+# off-arm seat is never penalised for making no tool calls.
+output_empty_result() {
+  local f="$1" calls="${2:-}" body
+  [[ -s "$f" ]] || return 1
+  body="$(sed -e '/^[[:space:]]*```/d' "$f" 2>/dev/null)"
+  printf '%s' "$body" | jq -e 'type=="object"' >/dev/null 2>&1 || return 1
+  printf '%s' "$body" | jq -e --arg calls "$calls" '
+    def txt: [ to_entries[] | select(.key != "findings") | .value | .. | strings ] | join(" ");
+    (txt) as $t
+    | if length == 0 then true
+      elif (.findings | type) != "array" or (.findings | length) > 0 then false
+      elif ($t | length) < 400
+           and ($t | test("pending|awaiting|not yet|to be (verified|confirmed|determined)|unable to (verify|complete)|incomplete|placeholder|tool verification"; "i")) then true
+      elif ($calls | test("^[0-9]+$")) and (($calls | tonumber) == 0) and ($t | length) < 200 then true
+      else false end' >/dev/null 2>&1
+}
+
 # output_no_verdict <file> — detect a preamble-only response: rc=0 with a tiny
 # output carrying neither a severity rank nor an explicit clean verdict. kimi
 # delivered a 161-byte "I will now review…" preamble on PR #2620 (2026-07-03)
@@ -2005,6 +2047,11 @@ $json_findings_suffix"
     echo "$slug: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
     rc=5
+  elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_empty_result "$out/${slug}.stdout" \
+         "$([[ "$tl_used" == true ]] && echo $(( TL_C_READ + TL_C_SEARCH + TL_C_LIST + TL_C_CHECK + TL_C_UNKNOWN )))"; then
+    echo "$slug: empty-findings reply with no work shown (stub/{}/0 tool calls) — classifying as failed, not a clean vote" >&2
+    fk_json='"empty_result"'
+    rc=5
   elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_no_verdict "$out/${slug}.stdout"; then
     echo "$slug: output is preamble-only (<512B, no severity or clean-verdict marker) — classifying as failed" >&2
     fk_json='"no_verdict_output"'
@@ -2697,6 +2744,10 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   if [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/kimi.stdout"; then
     echo "kimi: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
+    rc=5
+  elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_empty_result "$out/kimi.stdout"; then
+    echo "kimi: empty-findings reply with no work shown (stub/{}) — classifying as failed, not a clean vote" >&2
+    fk_json='"empty_result"'
     rc=5
   elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_no_verdict "$out/kimi.stdout"; then
     echo "kimi: output is preamble-only (<512B, no severity or clean-verdict marker) — classifying as failed" >&2
