@@ -12,7 +12,9 @@
 # Exit codes:
 #   0  clear to merge — reviewed at the current head, OR no review record to
 #      contradict it (see "green when absent" below), OR the check could not run
-#   1  STALE — a review record exists and is bound to a DIFFERENT commit
+#   1  STALE — a review record exists and is bound to a DIFFERENT commit, or
+#      PENDING — the record IS at the head but its verdict= says the review
+#      was not clean (FIXES_APPLIED, NEEDS_DECISION, BLOCKED; #186)
 #   2  usage error
 #
 # Green when absent, by design. A PR with no cross-review comment exits 0. This
@@ -67,8 +69,8 @@ emit() {
   if [[ "$as_json" -eq 1 ]]; then
     if command -v jq >/dev/null 2>&1; then
       jq -nc --arg s "$status" --arg p "$pr" --arg h "${cur_sha:-}" \
-             --arg r "${reviewed_sha:-}" --arg m "$reason" \
-        '{status:$s, pr:$p, head:$h, reviewed:$r, reason:$m}'
+             --arg r "${reviewed_sha:-}" --arg v "${reviewed_verdict:-}" --arg m "$reason" \
+        '{status:$s, pr:$p, head:$h, reviewed:$r, verdict:$v, reason:$m}'
     else
       # jq is how we got here in the first place on the indeterminate path;
       # keep --json honest rather than emitting nothing.
@@ -82,6 +84,7 @@ emit() {
 
 cur_sha=""
 reviewed_sha=""
+reviewed_verdict=""
 
 if ! command -v gh >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
   emit indeterminate 0 "gh or jq unavailable — cannot check review binding; not blocking."
@@ -172,7 +175,9 @@ reviewed_sha=""
 if [[ -x "$here/read_stamp.sh" ]]; then
   # read_stamp.sh's stderr is the marker-vs-prose disagreement warning — let it
   # through (kimi, #67 pass 2); only jq's own noise is suppressed.
-  reviewed_sha="$(printf '%s' "$review_body" | bash "$here/read_stamp.sh" --body-stdin | jq -r '.sha // ""' 2>/dev/null || true)"
+  stamp_json="$(printf '%s' "$review_body" | bash "$here/read_stamp.sh" --body-stdin || true)"
+  reviewed_sha="$(printf '%s' "$stamp_json" | jq -r '.sha // ""' 2>/dev/null || true)"
+  reviewed_verdict="$(printf '%s' "$stamp_json" | jq -r '.verdict // ""' 2>/dev/null || true)"
 fi
 # post_comment.sh prints the SHA abbreviated to 9 chars: Reviewed `abc123def`.
 [[ -n "$reviewed_sha" ]] || reviewed_sha="$(printf '%s' "$review_body" \
@@ -184,6 +189,15 @@ fi
 # the guard it should always have been.
 n="${#reviewed_sha}"
 if [[ -n "$reviewed_sha" && "${cur_sha:0:$n}" == "$reviewed_sha" ]]; then
+  # An explicit non-CLEAN verdict means this exact commit was looked at and
+  # found NOT YET clean — FIXES_APPLIED is fixes not themselves reviewed (the
+  # kindred-mama-ai#3362 pass-5 shape). Emitted before range coverage, which
+  # would otherwise clear the same head on this very record. No verdict at all
+  # is a record from before the field existed and clears as it always did.
+  # (#186)
+  if [[ -n "$reviewed_verdict" && "$reviewed_verdict" != "CLEAN" ]]; then
+    emit pending 1 "PR #$pr was reviewed at its current head ${cur_sha:0:9}, but that review's verdict is ${reviewed_verdict} — not a clean pass. Run another cross-review pass, or merge deliberately knowing it ended ${reviewed_verdict}."
+  fi
   emit clear 0 "PR #$pr was reviewed at its current head ${cur_sha:0:9}."
 fi
 
@@ -211,6 +225,12 @@ if [[ -x "$here/read_stamp.sh" && -x "$here/range_coverage.sh" ]] && command -v 
     [[ -z "$body" ]] && continue
     st="$(printf '%s' "$body" | bash "$here/read_stamp.sh" --body-stdin 2>/dev/null || true)"
     [[ -z "$st" ]] && continue
+    # A record whose review ended BLOCKED or NEEDS_DECISION covers nothing:
+    # its range was read and NOT cleared, and a later incremental pass never
+    # re-reads it. FIXES_APPLIED still counts — its fixes land in later
+    # commits, which later records must cover for the union to be complete.
+    # (#186)
+    case "$(jq -r '.verdict // ""' <<<"$st" 2>/dev/null)" in BLOCKED|NEEDS_DECISION) continue ;; esac
     if [[ "$(jq -r '.stamped' <<<"$st" 2>/dev/null)" == "true" ]]; then
       records="$(jq -c --argjson r "$st" '. + [{sha:$r.sha, base:$r.base, digest:$r.digest}]' <<<"$records")"
     fi

@@ -42,6 +42,8 @@ export CROSS_REVIEW_FINDING_EVENTS="$T/events.jsonl"; : >"$CROSS_REVIEW_FINDING_
 #   rf400    — first request WITH response_format 400s; retried request without it succeeds
 #   bill402  — every request 402s (OpenRouter "Insufficient credits" shape)
 #   err400   — every request 400s with a tools complaint (survives the rf-drop retry)
+#   zai1310  — every request hits Z.ai's weekly/monthly Coding Plan limit
+#              (code "1310" as a STRING, the shape Z.ai actually sends)
 #   nocache  — normal flow, but usage carries NO prompt_tokens_details (the
 #              Moonshot-direct shape: a host that reports no cache counters)
 cat >"$HOME/.local/bin/curl" <<'SHIM'
@@ -62,6 +64,10 @@ mkdir -p "$SHIM_LOG_DIR" 2>/dev/null
 echo "turn tool_msgs=$have_tool_msgs rf=$has_rf tool_choice=$tool_choice tools=$n_tools" >>"$SHIM_LOG_DIR/shim.log"
 if [ "${SHIM_MODE:-default}" = "bill402" ]; then
   printf '%s' '{"error":{"message":"Insufficient credits. Add more using https://openrouter.ai/settings/credits","code":402}}'
+  exit 0
+fi
+if [ "${SHIM_MODE:-default}" = "zai1310" ]; then
+  printf '%s' '{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-10-27 09:00:00"}}'
   exit 0
 fi
 if [ "${SHIM_MODE:-default}" = "err400" ]; then
@@ -427,6 +433,57 @@ run_lane "$T/ob3" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=err400 --
 META="$T/ob3/glm.meta.json"
 assert_eq "read arm generic 400 → provider_error"         "$(jq -r .failure_kind "$META")" "provider_error"
 assert_eq "…rf was dropped and retried first"             "$(jq -r .tool_stats.rf_dropped "$META")" "true"
+run_lane "$T/oz" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=zai1310 --
+assert_eq "a Z.ai plan limit in the lane → failure_kind quota_exhausted" "$(jq -r .failure_kind "$T/oz/glm.meta.json")" "quota_exhausted"
+# Like codex's wall: a sentinel carrying the reset time, and a line in the
+# dispatch log, so a lost baseline is said out loud rather than left to read
+# as a quiet round.
+assert_eq "…a sentinel carries the reset time" "$(cat "$T/oz/glm.quota_exhausted" 2>/dev/null)" "2026-10-27 09:00:00"
+assert_contains "…and the dispatch log says it dropped out" "$(cat "$T/oz.log")" "glm: plan limit reached"
+run_lane "$T/oz2" CROSS_REVIEW_TOOL_MODE=off SHIM_MODE=zai1310 --
+assert_eq "…on the single-shot arm too" "$(jq -r .failure_kind "$T/oz2/glm.meta.json")" "quota_exhausted"
+assert_eq "…with its sentinel too" "$(cat "$T/oz2/glm.quota_exhausted" 2>/dev/null)" "2026-10-27 09:00:00"
+# The seat that motivated this: glm-coding, the Z.ai baseline (cli=zai), not
+# the OpenRouter `glm` seat above. A plan wall resets hours or days later, so
+# a retry 5-15s on is a doomed call — it must not happen (codex + antigravity,
+# #191 pass 1).
+( cd "$REPO" && env CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=zai1310 ZAI_API_KEY=sk-zai-test \
+    bash "$S/run_reviewers.sh" --base main --out "$T/ozc" --reviewers glm-coding --timeout-glm-coding 60 >"$T/ozc.log" 2>&1 )
+assert_eq "glm-coding: a Z.ai plan wall → quota_exhausted" "$(jq -r .failure_kind "$T/ozc/glm-coding.meta.json")" "quota_exhausted"
+assert_eq "…its sentinel carries the reset time"           "$(cat "$T/ozc/glm-coding.quota_exhausted" 2>/dev/null)" "2026-10-27 09:00:00"
+assert_not_contains "…and it is NOT retried"               "$(cat "$T/ozc.log")" "attempt 1 failed"
+assert_eq "…meta records a single attempt"                 "$(jq -r .attempt "$T/ozc/glm-coding.meta.json")" "1"
+# A sentinel left in a REUSED output dir is not this attempt's evidence: a
+# transient failure must still get its retry (#191 pass 2).
+mkdir -p "$T/ostale" && printf '%s\n' "2026-10-27 09:00:00" >"$T/ostale/glm-coding.quota_exhausted"
+printf '%s\n' "x" >"$T/ostale/agy.quota_exhausted"; printf '%s\n' "x" >"$T/ostale/codex.quota_exhausted"
+( cd "$REPO" && env CROSS_REVIEW_TOOL_MODE=off SHIM_MODE=err400 ZAI_API_KEY=sk-zai-test \
+    bash "$S/run_reviewers.sh" --base main --out "$T/ostale" --reviewers glm-coding --timeout-glm-coding 60 >"$T/ostale.log" 2>&1 )
+assert_contains "…a stale sentinel does not suppress a transient failure's retry" "$(cat "$T/ostale.log")" "attempt 1 failed"
+assert_eq "…every stale sentinel in the reused dir is cleared, the shared agy one and codex's too" \
+  "$(ls "$T/ostale"/*.quota_exhausted 2>/dev/null | wc -l | tr -d ' ')" "0"
+# The health check must name the right provider: a glm-coding quota row is
+# not "the shared Gemini Individual quota" (codex P2, #191 pass 1).
+QRL="$T/quota-runlog.jsonl"
+for i in 1 2 3; do printf '{"reviewers":{"glm-coding":{"status":"quota","exit_code":1,"duration_s":2,"timeout_budget_s":900}}}\n' >>"$QRL"; done
+QWARN="$(CROSS_REVIEW_RUNLOG="$QRL" bash "$S/analyze_runlog.sh" --recent 10 --mode warn 2>&1)"
+assert_contains "health check flags glm-coding's quota" "$QWARN" "glm-coding hit its plan quota"
+assert_not_contains "…without calling it Gemini's"      "$QWARN" "Gemini Individual quota"
+# The Gemini seats keep their own branch: the shared Individual quota, not a
+# plan quota (#191 pass 2 — the split must not have dropped the agy wording).
+QRL_AGY="$T/quota-agy-runlog.jsonl"
+for i in 1 2 3; do printf '{"reviewers":{"antigravity":{"status":"quota","exit_code":3,"duration_s":2,"timeout_budget_s":600}}}\n' >>"$QRL_AGY"; done
+QWARN_AGY="$(CROSS_REVIEW_RUNLOG="$QRL_AGY" bash "$S/analyze_runlog.sh" --recent 10 --mode warn 2>&1)"
+assert_contains "health check flags antigravity's Gemini quota" "$QWARN_AGY" "Gemini Individual quota"
+assert_not_contains "…without calling it plan quota"            "$QWARN_AGY" "hit its plan quota"
+# Only a baseline's drop-out is a reviewer short: glm-coding's warning says so,
+# a rotation seat's (the OpenRouter glm) does not (#191 pass 2/3).
+assert_contains "a baseline's plan-quota warning says it leaves a reviewer short" "$QWARN" "A baseline that drops out"
+QRL_OR="$T/quota-or-runlog.jsonl"
+for i in 1 2 3; do printf '{"reviewers":{"glm":{"status":"quota","exit_code":1,"duration_s":2,"timeout_budget_s":900}}}\n' >>"$QRL_OR"; done
+QWARN_OR="$(CROSS_REVIEW_RUNLOG="$QRL_OR" bash "$S/analyze_runlog.sh" --recent 10 --mode warn 2>&1)"
+assert_contains "a rotation seat's plan-quota warning is named" "$QWARN_OR" "glm hit its plan quota"
+assert_not_contains "…and it does not claim to be a baseline" "$QWARN_OR" "A baseline that drops out"
 run_lane "$T/ob4" CROSS_REVIEW_TOOL_MODE=read SHIM_MODE=bill402 --
 # The learner must now ignore these: feed ob1's meta shape into the fixture ledger.
 printf '{"run_id":"x","reviewers":{"glm":%s}}\n' "$(jq -c '. + {status:"failed"}' "$T/ob1/glm.meta.json")" >>"$CROSS_REVIEW_RUNLOG"
@@ -442,6 +499,17 @@ assert_eq "429 → provider_rate_limited"       "$(tl_classify_api_error "$T/e1.
 assert_eq "balance message → provider_billing" "$(tl_classify_api_error "$T/e2.json")" "provider_billing"
 assert_eq "401 → provider_auth"                "$(tl_classify_api_error "$T/e3.json")" "provider_auth"
 assert_eq "anything else → provider_error"     "$(tl_classify_api_error "$T/e4.json")" "provider_error"
+# Z.ai (the glm-coding baseline) sends its own codes, as STRINGS. Its plan
+# limits used to fall through to provider_error, hiding a 26% wall rate on a
+# fixed baseline from every quota query (2026-10-20).
+printf '{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-10-27 09:00:00"}}' >"$T/z1.json"
+printf '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-10-20 14:00:00"}}' >"$T/z2.json"
+printf '{"error":{"code":"1302","message":"Rate limit reached for requests"}}' >"$T/z3.json"
+printf '{"error":{"code":"1214","message":"Invalid parameter"}}' >"$T/z4.json"
+assert_eq "Z.ai 1310 weekly/monthly limit → quota_exhausted" "$(tl_classify_api_error "$T/z1.json")" "quota_exhausted"
+assert_eq "Z.ai 1308 5-hour limit → quota_exhausted"        "$(tl_classify_api_error "$T/z2.json")" "quota_exhausted"
+assert_eq "Z.ai 1302 → provider_rate_limited (unchanged)"   "$(tl_classify_api_error "$T/z3.json")" "provider_rate_limited"
+assert_eq "control: another Z.ai code → provider_error"     "$(tl_classify_api_error "$T/z4.json")" "provider_error"
 
 # ── a dead provider catalog is fetched once, not once per turn ──
 # The production caller is pin_slug="$(tl_provider_slug …)" — a command

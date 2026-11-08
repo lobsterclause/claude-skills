@@ -19,7 +19,13 @@
 #   read_stamp.sh --body-stdin        parse one comment body from stdin
 #
 # Emits one JSON object on stdout:
-#   {"stamped":bool,"sha":"","base":"","pass":n,"digest":"","source":"marker|prose|none","abbrev":n}
+#   {"stamped":bool,"sha":"","base":"","pass":n,"digest":"","verdict":"","source":"marker|prose|none","abbrev":n}
+#
+# `verdict` is the marker's optional verdict= (#185/#186): CLEAN,
+# FIXES_APPLIED, NEEDS_DECISION or BLOCKED, read from the SAME marker as the
+# sha. "" means the record carries none — every record posted before #185 and
+# every prose-only stamp — which callers must treat as "predates the field",
+# not as "not clean". A value outside that vocabulary also reads as "".
 #
 # `source` matters to callers: a marker gives a full 40-char sha plus the base
 # and digest that range coverage needs; prose gives an abbreviated sha and
@@ -48,6 +54,8 @@ m_sha="$(sed -nE 's/.*sha=([0-9a-f]{40}).*/\1/p' <<<"$marker" | head -1)"
 m_base="$(sed -nE 's/.*[[:space:]]base=([0-9a-f]{40}).*/\1/p' <<<"$marker" | head -1)"
 m_pass="$(sed -nE 's/.*[[:space:]]pass=([0-9]+).*/\1/p' <<<"$marker" | head -1)"
 m_dig="$(sed -nE 's/.*[[:space:]]digest=([0-9a-f]{64}).*/\1/p' <<<"$marker" | head -1)"
+m_verdict="$(sed -nE 's/.*[[:space:]]verdict=([A-Z_]+)([[:space:]]|-->).*/\1/p' <<<"$marker" | head -1)"
+case "$m_verdict" in CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED) ;; *) m_verdict="" ;; esac
 
 # Prose fallback. Deliberately NOT `Reviewed at` -- see post_comment.sh: four
 # hand-written records used that phrasing and a working gate read them as
@@ -64,15 +72,15 @@ if [[ -n "$m_sha" && -n "$p_sha" ]]; then
 fi
 
 if [[ -n "$m_sha" ]]; then
-  jq -cn --arg s "$m_sha" --arg b "$m_base" --arg d "$m_dig" \
+  jq -cn --arg s "$m_sha" --arg b "$m_base" --arg d "$m_dig" --arg v "$m_verdict" \
          --argjson p "${m_pass:-0}" --arg w "$warn" \
-    '{stamped:true, sha:$s, base:$b, pass:$p, digest:$d, source:"marker", abbrev:40,
+    '{stamped:true, sha:$s, base:$b, pass:$p, digest:$d, verdict:$v, source:"marker", abbrev:40,
       disagreement:(if $w == "" then null else $w end)}'
 elif [[ -n "$p_sha" ]]; then
   jq -cn --arg s "$p_sha" --argjson n "${#p_sha}" \
-    '{stamped:true, sha:$s, base:"", pass:0, digest:"", source:"prose", abbrev:$n,
+    '{stamped:true, sha:$s, base:"", pass:0, digest:"", verdict:"", source:"prose", abbrev:$n,
       disagreement:null}'
 else
-  jq -cn '{stamped:false, sha:"", base:"", pass:0, digest:"", source:"none", abbrev:0,
+  jq -cn '{stamped:false, sha:"", base:"", pass:0, digest:"", verdict:"", source:"none", abbrev:0,
            disagreement:null}'
 fi

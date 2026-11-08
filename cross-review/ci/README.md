@@ -28,7 +28,10 @@ commit that is about to merge?**
 It reads PR comments for a record starting `## Cross-review` that carries a SHA
 stamp, and compares that SHA to the head.
 
-- bound to the head → `success`
+- bound to the head → `success`, unless the marker carries an explicit
+  non-CLEAN `verdict=` (FIXES_APPLIED, NEEDS_DECISION, BLOCKED) → `pending`:
+  reviewed, and the review said "not yet" (#186). A record with no `verdict=`
+  (everything posted before #185) is read as it always was.
 - bound to an earlier commit → `failure`, naming both commits
 - no record, or a record with no stamp → `failure`
 - **could not read** (gh/jq missing, API failure) → `success`, with a

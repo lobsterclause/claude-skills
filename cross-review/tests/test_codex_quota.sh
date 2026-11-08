@@ -22,7 +22,7 @@ export CROSS_REVIEW_PROFILES_FILE="$T/profiles.json"
 printf '#!/bin/sh\nprintf "shim\\n"\n' >"$T/bin/kimi"
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.7 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.8 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
 printf "shim review: no findings\n"
 SHIM
 chmod +x "$T/bin/"*

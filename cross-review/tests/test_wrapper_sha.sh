@@ -46,7 +46,7 @@ assert_not_contains() {
 # checkout lives. ──────────────────────────────────────────────────────────
 SKILL="$T/skill"
 mkdir -p "$SKILL/scripts" "$SKILL/references"
-cp "$S/worktree.sh" "$S/append_runlog.sh" "$S/analyze_runlog.sh" "$S/post_comment.sh" "$SKILL/scripts/"
+cp "$S/worktree.sh" "$S/append_runlog.sh" "$S/lib_append_lock.sh" "$S/analyze_runlog.sh" "$S/post_comment.sh" "$SKILL/scripts/"
 cp "$SKILL_DIR/references/reviewer_profiles.json" "$SKILL/references/reviewer_profiles.json" 2>/dev/null || echo '{}' >"$SKILL/references/reviewer_profiles.json"
 chmod +x "$SKILL/scripts/"*.sh
 

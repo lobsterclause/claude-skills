@@ -216,7 +216,7 @@ if [[ "$judge" != "none" ]]; then
   if [[ -f "$_judge_profile" ]]; then
     agy_judge_model="$(jq -r '.antigravity.model // empty' "$_judge_profile" 2>/dev/null)"
   fi
-  : "${agy_judge_model:=Gemini 3.7 Flash (High)}"
+  : "${agy_judge_model:=Gemini 3.8 Flash (High)}"
   or_judge_model="deepseek/deepseek-v4-flash"
   judge_timeout=60
   judge_raw="$tmp_dir/judge_raw.txt"

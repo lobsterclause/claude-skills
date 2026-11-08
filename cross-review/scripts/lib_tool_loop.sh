@@ -460,6 +460,12 @@ tl_classify_api_error() {
     402) echo provider_billing; return ;;
     429) echo provider_rate_limited; return ;;
     401|403) echo provider_auth; return ;;
+    # Z.ai (the glm-coding baseline's Coding Plan) sends its own codes, as
+    # strings: 1308 = the 5-hour limit, 1310 = the weekly/monthly limit. Both
+    # are plan quota walls with a reset time, the same thing agy's and codex's
+    # quota_exhausted mean. As provider_error they hid a 26% wall rate on a
+    # fixed baseline from every quota query (2026-10-20).
+    1308|1310) echo quota_exhausted; return ;;
   esac
   if printf '%s' "$msg" | grep -qiE 'insufficient (credits|balance|funds)|credits? (are|is) (exhausted|depleted)|negative balance|top up|payment required|billing'; then
     echo provider_billing
