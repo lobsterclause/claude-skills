@@ -119,6 +119,13 @@ acquired in a one-shot tool call as advisory at best.
    - **Wrong library major** — four reviewers called a Terraform stack syntactically
      invalid using provider v4 syntax against a v5 pin; `tofu validate` → Success. Check
      the pinned version before believing a "this cannot even parse" claim.
+   - **Permission borrowed from a sibling method** — "the provider calls
+     `projects.getBillingInfo`, which needs `billing.resourceAssociations.list`". The
+     call was real; the permission belongs to `billingAccounts.projects.list`, a different
+     method of the same API. `getBillingInfo`'s own doc names only
+     `resourcemanager.projects.get` (kindred-mama-ai #4333, 2026-10-07). For an IAM
+     claim, read the docstring of the exact method named. The installed gcloud SDK's
+     `generated_clients/apis/<api>/*_client.py` carries them offline.
    - **Premise absent from the build** — an argument from CSS Cascade Level 5 layer
      precedence, where `grep -c '@layer'` on the *compiled* output returns 0.
    - **Contradicted at the cited line** — "no try/catch around this read" when the cited
@@ -552,6 +559,13 @@ and the covering suites into the fix step, not into CI.
    after that, do not loop — either accept the bot's head when the delta is trivial
    and fully read (re-stamp it, let the SHA-pinned merge race the bot), or block the
    PR for a human. Two pushes by you against the same bot = you are the loop.
+   **Archive through the API, not the browser:** `POST
+   https://jules.googleapis.com/v1alpha/sessions/<id>:archive` with an empty `{}` body
+   and header `X-Goog-Api-Key`. The id is the number in the PR body's
+   `jules.google.com/task/<id>` link. Judge the result by `GET .../sessions/<id>`
+   returning `"archived": true`, never by the status code. The key's location is in
+   memory (`jules_agent_tiers_and_api`). On 2026-10-03 the drain clicked through the
+   web UI because that memory had no index line, and the user asked why.
 3c. **cwd does not survive between orchestrator tool calls.** A `cd <worktree>` in
    one Bash call is gone in the next; one drain contaminated the main checkout with
    a `git checkout -- <file>` and verified claims against the wrong tree because of
@@ -568,6 +582,32 @@ and the covering suites into the fix step, not into CI.
    Fix in-branch with a base-branch merge and a clearly-labeled commit. Track
    same-check-twice fairly: the first failure was the base's, so a second, different
    failure is attempt one for the PR itself — say so explicitly in the log.
+   The stale base can be CI's own, not the branch's. kindred-mama-ai's skipped-test
+   ratchet diffs `refs/pull/N/merge` against the event's `base.sha`. Once develop moves
+   past the PR's last push, it lists OTHER PRs' test files as "changed" and fails with
+   `/baseline/test-results.json contains no test results (0 assertions)`. That message
+   names no file at all, so read the step's "changed test files:" line. Pushing a
+   develop merge resets `base.sha` and clears it (#4297, 2026-10-03).
+
+6. **A merge watcher gates on EVERY check, not only `--required`.** In a repo with no
+   required checks, `gh pr checks --required --watch` returns at once with nothing to
+   wait on, and "nothing failed" reads as green. nem-workspace-mcp #5 merged on
+   2026-11-08 while both CodeQL jobs were still running, and CodeQL then went red on
+   the base. Wait until no check is PENDING, QUEUED or IN_PROGRESS, then require every
+   check to be SUCCESS, SKIPPED or NEUTRAL, with zero unresolved threads. The same
+   watcher caught a late codex thread on nem-app #83, which is the point.
+7. **Pass the review base as `origin/<base>`, never the bare branch name.** The
+   reviewer worktree resolves a bare `main` against the LOCAL branch, which can be
+   commits behind. One round on 2026-11-08 sent reviewers a 12-file diff for a 3-file PR.
+   Before trusting a round, compare its `size_files` with
+   `gh pr diff <n> --name-only | wc -l`, and kill the round if they differ.
+8. **A destructive script verified only in `--dry-run` is unverified.** A GC script
+   whose dry runs passed on both boxes would have aborted every real run: under
+   `set -e`, `tag="$([[ $DRY_RUN == 1 ]] && echo x)"` exits 1 when the test is false
+   (nem-runner-bootstrap #190, 2026-11-08). Require a real-mode test against stubbed
+   commands that record their calls, and assert the destructive calls are reached. Also
+   check that config files cannot override an explicit `--dry-run` (the next review
+   round found exactly that).
 
 ## Wake discipline (event-driven, not polling)
 
@@ -582,6 +622,12 @@ and the covering suites into the fix step, not into CI.
   not a code failure — Dagger Check may have already passed. Rerun the failed job once,
   relaunch the poller on the same SHA, and note which step the runner died in (a new
   resource-heavy step can be what killed the box).
+- **Arm a poller only once the rerun is visible.** `gh run rerun --failed` returns before
+  the new attempt registers. A poller started in that window reads the old `failure`
+  conclusion at the same SHA and exits `TERMINAL_FAIL` on its first poll (#4222,
+  2026-10-03). Wait until `gh run view <id> --json status` reads `queued` or
+  `in_progress` before arming. A poller that dies on POLL 1 right after a rerun read the
+  old result, so don't conclude CI failed again from it.
 - **A station agent that stalls twice on the same task gets taken over inline.** On the
   first stall (stream watchdog, no progress), snapshot the worktree state (`git status
   --porcelain`, HEAD SHA, held locks) and resume the agent WITH that snapshot so it
@@ -608,6 +654,13 @@ unblocked line, re-read each BLOCKED line's PR (`labels`, `mergeStateStatus`, re
 checks and review currency at the current head). The human may have acted days ago.
 When you block a PR on a human action, the PR comment should also say that the drain
 will not notice the action by itself.
+
+**Gates that read comments usually anchor on the comment's FIRST line.**
+kindred-mama-ai's `cross-review-currency.sh` matches `^Cross-review exemption:` against
+the whole comment body. A comment that starts with context and puts the exemption line
+further down is silently ignored, and the gate keeps asking for re-affirmation (#4211,
+2026-10-03). Post each gate-readable line as its own comment, starting with the marker,
+and put the context in a separate comment.
 
 **Editing the checklist body is a read-modify-write on a document another session may
 be editing too, and the race's failure mode is a blank issue, not a conflict.** On
