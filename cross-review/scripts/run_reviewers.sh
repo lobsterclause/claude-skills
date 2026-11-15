@@ -3160,13 +3160,11 @@ done
 # (it cannot tell a leftover from a deliberate single-lane re-run), so such a
 # round is kept off the merge gate by a lane it never ran.
 #
-# stale_scoped_lanes <skip-roster: 1|0> prints those lanes, comma-separated.
-# It looks where post_comment.sh looks: with `--out <run-dir>/raw` that is
-# --out and its parent, with `--out <run-dir>` it is --out and raw/ under it.
-# skip-roster=1 leaves out this round's own lanes in --out, which are about to
-# be rewritten.
+# stale_scoped_lanes prints those lanes, comma-separated. It looks where
+# post_comment.sh looks: with `--out <run-dir>/raw` that is --out and its
+# parent, with `--out <run-dir>` it is --out and raw/ under it.
 stale_scoped_lanes() {
-  local skip="$1" d pre mf name r found=""
+  local d pre mf found=""
   local dirs=("$out|" "$out/raw|raw/")
   [[ "$(basename "$out")" == raw ]] && dirs+=("$(dirname "$out")|../")
   for d in "${dirs[@]}"; do
@@ -3174,21 +3172,21 @@ stale_scoped_lanes() {
     for mf in "$d"/*.meta.json; do
       [[ -f "$mf" ]] || continue
       jq -e '(.paths? // empty) | arrays | length > 0' "$mf" >/dev/null 2>&1 || continue
-      name="$(basename "$mf")"
-      if [[ "$skip" == 1 && -z "$pre" ]]; then
-        for r in "${requested[@]}"; do [[ "${name%%.*}" == "$r" ]] && continue 2; done
-      fi
-      found="${found:+$found, }$pre$name"
+      found="${found:+$found, }$pre$(basename "$mf")"
     done
   done
   printf '%s' "$found"
 }
 # Said here, before any reviewer is launched, because this is the last point at
-# which the round can still be stopped and pointed at a fresh --out.
+# which the round can still be stopped and pointed at a fresh --out. It names
+# the roster's own lanes too: a roster lane's name on a file does not mean this
+# round replaces it (the lane may be skipped or die before writing, and an
+# attempt file outlives a run that needs no retry), so nothing is assumed
+# replaced. The check after the round says what was actually left.
 if [[ -z "$paths_list" ]]; then
-  _stale_scoped="$(stale_scoped_lanes 1)"
+  _stale_scoped="$(stale_scoped_lanes)"
   if [[ -n "$_stale_scoped" ]]; then
-    echo "WARN: $out holds lane output from a path-scoped round that this full-diff round will not replace ($_stale_scoped). post_comment.sh will post this run as path-scoped, off the merge gate. For a full-diff record, stop and dispatch into a fresh --out." >&2
+    echo "WARN: $out holds lane output from a path-scoped round ($_stale_scoped). Whatever this full-diff round does not rewrite makes post_comment.sh post the run as path-scoped, off the merge gate. For a full-diff record, stop and dispatch into a fresh --out." >&2
   fi
 fi
 
@@ -3364,7 +3362,7 @@ else
   # round's own lanes were just rewritten without `paths`, so anything still
   # scoped is a lane this round did not replace (a leftover, an attempt file,
   # or a roster lane that died before writing its meta.json).
-  _stale_scoped="$(stale_scoped_lanes 0)"
+  _stale_scoped="$(stale_scoped_lanes)"
   if [[ -n "$_stale_scoped" ]]; then
     echo "WARN: $out still holds lane output from a path-scoped round ($_stale_scoped). post_comment.sh will post this run as path-scoped, off the merge gate. For a full-diff record, dispatch into a fresh --out." >&2
   fi

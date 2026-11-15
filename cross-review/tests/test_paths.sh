@@ -223,11 +223,13 @@ assert_contains "…and warns that a scoped lane is still in the dir" "$(cat "$T
   "WARN: $T/o1r still holds lane output from a path-scoped round (glm.meta.json)"
 assert_contains "…and what that does to the record" "$(cat "$T/o1r.log")" "post_comment.sh will post this run as path-scoped"
 # The warning that can still be acted on is the one before the reviewers run.
-# It names only lanes this round will not rewrite: kimi is in the roster, glm
-# is the leftover.
-PRE="$(grep -n 'that this full-diff round will not replace' "$T/o1r.log" | head -1)"
-assert_contains "…and says so BEFORE the reviewers are launched" "$PRE" "WARN: $T/o1r holds lane output from a path-scoped round that this full-diff round will not replace (glm.meta.json)"
-assert_not_contains "…without naming the lane it is about to rewrite" "$PRE" "kimi.meta.json"
+# It names every scoped lane in the dir, the roster's own included: whether a
+# roster lane rewrites its file is not known until it has run (it may be
+# skipped, or die first), so nothing is assumed replaced. The line after the
+# round, above, is the one that says what was actually left.
+PRE="$(grep -n 'Whatever this full-diff round does not rewrite' "$T/o1r.log" | head -1)"
+assert_contains "…and says so BEFORE the reviewers are launched" "$PRE" "WARN: $T/o1r holds lane output from a path-scoped round (glm.meta.json, kimi.meta.json)."
+assert_contains "…with what to do about it" "$PRE" "stop and dispatch into a fresh --out"
 _pre_n="${PRE%%:*}"; _lane_n="$(grep -n '^kimi: ' "$T/o1r.log" | tail -1 | cut -d: -f1)"
 assert_eq "…ahead of the lane's own result line" "$([[ -n "$_pre_n" && -n "$_lane_n" && "$_pre_n" -lt "$_lane_n" ]] && echo before || echo "not before ($_pre_n vs $_lane_n)")" "before"
 for _l in "$T/o0.log" "$T/o1.log"; do
@@ -239,12 +241,29 @@ mkdir -p "$T/layA" "$T/layB/raw"
 printf '{"exit_code":0,"paths":["src/"],"paths_mode":"filtered"}\n' >"$T/layA/glm.meta.json"
 cr "$T/layA/raw" --base main --reviewers kimi --timeout-kimi 30 --allow-full-rereview
 assert_contains "--out <run-dir>/raw: a scoped lane beside findings.md is named before dispatch" "$(cat "$T/layA/raw.log")" \
-  "that this full-diff round will not replace (../glm.meta.json)"
+  "holds lane output from a path-scoped round (../glm.meta.json). Whatever"
 assert_contains "…and after it" "$(cat "$T/layA/raw.log")" "still holds lane output from a path-scoped round (../glm.meta.json)"
 printf '{"exit_code":0,"paths":["src/"],"paths_mode":"filtered"}\n' >"$T/layB/raw/kimi.meta.json"
 cr "$T/layB" --base main --reviewers kimi --timeout-kimi 30 --allow-full-rereview
 assert_contains "--out <run-dir>: a scoped lane under raw/ is named, roster lane or not" "$(cat "$T/layB.log")" \
-  "that this full-diff round will not replace (raw/kimi.meta.json)"
+  "holds lane output from a path-scoped round (raw/kimi.meta.json). Whatever"
+# A roster lane's name on a file does not mean the round replaces it. An
+# attempt file from the scoped round outlives a rerun that needs no retry, and
+# a lane that cannot launch rewrites nothing at all.
+mkdir -p "$T/att" "$T/nol"
+printf '{"exit_code":1,"paths":["src/"],"paths_mode":"filtered"}\n' >"$T/att/kimi.attempt2.meta.json"
+cr "$T/att" --base main --reviewers kimi --timeout-kimi 30 --allow-full-rereview
+assert_contains "a roster lane's scoped attempt file is named before dispatch" "$(cat "$T/att.log")" \
+  "holds lane output from a path-scoped round (kimi.attempt2.meta.json). Whatever"
+assert_contains "…and is still there after it" "$(cat "$T/att.log")" "still holds lane output from a path-scoped round (kimi.attempt2.meta.json)"
+printf '{"exit_code":0,"paths":["src/"],"paths_mode":"filtered"}\n' >"$T/nol/kimi27.meta.json"
+( unset MOONSHOT_API_KEY; cr "$T/nol" --base main --reviewers kimi,kimi27 --timeout-kimi 30 --allow-full-rereview )
+assert_contains "a roster lane that cannot launch is skipped" "$(cat "$T/nol.log")" "kimi27 (direct-Moonshot reviewer) unavailable"
+_nol_pre="$(grep -n 'holds lane output from a path-scoped round (kimi27.meta.json). Whatever' "$T/nol.log" | head -1 | cut -d: -f1)"
+_nol_skip="$(grep -n 'kimi27 (direct-Moonshot reviewer) unavailable' "$T/nol.log" | head -1 | cut -d: -f1)"
+assert_eq "…and its scoped file was named before any lane was launched" \
+  "$([[ -n "$_nol_pre" && -n "$_nol_skip" && "$_nol_pre" -lt "$_nol_skip" ]] && echo before || echo "not before ($_nol_pre vs $_nol_skip)")" "before"
+assert_contains "…and is still there after the round" "$(cat "$T/nol.log")" "still holds lane output from a path-scoped round (kimi27.meta.json)"
 
 echo "── doc_narrative_risk fires when the .md IS in scope ──"
 cr "$T/o2" --base main --reviewers kimi --paths docs/ --timeout-kimi 30
