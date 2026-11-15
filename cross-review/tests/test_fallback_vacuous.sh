@@ -25,7 +25,7 @@ mkdir -p "$T/bin"
 printf '#!/bin/sh\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 4 Argon (High)\n"; exit 0; fi
 printf "shim review: no findings\n"
 SHIM
 cat >"$T/canned.json" <<'EOF'

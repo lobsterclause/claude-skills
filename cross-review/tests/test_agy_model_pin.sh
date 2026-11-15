@@ -58,6 +58,19 @@ notes="$(jq -r '.antigravity.notes' "$PROFILE")"
   && ok "the seat's notes name the pinned --model" \
   || bad "the seat's notes name a different --model than '$pin'"
 
+echo "── gemini-pro routes (the one Gemini seat, a router since 2026-11-14) ──"
+# Every route's display name must be an exact `agy models` name: agy silently
+# falls back on an unrecognised --model string. Model names live ONLY in the
+# profile, so this pins their SHAPE (and that no 3.1 Pro pin survives).
+bad_routes="$(jq -r '.["gemini-pro"].routes | to_entries[] | select(.value | test("^Gemini 4 (Argon|Hydrogen) \\((Low|Medium|High|XHigh)\\)$") | not) | .key' "$PROFILE")"
+assert_eq "every gemini-pro route is a 'Gemini 4 <Argon|Hydrogen> (<Level>)' display name" "$bad_routes" ""
+assert_eq "route keys agree with their display names (model:level)" \
+  "$(jq -r '.["gemini-pro"].routes | to_entries[] | select((.key | split(":") | (.[0] + " " + .[1])) != (.value | ascii_downcase | sub("^gemini 4 "; "") | sub(" \\("; " ") | sub("\\)$"; ""))) | .key' "$PROFILE")" ""
+assert_eq "the profile .model is the pass-1 route" "$(jq -r '.["gemini-pro"].model' "$PROFILE")" \
+  "$(jq -r '.["gemini-pro"] as $g | $g.routes[$g.router.pass1]' "$PROFILE")"
+assert_eq "gemini-pro notes name the pass-1 --model" \
+  "$(jq -r --arg m "$(jq -r '.["gemini-pro"].model' "$PROFILE")" '.["gemini-pro"].notes | contains($m)' "$PROFILE")" "true"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

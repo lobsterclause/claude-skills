@@ -164,7 +164,12 @@ jq -rs --arg since "$since" '
           account_limit_pct: (($al * 100 / $n) | floor),
           median_duration_s: med($rows | map(.c.duration_s // 0)),
           findings_per_run: (($rows | map(.c.findings_total // 0) | add) * 100 / $n | floor / 100),
-          clean_pct: ((($rows | map(select(.verdict == "CLEAN")) | length) * 100 / $n) | floor)
+          clean_pct: ((($rows | map(select(.verdict == "CLEAN")) | length) * 100 / $n) | floor),
+          # The effort each run ACTUALLY ran at (codex.meta.json `effort`,
+          # recorded since 2026-11-14). Older rows never recorded it:
+          # "unrecorded", not a guess. This is what exposes a ladder that has
+          # drifted from what the config intends (the 2026-11-14 inversion).
+          efforts: ($rows | map(.c.effort // "unrecorded") | group_by(.) | map("\(.[0]) x\(length)") | join(", "))
         }
       end;
 
@@ -208,6 +213,10 @@ jq -rs --arg since "$since" '
         end
     )
   ),
+  "",
+  "  effort actually run, after window (codex.meta.json `effort`; \"unrecorded\" = row predates the field):",
+  (.by_pass | to_entries[] | "    pass \(.key): \(.value.after.efforts // "—")"),
+  "  Pass 2 or 3+ listed ABOVE pass 1 means the ladder is escalating, not saving.",
   "",
   "  acct_limit   % of codex runs that hit the quota wall and fell through to",
   "               metered OpenRouter. This is the number the ladder targets.",

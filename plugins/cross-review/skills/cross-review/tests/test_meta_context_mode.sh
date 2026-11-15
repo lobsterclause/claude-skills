@@ -49,7 +49,7 @@ printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings
 printf '#!/bin/sh\nprintf "shim\\n"\n' >"$T/bin/codex"
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 4 Argon (High)\n"; exit 0; fi
 printf "shim review: no findings\n"
 exit 0
 SHIM
@@ -90,14 +90,14 @@ SHIM
   chmod +x "$T/bin/curl"
 }
 
-echo "── (a) --context-mode files: codex/antigravity -> tools, kimi/glm -> files ──"
+echo "── (a) --context-mode files: codex/gemini-pro -> tools, kimi/glm -> files ──"
 canned_or_response
 bash "$S/run_reviewers.sh" --base main --out "$T/o1" \
-  --reviewers codex,antigravity,kimi,glm --context-mode files >/dev/null 2>&1
+  --reviewers codex,gemini-pro,kimi,glm --context-mode files >/dev/null 2>&1
 assert_eq "codex context_mode == tools" \
   "$(jq -r '.context_mode' "$T/o1/codex.meta.json")" "tools"
-assert_eq "antigravity context_mode == tools" \
-  "$(jq -r '.context_mode' "$T/o1/antigravity.meta.json")" "tools"
+assert_eq "gemini-pro context_mode == tools" \
+  "$(jq -r '.context_mode' "$T/o1/gemini-pro.meta.json")" "tools"
 assert_eq "kimi context_mode == files" \
   "$(jq -r '.context_mode' "$T/o1/kimi.meta.json")" "files"
 assert_eq "glm context_mode == files" \
@@ -153,12 +153,15 @@ CODEX_KEYS_BEFORE='["attempt","context_access","duration_s","exit_code","failure
 # telemetry + the learned tool arms); those pre-date context_mode on that
 # branch, so they belong in the "before" set.
 OR_KEYS_BEFORE='["attempt","cli","context_access","context_files","context_files_omitted","cost_usd","duration_s","exit_code","failure_kind","model","output_bytes","timed_out","timeout_budget_s","tokens_cache_write","tokens_cached","tokens_completion","tokens_prompt","tool_policy","tool_stats","total_diff_lines","truncated","upstream_provider","wall_over_budget"]'
+CODEX_KEYS_BEFORE="$(jq -c '. + ["effort","effort_source","pass_context"]' <<<"$CODEX_KEYS_BEFORE")"  # 2026-11-14: effort recorded
 KIMI_KEYS_BEFORE='["attempt","context_access","context_files","context_files_omitted","diff_line_cap","duration_s","exit_code","failure_kind","output_bytes","timed_out","timeout_budget_s","total_diff_lines","truncated","wall_over_budget"]'
 AGY_KEYS_BEFORE='["attempt","cli","context_access","duration_s","exit_code","failure_kind","model","model_resolved","output_bytes","quota_resets_in","timed_out","timeout_budget_s","wall_over_budget"]'
+# gemini-pro router fields added 2026-11-14 (route, route_reason, pass_context, diff_lines, effort-free).
+AGY_KEYS_BEFORE="$(jq -c '. + ["route","route_reason","pass_context","diff_lines"]' <<<"$AGY_KEYS_BEFORE")"
 
 canned_or_response
 bash "$S/run_reviewers.sh" --base main --out "$T/o5" \
-  --reviewers codex,antigravity,kimi,glm --context-mode files >/dev/null 2>&1
+  --reviewers codex,gemini-pro,kimi,glm --context-mode files >/dev/null 2>&1
 rm -f "$T/bin/curl"
 
 check_keys() {
@@ -172,7 +175,7 @@ check_keys() {
 check_keys "codex.meta.json" "$T/o5/codex.meta.json" "$CODEX_KEYS_BEFORE"
 check_keys "glm.meta.json" "$T/o5/glm.meta.json" "$OR_KEYS_BEFORE"
 check_keys "kimi.meta.json" "$T/o5/kimi.meta.json" "$KIMI_KEYS_BEFORE"
-check_keys "antigravity.meta.json" "$T/o5/antigravity.meta.json" "$AGY_KEYS_BEFORE"
+check_keys "gemini-pro.meta.json" "$T/o5/gemini-pro.meta.json" "$AGY_KEYS_BEFORE"
 
 echo "── (f) no_model_configured early exit stamps the INTENDED mode, not a constant ──"
 # The early exit fires before the prompt (and context_access) exists, so the

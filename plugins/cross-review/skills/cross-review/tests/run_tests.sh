@@ -48,7 +48,7 @@ assert_contains() {
 mkdir -p "$T/bin"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 printf '#!/bin/sh\nprintf "shim\\n"\n' >"$T/bin/codex"
-printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 4 Argon (High)\\n"; fi\n' >"$T/bin/agy"
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export OPENROUTER_API_KEY="sk-or-test-shim"   # lights the OR pool; never called
@@ -1002,26 +1002,26 @@ echo "── agy no-verdict gate: guarded by the rc/bytes if-elif chain ──"
 # verified live before pinning (see feedback_convergent_not_correct).]
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 4 Argon (High)\n"; exit 0; fi
 printf "Error: something went wrong during startup\n"
 exit 1
 SHIM
 chmod +x "$T/bin/agy"
-bash "$S/run_reviewers.sh" --base main --out "$T/o9" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+bash "$S/run_reviewers.sh" --base main --out "$T/o9" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 || true
 assert_eq "agy rc=1 + short no-marker stdout keeps real exit code" \
-  "$(jq -r '.exit_code' "$T/o9/antigravity.meta.json")" "1"
+  "$(jq -r '.exit_code' "$T/o9/gemini-pro.meta.json")" "1"
 assert_eq "agy rc=1 not reclassified as no_verdict_output" \
-  "$(jq -r '.failure_kind' "$T/o9/antigravity.meta.json")" "null"
+  "$(jq -r '.failure_kind' "$T/o9/gemini-pro.meta.json")" "null"
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 4 Argon (High)\n"; exit 0; fi
 printf "I will now examine the changes on the current branch and report back with an assessment.\n"
 exit 0
 SHIM
 chmod +x "$T/bin/agy"
-bash "$S/run_reviewers.sh" --base main --out "$T/o10" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+bash "$S/run_reviewers.sh" --base main --out "$T/o10" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 || true
 assert_eq "agy rc=0 preamble-only stamps no_verdict_output" \
-  "$(jq -r '.failure_kind' "$T/o10/antigravity.meta.json")" "no_verdict_output"
+  "$(jq -r '.failure_kind' "$T/o10/gemini-pro.meta.json")" "no_verdict_output"
 echo "── agy headless soft-deny classifies apart from empty_output ──"
 # [pin: 2026-07-20 — a soft-denied tool confirmation (agy >=1.1.3 headless)
 # used to land as failure_kind=empty_output, whose documented remedy is
@@ -1030,7 +1030,7 @@ echo "── agy headless soft-deny classifies apart from empty_output ──"
 # (prompt-shape bug, seat fine) vs unauthed (re-login).]
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 4 Argon (High)\n"; exit 0; fi
 while [ $# -gt 0 ]; do
   if [ "$1" = "--log-file" ]; then printf 'tool_confirmation_manager.go:183] Print mode: soft-denying tool confirmation\n' >"$2"; fi
   shift
@@ -1039,18 +1039,18 @@ printf 'jetski: no output produced - a tool required the "command" permission th
 exit 0
 SHIM
 chmod +x "$T/bin/agy"
-bash "$S/run_reviewers.sh" --base main --out "$T/o11" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+bash "$S/run_reviewers.sh" --base main --out "$T/o11" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 || true
 assert_eq "agy soft-deny stamps headless_permission_denied" \
-  "$(jq -r '.failure_kind' "$T/o11/antigravity.meta.json")" "headless_permission_denied"
+  "$(jq -r '.failure_kind' "$T/o11/gemini-pro.meta.json")" "headless_permission_denied"
 assert_eq "agy soft-deny is NOT misfiled as empty_output" \
-  "$(jq -r 'select(.failure_kind == "empty_output") | "LEAKED"' "$T/o11/antigravity.meta.json")" ""
+  "$(jq -r 'select(.failure_kind == "empty_output") | "LEAKED"' "$T/o11/gemini-pro.meta.json")" ""
 assert_eq "soft-deny maps to status permission_denied in the runlog" \
   "$(jq -c '. + {status: (if .timed_out == true then "timed_out"
                           elif .failure_kind == "quota_exhausted" then "quota"
                           elif .failure_kind == "headless_permission_denied" then "permission_denied"
                           elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
                           elif .exit_code == 0 then "empty"
-                          else "failed" end)} | .status' "$T/o11/antigravity.meta.json")" '"permission_denied"'
+                          else "failed" end)} | .status' "$T/o11/gemini-pro.meta.json")" '"permission_denied"'
 
 echo "── agy internal print-timeout classifies apart from empty_output/failed ──"
 # [pin: 2026-08-03 — Gemini 3.1 Pro at High effort needs 300-400s on a 100KB
@@ -1062,59 +1062,59 @@ echo "── agy internal print-timeout classifies apart from empty_output/faile
 # it must say so, and the remedy is a bigger budget.]
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 4 Argon (High)\n"; exit 0; fi
 printf 'Error: timeout waiting for response\n' >&2
 exit 1
 SHIM
 chmod +x "$T/bin/agy"
-bash "$S/run_reviewers.sh" --base main --out "$T/o13" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+bash "$S/run_reviewers.sh" --base main --out "$T/o13" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 || true
 assert_eq "agy print-timeout stamps print_timeout" \
-  "$(jq -r '.failure_kind' "$T/o13/antigravity.meta.json")" "print_timeout"
+  "$(jq -r '.failure_kind' "$T/o13/gemini-pro.meta.json")" "print_timeout"
 assert_eq "agy print-timeout marks timed_out=true so the runlog warning sees it" \
-  "$(jq -r '.timed_out' "$T/o13/antigravity.meta.json")" "true"
+  "$(jq -r '.timed_out' "$T/o13/gemini-pro.meta.json")" "true"
 assert_eq "agy print-timeout is NOT misfiled as empty_output" \
-  "$(jq -r 'select(.failure_kind == "empty_output") | "LEAKED"' "$T/o13/antigravity.meta.json")" ""
+  "$(jq -r 'select(.failure_kind == "empty_output") | "LEAKED"' "$T/o13/gemini-pro.meta.json")" ""
 assert_eq "print-timeout maps to status timed_out in the runlog" \
   "$(jq -c '. + {status: (if .timed_out == true then "timed_out"
                           elif .failure_kind == "quota_exhausted" then "quota"
                           elif .failure_kind == "headless_permission_denied" then "permission_denied"
                           elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
                           elif .exit_code == 0 then "empty"
-                          else "failed" end)} | .status' "$T/o13/antigravity.meta.json")" '"timed_out"'
+                          else "failed" end)} | .status' "$T/o13/gemini-pro.meta.json")" '"timed_out"'
 
 # A non-timeout nonzero exit must NOT be swallowed by the print_timeout branch.
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 4 Argon (High)\n"; exit 0; fi
 printf 'Error: something else entirely\n' >&2
 exit 1
 SHIM
 chmod +x "$T/bin/agy"
-bash "$S/run_reviewers.sh" --base main --out "$T/o14" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+bash "$S/run_reviewers.sh" --base main --out "$T/o14" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 || true
 assert_eq "unrelated agy failure does not claim print_timeout" \
-  "$(jq -r '.failure_kind' "$T/o14/antigravity.meta.json")" "null"
+  "$(jq -r '.failure_kind' "$T/o14/gemini-pro.meta.json")" "null"
 assert_eq "unrelated agy failure stays timed_out=false" \
-  "$(jq -r '.timed_out' "$T/o14/antigravity.meta.json")" "false"
+  "$(jq -r '.timed_out' "$T/o14/gemini-pro.meta.json")" "false"
 
 # Per-attempt artifacts must survive the retry that overwrites the canonical
 # paths — without them attempt 1's cause is unknowable (this flake took a
 # rebuild of the evidence trail to diagnose).
 assert_eq "attempt-stamped meta.json is preserved for forensics" \
-  "$(jq -r '.failure_kind' "$T/o13/antigravity.attempt1.meta.json" 2>/dev/null)" "print_timeout"
+  "$(jq -r '.failure_kind' "$T/o13/gemini-pro.attempt1.meta.json" 2>/dev/null)" "print_timeout"
 
 # Silent agy (no log line, no stderr) must STILL classify as empty_output —
 # the new branch must not swallow the genuine expired-auth case.
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\nGemini 4 Argon (High)\n"; exit 0; fi
 exit 0
 SHIM
 chmod +x "$T/bin/agy"
-bash "$S/run_reviewers.sh" --base main --out "$T/o12" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+bash "$S/run_reviewers.sh" --base main --out "$T/o12" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 || true
 assert_eq "silent agy still classifies as empty_output (auth path intact)" \
-  "$(jq -r '.failure_kind' "$T/o12/antigravity.meta.json")" "empty_output"
+  "$(jq -r '.failure_kind' "$T/o12/gemini-pro.meta.json")" "empty_output"
 
-printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 4 Argon (High)\\n"; fi\n' >"$T/bin/agy"
 chmod +x "$T/bin/agy"
 
 echo "── analyze_runlog.sh contaminated-window NOTE (raw vs clean timeout rate) ──"
@@ -1551,7 +1551,7 @@ echo "── agy shell gate is concurrency-safe (shared repo state) ──"
 # is a lock + holder refcount; these tests pin the two outcomes that matter.]
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-3.1-pro-high\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-4-argon-high\n"; exit 0; fi
 sleep 2
 printf 'shim review: no findings\n'
 exit 0
@@ -1563,7 +1563,7 @@ chmod +x "$T/bin/agy"
 mkdir -p "$REPO/.agents"
 printf '{"my-own-hook": {"PreToolUse": []}}\n' >"$REPO/.agents/hooks.json"
 gate_orig_sum="$(shasum "$REPO/.agents/hooks.json" | awk '{print $1}')"
-( bash "$S/run_reviewers.sh" --base main --out "$T/oc1" --reviewers antigravity --timeout 60 >/dev/null 2>&1 ) &
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc1" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 ) &
 gate_p1=$!
 ( bash "$S/run_reviewers.sh" --base main --out "$T/oc2" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 ) &
 gate_p2=$!
@@ -1578,7 +1578,7 @@ rm -f "$REPO/.agents/hooks.json"; rmdir "$REPO/.agents" 2>/dev/null || true
 
 # (b) with no pre-existing hooks.json, two overlapping runs must remove the
 #     gate entirely — a stale gate silently neuters every agy session there.
-( bash "$S/run_reviewers.sh" --base main --out "$T/oc3" --reviewers antigravity --timeout 60 >/dev/null 2>&1 ) &
+( bash "$S/run_reviewers.sh" --base main --out "$T/oc3" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 ) &
 gate_p3=$!
 ( bash "$S/run_reviewers.sh" --base main --out "$T/oc4" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 ) &
 gate_p4=$!
@@ -1596,7 +1596,7 @@ printf '{"my-own-hook": {"PreToolUse": []}}\n' >"$REPO/.agents/.cross-review-gat
 crash_orig_sum="$(shasum "$REPO/.agents/.cross-review-gate.orig" | awk '{print $1}')"
 printf '{"cross-review-shell-gate": {"PreToolUse": []}}\n' >"$REPO/.agents/hooks.json"
 printf '999999\n' >"$REPO/.agents/.cross-review-gate.holders"   # PID that cannot be alive
-bash "$S/run_reviewers.sh" --base main --out "$T/oc6" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+bash "$S/run_reviewers.sh" --base main --out "$T/oc6" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 || true
 assert_eq "crash recovery restores the user's ORIGINAL hooks.json, not the stale gate" \
   "$(shasum "$REPO/.agents/hooks.json" 2>/dev/null | awk '{print $1}')" "$crash_orig_sum"
 rm -rf "$REPO/.agents"
@@ -1606,13 +1606,13 @@ mkdir -p "$REPO/.agents"
 sleep 120 & gate_live_pid=$!
 printf '%s\n' "$gate_live_pid" >"$REPO/.agents/.cross-review-gate.holders"
 printf '{"cross-review-shell-gate": {"PreToolUse": []}}\n' >"$REPO/.agents/hooks.json"
-bash "$S/run_reviewers.sh" --base main --out "$T/oc5" --reviewers antigravity --timeout 60 >/dev/null 2>&1 || true
+bash "$S/run_reviewers.sh" --base main --out "$T/oc5" --reviewers gemini-pro --timeout 60 >/dev/null 2>&1 || true
 assert_eq "a run does not tear down a gate another live run is using" \
   "$([[ -f "$REPO/.agents/hooks.json" ]] && echo kept || echo REMOVED)" "kept"
 kill "$gate_live_pid" 2>/dev/null || true
 rm -rf "$REPO/.agents"
 
-printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\nprintf "shim review: no findings\\n"\n' >"$T/bin/agy"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 4 Argon (High)\\n"; fi\nprintf "shim review: no findings\\n"\n' >"$T/bin/agy"
 chmod +x "$T/bin/agy"
 
 echo "── agy gate message survives an apostrophe (shell quoting) ──"
@@ -1634,7 +1634,7 @@ fi
 
 echo "── agy model detection survives the models-listing rename ──"
 # [pin: 2026-08-03 — agy 1.1.10 changed `agy models` from display names
-# ("Gemini 3.1 Pro (High)") to slugs ("gemini-3.1-pro-high"). The detection
+# ("Gemini 4 Argon (High)") to slugs ("gemini-4-argon-high"). The detection
 # grep matched only the old shape, so gemini-pro silently false-negatived out
 # of every roster while the lap itself was perfectly healthy. Both shapes must
 # match, in detect_reviewers.sh AND select_roster.sh.]
@@ -1644,7 +1644,7 @@ echo "── agy model detection survives the models-listing rename ──"
 det_home="$T/dethome"
 det_cache="$det_home/.cross-review/cache/agy_models.txt"
 mkdir -p "$(dirname "$det_cache")"
-for shape in "Gemini 3.1 Pro (High)" "gemini-3.1-pro-high"; do
+for shape in "Gemini 4 Argon (High)" "gemini-4-argon-high"; do
   printf 'gemini-3.5-flash-high\n%s\n' "$shape" >"$det_cache"
   assert_eq "detect_reviewers sees gemini-pro in '$shape' listing" \
     "$(HOME="$det_home" PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "true"
@@ -1654,8 +1654,12 @@ done
 printf 'gemini-3.5-flash-high\ngemini-3.6-flash-low\n' >"$det_cache"
 assert_eq "detect_reviewers reports gemini-pro false when no Pro model is listed" \
   "$(HOME="$det_home" PATH="$T/bin:$PATH" bash "$SKILL_DIR/scripts/detect_reviewers.sh" 2>/dev/null | jq -r '."gemini-pro"')" "false"
-assert_contains "select_roster matches the slug shape too" \
-  "$(cat "$SKILL_DIR/scripts/select_roster.sh")" 'gemini[ ._-]?3'
+# Both scripts delegate the match to lib_agy_routes.sh, which derives the slug
+# shape from each routed display name (model names live only in the profile).
+assert_contains "select_roster delegates the match to the shared route matcher" \
+  "$(cat "$SKILL_DIR/scripts/select_roster.sh")" 'agy_routes_listed'
+assert_contains "the shared matcher matches the slug shape too" \
+  "$(cat "$SKILL_DIR/scripts/lib_agy_routes.sh")" "slug="
 
 echo "── agy silent model fallback is surfaced, not swallowed ──"
 # [pin: 2026-08-03 — `agy --model` NEVER errors on an unrecognised string; it
@@ -1664,7 +1668,7 @@ echo "── agy silent model fallback is surfaced, not swallowed ──"
 # diversity. The resolved model must be read back from agy's own log.]
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-3.1-pro-high\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-4-argon-high\n"; exit 0; fi
 while [ $# -gt 0 ]; do
   if [ "$1" = "--log-file" ]; then printf 'model_resolver.go:73] Resolving model Gemini 3.5 Flash (High)\n' >"$2"; fi
   shift
@@ -1681,21 +1685,21 @@ assert_contains "a silent Flash fallback on the Pro lap warns loudly" \
 # Matching model => no warning, and the field still round-trips.
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-3.1-pro-high\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "gemini-3.5-flash-high\ngemini-4-argon-high\n"; exit 0; fi
 while [ $# -gt 0 ]; do
-  if [ "$1" = "--log-file" ]; then printf 'model_resolver.go:73] Resolving model Gemini 3.1 Pro (High)\n' >"$2"; fi
+  if [ "$1" = "--log-file" ]; then printf 'model_resolver.go:73] Resolving model Gemini 4 Argon (High)\n' >"$2"; fi
   shift
 done
 printf 'shim review: no findings\n'
 exit 0
 SHIM
 chmod +x "$T/bin/agy"
-bash "$S/run_reviewers.sh" --base main --out "$T/o16" --reviewers gemini-pro --timeout 60 >/dev/null 2>"$T/o16.err" || true
+bash "$S/run_reviewers.sh" --base main --out "$T/o16" --reviewers gemini-pro --gemini-pro-route argon:high --timeout 60 >/dev/null 2>"$T/o16.err" || true
 assert_eq "no fallback warning when agy resolves the requested model" \
   "$(grep -c 'but agy resolved' "$T/o16.err" || true)" "0"
 assert_eq "matching resolution is still recorded in meta" \
-  "$(jq -r '.model_resolved' "$T/o16/gemini-pro.meta.json")" "Gemini 3.1 Pro (High)"
-printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+  "$(jq -r '.model_resolved' "$T/o16/gemini-pro.meta.json")" "Gemini 4 Argon (High)"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 4 Argon (High)\\n"; fi\n' >"$T/bin/agy"
 chmod +x "$T/bin/agy"
 
 echo "── agy shell gate (headless permission deadlock) ──"

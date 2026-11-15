@@ -270,12 +270,21 @@ cr "$T/o2" --base main --reviewers kimi --paths docs/ --timeout-kimi 30
 assert_contains "docs/ in scope -> the doc NOTE appears" "$(cat "$T/kimi.prompt")" "this diff touches documentation"
 
 echo "── agy prompt ──"
-cr "$T/o3" --base main --reviewers antigravity --paths src/ --timeout-antigravity 30
+# Its own --subject-id, so this is pass 1 of that subject: the router measures
+# the diff only on a first pass, and earlier rounds here already reviewed src/.
+cr "$T/o3" --base main --reviewers gemini-pro --paths src/ --timeout-gemini-pro 30 --subject-id gp-router
 AGY="$(cat "$T/agy.prompt" 2>/dev/null || echo MISSING)"
 assert_contains "agy: in-scope hunk" "$AGY" "IN_SCOPE_MARKER_b2"
 assert_not_contains "agy: no out-of-scope hunk" "$AGY" "OUT_SCOPE_MARKER_d4"
 assert_not_contains "agy: no out-of-scope file in --stat" "$AGY" "other/out.ts"
 assert_contains "agy: scope statement" "$AGY" "Review ONLY changes in these paths; other files are context"
+# The Gemini router picks a model by diff size. On a scoped round that is the
+# size of the diff the seat is sent, not of the whole branch.
+_gp_scoped="$(cd "$REPO" && git diff main...HEAD -- src/ | wc -l | tr -d ' ')"
+_gp_whole="$(cd "$REPO" && git diff main...HEAD | wc -l | tr -d ' ')"
+assert_eq "fixture: the scoped diff is smaller than the whole one" "$([[ "$_gp_scoped" -gt 0 && "$_gp_scoped" -lt "$_gp_whole" ]] && echo smaller || echo "not smaller ($_gp_scoped vs $_gp_whole)")" "smaller"
+assert_eq "gemini-pro: the router measures the scoped diff" "$(jq -r .diff_lines "$T/o3/gemini-pro.meta.json" 2>/dev/null)" "$_gp_scoped"
+assert_contains "gemini-pro: …and its route reason reports that size" "$(jq -r .route_reason "$T/o3/gemini-pro.meta.json" 2>/dev/null)" "lines=$_gp_scoped"
 
 echo "── tool loop: scope note ──"
 ( cd "$REPO" && CROSS_REVIEW_TOOL_MODE=read bash "$S/run_reviewers.sh" --base main --out "$T/o4" --reviewers glm --paths src/ --timeout-glm 60 >"$T/o4.log" 2>&1 )
