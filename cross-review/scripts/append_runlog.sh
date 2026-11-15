@@ -325,7 +325,12 @@ reviewer_obj() {
                        elif .failure_kind == "no_verdict_output" then "no_verdict"
                        elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
                        elif .exit_code == 0 then "empty"
-                       else "failed" end)}' "$meta" 2>/dev/null \
+                       else "failed" end)}
+        # `paths` (the pathspec array) is stamped on every lane meta.json by a
+        # --paths round; the ENTRY carries it once (top level), so the per-lane
+        # rows keep only the small `paths_mode` and a 20-lane row does not
+        # repeat it 20 times.
+        | del(.paths)' "$meta" 2>/dev/null \
     || echo '{"status":"failed","reason":"meta_unparseable"}'
 }
 
@@ -528,6 +533,30 @@ if [[ -f "$run_dir/context.json" ]]; then
   wrapper_branch_val="$(jq -r '.wrapper_branch // empty' "$run_dir/context.json" 2>/dev/null)"
 fi
 
+# paths / paths_hash / paths_mode: a --paths round's scope, from context.json
+# (worktree.sh start) or, failing that, the first lane meta.json that carries
+# them. Additive and optional -- absent on every full-diff round, and readers
+# treat absence as "the whole diff" (ledger schema-version policy: additive
+# fields do not bump SCHEMA_VERSION).
+paths_json="null"; paths_hash_val=""; paths_mode_val=""
+for _pf in "$run_dir/context.json" "$run_dir"/raw/*.meta.json "$run_dir"/*.meta.json; do
+  [[ -f "$_pf" ]] || continue
+  _pj="$(jq -c 'if (.paths | type) == "array" and (.paths | length) > 0 then .paths else empty end' "$_pf" 2>/dev/null)"
+  if [[ -n "$_pj" ]]; then
+    paths_json="$_pj"
+    paths_hash_val="$(jq -r '.paths_hash // empty' "$_pf" 2>/dev/null)"
+    paths_mode_val="$(jq -r '.paths_mode // empty' "$_pf" 2>/dev/null)"
+    # context.json says "filtered" (the round's intent); a lane that could not
+    # honour it (codex forced onto --base) makes the round "mixed".
+    _lane_metas=()
+    for _lm in "$run_dir"/raw/*.meta.json "$run_dir"/*.meta.json; do [[ -f "$_lm" ]] && _lane_metas+=("$_lm"); done
+    if [[ ${#_lane_metas[@]} -gt 0 ]] && jq -e -s 'map(select(.paths_mode == "base_unfiltered")) | length > 0' "${_lane_metas[@]}" >/dev/null 2>&1; then
+      paths_mode_val="mixed"
+    fi
+    break
+  fi
+done
+
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 entry=$(jq -nc \
@@ -573,6 +602,9 @@ entry=$(jq -nc \
   --arg wrapper_sha "$wrapper_sha_val" \
   --arg wrapper_dirty "$wrapper_dirty_val" \
   --arg wrapper_branch "$wrapper_branch_val" \
+  --argjson paths "$paths_json" \
+  --arg paths_hash "$paths_hash_val" \
+  --arg paths_mode "$paths_mode_val" \
   '{codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, "glm-coding": $glm_coding, glm: $glm,
     deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
     devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
@@ -608,7 +640,10 @@ entry=$(jq -nc \
   + (if $synthetic then {synthetic: true} else {} end)
   + (if $wrapper_sha == "" then {} else {wrapper_sha: $wrapper_sha} end)
   + (if $wrapper_dirty == "" then {} else {wrapper_dirty: ($wrapper_dirty == "true")} end)
-  + (if $wrapper_branch == "" then {} else {wrapper_branch: $wrapper_branch} end)')
+  + (if $wrapper_branch == "" then {} else {wrapper_branch: $wrapper_branch} end)
+  + (if $paths == null then {} else {paths: $paths} end)
+  + (if $paths == null or $paths_hash == "" then {} else {paths_hash: $paths_hash} end)
+  + (if $paths == null then {} else {paths_mode: (if $paths_mode == "" then "filtered" else $paths_mode end)} end)')
 
 # JSONL — one line, append-only, under the shared ledger lock. Rows are ~7KB,
 # far past PIPE_BUF, and an unlocked append on macOS (no flock) spliced two

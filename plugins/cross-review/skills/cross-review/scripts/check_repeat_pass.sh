@@ -39,6 +39,13 @@
 #   check_repeat_pass.sh --record --project <p> --branch <b> --base-sha <sha> --head-sha <sha>
 #   check_repeat_pass.sh --pass-context [--project <p>] [--branch <b>]
 #
+# --paths-hash <h> (any mode above) scopes the state key to a --paths round: a
+# round restricted to a set of pathspecs is a DIFFERENT review from the full
+# diff of the same subject (and from a round over other paths), so it must not
+# see -- or be refused by -- their records, and must not inherit their pass
+# count (the codex effort ladder steps down on it). Without the flag the key is
+# exactly what it always was.
+#
 # --pass-context is a QUERY, not a gate: it prints the pass number of the round
 # ABOUT TO RUN (1 for a first pass, 2 for the next, ...) and exits 0, derived
 # from the SAME record and the SAME staleness rule the block above uses. It
@@ -63,6 +70,7 @@
 set -uo pipefail
 
 project=""; branch=""; base_sha=""; head_sha=""; target_ref=""
+paths_hash=""
 state_dir=""; window_hours="${CROSS_REVIEW_REPEAT_WINDOW_HOURS:-24}"
 record=0; allow="${CROSS_REVIEW_ALLOW_FULL_REREVIEW:-0}"; pass_context=0
 
@@ -74,6 +82,7 @@ while [[ $# -gt 0 ]]; do
     --base-sha)            need_val "$1" "$#"; base_sha="$2";     shift 2 ;;
     --head-sha)            need_val "$1" "$#"; head_sha="$2";     shift 2 ;;
     --target-ref)          need_val "$1" "$#"; target_ref="$2";   shift 2 ;;
+    --paths-hash)          need_val "$1" "$#"; paths_hash="$2";   shift 2 ;;
     --state-dir)           need_val "$1" "$#"; state_dir="$2";    shift 2 ;;
     --window-hours)        need_val "$1" "$#"; window_hours="$2"; shift 2 ;;
     --record)              record=1; shift ;;
@@ -139,7 +148,13 @@ key_of() {
   # limit; the digest carries uniqueness regardless.
   printf '%s.%s' "${flat:0:80}" "$digest"
 }
-key="$(key_of "${project}//${branch}")"
+# The pathspec digest joins the key ONLY when set, so every existing record
+# (and every full-diff round) keeps the key it always had.
+if [[ -n "$paths_hash" ]]; then
+  key="$(key_of "${project}//${branch}//paths:${paths_hash}")"
+else
+  key="$(key_of "${project}//${branch}")"
+fi
 rec="$state_dir/$key.json"
 
 now_epoch="$(date +%s)"

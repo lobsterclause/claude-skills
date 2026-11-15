@@ -158,3 +158,12 @@ Authorization: Bearer $ZAI_API_KEY        # header reaches curl on stdin, never 
 - **antigravity + gemini-pro share one `agy` auth + rate limit.** Running both concurrently can trip Google rate limits; the wrapper staggers spawns by 2s to soften the simultaneous-handshake case. Empty stdout from either usually means the shared auth expired — `agy login` once.
 - **kimi will print "To resume this session: kimi -r <uuid>" at the end** of every `--print` run (to stderr). Harmless, just noise in the log. Don't confuse it with an error.
 - **codex and the two agy reviewers will read files in the repo** (kimi runs diff-only, no tools). If the repo contains untrusted input (e.g., fixture data for a parser), be aware that this is being sent to external providers — OpenAI (codex), Google (agy), and Moonshot (kimi, a China-origin provider). Worth flagging for security-sensitive or export-controlled work.
+## codex with `--paths` (path-scoped rounds)
+
+`codex exec review --base <branch>` runs its own diff and cannot be restricted to a set of paths. When `run_reviewers.sh` is given `--paths`, it drops `--base` and runs
+
+```
+codex exec review -c 'approval_policy="never"' -c 'sandbox_mode="workspace-write"' [-m <model>] [-c model_reasoning_effort=...] -   < prompt
+```
+
+where `prompt` is `references/review_prompt.txt` plus the scope statement and the **filtered** diff (`<diff>…</diff>`, 8000-line cap) — the "omit `--base` and describe the setup in the prompt" pattern from the gotcha above. The trailing `-` reads the prompt from stdin so a large diff never rides in argv. Workspace access is unchanged. `CROSS_REVIEW_CODEX_FORCE_BASE=1` / `--codex-force-base` goes back to `--base` (unfiltered; `paths_mode: "base_unfiltered"`). The stdin-prompt form is exercised only against a PATH shim in `tests/test_paths.sh`; confirm it against a real codex-cli before relying on it.

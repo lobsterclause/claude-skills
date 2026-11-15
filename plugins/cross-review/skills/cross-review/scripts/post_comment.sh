@@ -384,8 +384,20 @@ case "$mode" in
       wrapper_sha="$(jq -r '.wrapper_sha // empty' "$run_dir/context.json" 2>/dev/null)"
       [[ "$wrapper_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || wrapper_sha=""
     fi
+    # --paths scope (additive, optional): a path-scoped round reviewed only part
+    # of the diff, and a record that says "Reviewed <sha>" alone reads as full
+    # coverage. Carried as a trailing `paths=<hash>` marker token plus a visible
+    # Scope line; absent on every full-diff round, so those comments are
+    # byte-identical to before.
+    paths_hash_tok=""; paths_scope_line=""
+    if [[ -f "$run_dir/context.json" ]] && command -v jq >/dev/null 2>&1; then
+      _ph="$(jq -r '.paths_hash // empty' "$run_dir/context.json" 2>/dev/null)"
+      [[ "$_ph" =~ ^[0-9a-f]{8,64}$ ]] && paths_hash_tok="$_ph"
+      _pc="$(jq -r 'if (.paths | type) == "array" and (.paths | length) > 0 then (.paths | map("`" + (. | gsub("[`\\n]"; "")) + "`") | join(", ")) else empty end' "$run_dir/context.json" 2>/dev/null)"
+      [[ -n "$_pc" ]] && paths_scope_line="**Scope: path-scoped round — only changes in ${_pc} were reviewed; this is NOT a review of the whole diff.**"
+    fi
     marker=""
-    # Field order is `sha= pass= [wrapper=] [base=] [digest=] [verdict=]`: the
+    # Field order is `sha= pass= [wrapper=] [base=] [digest=] [verdict=] [paths=]`: the
     # `sha=<40> pass=<n>` prefix is byte-stable (pinned by #148's
     # test_wrapper_sha and CR_MARKER_RE); every parser (read_stamp.sh,
     # post_comment's pass capture, the currency CI) matches fields by name.
@@ -399,6 +411,7 @@ case "$mode" in
       [[ -n "$base_sha" ]] && marker+=" base=${base_sha}"
       [[ -n "$digest" ]] && marker+=" digest=${digest}"
       [[ -n "$verdict" ]] && marker+=" verdict=${verdict}"
+      [[ -n "$paths_hash_tok" ]] && marker+=" paths=${paths_hash_tok}"
       marker+=" -->"
     fi
 
@@ -407,6 +420,7 @@ case "$mode" in
       [[ -n "$marker" ]] && printf '%s\n\n' "$marker"
       [[ -n "$staleness" ]] && printf '%s' "$staleness"
       printf '_Automated review by %s.%s See the "Findings" collapsible for specifics._\n\n' "$roster_line" "${provenance:+ $provenance}"
+      [[ -n "$paths_scope_line" ]] && printf '%s\n\n' "$paths_scope_line"
       printf '<details><summary>Findings</summary>\n\n'
       cat "$findings"
       printf '\n</details>\n'
