@@ -531,7 +531,7 @@ fix: address cross-review findings (pass <N>)
 
 - <terse summary of what changed>
 
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+<the Co-Authored-By line from this session's commit attribution guidance>
 EOF
 )"
 ```
