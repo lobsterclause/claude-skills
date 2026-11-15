@@ -179,6 +179,51 @@ pr_json "$OLD" >"$CR_TEST_FIXTURE"
 body="$(post "$FULL" --verdict CLEAN)"
 assert_contains "control: a full-diff record's banner keeps its wording" "$body" "Reviewed \`${H:0:9}\`, current head is \`${OLD:0:9}\`"
 
+echo "── a round scoped by run_reviewers.sh alone is off the gate too ──"
+# run_reviewers.sh takes --paths without worktree.sh start, and then the scope
+# is recorded in each lane's raw/<reviewer>.meta.json and nowhere else. Such a
+# run dir has no context.json, or one that worktree.sh wrote for a full diff.
+# shellcheck disable=SC1091
+. "$S/lib_paths.sh"
+LANE_PH="$(printf 'apps/web/\ndocs/\n' | cr_paths_hash)"
+mklane() {  # mklane <name> <lane paths JSON | none> <context: none|full> → a run dir
+  local d="$T/runs/$1"; mkdir -p "$d/raw"
+  printf '# findings\n\nnothing to report\n' >"$d/findings.md"
+  if [[ "$2" == "none" ]]; then
+    printf '{"exit_code":0,"duration_s":5}\n' >"$d/raw/codex.meta.json"
+  else
+    printf '{"exit_code":0,"duration_s":5,"paths":%s,"paths_mode":"filtered"}\n' "$2" >"$d/raw/codex.meta.json"
+  fi
+  printf 'not json\n' >"$d/raw/broken.meta.json"   # one unreadable lane must not hide the others
+  [[ "$3" == "full" ]] && printf '{"head_sha":"%s","base_sha":"%s"}\n' "$H" "$OLD" >"$d/context.json"
+  printf '%s' "$d"
+}
+for ctx in none full; do
+  LANE="$(mklane "lane-$ctx" '["docs/","apps/web/"]' "$ctx")"
+  pr_json "$H" >"$CR_TEST_FIXTURE"
+  body="$(post "$LANE" --verdict CLEAN)"
+  assert_eq "[context $ctx] a CLEAN record carries no stamp a gate selects on" "$(gate_stamps "$body")" "0"
+  m="$(grep -o '<!-- cross-review-scoped: [^>]*-->' <<<"$body" | head -1)"
+  assert_contains "[context $ctx] its marker is the scoped one" "$m" "<!-- cross-review-scoped: sha=$H pass="
+  assert_contains "[context $ctx] …with the hash worktree.sh would have recorded" "$m" " paths=$LANE_PH -->"
+  assert_contains "[context $ctx] the Scope line names the paths" "$body" "only changes in \`apps/web/\`, \`docs/\` were reviewed"
+  assert_eq "[context $ctx] read_stamp.sh sees no stamp" "$(stamped "$body")" "false"
+  assert_not_contains "[context $ctx] merge_preflight does not clear on it" "$(pf "$H" "$body")" "clear"
+  assert_eq "[context $ctx] the currency CI does not pass on it" "$(cv "$body")" "failure"
+  pr_json "$H" >"$CR_TEST_FIXTURE"
+  body="$(post "$LANE" --verdict NEEDS_DECISION)"
+  assert_contains "[context $ctx] NEEDS_DECISION keeps the ordinary marker, with the paths token" \
+    "$(grep -o '<!-- cross-review: [^>]*-->' <<<"$body" | head -1)" " verdict=NEEDS_DECISION paths=$LANE_PH -->"
+done
+LANE0="$(mklane lane-unscoped none full)"
+pr_json "$H" >"$CR_TEST_FIXTURE"
+body="$(post "$LANE0" --verdict CLEAN)"
+m="$(grep -o '<!-- cross-review: [^>]*-->' <<<"$body" | head -1)"
+assert_contains "control: lanes with no paths leave a full-diff record" "$m" "<!-- cross-review: sha=$H pass=1 "
+assert_contains "…that ends at the verdict" "$m" " verdict=CLEAN -->"
+assert_not_contains "…with no Scope line" "$body" "Scope:"
+assert_eq "…and it clears at the head (preflight)" "$(pf "$H" "$body")" "clear 0"
+
 echo "── scoped records still count toward the next pass number ──"
 prior_scoped="$(printf '## Cross-review — pass 3\n\n<!-- cross-review-scoped: sha=%s pass=3 verdict=CLEAN paths=%s -->\n' "$OLD" "$PH")"
 pr_json "$H" "$(full "$OLD" CLEAN)" "$prior_scoped" >"$CR_TEST_FIXTURE"

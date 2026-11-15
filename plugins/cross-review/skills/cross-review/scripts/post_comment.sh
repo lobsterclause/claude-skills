@@ -35,6 +35,11 @@
 
 set -uo pipefail
 
+# --paths hashing shared with worktree.sh and run_reviewers.sh, so a scope read
+# back from lane metadata gets the hash those two would have recorded.
+# shellcheck source=lib_paths.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_paths.sh"
+
 pr=""
 repo=""
 mode="summary"
@@ -317,6 +322,37 @@ case "$mode" in
       [[ "$_ph" =~ ^[0-9a-f]{8,64}$ ]] && paths_hash_tok="$_ph"
       _pc="$(jq -r 'if (.paths | type) == "array" and (.paths | length) > 0 then (.paths | map("`" + (. | gsub("[`\\n]"; "")) + "`") | join(", ")) else empty end' "$run_dir/context.json" 2>/dev/null)"
       [[ -n "$_pc" ]] && paths_scope_line="**Scope: path-scoped round — only changes in ${_pc} were reviewed; this is NOT a review of the whole diff.**"
+    fi
+    # context.json is not the only place a scope is recorded. worktree.sh start
+    # writes it there, but run_reviewers.sh takes --paths on its own, and then
+    # the only record is the `paths` array it stamps into every lane's
+    # raw/<reviewer>.meta.json. Reading context.json alone, such a round was
+    # posted as a full-diff record and a CLEAN verdict over two directories
+    # cleared the merge — the hole the block below exists to close, open on
+    # this route. So when context.json names no scope, ask the lanes.
+    #
+    # Any lane that carries `paths` makes the record scoped: the mistake that
+    # costs something is calling a partial review complete, not the reverse.
+    # Each file is read on its own so one unreadable meta.json cannot hide the
+    # rest, and the hash is the one worktree.sh would have recorded for the
+    # same set (lib_paths.sh).
+    if [[ -z "$paths_hash_tok" && -z "$paths_scope_line" && -d "$raw_dir" ]] && command -v jq >/dev/null 2>&1; then
+      _lane_paths=""
+      for m in "$raw_dir"/*.meta.json; do
+        [[ -f "$m" ]] || continue
+        _lp="$(jq -r '(.paths? // empty) | arrays | .[] | strings' "$m" 2>/dev/null)" || continue
+        [[ -n "$_lp" ]] && _lane_paths+="$_lp"$'\n'
+      done
+      # Already normalised by run_reviewers.sh; sort -u only merges the lanes.
+      # Deliberately not re-validated: a scope this script cannot parse is
+      # still a scope, and dropping it would put the record back on the gate.
+      _lane_paths="$(printf '%s' "$_lane_paths" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u)"
+      if [[ -n "$_lane_paths" ]]; then
+        paths_hash_tok="$(printf '%s\n' "$_lane_paths" | cr_paths_hash)"
+        _pc="$(printf '%s\n' "$_lane_paths" | jq -R . | jq -sr 'map("`" + gsub("`"; "") + "`") | join(", ")' 2>/dev/null)"
+        [[ -n "$_pc" ]] || _pc="the paths recorded in this run's lane metadata"
+        paths_scope_line="**Scope: path-scoped round — only changes in ${_pc} were reviewed; this is NOT a review of the whole diff.**"
+      fi
     fi
 
     # A PATH-SCOPED RECORD MUST NOT CLEAR A MERGE.
