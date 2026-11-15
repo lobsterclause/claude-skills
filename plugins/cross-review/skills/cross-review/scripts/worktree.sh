@@ -116,7 +116,10 @@ case "$cmd" in
         --ref)  need_val --ref  "$#"; ref="$2";  shift 2 ;;
         --id)   need_val --id   "$#"; id="$2";   shift 2 ;;
         --base) need_val --base "$#"; base="$2"; shift 2 ;;
-        --paths|--path) need_val "$1" "$#"; paths_raw+=("$2"); shift 2 ;;
+        # --paths is a comma list; --path is ONE pathspec, comma and all (see
+        # lib_paths.sh). paths_raw holds newline-separated pathspecs either way.
+        --paths) need_val "$1" "$#"; paths_raw+=("$(cr_paths_csv "$2")"); shift 2 ;;
+        --path)  need_val "$1" "$#"; paths_raw+=("$2"); shift 2 ;;
         --allow-empty-paths) allow_empty_paths=1; shift ;;
         --allow-non-ancestor-base) allow_non_ancestor=1; shift ;;
         *) echo "unknown arg: $1" >&2; usage ;;
@@ -126,12 +129,12 @@ case "$cmd" in
     # Flags win over the environment (an explicit --paths is a decision, the
     # env var is a default).
     if [[ ${#paths_raw[@]} -eq 0 && -n "${CROSS_REVIEW_PATHS:-}" ]]; then
-      paths_raw=("$CROSS_REVIEW_PATHS")
+      paths_raw=("$(cr_paths_csv "$CROSS_REVIEW_PATHS")")
     fi
     paths_list=""
     ps_args=()
     if [[ ${#paths_raw[@]} -gt 0 ]]; then
-      paths_list="$(cr_paths_normalise "${paths_raw[@]}")" || exit 2
+      paths_list="$(cr_paths_normalise_lines "${paths_raw[@]}")" || exit 2
       while IFS= read -r _pp; do ps_args+=("$_pp"); done <<<"$paths_list"
       ps_args=(-- "${ps_args[@]}")
     fi

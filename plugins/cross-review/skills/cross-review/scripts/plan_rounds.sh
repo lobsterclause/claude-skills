@@ -82,7 +82,10 @@ fi
 plan="$(printf '%s\n' "$numstat" | jq -R -s -c \
   --argjson max "$max_lines" --arg mode "$group_by" \
   --arg base "$base" --arg ref "$ref" --arg bsha "$base_sha" --arg hsha "$ref_sha" '
-  def lit($p): if ($p | test("[*?\\[\\\\]")) then ":(literal)" + $p else $p end;
+  # A changed path is a filename, not a pattern. git reads glob characters in a
+  # pathspec as a pattern and a leading ":" as pathspec magic (":(exclude)x",
+  # ":!x", ":/x"), so either kind of name is emitted with the literal magic.
+  def lit($p): if ($p | test("^:|[*?\\[\\\\]")) then ":(literal)" + $p else $p end;
   # files: [{path, lines, parts}]
   (split("\n") | map(select(length > 0) | split("\t")
       | select(length >= 3)

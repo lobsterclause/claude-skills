@@ -364,6 +364,84 @@ assert_eq "…and JSON on stdout" "$(jq -r .group_by <<<"$BOTH")" "dir"
 assert_eq "plan_rounds refuses the descendant-base trap (exit 3)" "$RC" "3"
 ( cd "$PR" && bash "$S/plan_rounds.sh" --base main --ref main >/dev/null 2>&1 ); assert_eq "empty diff: exit 1" "$?" "1"
 
+# ── pathspecs the shell or git would otherwise reinterpret (PR #199 pass 1) ──
+# One fixture for three defects that all turned a pathspec into a different set
+# of files without saying so: a wildcard expanded against the checkout, a comma
+# inside a `--path` value split in two, and a filename starting with ":" read by
+# git as pathspec magic.
+ODD="$T/oddrepo"; mkdir -p "$ODD"
+(
+  cd "$ODD" || exit 1
+  git init -q -b main 2>/dev/null || git init -q
+  git config user.email t@t; git config user.name t
+  mkdir -p src
+  printf 'kept v1\n' >src/kept.ts
+  printf 'gone 1\ngone 2\ngone 3\ngone 4\ngone 5\n' >src/gone.ts
+  git add -A; git commit -qm init
+  git checkout -qb feat
+  mkdir -p dir ':odddir'
+  printf 'kept v2\n' >src/kept.ts
+  git rm -q src/gone.ts
+  printf 'c1\nc2\nc3\n' >'dir/a,b.ts'
+  printf 'odd\n' >':odd.txt'
+  printf 'excl\n' >':(exclude)keep.txt'
+  printf 'keep\n' >keep.txt
+  printf 'inner\n' >':odddir/f.txt'
+  printf 'q\n' >'q?.txt'
+  git add -A; git commit -qm change
+)
+OWTS() { ( cd "$ODD" && bash "$S/worktree.sh" start --ref feat --base main "$@" ); }
+
+echo "── a wildcard pathspec reaches git unexpanded ──"
+assert_eq "cr_paths_normalise keeps src/*.ts when files in cwd match it" \
+  "$(cd "$ODD" && cr_paths_normalise 'src/*.ts' | tr '\n' '|')" "src/*.ts|"
+assert_eq "…so the paths hash does not depend on the checkout" \
+  "$(cd "$ODD" && cr_paths_normalise 'src/*.ts' | cr_paths_hash)" "$(cd "$T" && cr_paths_normalise 'src/*.ts' | cr_paths_hash)"
+GLOB="$(OWTS --paths 'src/*.ts' --id odd-glob 2>/dev/null)"
+assert_eq "worktree.sh records the wildcard itself" "$(jq -c .paths <<<"$GLOB")" '["src/*.ts"]'
+assert_eq "…and a file the change DELETED is still in the round (2 files)" "$(jq -r .size_files <<<"$GLOB")" "2"
+
+echo "── --path keeps a comma; --paths still splits on one ──"
+assert_eq "cr_paths_normalise_lines does not split on a comma" \
+  "$(cr_paths_normalise_lines 'dir/a,b.ts' | tr '\n' '|')" "dir/a,b.ts|"
+assert_eq "…and mixes with a comma list" \
+  "$(cr_paths_normalise_lines "$(cr_paths_csv 'y/, x/')" 'dir/a,b.ts' | tr '\n' '|')" "dir/a,b.ts|x/|y/|"
+COMMA="$(OWTS --path 'dir/a,b.ts' --id odd-comma 2>/dev/null)"
+assert_eq "worktree.sh --path: one pathspec, comma intact" "$(jq -c .paths <<<"$COMMA")" '["dir/a,b.ts"]'
+assert_eq "…matching the one file" "$(jq -r .size_files <<<"$COMMA")" "1"
+OWTS --paths 'dir/a,b.ts' --id odd-comma-list >/dev/null 2>"$T/oddc.err"; RC=$?
+assert_eq "worktree.sh --paths: the same value is two pathspecs, which match nothing (exit 3)" "$RC" "3"
+CROSS_REVIEW_PATHS='src/kept.ts,keep.txt' OWTS --id odd-env >"$T/odde.out" 2>/dev/null
+assert_eq "CROSS_REVIEW_PATHS is a comma list" "$(jq -c .paths "$T/odde.out")" '["keep.txt","src/kept.ts"]'
+mkdir -p "$T/oc1"
+( cd "$ODD" && bash "$S/run_reviewers.sh" --base main --out "$T/oc1" --reviewers kimi --path 'dir/a,b.ts' --timeout-kimi 30 >"$T/oc1.log" 2>&1 ); RC=$?
+assert_eq "run_reviewers --path with a comma runs" "$RC" "0"
+assert_eq "…and the lane meta records one pathspec" "$(jq -c .paths "$T/oc1/kimi.meta.json" 2>/dev/null)" '["dir/a,b.ts"]'
+ODD_RUN="$(jq -r .run_dir <<<"$COMMA")"
+( cd "$ODD" && bash "$S/run_reviewers.sh" --base main --out "$ODD_RUN/raw" --reviewers kimi --timeout-kimi 30 >"$T/oc2.log" 2>&1 ); RC=$?
+assert_eq "the pathspec read back from context.json is not re-split" "$RC" "0"
+assert_eq "…same single pathspec in the lane meta" "$(jq -c .paths "$ODD_RUN/raw/kimi.meta.json" 2>/dev/null)" '["dir/a,b.ts"]'
+
+echo "── plan_rounds.sh: every suggested pathspec selects exactly its own files ──"
+ODD_ALL="$(cd "$ODD" && git -c core.quotePath=false diff --no-renames --name-only main...feat | LC_ALL=C sort)"
+for mode in "dir 1" "top 1000"; do
+  OP="$(cd "$ODD" && bash "$S/plan_rounds.sh" --base main --ref feat --group-by "${mode% *}" --max-lines "${mode#* }" --format json)"
+  GOT="$(cd "$ODD" && jq -r '.rounds[].paths[]' <<<"$OP" | while IFS= read -r spec; do
+      git -c core.quotePath=false diff --no-renames --name-only main...feat -- "$spec"
+    done | LC_ALL=C sort)"
+  assert_eq "[$mode] the specs cover each changed file once, through git" "$GOT" "$ODD_ALL"
+  # …and through the pasteable flags, into worktree.sh
+  SUM=0; NR="$(jq '.rounds | length' <<<"$OP")"; i=0
+  while [[ "$i" -lt "$NR" ]]; do
+    eval "ARGS=($(jq -r ".rounds[$i].flags" <<<"$OP"))"
+    N="$(OWTS "${ARGS[@]}" --id "odd-plan-${mode% *}-$i" 2>/dev/null | jq -r '.size_files // 0')"
+    SUM=$((SUM + ${N:-0})); i=$((i + 1))
+  done
+  assert_eq "[$mode] the pasted flags add up to every changed file" "$SUM" "$(jq -r .total_files <<<"$OP")"
+done
+assert_contains "a leading-colon filename is made literal" \
+  "$(cd "$ODD" && bash "$S/plan_rounds.sh" --base main --ref feat --group-by dir --max-lines 1 --format json | jq -c '[.rounds[].paths[]]')" '":(literal):odd.txt"'
+
 echo
 echo "══ test_paths: $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

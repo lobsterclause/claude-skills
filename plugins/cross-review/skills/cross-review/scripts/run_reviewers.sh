@@ -350,7 +350,10 @@ while [[ $# -gt 0 ]]; do
     --snapshot-dir)       need_val --snapshot-dir       "$#"; snapshot_dir="$2";       shift 2 ;;
     --context-mode)       need_val --context-mode       "$#"; context_mode="$2";       shift 2 ;;
     --tool-mode)          need_val --tool-mode          "$#"; tool_mode="$2";          shift 2 ;;
-    --paths|--path)       need_val "$1"                 "$#"; paths_raw+=("$2");       shift 2 ;;
+    # --paths is a comma list; --path is ONE pathspec, comma and all (see
+    # lib_paths.sh). paths_raw holds newline-separated pathspecs either way.
+    --paths)              need_val "$1"                 "$#"; paths_raw+=("$(cr_paths_csv "$2")"); shift 2 ;;
+    --path)               need_val "$1"                 "$#"; paths_raw+=("$2");       shift 2 ;;
     --no-paths)           no_paths=1;                                                  shift ;;
     --allow-empty-paths)  allow_empty_paths=1;                                         shift ;;
     --allow-non-ancestor-base) allow_non_ancestor=1;                                   shift ;;
@@ -573,7 +576,7 @@ fi
 # read the same filtered set, so no lane can see a file another lane was told
 # is out of scope.
 if [[ "$no_paths" != 1 && ${#paths_raw[@]} -eq 0 && -n "${CROSS_REVIEW_PATHS:-}" ]]; then
-  paths_raw=("$CROSS_REVIEW_PATHS")
+  paths_raw=("$(cr_paths_csv "$CROSS_REVIEW_PATHS")")
 fi
 if [[ "$no_paths" != 1 && ${#paths_raw[@]} -eq 0 ]]; then
   for _cj in "$out/context.json" "$out/../context.json"; do
@@ -585,7 +588,10 @@ if [[ "$no_paths" != 1 && ${#paths_raw[@]} -eq 0 ]]; then
   done
 fi
 if [[ ${#paths_raw[@]} -gt 0 ]]; then
-  paths_list="$(cr_paths_normalise "${paths_raw[@]}")" || exit 2
+  # _lines, not the comma-splitting entry point: every element is already one
+  # pathspec per line, and the context.json route above hands back recorded
+  # pathspecs that may legitimately contain a comma.
+  paths_list="$(cr_paths_normalise_lines "${paths_raw[@]}")" || exit 2
   while IFS= read -r _pp; do ps_args+=("$_pp"); done <<<"$paths_list"
   ps_args=(-- "${ps_args[@]}")
   paths_hash="$(printf '%s\n' "$paths_list" | cr_paths_hash)"

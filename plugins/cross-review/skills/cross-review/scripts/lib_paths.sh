@@ -1,31 +1,53 @@
 #!/usr/bin/env bash
 # lib_paths.sh — the ONE place `--paths` pathspec lists are parsed, normalised
-# and hashed. Sourced by worktree.sh, run_reviewers.sh and plan_rounds.sh so the
-# three cannot disagree about what "the same set of paths" means (the repeat-
-# pass key and the context.json record both depend on that).
+# and hashed. Sourced by worktree.sh, run_reviewers.sh and post_comment.sh so
+# they cannot disagree about what "the same set of paths" means (the repeat-
+# pass key, the context.json record and the posted marker all depend on that).
 #
 # A round can be restricted to a set of git pathspecs (`--paths a/,b/*.ts`,
 # repeatable `--path`, or CROSS_REVIEW_PATHS). Normalisation is deliberately
 # boring and deterministic:
-#   - split on commas and newlines, trim surrounding whitespace
+#   - one pathspec per line, surrounding whitespace trimmed
 #   - strip a leading "./", drop empties
 #   - REFUSE an absolute path or any ".." component (a pathspec must stay inside
 #     the repo; git would reject it later with a far less useful message)
 #   - sort + dedupe, so "b,a" and "a,b,a" are the same round
-# A comma cannot appear inside one pathspec when passed as a single --paths
-# value; use repeated --path for a name that contains one.
+#
+# WHERE A COMMA SEPARATES, AND WHERE IT DOES NOT. `--paths` and
+# CROSS_REVIEW_PATHS are comma lists: callers pass their value through
+# cr_paths_csv, which turns each comma into a newline. A `--path` value and a
+# pathspec read back from context.json are ONE pathspec each and go to
+# cr_paths_normalise_lines untouched, so a name that contains a comma survives.
+# Both callers used to push the two flags into one array that was comma-split
+# as a whole, and `--path 'dir/a,b.ts'` became `dir/a` plus `b.ts`.
+#
+# A newline always separates: the normalised list is line-oriented everywhere
+# it is stored or hashed, so a pathspec cannot contain one.
+#
+# NOTHING HERE MAY WORD-SPLIT A PATHSPEC. The splitter used to be an unquoted
+# `for item in $raw`, which also ran pathname expansion: `src/*.ts` became the
+# files that happened to exist in the caller's working directory. A file the
+# change deleted then dropped out of the round without a message, and the paths
+# hash followed the checkout. Lines are read with `read -r`, which expands
+# nothing.
 #
 # bash 3.2 compatible (no mapfile, no associative arrays).
 
-# cr_paths_normalise <raw>... — prints the normalised pathspecs, one per line.
-# Returns 2 (message on stderr) on an invalid entry or when nothing is left.
-cr_paths_normalise() {
+# cr_paths_csv <value> — a comma-list value (`--paths`, CROSS_REVIEW_PATHS) as
+# newline-separated pathspecs, ready for cr_paths_normalise_lines.
+cr_paths_csv() {
+  local nl=$'\n'
+  printf '%s' "${1//,/$nl}"
+}
+
+# cr_paths_normalise_lines <raw>... — each argument is one pathspec, or several
+# separated by newlines. Commas are NOT separators here. Prints the normalised
+# pathspecs, one per line. Returns 2 (message on stderr) on an invalid entry or
+# when nothing is left.
+cr_paths_normalise_lines() {
   local raw item out="" rc=0
   for raw in "$@"; do
-    # newline -> comma so one loop handles both separators
-    raw="$(printf '%s' "$raw" | tr '\n' ',')"
-    local IFS=','
-    for item in $raw; do
+    while IFS= read -r item || [[ -n "$item" ]]; do
       # trim whitespace
       item="${item#"${item%%[![:space:]]*}"}"
       item="${item%"${item##*[![:space:]]}"}"
@@ -38,7 +60,7 @@ cr_paths_normalise() {
         */../*) echo "paths: pathspec with a '..' component refused: $item" >&2; rc=2; continue ;;
       esac
       out+="$item"$'\n'
-    done
+    done <<<"$raw"
   done
   [[ "$rc" -eq 0 ]] || return 2
   if [[ -z "$out" ]]; then
@@ -46,6 +68,15 @@ cr_paths_normalise() {
     return 2
   fi
   printf '%s' "$out" | LC_ALL=C sort -u
+}
+
+# cr_paths_normalise <raw>... — every argument is a comma list (commas and
+# newlines both separate). Same output and return codes as
+# cr_paths_normalise_lines.
+cr_paths_normalise() {
+  local raw args=()
+  for raw in "$@"; do args+=("$(cr_paths_csv "$raw")"); done
+  cr_paths_normalise_lines ${args[@]+"${args[@]}"}
 }
 
 # cr_paths_hash — reads normalised pathspecs on stdin, prints a 12-hex digest.
