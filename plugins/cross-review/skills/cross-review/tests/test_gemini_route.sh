@@ -153,8 +153,13 @@ assert_eq "listed pick is untouched" "$(field route_reason | sed 's/(.*//')" "pa
 printf 'gemini-4-argon-high-preview\tGemini 4 Argon Preview (High)\ngemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\n' >"$CROSS_REVIEW_AGY_MODELS_CACHE"
 run "$T/big" availsup
 assert_eq "argon-high-preview listed (not argon-high): falls to the listed route" "$MODEL" "Gemini 4 Hydrogen (XHigh)"
+# a cache past the 6h TTL is not authoritative -> no reroute
+printf 'gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\n' >"$CROSS_REVIEW_AGY_MODELS_CACHE"
+touch -t 202001010000 "$CROSS_REVIEW_AGY_MODELS_CACHE"
+run "$T/big" availstale
+assert_eq "stale cache is ignored: pick kept" "$MODEL" "Gemini 4 Argon (High)"
 # not in the roster -> the availability block stays silent
-printf 'gemini-9-other\tSome Other Model\n' >"$CROSS_REVIEW_AGY_MODELS_CACHE"
+printf '#!/bin/sh\nprintf "shim review: no findings\\n"\n' >"$T/bin/codex"; chmod +x "$T/bin/codex"
 ( cd "$T/big" && AGY_ARGV="$T/argv-x" CROSS_REVIEW_STATE_DIR="$T/state-nog" bash "$S/run_reviewers.sh" --base master --out "$T/out-nog" --reviewers codex >"$T/log-nog" 2>&1 )
 grep -q "not in .agy models" "$T/log-nog" && bad "warned although gemini-pro is not in the roster" || ok "no availability warning when gemini-pro is not requested"
 # roster gate admits only models the router can pick

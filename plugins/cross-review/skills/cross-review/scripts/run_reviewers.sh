@@ -830,6 +830,10 @@ fi
 if [[ -n "$gemini_pro_route" && ",${reviewers//[[:space:]]/}," == *,gemini-pro,* ]]; then
   _gp_cache="${CROSS_REVIEW_AGY_MODELS_CACHE:-$HOME/.cross-review/cache/agy_models.txt}"
   _gp_pick="$(profile_map_get gemini-pro routes "$gemini_pro_route")"
+  # A cache older than the selector's 6h TTL is not authoritative (an explicit
+  # --reviewers run bypasses select_roster.sh, which is what refreshes it):
+  # treat it as unknown rather than rerouting off a stale list.
+  [[ -n "$(find "$_gp_cache" -mmin +360 2>/dev/null)" ]] && _gp_cache=""
   if [[ -s "$_gp_cache" && -n "$_gp_pick" ]] && ! agy_model_listed "$_gp_cache" "$_gp_pick"; then
     _gp_alt=""
     for _gp_k in pass1 pass1_small pass2 pass3_plus; do

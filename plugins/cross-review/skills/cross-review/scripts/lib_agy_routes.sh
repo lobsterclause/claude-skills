@@ -18,7 +18,7 @@
 #     exit 0 when that one model is listed (display name or slug). run_reviewers.sh
 #     uses it to check the model the router ACTUALLY picked, not just "any route".
 agy_model_listed() {
-  local cache="$1" name="$2" slug esc
+  local cache="$1" name="$2" slug esc cand
   [[ -s "$cache" && -n "$name" ]] || return 1
   slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[()]//g; s/[[:space:]]+/-/g')"
   # Match at identifier boundaries, not as a substring: a listed

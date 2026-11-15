@@ -128,8 +128,8 @@ jq -rs --arg since "$since" '
       | "  \($r | . + "                 " | .[0:16]) | \($n | tostring | "    \(.)" | .[-4:])\(if $n < 20 then "*" else " " end)| \($to * 100 / $n | floor | tostring | "         \(.)%" | .[-10:]) | \(med($rows | map(.g.duration_s // 0)) | tostring | "        \(.)" | .[-8:]) | \((($rows | map(.g.findings_total // 0) | add) * 100 / $n | floor) / 100 | tostring | "            \(.)" | .[-12:]) | \((($rows | map(select(.verdict == "CLEAN")) | length) * 100 / $n | floor) | tostring | "     \(.)%" | .[-6:])"),
     "",
     "  by rule that fired (route_reason, pass number stripped):",
-    ($routed | group_by(.g.route_reason // "?" | sub("\\(.*$"; "")) | .[]
-      | "    \(.[0].g.route_reason // "?" | sub("\\(.*$"; "") | . + "                    " | .[0:20]) \(length) run(s)"),
+    ($routed | group_by(.g.route_reason // "?" | sub("\\([^)]*\\)"; "")) | .[]
+      | "    \(.[0].g.route_reason // "?" | sub("\\([^)]*\\)"; "") | . + "                    " | .[0:20]) \(length) run(s)"),
     "",
     "  timed_out    runs that hit their timeout budget. If argon:high or hydrogen:xhigh",
     "               times out on big diffs, add a route_timeout_s entry or demote it.",
