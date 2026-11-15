@@ -209,6 +209,22 @@ assert_contains "…and the doc NOTE fires" "$K0" "this diff touches documentati
 assert_not_contains "…and carries no scope statement" "$K0" "PATH-SCOPED"
 assert_eq "…and meta.json has no paths key" "$(jq -r 'has("paths")' "$T/o0/kimi.meta.json")" "false"
 
+echo "── a full-diff round dispatched over a scoped round's leftovers says so ──"
+# post_comment.sh posts a run dir as path-scoped when ANY lane in it carries
+# `paths` (a partial review must never read as complete), so a full-diff round
+# into a reused --out is kept off the merge gate by a lane it did not run. That
+# is found out at posting time, after the round is spent, unless the dispatch
+# says so.
+cp -R "$T/o1" "$T/o1r"
+cr "$T/o1r" --base main --reviewers kimi --timeout-kimi 30 --allow-full-rereview
+assert_eq "the unscoped rerun dispatches" "$(cat "$T/o1r.rc")" "0"
+assert_eq "…and rewrites its own lane without paths" "$(jq -r 'has("paths")' "$T/o1r/kimi.meta.json")" "false"
+assert_contains "…and warns that a scoped lane is still in the dir" "$(cat "$T/o1r.log")" \
+  "WARN: $T/o1r still holds lane output from a path-scoped round (glm.meta.json)"
+assert_contains "…and what that does to the record" "$(cat "$T/o1r.log")" "post_comment.sh will post this run as path-scoped"
+assert_not_contains "control: a fresh --out gets no such warning" "$(cat "$T/o0.log")" "still holds lane output from a path-scoped round"
+assert_not_contains "control: neither does a scoped round" "$(cat "$T/o1.log")" "still holds lane output from a path-scoped round"
+
 echo "── doc_narrative_risk fires when the .md IS in scope ──"
 cr "$T/o2" --base main --reviewers kimi --paths docs/ --timeout-kimi 30
 assert_contains "docs/ in scope -> the doc NOTE appears" "$(cat "$T/kimi.prompt")" "this diff touches documentation"

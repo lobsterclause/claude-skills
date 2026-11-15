@@ -336,9 +336,20 @@ case "$mode" in
     # Each file is read on its own so one unreadable meta.json cannot hide the
     # rest, and the hash is the one worktree.sh would have recorded for the
     # same set (lib_paths.sh).
-    if [[ -z "$paths_hash_tok" && -z "$paths_scope_line" && -d "$raw_dir" ]] && command -v jq >/dev/null 2>&1; then
+    #
+    # That includes a lane left behind by an earlier scoped round when the run
+    # dir was reused for a full-diff one. From the files alone it cannot be
+    # told apart from one lane re-run by itself after the rest were scoped, and
+    # reading that second case as a full review would clear a merge on a
+    # partial one. So both stay off the gate; run_reviewers.sh warns when a
+    # full-diff dispatch leaves a dir in that state.
+    #
+    # Both layouts are read. SKILL.md dispatches with `--out "$run_dir/raw"`
+    # and, on the rebased-history route, `--out "$run_dir"`, which puts the
+    # lanes beside findings.md with no raw/ at all.
+    if [[ -z "$paths_hash_tok" && -z "$paths_scope_line" ]] && command -v jq >/dev/null 2>&1; then
       _lane_paths=""
-      for m in "$raw_dir"/*.meta.json; do
+      for m in "$raw_dir"/*.meta.json "$run_dir"/*.meta.json; do
         [[ -f "$m" ]] || continue
         _lp="$(jq -r '(.paths? // empty) | arrays | .[] | strings' "$m" 2>/dev/null)" || continue
         [[ -n "$_lp" ]] && _lane_paths+="$_lp"$'\n'

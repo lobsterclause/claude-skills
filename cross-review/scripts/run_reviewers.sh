@@ -3322,6 +3322,22 @@ if [[ -n "$paths_list" ]]; then
     jq -c --argjson p "$_paths_json" --arg m "$_pm" '. + {paths: $p, paths_mode: $m}' "$_mf" >"$_mf.tmp" 2>/dev/null \
       && mv -f "$_mf.tmp" "$_mf" || rm -f "$_mf.tmp"
   done
+else
+  # A full-diff round into an --out that an earlier path-scoped round used. This
+  # round's own lanes were just rewritten without `paths`, so any meta.json
+  # still carrying one belongs to a lane this round did not run.
+  # post_comment.sh posts a run dir as scoped when any lane in it is (it cannot
+  # tell a leftover from a deliberate single-lane re-run), so say it here,
+  # before the round is synthesized and posted off the merge gate.
+  _stale_scoped=""
+  for _mf in "$out"/*.meta.json; do
+    [[ -f "$_mf" ]] || continue
+    jq -e '(.paths? // empty) | arrays | length > 0' "$_mf" >/dev/null 2>&1 || continue
+    _stale_scoped="${_stale_scoped:+$_stale_scoped, }$(basename "$_mf")"
+  done
+  if [[ -n "$_stale_scoped" ]]; then
+    echo "WARN: $out still holds lane output from a path-scoped round ($_stale_scoped). post_comment.sh will post this run as path-scoped, off the merge gate. For a full-diff record, dispatch into a fresh --out." >&2
+  fi
 fi
 
 # Record this round for the repeat-pass guard now that a reviewer has actually

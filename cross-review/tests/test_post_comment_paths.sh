@@ -224,6 +224,62 @@ assert_contains "…that ends at the verdict" "$m" " verdict=CLEAN -->"
 assert_not_contains "…with no Scope line" "$body" "Scope:"
 assert_eq "…and it clears at the head (preflight)" "$(pf "$H" "$body")" "clear 0"
 
+echo "── lane metadata is found wherever run_reviewers.sh was pointed ──"
+# SKILL.md documents `--out "$run_dir/raw"` and, for the rebased-history route,
+# `--out "$run_dir"`. With the second the lanes sit beside findings.md and
+# there is no raw/ at all, so a reader of raw/ alone posts that scoped round as
+# a full-diff record.
+mkflat() {  # mkflat <name> <lane paths JSON | none> → a run dir with no raw/
+  local d="$T/runs/$1"; mkdir -p "$d"
+  printf '# findings\n\nnothing to report\n' >"$d/findings.md"
+  if [[ "$2" == "none" ]]; then
+    printf '{"exit_code":0,"duration_s":5}\n' >"$d/codex.meta.json"
+  else
+    printf '{"exit_code":0,"duration_s":5,"paths":%s,"paths_mode":"filtered"}\n' "$2" >"$d/codex.meta.json"
+  fi
+  printf '{"skipped": true, "reason": "no_diff_against_base", "base": "main"}\n' >"$d/run.meta.json"
+  printf '%s' "$d"
+}
+FLAT="$(mkflat flat-scoped '["docs/","apps/web/"]')"
+pr_json "$H" >"$CR_TEST_FIXTURE"
+body="$(post "$FLAT" --verdict CLEAN)"
+assert_eq "[flat] a CLEAN record carries no stamp a gate selects on" "$(gate_stamps "$body")" "0"
+m="$(grep -o '<!-- cross-review-scoped: [^>]*-->' <<<"$body" | head -1)"
+assert_contains "[flat] its marker is the scoped one, with the same hash" "$m" " paths=$LANE_PH -->"
+assert_contains "[flat] the Scope line names the paths" "$body" "only changes in \`apps/web/\`, \`docs/\` were reviewed"
+assert_not_contains "[flat] merge_preflight does not clear on it" "$(pf "$H" "$body")" "clear"
+assert_eq "[flat] the currency CI does not pass on it" "$(cv "$body")" "failure"
+FLAT0="$(mkflat flat-unscoped none)"
+pr_json "$H" >"$CR_TEST_FIXTURE"
+body="$(post "$FLAT0" --verdict CLEAN)"
+assert_contains "control: flat lanes with no paths leave a full-diff record" \
+  "$(grep -o '<!-- cross-review: [^>]*-->' <<<"$body" | head -1)" " verdict=CLEAN -->"
+assert_eq "…that clears at the head (preflight)" "$(pf "$H" "$body")" "clear 0"
+# Both layouts in one run dir: a scoped lane beside findings.md is not hidden
+# by an unscoped raw/.
+BOTH="$(mklane both-layouts none none)"
+printf '{"exit_code":0,"duration_s":5,"paths":["docs/"],"paths_mode":"filtered"}\n' >"$BOTH/kimi.meta.json"
+pr_json "$H" >"$CR_TEST_FIXTURE"
+body="$(post "$BOTH" --verdict CLEAN)"
+assert_eq "an unscoped raw/ does not hide a scoped lane beside findings.md" "$(gate_stamps "$body")" "0"
+assert_contains "…whose paths the Scope line names" "$body" "only changes in \`docs/\` were reviewed"
+
+echo "── one scoped lane among full-diff lanes keeps the record off the gate ──"
+# Deliberate, and pinned so it is not "fixed" by accident. A run dir reused for
+# a full-diff round can still hold an earlier scoped round's lane, and from the
+# files alone that is indistinguishable from one lane re-run on its own after
+# the others were scoped. Calling the second a full review would clear a merge
+# on a partial one, so both are posted as scoped; the cost is a full round that
+# has to be re-posted from a fresh run dir, and run_reviewers.sh warns at
+# dispatch when it leaves a dir in that state.
+MIX="$(mklane mixed-lanes none full)"
+printf '{"exit_code":0,"duration_s":5,"paths":["docs/"],"paths_mode":"filtered"}\n' >"$MIX/raw/kimi.meta.json"
+pr_json "$H" >"$CR_TEST_FIXTURE"
+body="$(post "$MIX" --verdict CLEAN)"
+assert_eq "a CLEAN record over mixed lanes carries no stamp a gate selects on" "$(gate_stamps "$body")" "0"
+assert_contains "…and says which paths the scoped lane saw" "$body" "only changes in \`docs/\` were reviewed"
+assert_not_contains "…and merge_preflight does not clear on it" "$(pf "$H" "$body")" "clear"
+
 echo "── scoped records still count toward the next pass number ──"
 prior_scoped="$(printf '## Cross-review — pass 3\n\n<!-- cross-review-scoped: sha=%s pass=3 verdict=CLEAN paths=%s -->\n' "$OLD" "$PH")"
 pr_json "$H" "$(full "$OLD" CLEAN)" "$prior_scoped" >"$CR_TEST_FIXTURE"
