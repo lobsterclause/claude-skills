@@ -36,7 +36,7 @@ assert_not_contains() {
 mkdir -p "$T/bin"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 printf '#!/bin/sh\nprintf "shim\\n"\n' >"$T/bin/codex"
-printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 4 Argon (High)\\n"; fi\n' >"$T/bin/agy"
 cat >"$T/canned_or_response.json" <<'EOF'
 {"choices":[{"message":{"content":"{\"findings\":[]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.001}}
 EOF
@@ -108,22 +108,22 @@ bash "$S/run_reviewers.sh" --base main --out "$T/o2" --reviewers codex --timeout
 assert_not_contains "codex stdout carries no JSON-schema mandate" \
   "$(cat "$T/o2/codex.stdout" 2>/dev/null)" "single JSON object"
 
-echo "── RED/GREEN: agy lanes (antigravity/gemini-pro) are untouched — prompt has no suffix ──"
+echo "── RED/GREEN: agy lanes (gemini-pro) are untouched — prompt has no suffix ──"
 cat >"$T/bin/agy" <<SHIM
 #!/bin/sh
-if [ "\$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; exit 0; fi
+if [ "\$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 4 Argon (High)\\n"; exit 0; fi
 printf '%s\n' "\$*" > "\${AGY_ARGV_CAPTURE:-/dev/null}"
 printf "shim review: no findings\\n"
 SHIM
 chmod +x "$T/bin/agy"
-AGY_ARGV_CAPTURE="$T/agy-argv.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o3" --reviewers antigravity --timeout 30 >/dev/null 2>&1 || true
+AGY_ARGV_CAPTURE="$T/agy-argv.txt" bash "$S/run_reviewers.sh" --base main --out "$T/o3" --reviewers gemini-pro --timeout 30 >/dev/null 2>&1 || true
 if [[ -f "$T/agy-argv.txt" ]]; then
-  assert_not_contains "antigravity (agy) prompt carries no JSON-schema mandate" \
+  assert_not_contains "gemini-pro (agy) prompt carries no JSON-schema mandate" \
     "$(cat "$T/agy-argv.txt")" "single JSON object"
 else
   bad "agy argv was never captured"
 fi
-printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 4 Argon (High)\\n"; fi\n' >"$T/bin/agy"
 chmod +x "$T/bin/agy"
 
 echo "── RED/GREEN: kimi CLI lane is untouched — stdin prompt has no suffix ──"
@@ -168,13 +168,13 @@ assert_not_contains "cooperative reviewers are NOT reported as unparsed" "$(cat 
 echo "── merge_raw_findings.sh: all-prose input still exits 0 with empty findings ──"
 ARAW="$T/araw"; mkdir -p "$ARAW"
 printf 'Looks fine to me, no issues.\n' >"$ARAW/kimi.stdout"
-printf 'LGTM, nothing to flag.\n' >"$ARAW/antigravity.stdout"
+printf 'LGTM, nothing to flag.\n' >"$ARAW/gemini-pro.stdout"
 bash "$S/merge_raw_findings.sh" --raw "$ARAW" --out "$T/all-prose.json" 2>"$T/all-prose.err"
 assert_eq "all-prose run still exits 0" "$?" "0"
 assert_eq "all-prose run yields an empty findings array" \
   "$(jq '.findings | length' "$T/all-prose.json")" "0"
 assert_contains "both prose reviewers reported unparsed" "$(cat "$T/all-prose.err")" "unparsed: kimi"
-assert_contains "both prose reviewers reported unparsed (2)" "$(cat "$T/all-prose.err")" "unparsed: antigravity"
+assert_contains "both prose reviewers reported unparsed (2)" "$(cat "$T/all-prose.err")" "unparsed: gemini-pro"
 
 
 echo "── merge_raw_findings.sh: non-object findings element → reviewer unparsed, contract intact ──"

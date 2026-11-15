@@ -176,7 +176,7 @@ echo "── (h) ci/planted_round.sh end-to-end (offline, shimmed) ──"
 
 mkdir -p "$T/bin"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim\\n"\n' >"$T/bin/codex"
-printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\\nGemini 4 Argon (High)\\n"; fi\n' >"$T/bin/agy"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
 chmod +x "$T/bin/"*
 

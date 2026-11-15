@@ -16,3 +16,5 @@ cross-review/merge_override_audit.jsonl
 # the cry-wolf failure tests/check_dual_copy.sh's own header warns about.
 cross-review/.pr-drain/
 **/*.bak-*
+# runtime state must never be committed from the plugin mirror either
+plugins/cross-review/skills/cross-review/state/

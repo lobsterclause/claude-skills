@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # detect_reviewers.sh — report which review CLIs are available.
 # Prints JSON to stdout:
-#   {"codex": bool, "antigravity": bool, "gemini-pro": bool, "kimi": bool,
+#   {"codex": bool, "gemini-pro": bool, "kimi": bool,
 #    "glm-coding": bool, "glm": bool, "deepseek": bool, "mimo": bool, "minimax": bool, "qwen": bool,
 #    "devstral": bool, "laguna": bool, "kat": bool,
 #    "north": bool, "nemotron": bool, "spark": bool,
@@ -9,13 +9,12 @@
 #    "kimi27": bool,
 #    "kimi3": bool, "openrouter": bool}
 #
-# As of the 2026-06-18 Gemini-CLI consumer sunset, BOTH Gemini-family reviewers
-# run on Google's `agy` (Antigravity) CLI:
-#   - antigravity → agy --model "Gemini 3.8 Flash (High)"   (fast lap)
-#   - gemini-pro  → agy --model "Gemini 3.1 Pro (High)"     (deep lap)
-# So their availability both track the single `agy` binary. The standalone
-# `gemini` CLI is no longer used (it stopped serving consumer requests on
-# 2026-06-18). codex and kimi are unchanged.
+# The ONE Gemini reviewer, gemini-pro, runs on Google's `agy` (Antigravity) CLI
+# on a Gemini 4 Hydrogen effort ladder (model names live in
+# references/reviewer_profiles.json). antigravity (the Flash lap) was retired
+# 2026-11-14 and is no longer reported. The standalone `gemini` CLI is not used
+# (it stopped serving consumer requests on 2026-06-18). codex and kimi are
+# unchanged.
 #
 # The OpenRouter pool (glm, deepseek, mimo, minimax, qwen, devstral, laguna,
 # kat, north, nemotron, spark, seed, grok, longcat, inkling)
@@ -37,6 +36,8 @@ set -euo pipefail
 # lib_path.sh for the incident.
 # shellcheck source=lib_path.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib_path.sh"
+# shellcheck source=lib_agy_routes.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_agy_routes.sh"
 nvm_bin="$CROSS_REVIEW_NVM_BIN"
 
 # Feature flags (which baseline is fixed, whether OpenRouter exists at all)
@@ -58,7 +59,6 @@ has() {
 }
 
 codex=false
-antigravity=false
 gemini_pro=false
 kimi=false
 glm_coding=false
@@ -69,15 +69,15 @@ kimi3=false
 has codex && codex=true
 # Both Gemini reviewers ride the same agy binary — but `agy --model` silently
 # falls back to Flash on an unrecognized model string. So only report gemini-pro
-# (the Pro lap) available if `agy models` actually lists a Gemini 3.1 Pro entry.
+# available if `agy models` actually lists a model on gemini-pro's
+# router (Argon/Hydrogen) (names live in the profile; see lib_agy_routes.sh).
 # The probe MUST be bounded and cached: an unhealthy agy (quota/auth) can hang
 # `agy models` for minutes and it ignores SIGTERM (codex P2, PR #18 pass 2).
 # Shares select_roster.sh's 6h cache; with no timeout binary available the
 # probe is skipped and Pro is assumed available (matches execution — the
 # wrapper pins the exact model string either way).
 if has agy; then
-  antigravity=true
-  models_cache="$HOME/.cross-review/cache/agy_models.txt"
+  models_cache="${CROSS_REVIEW_AGY_MODELS_CACHE:-$HOME/.cross-review/cache/agy_models.txt}"
   if [[ ! -s "$models_cache" || -n "$(find "$models_cache" -mmin +360 2>/dev/null)" ]]; then
     TIMEOUT_BIN=""
     command -v timeout  >/dev/null 2>&1 && TIMEOUT_BIN="timeout"
@@ -101,7 +101,7 @@ if has agy; then
     # agy 1.1.10 changed `agy models` output from display names
     # ("Gemini 3.1 Pro (High)") to slugs ("gemini-3.1-pro-high"), which
     # false-negatived gemini-pro out of every roster. Match either shape.
-    if grep -Eqi 'gemini[ ._-]?3\.1[ ._-]?pro' "$models_cache"; then gemini_pro=true; fi
+    if agy_routes_listed "$models_cache" "${CROSS_REVIEW_PROFILES_FILE:-$(dirname "${BASH_SOURCE[0]}")/../references/reviewer_profiles.json}"; then gemini_pro=true; fi
   else
     gemini_pro=true
   fi
@@ -209,10 +209,10 @@ done
 # WARNING: the format-string keys and the positional args below are coupled
 # by POSITION ONLY — inserting a reviewer in one without the other silently
 # shifts every later value (kimi+kat convergent nit, PR #29 pass 1). Keep the
-# order: 4 named CLIs, $glm_coding, 15x $openrouter for the OR pool, $kimi27,
+# order: 3 named CLIs, $glm_coding, 15x $openrouter for the OR pool, $kimi27,
 # $kimi3, $openrouter.
-printf '{"codex": %s, "antigravity": %s, "gemini-pro": %s, "kimi": %s, "glm-coding": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "spark": %s, "seed": %s, "grok": %s, "longcat": %s, "inkling": %s, "kimi27": %s, "kimi3": %s, "openrouter": %s}\n' \
-  "$codex" "$antigravity" "$gemini_pro" "$kimi" "$glm_coding" \
+printf '{"codex": %s, "gemini-pro": %s, "kimi": %s, "glm-coding": %s, "glm": %s, "deepseek": %s, "mimo": %s, "minimax": %s, "qwen": %s, "devstral": %s, "laguna": %s, "kat": %s, "north": %s, "nemotron": %s, "spark": %s, "seed": %s, "grok": %s, "longcat": %s, "inkling": %s, "kimi27": %s, "kimi3": %s, "openrouter": %s}\n' \
+  "$codex" "$gemini_pro" "$kimi" "$glm_coding" \
   "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" "$openrouter" \
   "$kimi27" "$kimi3" "$openrouter"
 
