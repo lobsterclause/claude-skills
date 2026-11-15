@@ -3155,6 +3155,43 @@ for r in "${requested[@]}"; do
   esac
 done
 
+# A full-diff round into an --out that an earlier path-scoped round used.
+# post_comment.sh posts a run dir as scoped when any lane in it carries `paths`
+# (it cannot tell a leftover from a deliberate single-lane re-run), so such a
+# round is kept off the merge gate by a lane it never ran.
+#
+# stale_scoped_lanes <skip-roster: 1|0> prints those lanes, comma-separated.
+# It looks where post_comment.sh looks: with `--out <run-dir>/raw` that is
+# --out and its parent, with `--out <run-dir>` it is --out and raw/ under it.
+# skip-roster=1 leaves out this round's own lanes in --out, which are about to
+# be rewritten.
+stale_scoped_lanes() {
+  local skip="$1" d pre mf name r found=""
+  local dirs=("$out|" "$out/raw|raw/")
+  [[ "$(basename "$out")" == raw ]] && dirs+=("$(dirname "$out")|../")
+  for d in "${dirs[@]}"; do
+    pre="${d#*|}"; d="${d%|*}"
+    for mf in "$d"/*.meta.json; do
+      [[ -f "$mf" ]] || continue
+      jq -e '(.paths? // empty) | arrays | length > 0' "$mf" >/dev/null 2>&1 || continue
+      name="$(basename "$mf")"
+      if [[ "$skip" == 1 && -z "$pre" ]]; then
+        for r in "${requested[@]}"; do [[ "${name%%.*}" == "$r" ]] && continue 2; done
+      fi
+      found="${found:+$found, }$pre$name"
+    done
+  done
+  printf '%s' "$found"
+}
+# Said here, before any reviewer is launched, because this is the last point at
+# which the round can still be stopped and pointed at a fresh --out.
+if [[ -z "$paths_list" ]]; then
+  _stale_scoped="$(stale_scoped_lanes 1)"
+  if [[ -n "$_stale_scoped" ]]; then
+    echo "WARN: $out holds lane output from a path-scoped round that this full-diff round will not replace ($_stale_scoped). post_comment.sh will post this run as path-scoped, off the merge gate. For a full-diff record, stop and dispatch into a fresh --out." >&2
+  fi
+fi
+
 # Install the PreToolUse gate before dispatch if either Gemini lap is in the
 # roster — both laps run concurrently and share the one hooks.json.
 for r in "${requested[@]}"; do
@@ -3323,18 +3360,11 @@ if [[ -n "$paths_list" ]]; then
       && mv -f "$_mf.tmp" "$_mf" || rm -f "$_mf.tmp"
   done
 else
-  # A full-diff round into an --out that an earlier path-scoped round used. This
-  # round's own lanes were just rewritten without `paths`, so any meta.json
-  # still carrying one belongs to a lane this round did not run.
-  # post_comment.sh posts a run dir as scoped when any lane in it is (it cannot
-  # tell a leftover from a deliberate single-lane re-run), so say it here,
-  # before the round is synthesized and posted off the merge gate.
-  _stale_scoped=""
-  for _mf in "$out"/*.meta.json; do
-    [[ -f "$_mf" ]] || continue
-    jq -e '(.paths? // empty) | arrays | length > 0' "$_mf" >/dev/null 2>&1 || continue
-    _stale_scoped="${_stale_scoped:+$_stale_scoped, }$(basename "$_mf")"
-  done
+  # The same check as before dispatch, now over what is actually on disk: this
+  # round's own lanes were just rewritten without `paths`, so anything still
+  # scoped is a lane this round did not replace (a leftover, an attempt file,
+  # or a roster lane that died before writing its meta.json).
+  _stale_scoped="$(stale_scoped_lanes 0)"
   if [[ -n "$_stale_scoped" ]]; then
     echo "WARN: $out still holds lane output from a path-scoped round ($_stale_scoped). post_comment.sh will post this run as path-scoped, off the merge gate. For a full-diff record, dispatch into a fresh --out." >&2
   fi

@@ -222,8 +222,29 @@ assert_eq "…and rewrites its own lane without paths" "$(jq -r 'has("paths")' "
 assert_contains "…and warns that a scoped lane is still in the dir" "$(cat "$T/o1r.log")" \
   "WARN: $T/o1r still holds lane output from a path-scoped round (glm.meta.json)"
 assert_contains "…and what that does to the record" "$(cat "$T/o1r.log")" "post_comment.sh will post this run as path-scoped"
-assert_not_contains "control: a fresh --out gets no such warning" "$(cat "$T/o0.log")" "still holds lane output from a path-scoped round"
-assert_not_contains "control: neither does a scoped round" "$(cat "$T/o1.log")" "still holds lane output from a path-scoped round"
+# The warning that can still be acted on is the one before the reviewers run.
+# It names only lanes this round will not rewrite: kimi is in the roster, glm
+# is the leftover.
+PRE="$(grep -n 'that this full-diff round will not replace' "$T/o1r.log" | head -1)"
+assert_contains "…and says so BEFORE the reviewers are launched" "$PRE" "WARN: $T/o1r holds lane output from a path-scoped round that this full-diff round will not replace (glm.meta.json)"
+assert_not_contains "…without naming the lane it is about to rewrite" "$PRE" "kimi.meta.json"
+_pre_n="${PRE%%:*}"; _lane_n="$(grep -n '^kimi: ' "$T/o1r.log" | tail -1 | cut -d: -f1)"
+assert_eq "…ahead of the lane's own result line" "$([[ -n "$_pre_n" && -n "$_lane_n" && "$_pre_n" -lt "$_lane_n" ]] && echo before || echo "not before ($_pre_n vs $_lane_n)")" "before"
+for _l in "$T/o0.log" "$T/o1.log"; do
+  assert_not_contains "control: $(basename "$_l") (fresh --out / scoped round) gets neither warning" "$(cat "$_l")" "lane output from a path-scoped round"
+done
+# post_comment.sh reads lane metadata in <run-dir>/raw AND beside findings.md,
+# so a leftover in the layout this round is not writing to counts as well.
+mkdir -p "$T/layA" "$T/layB/raw"
+printf '{"exit_code":0,"paths":["src/"],"paths_mode":"filtered"}\n' >"$T/layA/glm.meta.json"
+cr "$T/layA/raw" --base main --reviewers kimi --timeout-kimi 30 --allow-full-rereview
+assert_contains "--out <run-dir>/raw: a scoped lane beside findings.md is named before dispatch" "$(cat "$T/layA/raw.log")" \
+  "that this full-diff round will not replace (../glm.meta.json)"
+assert_contains "…and after it" "$(cat "$T/layA/raw.log")" "still holds lane output from a path-scoped round (../glm.meta.json)"
+printf '{"exit_code":0,"paths":["src/"],"paths_mode":"filtered"}\n' >"$T/layB/raw/kimi.meta.json"
+cr "$T/layB" --base main --reviewers kimi --timeout-kimi 30 --allow-full-rereview
+assert_contains "--out <run-dir>: a scoped lane under raw/ is named, roster lane or not" "$(cat "$T/layB.log")" \
+  "that this full-diff round will not replace (raw/kimi.meta.json)"
 
 echo "── doc_narrative_risk fires when the .md IS in scope ──"
 cr "$T/o2" --base main --reviewers kimi --paths docs/ --timeout-kimi 30
