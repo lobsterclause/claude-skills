@@ -436,6 +436,18 @@ profile_path() {
   jq -r --arg r "$r" "(.[\$r]${path} // empty)" "$profile_file" 2>/dev/null
 }
 
+profile_map_get() {
+  # Usage: profile_map_get <reviewer> <map-key> <entry-key>
+  # e.g. profile_map_get gemini-pro routes argon:high
+  # The entry key arrives via `jq --arg`, never by interpolation into the filter:
+  # it can come from a caller-supplied override (--gemini-pro-route), and a `"`
+  # in it must not be able to rewrite the jq program. (gemini-pro, #196 pass 3.)
+  local r="$1" m="$2" k="$3"
+  [[ -f "$profile_file" ]] || { echo ""; return; }
+  command -v jq >/dev/null 2>&1 || { echo ""; return; }
+  jq -r --arg r "$r" --arg m "$m" --arg k "$k" '(.[$r][$m][$k] // empty)' "$profile_file" 2>/dev/null
+}
+
 profile_flag() {
   # Usage: profile_flag <reviewer> <key> <default-true|false>
   # Booleans CANNOT go through profile_get: it uses jq's `//`, and `false //
@@ -769,7 +781,7 @@ case "$gemini_pro_pass" in ''|*[!0-9]*) gemini_pro_pass=1 ;; esac
 (( gemini_pro_pass < 1 )) && gemini_pro_pass=1
 if [[ -n "$gemini_pro_route" ]]; then
   gemini_pro_route="$(printf '%s' "$gemini_pro_route" | tr '[:upper:]' '[:lower:]')"
-  if [[ -n "$(profile_path gemini-pro ".routes.\"$gemini_pro_route\"" 2>/dev/null)" ]]; then
+  if [[ -n "$(profile_map_get gemini-pro routes "$gemini_pro_route")" ]]; then
     gemini_pro_route_reason="override"
   else
     echo "run_reviewers: ignoring unknown --gemini-pro-route '$gemini_pro_route' (allowed: $(jq -r '.["gemini-pro"].routes // {} | keys | join(", ")' "$profile_file" 2>/dev/null))" >&2
@@ -783,7 +795,16 @@ elif [[ -n "$(profile_path gemini-pro '.router.pass1')" ]]; then
   else
     _gp_small="$(profile_path gemini-pro '.router.small_diff_lines')"
     case "$_gp_small" in ''|*[!0-9]*) _gp_small=0 ;; esac
-    gemini_pro_diff_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
+    # A failed `git diff` must read as "size unknown" (-> router.pass1), not as
+    # 0 lines (-> pass1_small): `| wc -l` would print 0 and hide the failure.
+    # (gemini-pro, #196 pass 3.)
+    if _gp_d="$(git diff "$base"...HEAD 2>/dev/null)"; then
+      gemini_pro_diff_lines="$(printf '%s' "$_gp_d" | wc -l | tr -d ' ')"
+      [[ -n "$_gp_d" ]] && gemini_pro_diff_lines=$(( gemini_pro_diff_lines + 1 ))
+    else
+      gemini_pro_diff_lines=""
+    fi
+    unset _gp_d
     case "$gemini_pro_diff_lines" in ''|*[!0-9]*) gemini_pro_diff_lines="" ;; esac
     if [[ -n "$gemini_pro_diff_lines" ]] && (( gemini_pro_diff_lines < _gp_small )); then
       gemini_pro_route="$(profile_path gemini-pro '.router.pass1_small')"
@@ -796,14 +817,14 @@ elif [[ -n "$(profile_path gemini-pro '.router.pass1')" ]]; then
 fi
 gemini_pro_route_used=""
 if [[ -n "$gemini_pro_route" ]]; then
-  _gp_m="$(profile_path gemini-pro ".routes.\"$gemini_pro_route\"" 2>/dev/null)"
+  _gp_m="$(profile_map_get gemini-pro routes "$gemini_pro_route")"
   if [[ -n "$_gp_m" ]]; then
     gemini_pro_model="$_gp_m"
     gemini_pro_route_used="$gemini_pro_route"
     # Optional per-route timeout (profile `route_timeout_s`), below an explicit
     # --timeout-gemini-pro / --timeout. No route needs one yet: the 2026-11-14
     # smoke probe (a one-word prompt) says nothing about review-sized latency.
-    _gp_rt="$(profile_path gemini-pro ".route_timeout_s.\"$gemini_pro_route\"" 2>/dev/null)"
+    _gp_rt="$(profile_map_get gemini-pro route_timeout_s "$gemini_pro_route")"
     case "$_gp_rt" in ''|*[!0-9]*) ;; *) [[ -z "${timeout_gemini_pro:-}" && -z "${timeout_s:-}" ]] && gemini_pro_timeout="$_gp_rt" ;; esac
   else
     echo "run_reviewers: gemini-pro router picked '$gemini_pro_route' but the profile has no such route — using .model" >&2
@@ -1096,7 +1117,7 @@ maybe_or_fallback() {
   # family ran. `or_fallback.route_models` maps the route's model prefix
   # (argon|hydrogen) to a slug; absent -> the plain `.model` above.
   if [[ -n "${gemini_pro_route_used:-}" && "$name" == "gemini-pro" ]]; then
-    _fb_rm="$(profile_path "$name" ".or_fallback.route_models.\"${gemini_pro_route_used%%:*}\"")"
+    _fb_rm="$(jq -r --arg r "$name" --arg k "${gemini_pro_route_used%%:*}" '(.[$r].or_fallback.route_models[$k] // empty)' "$profile_file" 2>/dev/null)"
     [[ -n "$_fb_rm" ]] && fb_model="$_fb_rm"
   fi
   [[ "$enabled" == "true" && -n "$fb_model" ]] || { echo "$rc"; return; }

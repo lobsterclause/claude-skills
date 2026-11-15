@@ -122,7 +122,9 @@ CROSS_REVIEW_CODEX_EFFORT=low run "$T/big" both --allow-full-rereview --gemini-p
 assert_eq "gemini-pro meta carries pass 3 under an override" "$(field pass_context)" "3"
 
 echo "── bad override fails closed ──"
-for bad_route in "argon:xhigh" "hydrogen" "carbon:high" "argon:high;rm" ""; do
+# The last value is a jq-injection attempt: interpolated into the filter it
+# would have returned "Gemini 4 Hydrogen (Low)" and been accepted as a route.
+for bad_route in "argon:xhigh" "hydrogen" "carbon:high" "argon:high;rm" 'argon:high" | "Gemini 4 Hydrogen (Low)' ""; do
   [[ -z "$bad_route" ]] && continue
   run "$T/big" "bad$RANDOM" --gemini-pro-route "$bad_route"
   assert_eq "unknown route '$bad_route' -> profile default model" "$MODEL" "Gemini 4 Argon (High)"
