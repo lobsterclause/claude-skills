@@ -275,6 +275,18 @@ The prose forms stay accepted as a fallback because every comment already on
 GitHub is prose-only and those records are not re-postable. Dropping the
 fallback would red-flag genuinely reviewed work.
 
+**Path-scoped rounds (`--paths`) write neither form unless they found
+something.** A round over part of the diff is not a review of the PR, and this
+gate has no notion of scope: it would read a scoped `CLEAN` at the head as a
+clean review. So `post_comment.sh` writes a scoped record with the marker
+`<!-- cross-review-scoped: sha=… -->` and the prose "Path-scoped review of
+`<sha>`" — forms this gate does not match, so the record is not a candidate at
+all. The exception is a scoped record whose verdict is `BLOCKED` or
+`NEEDS_DECISION`: it keeps the ordinary stamps and reads as `pending`, because
+withholding a merge on a real finding is correct at any scope. The rule lives
+in the writer, not here, so copies of this gate that predate `--paths` are
+covered too. Do not "fix" the gate to accept the scoped marker.
+
 ## What it does not do
 
 - It does not block merge by itself. It reports a commit status; whether that

@@ -247,7 +247,7 @@ if [[ "$mode" == "summary" && "$pass_explicit" -eq 0 && -n "$pr" ]] &&
   # argument entirely and produces exactly that failure -- done live, caught by
   # the pass-numbering test.)
   prior="$(gh pr view "$pr" ${gh_repo[@]+"${gh_repo[@]}"} --json comments \
-    --jq '[.comments[].body | capture("<!-- cross-review:[^>]* pass=(?<n>[0-9]+)").n | tonumber] | max // 0' \
+    --jq '[.comments[].body | capture("<!-- cross-review(-scoped)?:[^>]* pass=(?<n>[0-9]+)").n | tonumber] | max // 0' \
     2>/dev/null || true)"
   if [[ "$prior" =~ ^[0-9]+$ ]]; then
     pass="$((prior + 1))"
@@ -306,11 +306,56 @@ case "$mode" in
     fi
     [[ -z "$roster_line" ]] && roster_line="external reviewers"
 
+    # --paths scope (additive, optional): a path-scoped round reviewed only part
+    # of the diff, and a record that says "Reviewed <sha>" alone reads as full
+    # coverage. Carried as a trailing `paths=<hash>` marker token plus a visible
+    # Scope line; absent on every full-diff round, so those comments are
+    # byte-identical to before.
+    paths_hash_tok=""; paths_scope_line=""
+    if [[ -f "$run_dir/context.json" ]] && command -v jq >/dev/null 2>&1; then
+      _ph="$(jq -r '.paths_hash // empty' "$run_dir/context.json" 2>/dev/null)"
+      [[ "$_ph" =~ ^[0-9a-f]{8,64}$ ]] && paths_hash_tok="$_ph"
+      _pc="$(jq -r 'if (.paths | type) == "array" and (.paths | length) > 0 then (.paths | map("`" + (. | gsub("[`\\n]"; "")) + "`") | join(", ")) else empty end' "$run_dir/context.json" 2>/dev/null)"
+      [[ -n "$_pc" ]] && paths_scope_line="**Scope: path-scoped round — only changes in ${_pc} were reviewed; this is NOT a review of the whole diff.**"
+    fi
+
+    # A PATH-SCOPED RECORD MUST NOT CLEAR A MERGE.
+    #
+    # Both gates (scripts/merge_preflight.sh and ci/cross-review-currency.sh,
+    # plus the copies of that CI script other repos carry) pick a record by one
+    # of two stamps — the `<!-- cross-review: sha=<40> ` marker or the prose
+    # "Reviewed `<sha>`" — and clear the merge when that sha is the head. The
+    # Scope line is prose no gate reads, and `paths=` is a token no gate reads,
+    # so a clean round over two files cleared a forty-file PR.
+    #
+    # So a scoped record carries NEITHER stamp. Its marker is spelled
+    # `cross-review-scoped:` and its prose "Path-scoped review of". Every gate,
+    # including one written before --paths existed, then does not see it as a
+    # record and decides on the full-diff records alone. Writer-side on
+    # purpose: a reader-side rule protects only the gates that were updated.
+    #
+    # One exception, in the direction that can only withhold a merge: a scoped
+    # round that ended BLOCKED or NEEDS_DECISION keeps the ordinary stamps.
+    # Both gates read those verdicts as `pending` at the head and as covering
+    # nothing in range coverage, so a problem found in part of the diff still
+    # stops the merge. FIXES_APPLIED does not qualify — range coverage counts
+    # it as reviewed — and neither does a record with no verdict.
+    scoped_off_gate=0
+    if [[ -n "$paths_hash_tok" || -n "$paths_scope_line" ]]; then
+      case "$verdict" in
+        BLOCKED|NEEDS_DECISION) ;;
+        *) scoped_off_gate=1
+           [[ -n "$paths_scope_line" ]] && paths_scope_line+=" **It does not count toward the merge gate — a full-diff round is still required.**" ;;
+      esac
+    fi
+    reviewed_phrase="Reviewed"
+    [[ "$scoped_off_gate" -eq 1 ]] && reviewed_phrase="Path-scoped review of"
+
     # Provenance + staleness. A review record is read long after it is posted,
     # so it must say what it covered. Every query below fails OPEN: if `gh` or
     # `jq` is unavailable the comment still posts, just without the banner.
     provenance=""
-    [[ -n "$head_sha" ]] && provenance="Reviewed \`${head_sha:0:9}\`."
+    [[ -n "$head_sha" ]] && provenance="${reviewed_phrase} \`${head_sha:0:9}\`."
 
     # THE MACHINE-WRITTEN STAMP.
     #
@@ -343,7 +388,7 @@ case "$mode" in
           staleness+="> [!WARNING]"$'\n'"> **This PR was closed before the review finished.**"$'\n\n'
         fi
         if [[ -n "$head_sha" && -n "$cur_sha" && "$cur_sha" != "$head_sha" ]]; then
-          staleness+="> [!WARNING]"$'\n'"> **Stale: the head moved during this review.** Reviewed \`${head_sha:0:9}\`, current head is \`${cur_sha:0:9}\`. Findings below may describe code that no longer exists, and fixes confirmed here may have been overwritten. Re-review before trusting this record."$'\n\n'
+          staleness+="> [!WARNING]"$'\n'"> **Stale: the head moved during this review.** ${reviewed_phrase} \`${head_sha:0:9}\`, current head is \`${cur_sha:0:9}\`. Findings below may describe code that no longer exists, and fixes confirmed here may have been overwritten. Re-review before trusting this record."$'\n\n'
         fi
       fi
     fi
@@ -384,18 +429,6 @@ case "$mode" in
       wrapper_sha="$(jq -r '.wrapper_sha // empty' "$run_dir/context.json" 2>/dev/null)"
       [[ "$wrapper_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || wrapper_sha=""
     fi
-    # --paths scope (additive, optional): a path-scoped round reviewed only part
-    # of the diff, and a record that says "Reviewed <sha>" alone reads as full
-    # coverage. Carried as a trailing `paths=<hash>` marker token plus a visible
-    # Scope line; absent on every full-diff round, so those comments are
-    # byte-identical to before.
-    paths_hash_tok=""; paths_scope_line=""
-    if [[ -f "$run_dir/context.json" ]] && command -v jq >/dev/null 2>&1; then
-      _ph="$(jq -r '.paths_hash // empty' "$run_dir/context.json" 2>/dev/null)"
-      [[ "$_ph" =~ ^[0-9a-f]{8,64}$ ]] && paths_hash_tok="$_ph"
-      _pc="$(jq -r 'if (.paths | type) == "array" and (.paths | length) > 0 then (.paths | map("`" + (. | gsub("[`\\n]"; "")) + "`") | join(", ")) else empty end' "$run_dir/context.json" 2>/dev/null)"
-      [[ -n "$_pc" ]] && paths_scope_line="**Scope: path-scoped round — only changes in ${_pc} were reviewed; this is NOT a review of the whole diff.**"
-    fi
     marker=""
     # Field order is `sha= pass= [wrapper=] [base=] [digest=] [verdict=] [paths=]`: the
     # `sha=<40> pass=<n>` prefix is byte-stable (pinned by #148's
@@ -407,6 +440,8 @@ case "$mode" in
     # line without touching CR_MARKER_RE's sha/pass prefix match.
     if [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
       marker="<!-- cross-review: sha=${head_sha} pass=${pass}"
+      # Off the gate (see scoped_off_gate above): same fields, a tag no gate matches.
+      [[ "$scoped_off_gate" -eq 1 ]] && marker="<!-- cross-review-scoped: sha=${head_sha} pass=${pass}"
       [[ -n "$wrapper_sha" ]] && marker+=" wrapper=${wrapper_sha}"
       [[ -n "$base_sha" ]] && marker+=" base=${base_sha}"
       [[ -n "$digest" ]] && marker+=" digest=${digest}"
