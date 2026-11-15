@@ -17,7 +17,7 @@
 #                 / CROSS_REVIEW_GEMINI_PRO_ROUTE. NEVER pair --model with agy's
 #                 --effort flag: agy rejects the combination (see the router block).
 #   antigravity — RETIRED 2026-11-14 (owner: one Gemini seat is enough; the
-#                 Hydrogen ladder replaces both laps). `--reviewers antigravity`
+#                 Argon/Hydrogen router replaces both laps). `--reviewers antigravity`
 #                 is refused with a pointer at gemini-pro.
 #   Install agy: `curl -fsSL https://antigravity.google/cli/install.sh | bash`
 #                (lands at ~/.local/bin/agy). Auth: `agy login` once interactively.
@@ -392,13 +392,17 @@ if [[ -z "$reviewers" ]]; then
 fi
 
 # antigravity (the Gemini 3.8 Flash lap) was retired 2026-11-14: one Gemini seat
-# is enough and the Hydrogen ladder replaces both laps. An explicit request is
+# is enough and the Argon/Hydrogen router replaces both laps. An explicit request is
 # refused loudly rather than silently dropped, so a stale script or muscle-memory
 # `--reviewers codex,antigravity` cannot quietly run a roster without the seat
 # the caller thought they had.
-case ",$reviewers," in
+# Compared on the whitespace-stripped list, because the dispatch loop below
+# strips spaces around commas (`--reviewers "codex, antigravity"` is accepted
+# there) — checking the raw string let that spelling past the guard and ran the
+# round one seat short. (gemini-pro, cross-review of PR #196, pass 1.)
+case ",${reviewers//[[:space:]]/}," in
   *,antigravity,*)
-    echo "run_reviewers: reviewer 'antigravity' is retired (2026-11-14: one Gemini seat is enough). Use 'gemini-pro' — it now runs the Gemini 4 Hydrogen effort ladder." >&2
+    echo "run_reviewers: reviewer 'antigravity' is retired (2026-11-14: one Gemini seat is enough). Use 'gemini-pro' — it now runs the Gemini 4 Argon/Hydrogen router." >&2
     exit 2 ;;
 esac
 
@@ -501,8 +505,7 @@ kimi27_profile="$(profile_timeout kimi27)"
 kimi3_profile="$(profile_timeout kimi3)"
 codex_timeout="${timeout_codex:-${timeout_s:-${codex_profile:-$(( timeout_s_default > 900 ? timeout_s_default : 900 ))}}}"
 # gemini-pro defaults to a longer budget than the 600s baseline: deep reasoning
-# routinely runs 2-3x longer on the same diff. 900s is kept for the Hydrogen
-# ladder (no measurement yet says XHigh needs more; revisit from the runlog's
+# routinely runs 2-3x longer on the same diff. 900s is kept for the router (no measurement yet says XHigh needs more; revisit from the runlog's
 # gemini-pro duration_s / wall_over_budget rows once pass-1 XHigh data exists).
 gemini_pro_timeout="${timeout_gemini_pro:-${timeout_s:-${gemini_pro_profile:-900}}}"
 kimi_timeout="${timeout_kimi:-${timeout_s:-${kimi_profile:-$timeout_s_default}}}"
@@ -678,10 +681,11 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # late pass that is really a structural re-review wants xhigh back.
   # The pass number is computed ONCE and shared with the gemini-pro router
   # below, so both seats agree on which pass this is.
-  if [[ -z "$codex_effort" || -z "$gemini_pro_route" ]]; then
-    _pc="$(bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --pass-context 2>/dev/null || echo 1)"
-    case "$_pc" in ''|*[!0-9]*) _pc=1 ;; esac
-  fi
+  # Always computed, even when both seats are pinned by an override: the pass
+  # is also what the meta/runlog record, and an override must not make a pass-3
+  # round stamp itself pass 1. (gemini-pro, cross-review of PR #196, pass 1.)
+  _pc="$(bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --pass-context 2>/dev/null || echo 1)"
+  case "$_pc" in ''|*[!0-9]*) _pc=1 ;; esac
   codex_effort_source="config"
   if [[ -n "$codex_effort" ]]; then
     codex_effort_source="override"
@@ -1499,7 +1503,7 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 prompt_file="$script_dir/../references/review_prompt.txt"
 
 # Note: review_prompt is used by antigravity, gemini-pro, AND kimi (all three
-# consume the `$review_prompt` variable below — see run_antigravity,
+# consume the `$review_prompt` variable below — see run_gemini_pro,
 # run_gemini_pro, run_kimi). codex exec review --base <ref> applies codex's
 # own built-in review instructions (which already rank findings with
 # [P1]/[P2]/[P3] labels — equivalent to High/Medium/Low — and cover
@@ -2656,7 +2660,7 @@ $context_intro HARD CONSTRAINT: you are running headless with no interactive per
 }
 
 run_gemini_pro() {
-  # The one Gemini seat: agy on a Gemini 4 Hydrogen effort-ladder model
+  # The one Gemini seat: agy on the router-picked Gemini 4 Argon/Hydrogen model
   # ($gemini_pro_model, resolved from the profile ladder after the codex effort
   # block).
   run_agy_reviewer gemini-pro "$gemini_pro_model" "$gemini_pro_timeout"
@@ -3153,8 +3157,9 @@ done
 # auth handshakes and simultaneous first requests against shared upstream
 # endpoints, which reliably flakes the Gemini-family and kimi clients.
 # A small offset lets each initial handshake settle before the next starts.
-# NOTE: antigravity + gemini-pro both hit Google via agy — the stagger matters
-# more now that two reviewers share one provider, auth state, and rate limit.
+# NOTE: gemini-pro hits Google via agy (antigravity, the second agy lap, was
+# retired 2026-11-14); the stagger still softens the handshake against the
+# codex/kimi/OpenRouter lanes starting alongside it.
 stagger_s=2
 
 # Warn about model slugs that have been delisted upstream before spending a
@@ -3168,10 +3173,10 @@ for r in "${requested[@]}"; do
   esac
 done
 
-# Install the PreToolUse gate before dispatch if either Gemini lap is in the
-# roster — both laps run concurrently and share the one hooks.json.
+# Install the PreToolUse gate before dispatch if the Gemini seat is in the
+# roster.
 for r in "${requested[@]}"; do
-  if [[ "$r" == "antigravity" || "$r" == "gemini-pro" ]] && command -v agy >/dev/null 2>&1; then
+  if [[ "$r" == "gemini-pro" ]] && command -v agy >/dev/null 2>&1; then
     install_agy_shell_gate
     break
   fi
@@ -3202,7 +3207,7 @@ for r in "${requested[@]}"; do
         pids+=($!)
         ran+=("gemini-pro")
       else
-        echo "gemini-pro (agy CLI on Gemini 4 Hydrogen) not installed — skipping. Install: curl -fsSL https://antigravity.google/cli/install.sh | bash" >&2
+        echo "gemini-pro (agy CLI on Gemini 4 Argon/Hydrogen) not installed — skipping. Install: curl -fsSL https://antigravity.google/cli/install.sh | bash" >&2
       fi
       ;;
     kimi)
@@ -3279,7 +3284,7 @@ if [[ ${#pids[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# Wait for each; track individual status. Since run_codex/run_antigravity/
+# Wait for each; track individual status. Since run_codex/run_gemini_pro/
 # run_gemini_pro/run_kimi all `return "$rc"`, wait sees the real reviewer
 # exit code.
 any_ok=0

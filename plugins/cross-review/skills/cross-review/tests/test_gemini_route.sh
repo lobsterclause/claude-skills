@@ -116,6 +116,11 @@ prior_passes "$T/big" ovp 2
 run "$T/big" ovp --allow-full-rereview --gemini-pro-route argon:high
 assert_eq "an override beats the pass rule" "$MODEL" "Gemini 4 Argon (High)"
 
+echo "── pass context is recorded even when BOTH seats are pinned ──"
+prior_passes "$T/big" both 2
+CROSS_REVIEW_CODEX_EFFORT=low run "$T/big" both --allow-full-rereview --gemini-pro-route argon:high
+assert_eq "gemini-pro meta carries pass 3 under an override" "$(field pass_context)" "3"
+
 echo "── bad override fails closed ──"
 for bad_route in "argon:xhigh" "hydrogen" "carbon:high" "argon:high;rm" ""; do
   [[ -z "$bad_route" ]] && continue
@@ -149,6 +154,11 @@ echo "── antigravity is retired ──"
 assert_eq "--reviewers antigravity exits 2" "$rc" "2"
 grep -q "retired.*gemini-pro" "$T/log-ag" && ok "the message points at gemini-pro" || bad "message: $(cat "$T/log-ag")"
 [[ ! -e "$T/argv-ag" ]] && ok "agy was not run" || bad "agy ran for a retired seat"
+for spelling in "codex, antigravity" "codex ,antigravity" " antigravity " "gemini-pro,antigravity "; do
+  ( cd "$T/big" && AGY_ARGV="$T/argv-ag2" bash "$S/run_reviewers.sh" --base master --out "$T/out-ag2" \
+      --reviewers "$spelling" >"$T/log-ag2" 2>&1 ); rc=$?
+  assert_eq "whitespace spelling '$spelling' is refused too" "$rc" "2"
+done
 assert_eq "detect_reviewers no longer reports antigravity" \
   "$(bash "$S/detect_reviewers.sh" 2>/dev/null | jq 'has("antigravity")')" "false"
 assert_eq "detect_reviewers reports gemini-pro from the routed models" \
