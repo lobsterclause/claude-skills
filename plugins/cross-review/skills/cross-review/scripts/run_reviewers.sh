@@ -9,14 +9,16 @@
 #   CROSS_REVIEW_OPENROUTER=0     the whole OpenRouter lane, pool AND the
 #                                 or_fallback rescue, off since 2026-09-07
 #
-# Gemini-family reviewers (both via Google's `agy` Antigravity CLI as of the
-# 2026-06-18 Gemini-CLI consumer sunset):
-#   antigravity — `agy --model "Gemini 3.5 Flash (High)"`. Fast lap. Replaces the
-#                 retired `gemini` (Gemini CLI Flash) reviewer slot.
-#   gemini-pro  — `agy --model "Gemini 3.1 Pro (High)"`. Deep lap, slower. Was
-#                 previously the standalone `gemini` CLI on gemini-3.1-pro-preview;
-#                 migrated to agy because the gemini CLI stopped serving consumer
-#                 requests on 2026-06-18 and agy now hosts Gemini 3.1 Pro + --model.
+# Gemini reviewer (ONE seat, via Google's `agy` Antigravity CLI):
+#   gemini-pro  — `agy --model "<Gemini 4 Argon|Hydrogen (<Level>)>"`. A ROUTER
+#                 picks model AND level per round from references/reviewer_profiles.json
+#                 (`routes` + `router`): pass number (the same one codex's ladder
+#                 uses) and diff size. Override: --gemini-pro-route <model>:<level>
+#                 / CROSS_REVIEW_GEMINI_PRO_ROUTE. NEVER pair --model with agy's
+#                 --effort flag: agy rejects the combination (see the router block).
+#   antigravity — RETIRED 2026-11-14 (owner: one Gemini seat is enough; the
+#                 Hydrogen ladder replaces both laps). `--reviewers antigravity`
+#                 is refused with a pointer at gemini-pro.
 #   Install agy: `curl -fsSL https://antigravity.google/cli/install.sh | bash`
 #                (lands at ~/.local/bin/agy). Auth: `agy login` once interactively.
 #
@@ -57,16 +59,16 @@
 #   running; that is the point of it.
 #
 # GOTCHA: `agy --model` takes the EXACT display-name string `agy models` prints
-# (e.g. "Gemini 3.1 Pro (High)"). On an unrecognized string agy does NOT error —
+# (e.g. "Gemini 4 Hydrogen (High)"). On an unrecognized string agy does NOT error —
 # it silently falls back to its default (Gemini 3.5 Flash). So a typo here turns
 # the "deep lap" into a second Flash run with no warning. Keep the model strings
 # below in sync with `agy models`.
 #
 # Usage:
 #   run_reviewers.sh --base <branch> --out <dir>
-#                    [--reviewers codex,glm-coding,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling]
+#                    [--reviewers codex,glm-coding,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling]
 #                    [--timeout <sec>]
-#                    [--timeout-codex <sec>] [--timeout-antigravity <sec>]
+#                    [--timeout-codex <sec>] 
 #                    [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>]
 #                    [--timeout-glm <sec>] [--timeout-glm-coding <sec>]
 #                    [--snapshot-dir <dir>]
@@ -256,11 +258,13 @@ timeout_codex=""
 # Reasoning effort for the codex lane. Empty = derive it (see the resolution
 # block below the repeat-pass guard); an explicit value pins it.
 codex_effort="${CROSS_REVIEW_CODEX_EFFORT:-}"
+# Route for the gemini-pro seat, "<model>:<level>" (e.g. argon:high). Empty =
+# derive it from pass number + diff size via the profile's `router` table.
+gemini_pro_route="${CROSS_REVIEW_GEMINI_PRO_ROUTE:-}"
 # Subject identity for the repeat-pass guard's state key. Empty = let the
 # guard derive it from git, which is right for a plain checkout and useless in
 # a worktree — see the note above the guard block.
 subject_id="${CROSS_REVIEW_SUBJECT_ID:-}"
-timeout_antigravity=""
 timeout_gemini_pro=""
 timeout_kimi=""
 timeout_glm=""
@@ -278,7 +282,7 @@ timeout_glm_coding=""
 #
 # The names below are the API-lane reviewers whose model comes from the profile.
 # Resolution happens after profile_get is defined, further down.
-model_backed_reviewers=(antigravity gemini-pro glm-coding glm deepseek mimo
+model_backed_reviewers=(gemini-pro glm-coding glm deepseek mimo
                         minimax qwen
                         devstral laguna kat north nemotron spark seed grok
                         longcat inkling kimi27 kimi3)
@@ -318,10 +322,10 @@ while [[ $# -gt 0 ]]; do
     --reviewers)          need_val --reviewers          "$#"; reviewers="$2";          shift 2 ;;
     --timeout)            need_val --timeout            "$#"; timeout_s="$2";          shift 2 ;;
     --timeout-codex)      need_val --timeout-codex      "$#"; timeout_codex="$2";      shift 2 ;;
+    --gemini-pro-route)   need_val --gemini-pro-route   "$#"; gemini_pro_route="$2";   shift 2 ;;
     --codex-effort)       need_val --codex-effort       "$#"; codex_effort="$2";       shift 2 ;;
     --subject-id)        need_val --subject-id        "$#"; subject_id="$2";        shift 2 ;;
-    --timeout-antigravity) need_val --timeout-antigravity "$#"; timeout_antigravity="$2"; shift 2 ;;
-    --timeout-gemini-pro) need_val --timeout-gemini-pro "$#"; timeout_gemini_pro="$2"; shift 2 ;;
+        --timeout-gemini-pro) need_val --timeout-gemini-pro "$#"; timeout_gemini_pro="$2"; shift 2 ;;
     --timeout-kimi)       need_val --timeout-kimi       "$#"; timeout_kimi="$2";       shift 2 ;;
     --timeout-glm)        need_val --timeout-glm        "$#"; timeout_glm="$2";        shift 2 ;;
     --timeout-glm-coding) need_val --timeout-glm-coding "$#"; timeout_glm_coding="$2"; shift 2 ;;
@@ -333,7 +337,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,glm-coding,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff]" >&2
+  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,glm-coding,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>]  [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff]" >&2
   exit 2
 fi
 case "$context_mode" in
@@ -354,11 +358,11 @@ esac
 # what it is). Missing/failed selector → classic fixed fleet.
 #
 # The fallback fleet is DERIVED from the flags rather than written out: a
-# hardcoded "codex,antigravity,gemini-pro,kimi,glm" would quietly resurrect
+# hardcoded "codex,gemini-pro,kimi,glm" would quietly resurrect
 # both the retired kimi baseline and an OpenRouter seat on exactly the path
 # taken when the selector is broken -- i.e. it would spend on a lane the
 # operator switched off, at the moment nobody is watching.
-fallback_fleet="codex,antigravity,gemini-pro"
+fallback_fleet="codex,gemini-pro"
 cr_glm_baseline_on  && fallback_fleet="$fallback_fleet,glm-coding"
 cr_kimi_baseline_on && fallback_fleet="$fallback_fleet,kimi"
 cr_openrouter_on    && fallback_fleet="$fallback_fleet,glm"
@@ -386,6 +390,17 @@ if [[ -z "$reviewers" ]]; then
     echo "roster: selector unavailable — using fixed fallback fleet: $reviewers" >&2
   fi
 fi
+
+# antigravity (the Gemini 3.8 Flash lap) was retired 2026-11-14: one Gemini seat
+# is enough and the Hydrogen ladder replaces both laps. An explicit request is
+# refused loudly rather than silently dropped, so a stale script or muscle-memory
+# `--reviewers codex,antigravity` cannot quietly run a roster without the seat
+# the caller thought they had.
+case ",$reviewers," in
+  *,antigravity,*)
+    echo "run_reviewers: reviewer 'antigravity' is retired (2026-11-14: one Gemini seat is enough). Use 'gemini-pro' — it now runs the Gemini 4 Hydrogen effort ladder." >&2
+    exit 2 ;;
+esac
 
 # Per-reviewer timeout precedence (CLI > config > built-in default):
 #   1. --timeout-<reviewer>      (per-reviewer CLI flag, explicit)
@@ -464,7 +479,6 @@ for _r in "${model_backed_reviewers[@]}"; do
 done
 
 codex_profile="$(profile_timeout codex)"
-antigravity_profile="$(profile_timeout antigravity)"
 gemini_pro_profile="$(profile_timeout gemini-pro)"
 kimi_profile="$(profile_timeout kimi)"
 glm_profile="$(profile_timeout glm)"
@@ -486,9 +500,10 @@ inkling_profile="$(profile_timeout inkling)"
 kimi27_profile="$(profile_timeout kimi27)"
 kimi3_profile="$(profile_timeout kimi3)"
 codex_timeout="${timeout_codex:-${timeout_s:-${codex_profile:-$(( timeout_s_default > 900 ? timeout_s_default : 900 ))}}}"
-antigravity_timeout="${timeout_antigravity:-${timeout_s:-${antigravity_profile:-$timeout_s_default}}}"
-# gemini-pro defaults to a longer budget than Flash: Pro's deeper reasoning
-# routinely runs 2-3x longer than Flash on the same diff.
+# gemini-pro defaults to a longer budget than the 600s baseline: deep reasoning
+# routinely runs 2-3x longer on the same diff. 900s is kept for the Hydrogen
+# ladder (no measurement yet says XHigh needs more; revisit from the runlog's
+# gemini-pro duration_s / wall_over_budget rows once pass-1 XHigh data exists).
 gemini_pro_timeout="${timeout_gemini_pro:-${timeout_s:-${gemini_pro_profile:-900}}}"
 kimi_timeout="${timeout_kimi:-${timeout_s:-${kimi_profile:-$timeout_s_default}}}"
 glm_timeout="${timeout_glm:-${timeout_s:-${glm_profile:-$timeout_s_default}}}"
@@ -578,6 +593,25 @@ fi
 # A per-round ref is also the only *safe* key. Substituting a literal like
 # "detached" would collide every detached review of a repo onto one key — and
 # since they also share a base, the guard would start refusing unrelated PRs.
+# Reasoning-effort helpers for the codex ladder. effort_rank orders the levels
+# (minimal < low < medium < high < xhigh); unknown prints -1. codex_config_effort
+# prints the top-level model_reasoning_effort codex itself would inherit from
+# ${CODEX_HOME:-$HOME/.codex}/config.toml, or nothing when it cannot be read
+# (no file, no top-level key, or a value outside the known set).
+effort_rank() {
+  case "$1" in minimal) echo 0 ;; low) echo 1 ;; medium) echo 2 ;; high) echo 3 ;; xhigh) echo 4 ;; *) echo -1 ;; esac
+}
+codex_config_effort() {
+  local f="${CODEX_HOME:-$HOME/.codex}/config.toml" v
+  [[ -r "$f" ]] || return 0
+  # Top-level keys only: stop at the first [table] header.
+  v="$(awk '/^[[:space:]]*\[/ { exit }
+            /^[[:space:]]*model_reasoning_effort[[:space:]]*=/ {
+              sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*#.*$/, ""); gsub(/["'"'"'[:space:]]/, ""); print; exit }' "$f" 2>/dev/null)"
+  [[ "$(effort_rank "$v")" -ge 0 ]] && printf '%s' "$v"
+  return 0
+}
+
 _guard_id_args=()
 [[ -n "$subject_id" ]] && _guard_id_args=(--branch "$subject_id")
 
@@ -605,32 +639,63 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # Reasoning effort for codex, decided BEFORE the record below flips this
   # branch's answer from "first" to "repeat".
   #
-  # ~/.codex/config.toml sets model_reasoning_effort = "xhigh" globally, tuned
-  # for interactive deep work, and run_codex() never overrode it — so a pass-3
-  # confirmation on a 39-line incremental diff that returns a 15-byte "no
-  # findings" verdict was billed at the same effort as the first full review.
-  # Measured 2026-08-29: 1,426 review runs, all at xhigh; 90 of them fell
-  # through to metered OpenRouter on account_limit. The cost of a repeat pass
-  # is what took codex out of the fleet for five days on 2026-08-22.
+  # codex's own config (${CODEX_HOME:-~/.codex}/config.toml) sets
+  # model_reasoning_effort, and run_codex() never overrode it for pass 1 — so a
+  # pass-3 confirmation on a 39-line incremental diff that returns a 15-byte
+  # "no findings" verdict was billed at the same effort as the first full
+  # review. Measured 2026-08-29, when the config said "xhigh": 1,426 review
+  # runs, all at xhigh; 90 of them fell through to metered OpenRouter on
+  # account_limit. The cost of a repeat pass is what took codex out of the
+  # fleet for five days on 2026-08-22.
   #
-  # The ladder follows what each pass is actually doing, measured over August:
+  # The ladder follows what each pass is actually doing, measured over August,
+  # and is RELATIVE to pass 1's level — it only ever steps DOWN from it:
   #
-  #   pass 1   xhigh (config)  the full diff, first look
-  #   pass 2   high            a narrow fix check — still productive,
-  #                            51% FIXES_APPLIED
-  #   pass 3+  medium          mostly codex confirming its own earlier
-  #                            verdict — 57% CLEAN (115/202)
+  #   pass 1   the config level  the full diff, first look (inherited)
+  #   pass 2   min(high, config)    a narrow fix check — still productive,
+  #                                 51% FIXES_APPLIED
+  #   pass 3+  min(medium, config)  mostly codex confirming its own earlier
+  #                                 verdict — 57% CLEAN (115/202)
+  #
+  # (order: minimal < low < medium < high < xhigh). With the config at xhigh
+  # that is xhigh/high/medium; at medium, medium/medium/medium; at low,
+  # low/low/low.
+  #
+  # INCIDENT 2026-11-14: the ladder was written against a config of "xhigh" and
+  # hardcoded "high" for pass 2. The owner then deliberately set the config to
+  # "medium", which silently INVERTED the ladder — the narrow fix-check pass
+  # ran at high, above the first full review. Found from the codex banners of
+  # one run (medium/high/medium/medium). Hence the min(): the ladder may never
+  # spend more than the owner's configured level. When the config cannot be
+  # read (no file, no top-level key, unrecognised value) the level is unknown,
+  # nothing can be clamped, and the original fixed rungs (high / medium) apply.
   #
   # It stops at medium. Nothing measured says a confirmation pass at `low`
   # still catches regressions, and a re-pass that silently stops looking is
-  # worse than an expensive one. --codex-effort / CROSS_REVIEW_CODEX_EFFORT
-  # pin the level when the caller knows better — a late pass that is really a
-  # structural re-review wants xhigh back.
-  if [[ -z "$codex_effort" ]]; then
+  # worse than an expensive one — but a config BELOW medium is the owner's own
+  # choice, and the min() honours it. --codex-effort / CROSS_REVIEW_CODEX_EFFORT
+  # pin the level absolutely (no clamping) when the caller knows better — a
+  # late pass that is really a structural re-review wants xhigh back.
+  # The pass number is computed ONCE and shared with the gemini-pro router
+  # below, so both seats agree on which pass this is.
+  if [[ -z "$codex_effort" || -z "$gemini_pro_route" ]]; then
     _pc="$(bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --pass-context 2>/dev/null || echo 1)"
     case "$_pc" in ''|*[!0-9]*) _pc=1 ;; esac
-    if   (( _pc >= 3 )); then codex_effort="medium"
-    elif (( _pc == 2 )); then codex_effort="high"
+  fi
+  codex_effort_source="config"
+  if [[ -n "$codex_effort" ]]; then
+    codex_effort_source="override"
+  else
+    _cx_target=""
+    if   (( _pc >= 3 )); then _cx_target="medium"
+    elif (( _pc == 2 )); then _cx_target="high"
+    fi
+    if [[ -n "$_cx_target" ]]; then
+      codex_effort="$_cx_target"; codex_effort_source="ladder"
+      _cx_cfg="$(codex_config_effort)"
+      if [[ -n "$_cx_cfg" ]] && (( $(effort_rank "$_cx_cfg") < $(effort_rank "$_cx_target") )); then
+        codex_effort="$_cx_cfg"; codex_effort_source="ladder_clamped_to_config"
+      fi
     fi
   fi
 
@@ -651,6 +716,97 @@ case "$codex_effort" in
   *) echo "run_reviewers: ignoring unknown --codex-effort '$codex_effort' (want minimal|low|medium|high|xhigh)" >&2
      codex_effort="" ;;
 esac
+# What the codex lane will actually run at, for the meta/runlog (measure_codex_effort.sh
+# reads `effort`): the pinned/ladder level, else whatever the config gives pass 1.
+if [[ -z "$codex_effort" ]]; then codex_effort_source="config"
+elif [[ -z "${codex_effort_source:-}" ]]; then codex_effort_source="override"; fi
+codex_effort_used="${codex_effort:-$(codex_config_effort)}"
+codex_pass="${_pc:-1}"
+
+# gemini-pro ROUTER: picks the agy model AND its level for this round.
+#
+# The DATA lives in the profile (`routes`: "<model>:<level>" -> exact `agy
+# models` display name; `router`: thresholds and which route each rule picks);
+# model names are kept out of this script. Inputs are the pass number (the same
+# ${_pc} the codex ladder just used; 1 when no pass context exists) and the diff
+# size in lines. The table is a STARTING GUESS to be measured, not a result:
+# scripts/measure_gemini_route.sh --if-due raises a banner when the review date
+# in `router.review_due` passes.
+#
+#   pass 1, diff >= router.small_diff_lines   router.pass1        (argon:high)
+#   pass 1, diff <  router.small_diff_lines   router.pass1_small  (hydrogen:xhigh)
+#   pass 1, size unknown                      router.pass1
+#   pass 2                                    router.pass2        (hydrogen:high)
+#   pass 3+                                   router.pass3_plus   (hydrogen:medium)
+#
+# Pass 3+ stops at medium on purpose, exactly as codex's ladder does: nothing
+# measured says a confirmation pass at `low` still catches regressions, and a
+# re-pass that silently stops looking is worse than an expensive one.
+#
+# WHY Argon takes the big first look: OpenRouter's catalog describes Argon as
+# Google's "flagship reasoning model" and Hydrogen as the "high-efficiency
+# workhorse ... lower cost and latency", with Argon at ~1.33x Hydrogen's price.
+# So the deepest first look goes to Argon (its top level is High — it has no
+# XHigh), and Hydrogen takes the cheaper confirmation passes and tiny diffs.
+#
+# WHY the level rides in the --model display name and NEVER in agy's --effort:
+# probed 2026-11-14 on agy 1.5.9, `--model "Gemini 4 Hydrogen (Low)" --effort
+# high` exits with "--effort is not supported for model ..." (and a bare
+# "Gemini 4 Hydrogen" is refused the same way). The two are conflicting, not
+# redundant; the display name is the only dial.
+#
+# An unknown --gemini-pro-route is ignored with a warning and the seat stays on
+# the profile's `.model` (the pass-1 default): a typo must not silently change
+# what a round costs. Fail closed against the profile's `routes` keys.
+gemini_pro_route_reason=""
+gemini_pro_diff_lines=""
+gemini_pro_pass="${_pc:-1}"
+case "$gemini_pro_pass" in ''|*[!0-9]*) gemini_pro_pass=1 ;; esac
+(( gemini_pro_pass < 1 )) && gemini_pro_pass=1
+if [[ -n "$gemini_pro_route" ]]; then
+  gemini_pro_route="$(printf '%s' "$gemini_pro_route" | tr '[:upper:]' '[:lower:]')"
+  if [[ -n "$(profile_path gemini-pro ".routes.\"$gemini_pro_route\"" 2>/dev/null)" ]]; then
+    gemini_pro_route_reason="override"
+  else
+    echo "run_reviewers: ignoring unknown --gemini-pro-route '$gemini_pro_route' (allowed: $(jq -r '.["gemini-pro"].routes // {} | keys | join(", ")' "$profile_file" 2>/dev/null))" >&2
+    gemini_pro_route="" ; gemini_pro_route_reason="default(bad_override)"
+  fi
+elif [[ -n "$(profile_path gemini-pro '.router.pass1')" ]]; then
+  if (( gemini_pro_pass >= 3 )); then
+    gemini_pro_route="$(profile_path gemini-pro '.router.pass3_plus')"; gemini_pro_route_reason="pass3_plus(pass=$gemini_pro_pass)"
+  elif (( gemini_pro_pass == 2 )); then
+    gemini_pro_route="$(profile_path gemini-pro '.router.pass2')"; gemini_pro_route_reason="pass2"
+  else
+    _gp_small="$(profile_path gemini-pro '.router.small_diff_lines')"
+    case "$_gp_small" in ''|*[!0-9]*) _gp_small=0 ;; esac
+    gemini_pro_diff_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
+    case "$gemini_pro_diff_lines" in ''|*[!0-9]*) gemini_pro_diff_lines="" ;; esac
+    if [[ -n "$gemini_pro_diff_lines" ]] && (( gemini_pro_diff_lines < _gp_small )); then
+      gemini_pro_route="$(profile_path gemini-pro '.router.pass1_small')"
+      gemini_pro_route_reason="pass1_small(lines=$gemini_pro_diff_lines<$_gp_small)"
+    else
+      gemini_pro_route="$(profile_path gemini-pro '.router.pass1')"
+      gemini_pro_route_reason="pass1(lines=${gemini_pro_diff_lines:-unknown})"
+    fi
+  fi
+fi
+gemini_pro_route_used=""
+if [[ -n "$gemini_pro_route" ]]; then
+  _gp_m="$(profile_path gemini-pro ".routes.\"$gemini_pro_route\"" 2>/dev/null)"
+  if [[ -n "$_gp_m" ]]; then
+    gemini_pro_model="$_gp_m"
+    gemini_pro_route_used="$gemini_pro_route"
+    # Optional per-route timeout (profile `route_timeout_s`), below an explicit
+    # --timeout-gemini-pro / --timeout. No route needs one yet: the 2026-11-14
+    # smoke probe (a one-word prompt) says nothing about review-sized latency.
+    _gp_rt="$(profile_path gemini-pro ".route_timeout_s.\"$gemini_pro_route\"" 2>/dev/null)"
+    case "$_gp_rt" in ''|*[!0-9]*) ;; *) [[ -z "${timeout_gemini_pro:-}" && -z "${timeout_s:-}" ]] && gemini_pro_timeout="$_gp_rt" ;; esac
+  else
+    echo "run_reviewers: gemini-pro router picked '$gemini_pro_route' but the profile has no such route — using .model" >&2
+    gemini_pro_route_reason="default(route_missing:$gemini_pro_route)"
+  fi
+fi
+[[ -z "$gemini_pro_route_used" && -z "$gemini_pro_route_reason" ]] && gemini_pro_route_reason="default(no_router)"
 
 # Whole-file context for the text-only lanes (--context-mode files). Built
 # ONCE here, before dispatch, because every text-only seat gets the identical
@@ -931,6 +1087,14 @@ maybe_or_fallback() {
   if ! cr_openrouter_on; then echo "$rc"; return; fi
   enabled="$(profile_path "$name" '.or_fallback.enabled')"
   fb_model="$(profile_path "$name" '.or_fallback.model')"
+  # A routed seat (gemini-pro) falls back to the OpenRouter slug of the model the
+  # router actually picked, so "same model over OpenRouter" holds whichever
+  # family ran. `or_fallback.route_models` maps the route's model prefix
+  # (argon|hydrogen) to a slug; absent -> the plain `.model` above.
+  if [[ -n "${gemini_pro_route_used:-}" && "$name" == "gemini-pro" ]]; then
+    _fb_rm="$(profile_path "$name" ".or_fallback.route_models.\"${gemini_pro_route_used%%:*}\"")"
+    [[ -n "$_fb_rm" ]] && fb_model="$_fb_rm"
+  fi
   [[ "$enabled" == "true" && -n "$fb_model" ]] || { echo "$rc"; return; }
   reason="$(bash "$script_dir/fallback_eligible.sh" --name "$name" --rc "$rc" --out "$out")" \
     || { echo "$rc"; return; }
@@ -1586,8 +1750,9 @@ run_codex() {
     fk_json='"no_verdict_output"'
     rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "agent", "context_mode": "tools"}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" "$fk_json" "$(wall_over_budget "$((end - start))" "$codex_timeout")" >"$out/codex.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "agent", "context_mode": "tools", "effort": %s, "effort_source": "%s", "pass_context": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" "$fk_json" "$(wall_over_budget "$((end - start))" "$codex_timeout")" \
+    "$([[ -n "${codex_effort_used:-}" ]] && printf '"%s"' "$codex_effort_used" || printf null)" "${codex_effort_source:-config}" "${codex_pass:-1}" >"$out/codex.meta.json"
   # IMPORTANT: return $rc so the caller's `wait "$pid"` sees the real exit code.
   # Previous version ended with `printf` whose success (exit 0) masked every
   # upstream reviewer failure.
@@ -2154,7 +2319,7 @@ agy_soft_denied() {
 # Signature (verified 2026-08-03, agy 1.1.8): rc=1, 0 bytes stdout, stderr is
 # exactly `Error: timeout waiting for response`, and coreutils `timeout` never
 # fires (so rc is 1, not 124, and the old code left failure_kind=null). This is
-# the gemini-pro "attempt 1 empty, attempt 2 fine" flake: Gemini 3.1 Pro at High
+# the gemini-pro "attempt 1 empty, attempt 2 fine" flake: Gemini Pro-class models at High
 # effort routinely needs 300-400s on a 100KB prompt, so a budget whose internal
 # timeout lands near that mark loses the race intermittently. The remedy is a
 # bigger --timeout-gemini-pro, NOT re-auth — which is exactly what the
@@ -2165,11 +2330,11 @@ agy_print_timeout() {
   return 1
 }
 
-# run_agy_reviewer: shared body for the two Gemini-family laps. Both run on the
-# `agy` (Antigravity) CLI; they differ only in slug, --model, and timeout.
+# run_agy_reviewer: the agy lane body. Since 2026-11-14 only gemini-pro uses it
+# (antigravity retired); it stays parameterised by slug/--model/timeout.
 # POLICY: no OpenRouter fallback for first-party laps — on quota/panic the lap
 # fails honestly and roster rotation covers the gap on subsequent runs. Args:
-#   $1 slug   (antigravity | gemini-pro)
+#   $1 slug   (gemini-pro)
 #   $2 model  (exact `agy models` display name)
 #   $3 timeout_budget (seconds)
 run_agy_reviewer() {
@@ -2182,9 +2347,9 @@ run_agy_reviewer() {
     return 2
   fi
 
-  # Quota sentinel: the two laps share one Google "Individual quota" (resets on
-  # a ~2-day cadence — it will NOT recover within this run). If the sibling lap
-  # or an earlier attempt already hit the wall, don't burn another agy call.
+  # Quota sentinel: the Google "Individual quota" resets on a ~2-day cadence —
+  # it will NOT recover within this run. If an earlier attempt already hit the
+  # wall, don't burn another agy call.
   if [[ -f "$out/agy.quota_exhausted" ]]; then
     echo "$slug: agy quota already exhausted this run ($(cat "$out/agy.quota_exhausted" 2>/dev/null)) — skipping agy" >&2
     printf '{"exit_code": 3, "duration_s": 0, "timed_out": false, "output_bytes": 0, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": "quota_exhausted", "agy_call_skipped": true, "context_mode": "tools"}\n' \
@@ -2447,7 +2612,7 @@ $context_intro HARD CONSTRAINT: you are running headless with no interactive per
       # budget, instead of chasing an auth problem that does not exist.
       failure_kind="print_timeout"
       timed_out="true"
-      echo "$slug: agy gave up at its internal print-timeout (${agy_internal_timeout}) with no output — raise --timeout-${slug} if this recurs (Gemini 3.1 Pro at High effort often needs 300-400s)" >&2
+      echo "$slug: agy gave up at its internal print-timeout (${agy_internal_timeout}) with no output — raise --timeout-${slug} if this recurs (Gemini 4 Hydrogen at XHigh effort often needs 300-400s)" >&2
     elif [[ $rc -eq 0 && "$bytes" -eq 0 ]] && agy_soft_denied "$agy_log" "$out/${slug}.stderr"; then
       # Gagged, not dead: the seat is authed and in quota, but a tool call it
       # made couldn't be confirmed in headless mode. Distinct remedy from
@@ -2470,12 +2635,19 @@ $context_intro HARD CONSTRAINT: you are running headless with no interactive per
     failure_kind="no_verdict_output"
     rc=5
   fi
-  local fk_json="null" qr_json="null" rm_json="null"
+  local fk_json="null" qr_json="null" rm_json="null" rt_json="null" rr_json="null" dl_json="null"
+  # Which route (model:level) the router picked, and which rule fired, so
+  # measure_gemini_route.sh can compare routes later. Null off the router.
+  if [[ "$slug" == "gemini-pro" ]]; then
+    [[ -n "${gemini_pro_route_used:-}" ]] && rt_json="\"$gemini_pro_route_used\""
+    [[ -n "${gemini_pro_route_reason:-}" ]] && rr_json="\"$gemini_pro_route_reason\""
+    [[ -n "${gemini_pro_diff_lines:-}" ]] && dl_json="$gemini_pro_diff_lines"
+  fi
   [[ -n "$resolved_model" ]] && rm_json="\"$resolved_model\""
   [[ -n "$failure_kind" ]] && fk_json="\"$failure_kind\""
   [[ -n "$quota_resets_in" ]] && qr_json="\"$quota_resets_in\""
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s, "model_resolved": %s, "context_access": "workspace_read", "context_mode": "tools"}\n' \
-    "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$rm_json" >"$out/${slug}.meta.json"
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": %d, "timeout_budget_s": %d, "model": "%s", "cli": "agy", "failure_kind": %s, "quota_resets_in": %s, "wall_over_budget": %s, "model_resolved": %s, "context_access": "workspace_read", "context_mode": "tools", "route": %s, "route_reason": %s, "pass_context": %s, "diff_lines": %s}\n' \
+    "$rc" "$((end - start))" "$timed_out" "$bytes" "${CROSS_REVIEW_ATTEMPT:-1}" "$timeout_budget" "$model" "$fk_json" "$qr_json" "$(wall_over_budget "$((end - start))" "$timeout_budget")" "$rm_json" "$rt_json" "$rr_json" "${gemini_pro_pass:-1}" "$dl_json" >"$out/${slug}.meta.json"
   cp -f "$out/${slug}.meta.json" "$out/${slug}.attempt${attempt_n}.meta.json" 2>/dev/null || true
   # No fallback: a failed agy lap stays failed (failure_kind says why). Roster
   # rotation compensates across runs; the leaderboard's reliability signal
@@ -2483,14 +2655,10 @@ $context_intro HARD CONSTRAINT: you are running headless with no interactive per
   return "$rc"
 }
 
-run_antigravity() {
-  # Fast lap: agy on Gemini 3.5 Flash. Replaces the retired `gemini` CLI slot.
-  run_agy_reviewer antigravity "$antigravity_model" "$antigravity_timeout"
-}
-
 run_gemini_pro() {
-  # Deep lap: agy on Gemini 3.1 Pro. Migrated off the standalone `gemini` CLI in
-  # the 2026-06-18 sunset; now shares the agy binary with antigravity.
+  # The one Gemini seat: agy on a Gemini 4 Hydrogen effort-ladder model
+  # ($gemini_pro_model, resolved from the profile ladder after the codex effort
+  # block).
   run_agy_reviewer gemini-pro "$gemini_pro_model" "$gemini_pro_timeout"
 }
 
@@ -3027,16 +3195,6 @@ for r in "${requested[@]}"; do
         echo "codex not installed — skipping" >&2
       fi
       ;;
-    antigravity)
-      if command -v agy >/dev/null 2>&1; then
-        [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
-        retry_reviewer run_antigravity antigravity &
-        pids+=($!)
-        ran+=("antigravity")
-      else
-        echo "antigravity (agy CLI) not installed — skipping. Install: curl -fsSL https://antigravity.google/cli/install.sh | bash" >&2
-      fi
-      ;;
     gemini-pro)
       if command -v agy >/dev/null 2>&1; then
         [[ ${#pids[@]} -gt 0 ]] && sleep "$stagger_s"
@@ -3044,7 +3202,7 @@ for r in "${requested[@]}"; do
         pids+=($!)
         ran+=("gemini-pro")
       else
-        echo "gemini-pro (agy CLI on Gemini 3.1 Pro) not installed — skipping. Install: curl -fsSL https://antigravity.google/cli/install.sh | bash" >&2
+        echo "gemini-pro (agy CLI on Gemini 4 Hydrogen) not installed — skipping. Install: curl -fsSL https://antigravity.google/cli/install.sh | bash" >&2
       fi
       ;;
     kimi)

@@ -32,24 +32,26 @@ Flags we deliberately do not use:
 
 Auth: codex uses its own login (`codex login`). If the first run hangs on auth, that's almost always it. Re-run `codex login` interactively once, then headless runs work.
 
-## antigravity & gemini-pro (both via `agy`)
+## gemini-pro (via `agy`; antigravity retired 2026-11-14)
 
 Binary: `agy` (Google Antigravity CLI). Verify with `agy --version`. Install: `curl -fsSL https://antigravity.google/cli/install.sh | bash` (lands at `~/.local/bin/agy`). Auth: `agy login` once interactively (Google OAuth); state persists for headless runs.
 
-> **Why two reviewers on one CLI.** As of the **2026-06-18 Gemini-CLI consumer sunset**, the standalone `gemini` CLI no longer serves free/Pro/Ultra requests. Google's replacement is Antigravity (`agy`), which now hosts the whole Gemini lineup *and* exposes `--model`. So both Gemini-family reviewers ride `agy`, differing only by `--model`:
+> **One Gemini seat on `agy`.** As of the **2026-06-18 Gemini-CLI consumer sunset**, the standalone `gemini` CLI no longer serves free/Pro/Ultra requests. Google's replacement is Antigravity (`agy`), which hosts the Gemini lineup *and* exposes `--model`. The one Gemini reviewer, `gemini-pro`, rides `agy`; a router picks the `--model` per round:
 >
-> | Reviewer | `--model` | Role | Default timeout |
-> |---|---|---|---|
-> | `antigravity` | `Gemini 3.8 Flash (High)` | fast lap | 600s |
-> | `gemini-pro`  | `Gemini 3.1 Pro (High)`   | deep lap | 900s |
+> | Route | `--model` display name |
+> |---|---|
+> | `argon:high` (pass 1, diff >= 80 lines) | `Gemini 4 Argon (High)` |
+> | `hydrogen:xhigh` (pass 1, smaller diff) | `Gemini 4 Hydrogen (XHigh)` |
+> | `hydrogen:high` (pass 2) | `Gemini 4 Hydrogen (High)` |
+> | `hydrogen:medium` (pass 3+, the floor) | `Gemini 4 Hydrogen (Medium)` |
 >
-> They are the **same provider (Google)** — count their agreement as a single provider's vote, not two independent ones (see `reviewer_profiles.json` `_synthesis_rules.provider_independence`).
+> The table lives in `reviewer_profiles.json` (`gemini-pro.routes` / `.router`); default timeout 900s. `antigravity` (Gemini 3.8 Flash) was retired 2026-11-14. **Do not add agy's `--effort`:** probed 2026-11-14 on agy 1.5.9, `--model "Gemini 4 Hydrogen (Low)" --effort high` is rejected (`--effort is not supported for model`); the level is part of the display name.
 
-Invocation used by this skill (identical bar `--model` and timeout — see `run_agy_reviewer()`):
+Invocation used by this skill (see `run_agy_reviewer()`):
 
 ```bash
 agy \
-  --model "Gemini 3.1 Pro (High)" \
+  --model "Gemini 4 Argon (High)" \
   --sandbox \
   --print-timeout <budget>s \
   --log-file <out>/<slug>.agy.log \
@@ -58,7 +60,7 @@ agy \
 
 Why these flags:
 
-- `--model "<exact display name>"` — pins the model. **The value MUST match an `agy models` display name string exactly** (e.g. `Gemini 3.1 Pro (High)`, *with* the parenthesized reasoning tier). On an unrecognized string, `agy` does **NOT error** — it silently falls back to its default (`Gemini 3.5 Flash`). Verified on `agy 1.0.9` (2026-06-18). This silent fallback is the single biggest footgun: a typo turns the "deep lap" into a second Flash run with no warning. Run `agy models` to see the current valid strings; keep them in sync with `reviewer_profiles.json` `.model` and the defaults in `run_reviewers.sh`.
+- `--model "<exact display name>"` — pins the model. **The value MUST match an `agy models` display name string exactly** (e.g. `Gemini 4 Argon (High)`, *with* the parenthesized reasoning tier). On an unrecognized string, `agy` does **NOT error** — it silently falls back to its default (`Gemini 3.5 Flash`). Verified on `agy 1.0.9` (2026-06-18). This silent fallback is the single biggest footgun: a typo silently runs a different model with no warning. Run `agy models` to see the current valid strings; keep them in sync with `reviewer_profiles.json` `.model` and `.routes`.
 - `--sandbox` — enables terminal/shell sandbox restrictions (the closest thing `agy` has to a read-only mode). We also prompt-instruct "do not edit/write/commit" as a backstop.
 - `--print-timeout <dur>` — `agy`'s own in-CLI timeout (Go duration syntax, e.g. `600s`). Set just under the wrapper's `timeout` budget so `agy` exits cleanly and flushes partial output rather than being hard-killed mid-write.
 - `-p <prompt>` — non-interactive single-shot. Aliases: `--print`, `--prompt`. Without it, `agy` launches its agent TUI and blocks forever in a pipeline.
@@ -152,9 +154,9 @@ Authorization: Bearer $ZAI_API_KEY        # header reaches curl on stdin, never 
 
 ## Known issues and gotchas
 
-- **All CLIs can cold-start slowly** on first run of the day (30–60s). Per-reviewer timeouts default to codex=300s, antigravity=600s, gemini-pro=900s, kimi=600s; if one hits its cap, it's usually auth or network, not actual work.
+- **All CLIs can cold-start slowly** on first run of the day (30–60s). Per-reviewer timeouts default to codex=300s, gemini-pro=900s, kimi=600s; if one hits its cap, it's usually auth or network, not actual work.
 - **codex may emit warnings about rate limits** on the free tier; they show up in stderr and do not fail the run. The final JSONL event will still contain the review.
-- **`agy --model` fails silently on a bad model string** — it falls back to Flash instead of erroring (see the antigravity/gemini-pro section above). If `gemini-pro` results look suspiciously fast/shallow, confirm the model string still matches an `agy models` entry.
-- **antigravity + gemini-pro share one `agy` auth + rate limit.** Running both concurrently can trip Google rate limits; the wrapper staggers spawns by 2s to soften the simultaneous-handshake case. Empty stdout from either usually means the shared auth expired — `agy login` once.
+- **`agy --model` fails silently on a bad model string** — it falls back to Flash instead of erroring (see the gemini-pro section above). If `gemini-pro` results look suspiciously fast/shallow, confirm the model string still matches an `agy models` entry.
+- **gemini-pro's `agy` auth + rate limit is a shared Google quota.** Empty stdout usually means the auth expired (`agy login` once) or the quota is exhausted (check `failure_kind`).
 - **kimi will print "To resume this session: kimi -r <uuid>" at the end** of every `--print` run (to stderr). Harmless, just noise in the log. Don't confuse it with an error.
-- **codex and the two agy reviewers will read files in the repo** (kimi runs diff-only, no tools). If the repo contains untrusted input (e.g., fixture data for a parser), be aware that this is being sent to external providers — OpenAI (codex), Google (agy), and Moonshot (kimi, a China-origin provider). Worth flagging for security-sensitive or export-controlled work.
+- **codex and the agy reviewer will read files in the repo** (kimi runs diff-only, no tools). If the repo contains untrusted input (e.g., fixture data for a parser), be aware that this is being sent to external providers — OpenAI (codex), Google (agy), and Moonshot (kimi, a China-origin provider). Worth flagging for security-sensitive or export-controlled work.

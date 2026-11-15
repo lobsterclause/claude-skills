@@ -25,7 +25,7 @@ command -v jq >/dev/null 2>&1 || { echo "jq required" >&2; exit 1; }
 mkdir -p "$T/bin" "$T/home"; export HOME="$T/home"
 cat >"$T/bin/agy" <<'SHIM'
 #!/bin/sh
-if [ "$1" = "models" ]; then printf "Gemini 3.8 Flash (High)\nGemini 3.1 Pro (High)\n"; exit 0; fi
+if [ "$1" = "models" ]; then printf "Gemini 3.8 Flash (High)\nGemini 4 Argon (High)\n"; exit 0; fi
 for a in "$@"; do printf '%s\n' "$a"; done >"$AGY_ARGV"
 printf "shim review: no findings\n"
 SHIM
@@ -48,7 +48,7 @@ add_dirs() {
 }
 run() {  # run <dir> <argv-file>
   ( cd "$1" && AGY_ARGV="$2" bash "$S/run_reviewers.sh" --base master --out "$2.out" \
-      --reviewers antigravity >"$2.log" 2>&1 )
+      --reviewers gemini-pro >"$2.log" 2>&1 )
 }
 
 echo "── agy add-dir in a linked worktree ──"

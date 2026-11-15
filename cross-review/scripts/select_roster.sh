@@ -90,6 +90,8 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 # reported it available. See lib_path.sh.
 # shellcheck source=lib_path.sh
 . "$script_dir/lib_path.sh"
+# shellcheck source=lib_agy_routes.sh
+. "$script_dir/lib_agy_routes.sh"
 # Baseline/OpenRouter feature flags — shared with detect_reviewers.sh and
 # run_reviewers.sh so the three cannot disagree about who exists.
 # shellcheck source=lib_flags.sh
@@ -168,8 +170,9 @@ if [[ ${#missing_baselines[@]} -gt 0 ]]; then
 fi
 
 POOL=()
+# antigravity (the Flash lap) was retired 2026-11-14: one Gemini seat is enough.
+# gemini-pro is the only agy seat in the draw.
 if command -v agy >/dev/null 2>&1; then
-  POOL+=(antigravity)
   # The Pro-availability probe (`agy models`) can hang for MINUTES on a cold
   # start when the Google quota is exhausted (agy retries its network
   # handshake). An availability check must never cost that, so: 6h TTL cache,
@@ -205,7 +208,8 @@ if command -v agy >/dev/null 2>&1; then
   fi
   if [[ -s "$models_cache" ]]; then
     # Slug or display name — see detect_reviewers.sh (agy 1.1.10 switched).
-    grep -Eqi 'gemini[ ._-]?3\.1[ ._-]?pro' "$models_cache" && POOL+=(gemini-pro)
+    # Available when any model on the profile's gemini-pro routes is listed.
+    agy_routes_listed "$models_cache" "${CROSS_REVIEW_PROFILES_FILE:-$script_dir/../references/reviewer_profiles.json}" && POOL+=(gemini-pro)
   else
     echo "  note: agy models probe unavailable — assuming gemini-pro exists" >&2
     POOL+=(gemini-pro)

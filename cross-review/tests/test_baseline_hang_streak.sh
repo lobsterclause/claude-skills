@@ -46,7 +46,7 @@ export CROSS_REVIEW_RUNLOG="$FIXLOG"
 mkdir -p "$T/bin"
 printf '#!/bin/sh\nprintf "shim\\n"\n' >"$T/bin/codex"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "shim review: no findings\\n"\n' >"$T/bin/kimi"
-printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.8 Flash (High)\\nGemini 3.1 Pro (High)\\n"; fi\n' >"$T/bin/agy"
+printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.8 Flash (High)\\nGemini 4 Argon (High)\\n"; fi\n' >"$T/bin/agy"
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export HOME="$T/home"; mkdir -p "$HOME"
