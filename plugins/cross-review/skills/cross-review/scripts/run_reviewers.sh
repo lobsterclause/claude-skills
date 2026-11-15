@@ -63,7 +63,7 @@
 # below in sync with `agy models`.
 #
 # Usage:
-#   run_reviewers.sh --base <branch> --out <dir>
+#   run_reviewers.sh --base <ref> --out <dir> [--target-ref <fully-qualified-ref>]
 #                    [--reviewers codex,glm-coding,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling]
 #                    [--timeout <sec>]
 #                    [--timeout-codex <sec>] [--timeout-antigravity <sec>]
@@ -221,6 +221,7 @@ done
 export PATH
 
 base=""
+target_ref=""
 allow_full_rereview="${CROSS_REVIEW_ALLOW_FULL_REREVIEW:-0}"
 out=""
 # Empty default: no per-reviewer snapshots. When set via --snapshot-dir, a
@@ -309,6 +310,7 @@ need_val() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base)               need_val --base               "$#"; base="$2";               shift 2 ;;
+    --target-ref)         need_val --target-ref         "$#"; target_ref="$2";         shift 2 ;;
     # Documented in SKILL.md's re-review loop as the escape hatch for a
     # deliberate full re-review. It was documented but never parsed, so the
     # only way past the guard was the env var and the documented flag killed
@@ -333,7 +335,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <branch> --out <dir> [--reviewers codex,glm-coding,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff]" >&2
+  echo "usage: $0 --base <ref> --out <dir> [--target-ref refs/remotes/<remote>/<branch>] [--reviewers codex,glm-coding,antigravity,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-antigravity <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff]" >&2
   exit 2
 fi
 case "$context_mode" in
@@ -590,6 +592,7 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # into a "guard returned 0 — continuing" and dispatched the round anyway.
   # Caught by the integration test in tests/test_repeat_pass_guard.sh.
   _guard_args=(${_guard_id_args[@]+"${_guard_id_args[@]}"} --base-sha "$_base_sha" --head-sha "$_head_sha")
+  [[ -n "$target_ref" ]] && _guard_args+=(--target-ref "$target_ref")
   [[ "$allow_full_rereview" == 1 ]] && _guard_args+=(--allow-full-rereview)
   bash "$_guard" "${_guard_args[@]}"
   _grc=$?
