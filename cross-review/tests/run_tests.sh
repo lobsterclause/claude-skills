@@ -1488,6 +1488,13 @@ echo "── delisted OpenRouter slugs are caught before the round ──"
 val_home="$T/valhome"
 mkdir -p "$val_home/.cross-review/cache"
 printf 'z-ai/glm-5.2\npoolside/laguna-s-2.1\n' >"$val_home/.cross-review/cache/or_models.txt"
+# Seed the catalog cache too. The validator refetches when EITHER cache file is
+# missing, and https://openrouter.ai/api/v1/models answers without a real key —
+# so with only or_models.txt here this block silently replaced the fixture with
+# the live catalog and asserted against whatever OpenRouter listed that day
+# (2026-11-14: `.missing` came back 2, not 1). An empty catalog keeps the run
+# offline and gives the pricing-drift pass nothing to report.
+printf '[]\n' >"$val_home/.cross-review/cache/or_catalog.json"
 cat >"$T/val_profiles.json" <<'JSON'
 {
   "glm":    { "cli": "openrouter", "model": "z-ai/glm-5.2" },
