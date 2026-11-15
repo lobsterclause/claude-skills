@@ -537,19 +537,39 @@ EOF
 
 ### 6. Re-review loop
 
-After committing, re-run steps 3–5 — but **incrementally**: pass the *previous pass's HEAD* as `--base` so reviewers see only the fix commits, and include the prior pass's findings table in the prompt preamble with the ask "verify each fix landed; scan only these new hunks for regressions." A re-pass is answering a narrow question, not re-finding everything — this cuts pass-2+ from ~30 minutes to single digits on large PRs (and it's why big-diff first passes are the only slow case). Use `select_roster.sh --fast` for re-pass rotation picks. Run the full-diff review only when the fixes were structural enough to invalidate the original review's context.
+After committing, re-run steps 3–5 and include the prior pass's findings table in the prompt preamble with the ask "verify each fix landed; scan only these new hunks for regressions." Choose `--base` from the commit graph:
+
+- If the previous pass's HEAD is still an ancestor of the current HEAD, use that previous HEAD as `--base`. This reviews the new fix commits.
+- If a rebase or history rewrite moved current HEAD off the previous pass's history, do **not** use that stale HEAD. Fetch the PR's actual target branch, name it with a fully qualified local or remote ref, and use the merge-base of current HEAD and that target for `--base`:
+
+  ```bash
+  target_ref=refs/remotes/origin/<actual-pr-target-branch>
+  git fetch origin <actual-pr-target-branch>
+  review_base="$(git merge-base HEAD "$target_ref")"
+  bash ~/.claude/skills/cross-review/scripts/run_reviewers.sh \
+    --base "$review_base" --target-ref "$target_ref" --out "$run_dir" \
+    --reviewers "$reviewers"
+  ```
+
+  Derive the target from this PR; do not assume a repository-wide default. If the target ref is missing, ambiguous, or has no merge-base with HEAD, stop and resolve the target before dispatching reviewers. The guard refuses an unverified rebase baseline.
+
+Use `select_roster.sh --fast` for re-pass rotation picks. A full re-review is appropriate when the fixes were structural enough to invalidate the original review's context. `--allow-full-rereview` can authorize that intentional full review when the ordinary history is available; after a rebase, the supplied base must still be the verified target merge-base.
 
 > **This is now enforced, not advised.** `run_reviewers.sh` calls
 > `scripts/check_repeat_pass.sh` before dispatching anything: if this
 > project+branch already had a round at the *same* base and HEAD has moved
-> since, the round is refused (exit 3) and the message names the base you
-> should have used. It was prose until 2026-08-29, and prose lost — 29% of
+> since, the round is refused (exit 3). It also checks that an incremental
+> base is the previous HEAD when that commit remains an ancestor; after a
+> rebase it requires `--target-ref` and the exact target merge-base. It was
+> prose until 2026-08-29, and prose lost — 29% of
 > August's multi-pass rounds re-reviewed the full diff anyway (43 PRs,
 > 162,929 diff lines re-read; PR #2168 read ~23,600 lines to review ~200).
 > For a deliberate full re-review, pass `--allow-full-rereview` (or set
 > `CROSS_REVIEW_ALLOW_FULL_REREVIEW=1`) — the escape hatch this paragraph
 > already allowed, now stated explicitly rather than assumed. The guard fails
-> **open**: a missing or unreadable state record never blocks a round.
+> **open**: a missing or unreadable state record never blocks a round. If a
+> prior record exists but its commit objects are unavailable, the guard fails
+> closed unless the caller supplies a verifiable target merge-base.
 >
 > The same record also sets **codex's reasoning effort**. `~/.codex/config.toml`
 > pins `model_reasoning_effort` globally (it was `xhigh` in August, tuned for interactive deep

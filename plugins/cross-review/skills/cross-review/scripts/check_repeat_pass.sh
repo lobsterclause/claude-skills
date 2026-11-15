@@ -4,9 +4,9 @@
 #
 # THE RULE THIS ENFORCES (SKILL.md, "Re-review loop"):
 #
-#   pass the *previous pass's HEAD* as --base so reviewers see only the fix
-#   commits ... A re-pass is answering a narrow question, not re-finding
-#   everything.
+#   use the *previous pass's HEAD* as --base while it remains an ancestor of
+#   the current HEAD. After a rebase/history rewrite, use the merge-base with
+#   the actual PR target supplied via --target-ref; never reuse the stale HEAD.
 #
 # That rule was prose, and prose is advisory. Measured on runlog.jsonl
 # 2026-08-29: 43 multi-pass PRs in August (29% of the month's multi-pass
@@ -23,18 +23,19 @@
 #     because they all share one base (`origin/develop`). The subject branch is
 #     the only thing that separates them, and the runlog does not record it.
 #
-#   So the guard keeps a small record per (project, subject branch). It is
-#   advisory state: losing it fails OPEN (a missing record allows the round).
+#   So the guard keeps a small record per (project, subject branch). A missing
+#   record allows the round. If the record exists but its commit objects are
+#   unavailable, require a verified merge-base against the explicit target.
 #
-# WHAT COUNTS AS A VIOLATION: a recorded round exists for this project+branch,
-# its base is the SAME as the one now requested, AND HEAD has moved since. The
-# moved-HEAD condition is what separates a genuine repeat pass (new fix
-# commits, same base = full re-review) from re-running an identical round after
-# a crash or a timeout, which must stay allowed.
+# WHAT COUNTS AS A VIOLATION: a fresh record exists for this project+branch,
+# HEAD moved, and the requested base is neither the previous HEAD nor a
+# verified target merge-base after rebase. Re-running an identical round after
+# a crash or timeout stays allowed.
 #
 # usage:
 #   check_repeat_pass.sh --project <p> --branch <b> --base-sha <sha> --head-sha <sha>
-#                        [--state-dir <d>] [--window-hours <n>] [--allow-full-rereview]
+#                        [--target-ref <fully-qualified-ref>] [--state-dir <d>]
+#                        [--window-hours <n>] [--allow-full-rereview]
 #   check_repeat_pass.sh --record --project <p> --branch <b> --base-sha <sha> --head-sha <sha>
 #   check_repeat_pass.sh --pass-context [--project <p>] [--branch <b>]
 #
@@ -61,7 +62,7 @@
 
 set -uo pipefail
 
-project=""; branch=""; base_sha=""; head_sha=""
+project=""; branch=""; base_sha=""; head_sha=""; target_ref=""
 state_dir=""; window_hours="${CROSS_REVIEW_REPEAT_WINDOW_HOURS:-24}"
 record=0; allow="${CROSS_REVIEW_ALLOW_FULL_REREVIEW:-0}"; pass_context=0
 
@@ -72,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --branch)              need_val "$1" "$#"; branch="$2";       shift 2 ;;
     --base-sha)            need_val "$1" "$#"; base_sha="$2";     shift 2 ;;
     --head-sha)            need_val "$1" "$#"; head_sha="$2";     shift 2 ;;
+    --target-ref)          need_val "$1" "$#"; target_ref="$2";   shift 2 ;;
     --state-dir)           need_val "$1" "$#"; state_dir="$2";    shift 2 ;;
     --window-hours)        need_val "$1" "$#"; window_hours="$2"; shift 2 ;;
     --record)              record=1; shift ;;
@@ -234,8 +236,85 @@ prev_epoch="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
 # later is a new review, not a repeat pass. Same predicate --pass-context uses.
 record_is_fresh "$prev_epoch" || exit 0
 
-[[ "$base_sha" == "$prev_base" ]] || exit 0    # base advanced -> incremental
 [[ "$head_sha" != "$prev_head" ]] || exit 0    # HEAD unmoved -> retry, allow
+
+# A rebase can move HEAD off the previous review's history. In that case the
+# old HEAD is not a valid incremental base: three-dot diff against it can
+# include unrelated history or hide the current PR's real changes. Require the
+# actual PR target as a fully-qualified branch ref and insist that --base is
+# the merge-base of the current HEAD and that target. If the previous review's
+# HEAD is still an ancestor, the only safe incremental base is that HEAD.
+if git cat-file -e "$prev_head^{commit}" 2>/dev/null &&
+   git cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+  if git merge-base --is-ancestor "$prev_head" "$head_sha" 2>/dev/null; then
+    if [[ "$base_sha" == "$prev_head" ]]; then exit 0; fi
+    if [[ "$base_sha" != "$prev_base" && "$allow" != 1 ]]; then
+      printf 'check_repeat_pass: incremental review must use previous HEAD as --base: %s (supplied %s)\n' \
+        "$prev_head" "$base_sha" >&2
+      exit 3
+    fi
+  else
+    ancestor_rc=$?
+    if [[ "$ancestor_rc" -ne 1 ]]; then
+      echo "check_repeat_pass: cannot verify previous HEAD ancestry" >&2
+      exit 3
+    fi
+    case "$target_ref" in
+      refs/heads/*|refs/remotes/*) ;;
+      *)
+        echo "check_repeat_pass: rebased HEAD is not descended from the prior review; pass the fully-qualified PR target ref with --target-ref" >&2
+        exit 3
+        ;;
+    esac
+    if ! git rev-parse --verify --quiet "$target_ref^{commit}" >/dev/null 2>&1; then
+      echo "check_repeat_pass: target ref is missing or does not resolve to a commit: $target_ref" >&2
+      exit 3
+    fi
+    expected_base="$(git merge-base "$head_sha" "$target_ref" 2>/dev/null || true)"
+    if [[ ! "$expected_base" =~ ^[0-9a-fA-F]{40}$ ]]; then
+      echo "check_repeat_pass: no merge-base between current HEAD and target ref $target_ref" >&2
+      exit 3
+    fi
+    if [[ "$base_sha" != "$expected_base" ]]; then
+      cat >&2 <<MSG
+check_repeat_pass: rebased review base is not the PR target merge-base.
+
+  current HEAD : $head_sha
+  target ref   : $target_ref
+  required base: $expected_base
+  supplied base: $base_sha
+
+Re-run using --base $expected_base --target-ref $target_ref.
+MSG
+      exit 3
+    fi
+    echo "check_repeat_pass: rebase detected; using PR target merge-base $expected_base" >&2
+    exit 0
+  fi
+else
+  # Missing/pruned history cannot establish that the prior HEAD is an
+  # ancestor. Fail closed unless the caller supplies the actual PR target and
+  # an exact, verifiable merge-base. This also prevents --allow-full-rereview
+  # from authorizing a stale previous-HEAD baseline.
+  case "$target_ref" in
+    refs/heads/*|refs/remotes/*) ;;
+    *)
+      echo "check_repeat_pass: cannot verify prior HEAD ancestry; pass the fully-qualified PR target ref with --target-ref" >&2
+      exit 3
+      ;;
+  esac
+  if ! git rev-parse --verify --quiet "$target_ref^{commit}" >/dev/null 2>&1; then
+    echo "check_repeat_pass: target ref is missing or does not resolve to a commit: $target_ref" >&2
+    exit 3
+  fi
+  expected_base="$(git merge-base "$head_sha" "$target_ref" 2>/dev/null || true)"
+  if [[ ! "$expected_base" =~ ^[0-9a-fA-F]{40}$ || "$base_sha" != "$expected_base" ]]; then
+    echo "check_repeat_pass: cannot verify supplied base as the target merge-base for $target_ref" >&2
+    exit 3
+  fi
+  echo "check_repeat_pass: prior history unavailable; using verified PR target merge-base $expected_base" >&2
+  exit 0
+fi
 
 if [[ "$allow" == 1 ]]; then
   echo "check_repeat_pass: full re-review of the same base — allowed by override" >&2
