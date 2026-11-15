@@ -59,7 +59,7 @@ prior_passes() {
   local repo="$1" tag="$2" n="$3" i
   for ((i = 1; i <= n; i++)); do
     ( cd "$repo" && bash "$S/check_repeat_pass.sh" --record --state-dir "$T/state-$tag/last_base" \
-        --branch "pr-$tag" --base-sha "base$i" --head-sha "head$i" >/dev/null 2>&1 )
+        --branch "pr-$tag" --base-sha "base$i" --head-sha "$(git rev-parse master)" >/dev/null 2>&1 )
   done
 }
 field() { jq -r ".$1 // \"null\"" "$META" 2>/dev/null; }

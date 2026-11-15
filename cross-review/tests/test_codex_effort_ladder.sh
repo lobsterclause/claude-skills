@@ -51,7 +51,7 @@ run() {
   local i
   for ((i = 1; i < pass; i++)); do
     ( cd "$REPO" && bash "$S/check_repeat_pass.sh" --record --state-dir "$T/state-$tag/last_base" \
-        --branch "pr-$tag" --base-sha "b$i" --head-sha "h$i" >/dev/null 2>&1 )
+        --branch "pr-$tag" --base-sha "b$i" --head-sha "$(git rev-parse master)" >/dev/null 2>&1 )
   done
   ( cd "$REPO" && CROSS_REVIEW_STATE_DIR="$T/state-$tag" bash "$S/run_reviewers.sh" --base master \
       --out "$T/out-$tag" --reviewers codex --subject-id "pr-$tag" --allow-full-rereview "$@" >"$T/log-$tag" 2>&1 )
