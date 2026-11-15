@@ -160,6 +160,7 @@ run "$T/big" availstale
 assert_eq "stale cache is ignored: pick kept" "$MODEL" "Gemini 4 Argon (High)"
 # not in the roster -> the availability block stays silent
 printf '#!/bin/sh\nprintf "shim review: no findings\\n"\n' >"$T/bin/codex"; chmod +x "$T/bin/codex"
+printf 'gemini-9-other\tSome Other Model\n' >"$CROSS_REVIEW_AGY_MODELS_CACHE"   # fresh mtime: the guard, not staleness, must keep it silent
 ( cd "$T/big" && AGY_ARGV="$T/argv-x" CROSS_REVIEW_STATE_DIR="$T/state-nog" bash "$S/run_reviewers.sh" --base master --out "$T/out-nog" --reviewers codex >"$T/log-nog" 2>&1 )
 grep -q "not in .agy models" "$T/log-nog" && bad "warned although gemini-pro is not in the roster" || ok "no availability warning when gemini-pro is not requested"
 # roster gate admits only models the router can pick
