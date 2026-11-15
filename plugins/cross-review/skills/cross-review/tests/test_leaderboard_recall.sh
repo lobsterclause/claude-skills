@@ -18,6 +18,15 @@ S="$SKILL_DIR/scripts"
 CI_DIR="$SKILL_DIR/ci"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
+# The repeat-pass guard keeps its records under the skill's own state/ unless
+# told otherwise. Point it at this run's temp dir: a fixture round must not
+# write into the live state, and a record left by an earlier run of this test
+# makes the guard refuse the next one.
+export CROSS_REVIEW_STATE_DIR="$T/state"
+# This test drives kimi/glm seats and the OpenRouter fallback lane, which the
+# default fleet no longer has. Set the legacy-fleet flags here too, so the
+# test passes when run on its own and not only under run_tests.sh.
+. "$SKILL_DIR/tests/legacy_fleet_env.sh"
 
 PASS=0
 FAIL=0

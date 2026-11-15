@@ -15,6 +15,10 @@ trap 'rm -rf "$T"' EXIT
 # write into the live state, and a record left by another test (same fixture
 # repo name and branch, different history) makes the guard refuse this one.
 export CROSS_REVIEW_STATE_DIR="$T/state"
+# This test drives kimi/glm seats and the OpenRouter fallback lane, which the
+# default fleet no longer has. Set the legacy-fleet flags here too, so the
+# test passes when run on its own and not only under run_tests.sh.
+. "$SKILL_DIR/tests/legacy_fleet_env.sh"
 PASS=0; FAIL=0
 ok()  { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
