@@ -135,6 +135,22 @@ prior_passes "$T/big" badp 2
 run "$T/big" badp --allow-full-rereview --gemini-pro-route nonsense
 assert_eq "a bad override does NOT fall through to the pass rule (stays on .model)" "$MODEL" "Gemini 4 Argon (High)"
 
+echo "── availability: the route that will actually run must be listed ──"
+mkdir -p "$HOME/.cross-review/cache"
+printf 'gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\n' >"$HOME/.cross-review/cache/agy_models.txt"
+run "$T/big" avail
+assert_eq "Hydrogen-only list: pass-1 big diff (argon:high) falls to a listed route" "$MODEL" "Gemini 4 Hydrogen (XHigh)"
+case "$(field route_reason)" in *+unlisted_fallback) ok "reason records the fallback ($(field route_reason))" ;; *) bad "reason: $(field route_reason)" ;; esac
+grep -q "not in .agy models" "$T/log-avail" && ok "  warned about the unlisted pick" || bad "  no warning"
+printf 'gemini-9-other\tSome Other Model\n' >"$HOME/.cross-review/cache/agy_models.txt"
+run "$T/big" availnone
+assert_eq "no router route listed: keeps the pick" "$MODEL" "Gemini 4 Argon (High)"
+case "$(field route_reason)" in *+unlisted_no_alternative) ok "reason records no alternative" ;; *) bad "reason: $(field route_reason)" ;; esac
+printf 'gemini-4-argon-high\tGemini 4 Argon (High)\n' >"$HOME/.cross-review/cache/agy_models.txt"
+run "$T/big" availok
+assert_eq "listed pick is untouched" "$(field route_reason | sed 's/(.*//')" "pass1"
+rm -f "$HOME/.cross-review/cache/agy_models.txt"
+
 echo "── per-route timeout (optional profile map) ──"
 jq '.["gemini-pro"].route_timeout_s = {"argon:high": 1234}' "$FIX" >"$T/pt.json"
 CROSS_REVIEW_PROFILES_FILE="$T/pt.json" run "$T/big" rt

@@ -301,6 +301,8 @@ model_backed_reviewers=(gemini-pro glm-coding glm deepseek mimo
 # fleet the runner will not dispatch. See lib_flags.sh for each flag.
 # shellcheck source=lib_flags.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib_flags.sh"
+# shellcheck source=lib_agy_routes.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_agy_routes.sh"
 
 need_val() {
   local flag="$1"
@@ -817,6 +819,34 @@ elif [[ -n "$(profile_path gemini-pro '.router.pass1')" ]]; then
       gemini_pro_route_reason="pass1(lines=${gemini_pro_diff_lines:-unknown})"
     fi
   fi
+fi
+# AVAILABILITY of the route that will actually run. detect_reviewers.sh /
+# select_roster.sh admit gemini-pro when ANY routed model is listed by
+# `agy models`; with only Hydrogen listed the router could still pick argon:high
+# and dispatch an unavailable model. When the cached model list is present and
+# the picked model is not in it, move to the first LISTED route among the
+# router's own picks (all >= medium; never a low route), else warn loudly and
+# keep the pick (agy then fails visibly). No cache = unknown = proceed.
+if [[ -n "$gemini_pro_route" ]]; then
+  _gp_cache="${CROSS_REVIEW_AGY_MODELS_CACHE:-$HOME/.cross-review/cache/agy_models.txt}"
+  _gp_pick="$(profile_map_get gemini-pro routes "$gemini_pro_route")"
+  if [[ -s "$_gp_cache" && -n "$_gp_pick" ]] && ! agy_model_listed "$_gp_cache" "$_gp_pick"; then
+    _gp_alt=""
+    for _gp_k in pass1 pass1_small pass2 pass3_plus; do
+      _gp_r="$(profile_path gemini-pro ".router.$_gp_k")"
+      [[ -n "$_gp_r" ]] || continue
+      _gp_n="$(profile_map_get gemini-pro routes "$_gp_r")"
+      if [[ -n "$_gp_n" ]] && agy_model_listed "$_gp_cache" "$_gp_n"; then _gp_alt="$_gp_r"; break; fi
+    done
+    if [[ -n "$_gp_alt" ]]; then
+      echo "run_reviewers: gemini-pro route '$gemini_pro_route' ($_gp_pick) is not in \`agy models\`; using listed route '$_gp_alt'" >&2
+      gemini_pro_route="$_gp_alt"; gemini_pro_route_reason="${gemini_pro_route_reason}+unlisted_fallback"
+    else
+      echo "run_reviewers: WARNING gemini-pro route '$gemini_pro_route' ($_gp_pick) is not in \`agy models\` and no router route is listed; dispatching anyway (expect an agy failure)" >&2
+      gemini_pro_route_reason="${gemini_pro_route_reason}+unlisted_no_alternative"
+    fi
+  fi
+  unset _gp_cache _gp_pick _gp_alt _gp_k _gp_r _gp_n
 fi
 gemini_pro_route_used=""
 if [[ -n "$gemini_pro_route" ]]; then

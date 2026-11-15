@@ -14,18 +14,23 @@
 #     exit 0 when at least one routed model is listed; 1 otherwise (including
 #     an unreadable profile or no jq — callers decide what "unknown" means).
 
+#   agy_model_listed <models-cache-file> <display-name>
+#     exit 0 when that one model is listed (display name or slug). run_reviewers.sh
+#     uses it to check the model the router ACTUALLY picked, not just "any route".
+agy_model_listed() {
+  local cache="$1" name="$2" slug
+  [[ -s "$cache" && -n "$name" ]] || return 1
+  slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[()]//g; s/[[:space:]]+/-/g')"
+  grep -Fqi -- "$name" "$cache" 2>/dev/null || grep -Fqi -- "$slug" "$cache" 2>/dev/null
+}
+
 agy_routes_listed() {
-  local cache="$1" profile="$2" name slug
+  local cache="$1" profile="$2" name
   [[ -s "$cache" && -f "$profile" ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[()]//g; s/[[:space:]]+/-/g')"
-    if grep -Fqix -- "$name" "$cache" 2>/dev/null \
-       || grep -Fqi -- "$name" "$cache" 2>/dev/null \
-       || grep -Fqi -- "$slug" "$cache" 2>/dev/null; then
-      return 0
-    fi
+    agy_model_listed "$cache" "$name" && return 0
   done < <(jq -r '.["gemini-pro"] | ([.model] + ((.routes // {}) | [.[]])) | .[] | select(. != null)' "$profile" 2>/dev/null)
   return 1
 }
