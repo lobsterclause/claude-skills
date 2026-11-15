@@ -77,7 +77,7 @@ has codex && codex=true
 # probe is skipped and Pro is assumed available (matches execution — the
 # wrapper pins the exact model string either way).
 if has agy; then
-  models_cache="$HOME/.cross-review/cache/agy_models.txt"
+  models_cache="${CROSS_REVIEW_AGY_MODELS_CACHE:-$HOME/.cross-review/cache/agy_models.txt}"
   if [[ ! -s "$models_cache" || -n "$(find "$models_cache" -mmin +360 2>/dev/null)" ]]; then
     TIMEOUT_BIN=""
     command -v timeout  >/dev/null 2>&1 && TIMEOUT_BIN="timeout"

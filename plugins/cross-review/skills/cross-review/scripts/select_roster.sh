@@ -179,8 +179,8 @@ if command -v agy >/dev/null 2>&1; then
   # 15s hard timeout on refresh, and on probe failure assume Pro exists (agy
   # is installed; the silent-Flash-fallback rename risk is rare and already
   # documented in run_reviewers.sh).
-  cache_dir="$HOME/.cross-review/cache"
-  models_cache="$cache_dir/agy_models.txt"
+  models_cache="${CROSS_REVIEW_AGY_MODELS_CACHE:-$HOME/.cross-review/cache/agy_models.txt}"
+  cache_dir="$(dirname "$models_cache")"
   mkdir -p "$cache_dir"
   if [[ ! -s "$models_cache" || -n "$(find "$models_cache" -mmin +360 2>/dev/null)" ]]; then
     # PID-suffixed temp: concurrent selector runs (splitstream rounds) would
