@@ -66,11 +66,11 @@ export ZAI_API_KEY="sk-zai-test-shim"         # lights glm-coding; never called
 # The NEW defaults (glm-coding baseline, OpenRouter off) are covered by
 # tests/test_flags.sh, which sets its own flags per case and is picked up by
 # the standalone-test discovery at the bottom of this file. Do not "simplify"
-# by deleting these exports: without them the selector cases assert the old
+# by deleting this block: without the flags the selector cases assert the old
 # fleet against the new one and fail for the wrong reason.
-export CROSS_REVIEW_KIMI_BASELINE=1
-export CROSS_REVIEW_GLM_BASELINE=0
-export CROSS_REVIEW_OPENROUTER=1
+# The flags live in legacy_fleet_env.sh so the standalone tests that need them
+# can set the same ones when run on their own.
+. "$SKILL_DIR/tests/legacy_fleet_env.sh"
 # Sandbox HOME: the selector caches `agy models` output under
 # $HOME/.cross-review/cache with a 6h TTL — running tests against the real
 # HOME would poison real roster draws with the shim's list (codex P2, PR #19).
