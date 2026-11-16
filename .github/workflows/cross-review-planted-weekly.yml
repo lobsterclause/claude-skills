@@ -59,7 +59,11 @@ jobs:
           # Fail on a missing key here, with the fix in the message. Without
           # this the seat is skipped a few layers down and the run ends in
           # "no reviewers available or requested", which names no cause.
-          case ",$PLANTED_ROUND_ROSTER," in
+          # run_reviewers.sh ignores whitespace in a roster, so the key check
+          # and the grader must see the same spelling it does: "glm, glm-coding"
+          # still needs the Z.ai key.
+          roster="$(printf '%s' "$PLANTED_ROUND_ROSTER" | tr -d '[:space:]')"
+          case ",$roster," in
             *,glm-coding,*)
               if [ -z "$ZAI_API_KEY" ]; then
                 echo "::error::The roster includes glm-coding but the ZAI_API_KEY secret is empty. Add it under Settings > Secrets and variables > Actions."
@@ -78,7 +82,7 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE" \
             --operators-file cross-review/references/mutation_operators.json \
             --fixture auto \
-            --roster "$PLANTED_ROUND_ROSTER" \
+            --roster "$roster" \
             --out "$out"
 
       - name: Upload drill artifacts
