@@ -167,6 +167,22 @@ case "$cmd" in
       exit 1
     fi
 
+    # No merge base at all: unrelated histories, or a shallow clone cut off
+    # below the fork point. The three-dot diff (merge-base...ref) cannot be
+    # computed then -- git exits 128 -- and nothing can be reviewed. This is not
+    # the descendant-base trap below and --allow-non-ancestor-base does not
+    # cover it: that flag accepts an EMPTY diff, and here there is no diff to
+    # be empty. Checked before anything is created; the size pipeline further
+    # down used to die on it under `set -e`, after the worktree and run dir
+    # existed, with nothing on stdout.
+    _ref_sha="$(git -C "$repo_root" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null || true)"
+    _base_sha0="$(git -C "$repo_root" rev-parse "$base^{commit}")"
+    if [[ -n "$_ref_sha" ]] && ! git -C "$repo_root" merge-base "$_base_sha0" "$_ref_sha" >/dev/null 2>&1; then
+      echo "ERROR: --base ($base) and --ref ($ref) have no merge base, so the three-dot diff (merge-base...ref) cannot be computed and there is nothing to review." >&2
+      echo "  Pass a --base that shares history with --ref. In a shallow clone, fetch more history first (git fetch --unshallow)." >&2
+      exit 3
+    fi
+
     # --paths guards, BEFORE anything is created (a refusal must leave no
     # worktree or run dir behind).
     #
@@ -178,17 +194,16 @@ case "$cmd" in
     # PR shape and three-dot handles it correctly, so that case is only noted.
     base_is_ancestor_json="null"
     if [[ -n "$paths_list" ]]; then
-      _ref_sha="$(git -C "$repo_root" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null || true)"
-      _base_sha0="$(git -C "$repo_root" rev-parse "$base^{commit}")"
       if [[ -n "$_ref_sha" ]]; then
         if git -C "$repo_root" merge-base --is-ancestor "$_base_sha0" "$_ref_sha" 2>/dev/null; then
           base_is_ancestor_json="true"
         else
           base_is_ancestor_json="false"
+          # A merge base exists (checked above), so the only shape left that
+          # empties the diff is a base that descends from the ref.
           _mb="$(git -C "$repo_root" merge-base "$_base_sha0" "$_ref_sha" 2>/dev/null || true)"
-          if [[ -z "$_mb" || "$_mb" == "$_ref_sha" ]]; then
+          if [[ "$_mb" == "$_ref_sha" ]]; then
             _why="--base ($base) is a descendant of --ref ($ref)"
-            [[ -z "$_mb" ]] && _why="--base ($base) and --ref ($ref) share no history"
             if [[ "$allow_non_ancestor" == 1 ]]; then
               echo "WARN: $_why — the three-dot diff will be empty (allowed by --allow-non-ancestor-base)" >&2
             else
@@ -201,7 +216,15 @@ case "$cmd" in
             echo "NOTE: --base ($base) is not an ancestor of --ref ($ref); using the merge-base diff (normal for a branch whose base moved on)" >&2
           fi
         fi
-        _n_filtered="$(git -C "$repo_root" diff --name-only "$base"..."$_ref_sha" "${ps_args[@]}" 2>/dev/null | wc -l | tr -d ' ')"
+        # git's exit status is read on its own. Piped straight into `wc`, a
+        # failing diff aborted the script under pipefail with no message, and
+        # without pipefail it would have counted as "0 files match".
+        if ! _filtered_names="$(git -C "$repo_root" diff --name-only "$base"..."$_ref_sha" "${ps_args[@]}" 2>/dev/null)"; then
+          echo "ERROR: git could not compute the filtered diff ($base...$ref with --paths). git said:" >&2
+          { git -C "$repo_root" diff --name-only "$base"..."$_ref_sha" "${ps_args[@]}" 2>&1 >/dev/null | head -3 >&2; } || true
+          exit 1
+        fi
+        _n_filtered="$(printf '%s\n' "$_filtered_names" | sed '/^$/d' | wc -l | tr -d ' ')"
         if [[ "${_n_filtered:-0}" -eq 0 ]]; then
           if [[ "$allow_empty_paths" == 1 ]]; then
             echo "WARN: no changed files match --paths ($(printf '%s' "$paths_list" | tr '\n' ',' | sed 's/,$//')) between $base and $ref (allowed by --allow-empty-paths)" >&2

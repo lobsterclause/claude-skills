@@ -11,7 +11,18 @@
 #   - strip a leading "./", drop empties
 #   - REFUSE an absolute path or any ".." component (a pathspec must stay inside
 #     the repo; git would reject it later with a far less useful message)
+#   - REFUSE pathspec magic other than ":(literal)<path>" (see below)
 #   - sort + dedupe, so "b,a" and "a,b,a" are the same round
+#
+# PATHSPEC MAGIC. git reads a leading ":" as magic: ":!x", ":^x" and
+# ":(exclude)x" SUBTRACT files, ":(top)x" and ":/x" re-anchor the path, and
+# ":(literal)/abs" or ":(top).." walk past the two refusals above, which only
+# looked at the first characters. A scope list says what a round reviewed, and
+# every record prints it that way ("only changes in `a`, `b` were reviewed"),
+# so an exclude in it was listed as a reviewed path. The only magic accepted is
+# ":(literal)<path>", which plan_rounds.sh emits for a filename that starts
+# with ":" or contains a glob character; the absolute and ".." refusals are
+# applied to the path after it.
 #
 # WHERE A COMMA SEPARATES, AND WHERE IT DOES NOT. `--paths` and
 # CROSS_REVIEW_PATHS are comma lists: callers pass their value through
@@ -45,7 +56,7 @@ cr_paths_csv() {
 # pathspecs, one per line. Returns 2 (message on stderr) on an invalid entry or
 # when nothing is left.
 cr_paths_normalise_lines() {
-  local raw item out="" rc=0
+  local raw item path out="" rc=0 lit=':(literal)'
   for raw in "$@"; do
     while IFS= read -r item || [[ -n "$item" ]]; do
       # trim whitespace
@@ -53,10 +64,21 @@ cr_paths_normalise_lines() {
       item="${item%"${item##*[![:space:]]}"}"
       while [[ "$item" == ./* ]]; do item="${item#./}"; done
       [[ -n "$item" && "$item" != "." ]] || continue
+      # `path` is what git will match: the item itself, or what follows the one
+      # accepted magic prefix. The refusals below look at `path`, so they cannot
+      # be stepped over with a prefix.
+      path="$item"
       case "$item" in
+        "$lit"*) path="${item#"$lit"}" ;;
+        :*) echo "paths: pathspec magic refused: $item (a scope lists the paths a round reviews, so excludes and other magic are not accepted; for a name that starts with ':' write ':(literal)<path>')" >&2; rc=2; continue ;;
+      esac
+      if [[ -z "$path" ]]; then
+        echo "paths: ':(literal)' with no path after it refused" >&2; rc=2; continue
+      fi
+      case "$path" in
         /*) echo "paths: absolute pathspec refused: $item (use a repo-relative path)" >&2; rc=2; continue ;;
       esac
-      case "/$item/" in
+      case "/$path/" in
         */../*) echo "paths: pathspec with a '..' component refused: $item" >&2; rc=2; continue ;;
       esac
       out+="$item"$'\n'

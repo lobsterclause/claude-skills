@@ -17,6 +17,15 @@
 # 3. meta.json / context.json / runlog carry paths + paths_mode.
 # 4. A path-scoped round has its OWN repeat-pass key; full-diff keys unchanged.
 # 5. plan_rounds.sh is deterministic.
+# 6. A base with no merge base is refused by worktree.sh start and
+#    run_reviewers.sh, with or without --paths, before anything is created or
+#    dispatched.
+# 7. One run dir, one scope: a dispatch whose scope differs from the run dir's
+#    context.json is refused.
+# 8. Pathspec magic other than ':(literal)<path>' is refused, so an exclude is
+#    never listed as a reviewed path.
+# 9. A round scoped only by run_reviewers.sh --paths gets the same paths_hash
+#    and round-level paths_mode in the run log as one started by worktree.sh.
 #
 # Run:  bash tests/test_paths.sh        Exit: 0 all green, 1 any failure.
 
@@ -111,6 +120,10 @@ REPO="$T/repo"; mkdir -p "$REPO"
   # a base that DESCENDS from feat: the "synthetic base" shape that bit us
   git checkout -qb synth; echo more >src/app.ts.more; git add -A; git commit -qm synth
   git checkout -q feat
+  # a base that shares NO history with feat: a parentless commit holding main's
+  # tree. It resolves, and its content differs from feat, but there is no merge
+  # base, so no three-dot diff exists.
+  git update-ref refs/heads/orphan "$(git commit-tree -m orphan 'main^{tree}')"
 )
 cr() { # cr <outdir> <args...>
   local o="$1"; shift
@@ -125,6 +138,24 @@ assert_eq "same set -> same hash regardless of order" \
 cr_paths_normalise '/etc' >/dev/null 2>&1; assert_eq "absolute pathspec refused" "$?" "2"
 cr_paths_normalise 'a/../b' >/dev/null 2>&1; assert_eq "'..' pathspec refused" "$?" "2"
 cr_paths_normalise ' , ' >/dev/null 2>&1; assert_eq "empty pathspec list refused" "$?" "2"
+# Pathspec magic. An exclude in a scope list was printed as a reviewed path, and
+# a prefix stepped over the absolute / '..' refusals, which only looked at the
+# first characters. Only ':(literal)<path>' is accepted (plan_rounds.sh emits it).
+for _magic in ':!src/' ':^src/' ':(exclude)src/' ':(top)src/' ':/src/' ':(glob)src/**' ':(icase)SRC/' ':(top,literal)src/'; do
+  cr_paths_normalise_lines "$_magic" >/dev/null 2>"$T/magic.err"
+  assert_eq "pathspec magic refused: $_magic" "$?" "2"
+done
+assert_contains "…with a message that names ':(literal)' as the way to write a ':' name" "$(cat "$T/magic.err")" ":(literal)<path>"
+cr_paths_normalise_lines 'src/' ':!src/gen/' >/dev/null 2>&1
+assert_eq "an exclude beside a good path refuses the whole list" "$?" "2"
+cr_paths_normalise_lines ':(literal)/etc/passwd' >/dev/null 2>&1
+assert_eq "':(literal)' does not step over the absolute refusal" "$?" "2"
+cr_paths_normalise_lines ':(literal)a/../../b' >/dev/null 2>&1
+assert_eq "':(literal)' does not step over the '..' refusal" "$?" "2"
+cr_paths_normalise_lines ':(literal)' >/dev/null 2>&1
+assert_eq "':(literal)' with no path refused" "$?" "2"
+assert_eq "':(literal)<path>' is accepted and kept as written" \
+  "$(cr_paths_normalise_lines ':(literal):odd*.txt' 'src/' | tr '\n' '|')" ":(literal):odd*.txt|src/|"
 
 echo "── worktree.sh start: the descendant-base trap ──"
 WTS() { ( cd "$REPO" && bash "$S/worktree.sh" start "$@" ); }
@@ -145,6 +176,24 @@ assert_contains "…and says so" "$(cat "$T/trap2.err")" "no changed files match
 WTS --ref feat --base synth --paths src/ --id trap-allow2 --allow-non-ancestor-base --allow-empty-paths >"$T/trap3.out" 2>"$T/trap3.err"; RC=$?
 assert_eq "both escapes together proceed (exit 0)" "$RC" "0"
 assert_eq "…recording base_is_ancestor=false" "$(jq -r .base_is_ancestor "$T/trap3.out")" "false"
+
+echo "── worktree.sh start: a base with no shared history is refused ──"
+# No merge base means no three-dot diff at all. With --paths and
+# --allow-non-ancestor-base this used to exit 128 with empty stdout from the
+# middle of a pipeline; without --paths it died the same way AFTER the worktree
+# and run dir had been created.
+WTS --ref feat --base orphan --id nomb-full >"$T/nm0.out" 2>"$T/nm0.err"; RC=$?
+assert_eq "no merge base, no --paths: exit 3" "$RC" "3"
+assert_contains "…with a message naming the cause" "$(cat "$T/nm0.err")" "no merge base"
+assert_eq "…and nothing on stdout" "$(cat "$T/nm0.out")" ""
+WTS --ref feat --base orphan --paths src/ --id nomb-paths >"$T/nm1.out" 2>"$T/nm1.err"; RC=$?
+assert_eq "no merge base + --paths: exit 3" "$RC" "3"
+assert_contains "…same message" "$(cat "$T/nm1.err")" "no merge base"
+WTS --ref feat --base orphan --paths src/ --id nomb-allow --allow-non-ancestor-base --allow-empty-paths >"$T/nm2.out" 2>"$T/nm2.err"; RC=$?
+assert_eq "neither escape covers it (exit 3, not git's 128)" "$RC" "3"
+assert_contains "…and it still says why" "$(cat "$T/nm2.err")" "no merge base"
+assert_eq "…no run dir was created by any of the three" "$(ls "$T/runs" 2>/dev/null | grep -c 'nomb-')" "0"
+assert_eq "…and no worktree" "$(ls "$T/wt" 2>/dev/null | grep -c 'nomb-')" "0"
 
 echo "── worktree.sh start: empty filtered diff fails loudly ──"
 WTS --ref feat --base main --paths nothing/here --id empty-f >"$T/e1.out" 2>"$T/e1.err"; RC=$?
@@ -326,6 +375,19 @@ assert_eq "descendant base + --paths: exit 4" "$(cat "$T/f2.rc")" "4"
 assert_eq "…reason base_not_ancestor" "$(jq -r .reason "$T/f2/run.meta.json")" "base_not_ancestor"
 cr "$T/f3" --base main --reviewers kimi --paths src/ --paths /abs --timeout-kimi 30
 assert_eq "an absolute pathspec is refused (exit 2)" "$(cat "$T/f3.rc")" "2"
+cr "$T/f3b" --base main --reviewers kimi --paths 'src/,:!src/far.ts' --timeout-kimi 30
+assert_eq "an exclude pathspec is refused (exit 2)" "$(cat "$T/f3b.rc")" "2"
+# No merge base: `git diff --quiet` exits 128, which was read as "has a diff",
+# and the round went out with an empty diff in every prompt.
+rm -f "$T/kimi.prompt"
+cr "$T/f4" --base orphan --reviewers kimi --timeout-kimi 30
+assert_eq "no merge base, full diff: exit 4" "$(cat "$T/f4.rc")" "4"
+assert_eq "…run.meta.json says why" "$(jq -r .reason "$T/f4/run.meta.json")" "base_no_merge_base"
+assert_contains "…and so does stderr" "$(cat "$T/f4.log")" "no merge base"
+cr "$T/f5" --base orphan --reviewers kimi --paths src/ --allow-non-ancestor-base --allow-empty-paths --timeout-kimi 30
+assert_eq "no merge base + --paths + both escapes: still exit 4" "$(cat "$T/f5.rc")" "4"
+assert_eq "…same reason" "$(jq -r .reason "$T/f5/run.meta.json")" "base_no_merge_base"
+assert_eq "…and no reviewer was sent anything in either case" "$([[ -f "$T/kimi.prompt" ]] && echo sent || echo none)" "none"
 
 echo "── run_reviewers: --paths read from context.json in the run dir ──"
 RUNDIR="$(jq -r .run_dir <<<"$FILT")"
@@ -334,9 +396,30 @@ rm -f "$T/kimi.prompt"
 assert_contains "context.json paths picked up with no flag" "$(cat "$T/kimi.prompt" 2>/dev/null)" "Review ONLY changes in these paths"
 assert_not_contains "…and applied" "$(cat "$T/kimi.prompt" 2>/dev/null)" "OUT_SCOPE_MARKER_d4"
 rm -f "$T/kimi.prompt"
-mkdir -p "$RUNDIR/raw3"
-( cd "$REPO" && bash "$S/run_reviewers.sh" --base main --out "$RUNDIR/raw3" --reviewers kimi --no-paths --timeout-kimi 30 >"$T/ctx3.log" 2>&1 )
-assert_contains "--no-paths ignores context.json" "$(cat "$T/kimi.prompt" 2>/dev/null)" "OUT_SCOPE_MARKER_d4"
+
+echo "── run_reviewers: one run dir, one scope ──"
+# The run dir's pre-flight (size, secret paths) covered src/ only, and the
+# posted record and the run log describe the run dir by context.json. A
+# dispatch with another scope used to run and be recorded as a review of src/.
+( cd "$REPO" && bash "$S/run_reviewers.sh" --base main --out "$RUNDIR/raw3" --reviewers kimi --no-paths --timeout-kimi 30 >"$T/ctx3.log" 2>&1 ); RC=$?
+assert_eq "--no-paths into a scoped run dir is refused (exit 2)" "$RC" "2"
+assert_contains "…naming the recorded scope" "$(cat "$T/ctx3.log")" "scoped to src/"
+assert_contains "…and what this dispatch asked for" "$(cat "$T/ctx3.log")" "the full diff"
+( cd "$REPO" && bash "$S/run_reviewers.sh" --base main --out "$RUNDIR/raw4" --reviewers kimi --paths other/ --timeout-kimi 30 >"$T/ctx4.log" 2>&1 ); RC=$?
+assert_eq "--paths <another set> into a scoped run dir is refused (exit 2)" "$RC" "2"
+assert_contains "…naming both scopes" "$(cat "$T/ctx4.log")" "the paths other/"
+( cd "$REPO" && CROSS_REVIEW_PATHS=other/ bash "$S/run_reviewers.sh" --base main --out "$RUNDIR/raw5" --reviewers kimi --timeout-kimi 30 >"$T/ctx5.log" 2>&1 ); RC=$?
+assert_eq "a CROSS_REVIEW_PATHS that differs is refused too (exit 2)" "$RC" "2"
+assert_eq "…and none of the three sent a reviewer anything" "$([[ -f "$T/kimi.prompt" ]] && echo sent || echo none)" "none"
+( cd "$REPO" && bash "$S/run_reviewers.sh" --base main --out "$RUNDIR/raw6" --reviewers kimi --paths './src/,src/' --timeout-kimi 30 >"$T/ctx6.log" 2>&1 ); RC=$?
+assert_eq "the same scope given explicitly runs (exit 0)" "$RC" "0"
+assert_not_contains "…filtered as recorded" "$(cat "$T/kimi.prompt" 2>/dev/null)" "OUT_SCOPE_MARKER_d4"
+# Outside a scoped run dir --no-paths is unchanged: it turns CROSS_REVIEW_PATHS off.
+rm -f "$T/kimi.prompt"
+( cd "$REPO" && CROSS_REVIEW_PATHS=src/ bash "$S/run_reviewers.sh" --base main --out "$T/np1" --reviewers kimi --no-paths --timeout-kimi 30 >"$T/np1.log" 2>&1 ); RC=$?
+assert_eq "--no-paths in an unscoped out dir runs (exit 0)" "$RC" "0"
+assert_contains "…on the full diff, ignoring CROSS_REVIEW_PATHS" "$(cat "$T/kimi.prompt" 2>/dev/null)" "OUT_SCOPE_MARKER_d4"
+assert_eq "…and its lane carries no scope" "$(jq -r 'has("paths")' "$T/np1/kimi.meta.json")" "false"
 
 echo "── repeat-pass guard: a path-scoped round has its own key ──"
 G="$S/check_repeat_pass.sh"; SD="$T/guard"; mkdir -p "$SD"
@@ -383,6 +466,28 @@ assert_eq "runlog entry: a lane forced onto --base makes the round 'mixed'" "$(j
 assert_eq "runlog entry: per-lane row keeps paths_mode" "$(jq -r .reviewers.kimi.paths_mode <<<"$E")" "filtered"
 assert_eq "runlog entry: per-lane row does NOT repeat the paths array" "$(jq -r '.reviewers.kimi | has("paths")' <<<"$E")" "false"
 assert_eq "runlog entry: schema_version unchanged (additive field)" "$(jq -r .schema_version <<<"$E")" "1"
+# A round whose only scope record is the lanes (run_reviewers.sh --paths with no
+# worktree.sh start). The entry used to copy the first lane's fields: no
+# paths_hash (a lane has none) and codex's own "explicit_prompt" as the ROUND's
+# mode. codex.meta.json sorts first, so this fixture is that case.
+RUN_L="$T/run-l"; mkdir -p "$RUN_L/raw"
+cp "$T/o5/codex.meta.json" "$RUN_L/raw/codex.meta.json"
+cp "$T/o1/kimi.meta.json" "$RUN_L/raw/kimi.meta.json"
+CROSS_REVIEW_RUNLOG="$T/runlog3.jsonl" bash "$S/append_runlog.sh" --run-dir "$RUN_L" --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+EL="$(tail -1 "$T/runlog3.jsonl")"
+assert_eq "lanes-only round: paths is the union of the lanes" "$(jq -c .paths <<<"$EL")" '["src/"]'
+assert_eq "lanes-only round: paths_hash is computed (same digest worktree.sh records)" "$(jq -r .paths_hash <<<"$EL")" "$(jq -r .paths_hash <<<"$FILT")"
+assert_eq "lanes-only round: paths_mode is the round's, not codex's" "$(jq -r .paths_mode <<<"$EL")" "filtered"
+assert_eq "lanes-only round: codex's own row still says explicit_prompt" "$(jq -r .reviewers.codex.paths_mode <<<"$EL")" "explicit_prompt"
+cp "$T/o6/codex.meta.json" "$RUN_L/raw/codex.meta.json"
+CROSS_REVIEW_RUNLOG="$T/runlog3.jsonl" bash "$S/append_runlog.sh" --run-dir "$RUN_L" --project p --base main --pr - --pass 2 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+assert_eq "lanes-only round with codex forced onto --base: 'mixed'" "$(tail -1 "$T/runlog3.jsonl" | jq -r .paths_mode)" "mixed"
+# A context.json that carries paths and no hash (hand-written, or an older copy).
+RUN_H="$T/run-h"; mkdir -p "$RUN_H/raw"
+printf '{"started_at":"20260101T000000","paths":["src/"]}\n' >"$RUN_H/context.json"
+cp "$T/o1/kimi.meta.json" "$RUN_H/raw/kimi.meta.json"
+CROSS_REVIEW_RUNLOG="$T/runlog4.jsonl" bash "$S/append_runlog.sh" --run-dir "$RUN_H" --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+assert_eq "context.json paths with no hash: the hash is computed" "$(tail -1 "$T/runlog4.jsonl" | jq -r .paths_hash)" "$(jq -r .paths_hash <<<"$FILT")"
 RUN_N="$T/run-n"; mkdir -p "$RUN_N/raw"; cp "$T/o0/kimi.meta.json" "$RUN_N/raw/kimi.meta.json"
 CROSS_REVIEW_RUNLOG="$T/runlog2.jsonl" bash "$S/append_runlog.sh" --run-dir "$RUN_N" --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
 assert_eq "a full-diff entry has no paths keys" "$(tail -1 "$T/runlog2.jsonl" | jq -r 'has("paths") or has("paths_mode")')" "false"

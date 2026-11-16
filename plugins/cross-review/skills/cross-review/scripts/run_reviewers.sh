@@ -592,38 +592,89 @@ if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
   exit 1
 fi
 
+# A base that resolves can still have no merge base with HEAD: unrelated
+# histories, or a shallow clone cut off below the fork point. Every diff below
+# is three-dot (merge-base...HEAD), and without a merge base git exits 128 on
+# each of them. `git diff --quiet` returning 128 was read as "has a diff", so
+# the round was dispatched and every lane got an empty diff. Refused for
+# full-diff and path-scoped rounds alike; --allow-non-ancestor-base does not
+# cover it (that flag accepts an EMPTY diff, and here there is none to be
+# empty).
+_pb="$(git rev-parse "$base^{commit}")"; _ph="$(git rev-parse HEAD)"
+if ! git merge-base "$_pb" "$_ph" >/dev/null 2>&1; then
+  printf '{"skipped": true, "reason": "base_no_merge_base", "base": "%s"}\n' "$base" > "$out/run.meta.json"
+  echo "ERROR: --base ($base) and HEAD have no merge base, so the three-dot diff (merge-base...HEAD) cannot be computed and reviewers would run on nothing. Pass a --base that shares history with HEAD; in a shallow clone, fetch more history first (git fetch --unshallow)." >&2
+  exit 4
+fi
+
 # Empty-diff short-circuit: burning 5 min + tens of thousands of tokens on a
 # no-op branch produces nothing real (and sometimes invites hallucinated
 # findings). Reviewers also can't diff what they can't see.
-# (Base is validated above, so `git diff --quiet` here returns 0 (no diff) or
-# 1 (has diff) cleanly, never 128.)
+# (`git diff --quiet` answers 0 for no diff and 1 for a diff. Anything higher
+# is git failing, and is treated as that below, never as "has a diff".)
 # ── PATH-SCOPED ROUNDS (--paths) ────────────────────────────────────────────
 # A round may be restricted to a set of git pathspecs so a huge change can be
 # reviewed in focused rounds (plan_rounds.sh suggests the split). Precedence:
 # --paths/--path flags, then CROSS_REVIEW_PATHS, then the `paths` that
 # worktree.sh start recorded in context.json (read from --out or its parent,
-# i.e. a run dir), unless --no-paths. Resolved ONCE here into ps_args, which is
+# i.e. a run dir). --no-paths turns the last two off: it asks for the full diff
+# whatever the environment says, and in a run dir that was started with a scope
+# it is refused (see ONE RUN DIR, ONE SCOPE below). Resolved ONCE here into ps_args, which is
 # spliced after every `git diff <base>...HEAD` below -- the inlined <diff>, the
 # whole-file block, --stat, doc_narrative_risk and the agy/codex prompts all
 # read the same filtered set, so no lane can see a file another lane was told
 # is out of scope.
+#
+# The scope the run dir was started with, if any, is read first and kept: it is
+# both the default and what this dispatch is checked against further down.
+_ctx_file=""; _ctx_paths=""
+for _cj in "$out/context.json" "$out/../context.json"; do
+  if [[ -f "$_cj" ]] && _cj_paths="$(jq -r 'if (.paths | type) == "array" and (.paths | length) > 0 then (.paths | join("\n")) else empty end' "$_cj" 2>/dev/null)" && [[ -n "$_cj_paths" ]]; then
+    _ctx_file="$_cj"; _ctx_paths="$_cj_paths"
+    break
+  fi
+done
 if [[ "$no_paths" != 1 && ${#paths_raw[@]} -eq 0 && -n "${CROSS_REVIEW_PATHS:-}" ]]; then
   paths_raw=("$(cr_paths_csv "$CROSS_REVIEW_PATHS")")
 fi
-if [[ "$no_paths" != 1 && ${#paths_raw[@]} -eq 0 ]]; then
-  for _cj in "$out/context.json" "$out/../context.json"; do
-    if [[ -f "$_cj" ]] && _cj_paths="$(jq -r 'if (.paths | type) == "array" and (.paths | length) > 0 then (.paths | join("\n")) else empty end' "$_cj" 2>/dev/null)" && [[ -n "$_cj_paths" ]]; then
-      paths_raw=("$_cj_paths")
-      echo "paths: using the pathspecs recorded in $_cj" >&2
-      break
-    fi
-  done
+if [[ "$no_paths" != 1 && ${#paths_raw[@]} -eq 0 && -n "$_ctx_paths" ]]; then
+  paths_raw=("$_ctx_paths")
+  echo "paths: using the pathspecs recorded in $_ctx_file" >&2
 fi
 if [[ ${#paths_raw[@]} -gt 0 ]]; then
   # _lines, not the comma-splitting entry point: every element is already one
   # pathspec per line, and the context.json route above hands back recorded
   # pathspecs that may legitimately contain a comma.
   paths_list="$(cr_paths_normalise_lines "${paths_raw[@]}")" || exit 2
+fi
+
+# ONE RUN DIR, ONE SCOPE. A run dir that `worktree.sh start --paths A` created
+# is scoped to A for good: the size and secret pre-flight covered the filtered
+# diff only, and post_comment.sh and append_runlog.sh describe the whole run
+# dir by the scope in its context.json. A dispatch into it with another scope
+# (`--no-paths`, `--paths B`, or a CROSS_REVIEW_PATHS that differs) sent
+# reviewers files nobody screened and was then recorded as a review of A. So
+# it is refused here, before a reviewer is spent. The recorded list is put
+# through the same normaliser when it parses, and compared as written when it
+# does not (a context.json from an older copy), so the same set always matches.
+if [[ -n "$_ctx_paths" ]]; then
+  _ctx_list="$(cr_paths_normalise_lines "$_ctx_paths" 2>/dev/null)" \
+    || _ctx_list="$(printf '%s\n' "$_ctx_paths" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u)"
+  if [[ "$_ctx_list" != "$paths_list" ]]; then
+    _ctx_csv="$(printf '%s' "$_ctx_list" | tr '\n' ',' | sed 's/,$//')"
+    if [[ -n "$paths_list" ]]; then
+      _this_scope="the paths $(printf '%s' "$paths_list" | tr '\n' ',' | sed 's/,$//')"
+    else
+      _this_scope="the full diff"
+    fi
+    echo "ERROR: this run dir is scoped to $_ctx_csv (recorded in $_ctx_file), and this dispatch would review $_this_scope." >&2
+    echo "  One run dir holds one scope: its pre-flight (size, secret paths) covered the recorded paths only, and the posted record and the run log describe the run dir by them." >&2
+    echo "  For a different scope start a new run dir (worktree.sh start, with the --paths you want or none), or pass an --out that is not inside this one." >&2
+    exit 2
+  fi
+fi
+
+if [[ -n "$paths_list" ]]; then
   while IFS= read -r _pp; do ps_args+=("$_pp"); done <<<"$paths_list"
   ps_args=(-- "${ps_args[@]}")
   paths_hash="$(printf '%s\n' "$paths_list" | cr_paths_hash)"
@@ -632,12 +683,11 @@ if [[ ${#paths_raw[@]} -gt 0 ]]; then
   # --base that is a DESCENDANT of HEAD has merge-base == HEAD and an empty
   # diff. Without this the empty-diff short-circuit below read it as "nothing
   # to review" and exited 0.
-  _pb="$(git rev-parse "$base^{commit}")"; _ph="$(git rev-parse HEAD)"
+  # (No merge base at all was refused above, for every round.)
   if ! git merge-base --is-ancestor "$_pb" "$_ph" 2>/dev/null; then
     _mb="$(git merge-base "$_pb" "$_ph" 2>/dev/null || true)"
-    if [[ -z "$_mb" || "$_mb" == "$_ph" ]]; then
+    if [[ "$_mb" == "$_ph" ]]; then
       _why="--base ($base) is a descendant of HEAD"
-      [[ -z "$_mb" ]] && _why="--base ($base) and HEAD share no history"
       if [[ "$allow_non_ancestor" == 1 ]]; then
         echo "WARN: $_why — the three-dot diff will be empty (allowed by --allow-non-ancestor-base)" >&2
       else
@@ -647,7 +697,12 @@ if [[ ${#paths_raw[@]} -gt 0 ]]; then
       fi
     fi
   fi
-  if git diff --quiet "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"}; then
+  git diff --quiet "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"}; _dq=$?
+  if [[ "$_dq" -gt 1 ]]; then
+    echo "ERROR: git diff failed (exit $_dq) for $base...HEAD with --paths, so there is no telling what the round would review. Not dispatching." >&2
+    exit 1
+  fi
+  if [[ "$_dq" -eq 0 ]]; then
     if [[ "$allow_empty_paths" == 1 ]]; then
       echo "WARN: no changed files match --paths against $base (allowed by --allow-empty-paths) — skipping reviewers" >&2
       printf '{"skipped": true, "reason": "no_diff_in_paths", "base": "%s"}\n' "$base" > "$out/run.meta.json"
@@ -674,10 +729,17 @@ Changed files in scope ($_scope_n):
 $_scope_list
 Report findings only about changes in these paths. You may read or cite code outside them as evidence for a finding about an in-scope change, but do not report problems whose primary location is outside the scope, and do not assume the diff you were given is the whole change. If a code-context snapshot is supplied instead of the diff, apply the same rule: files in it that are not in scope are context only."
   echo "paths: round scoped to $_scope_n file(s) via $(printf '%s' "$paths_list" | tr '\n' ',' | sed 's/,$//') (hash $paths_hash)" >&2
-elif git diff --quiet "$base"...HEAD; then
-  printf '{"skipped": true, "reason": "no_diff_against_base", "base": "%s"}\n' "$base" > "$out/run.meta.json"
-  echo "no diff against $base — skipping reviewers" >&2
-  exit 0
+else
+  git diff --quiet "$base"...HEAD; _dq=$?
+  if [[ "$_dq" -gt 1 ]]; then
+    echo "ERROR: git diff failed (exit $_dq) for $base...HEAD, so there is no telling what the round would review. Not dispatching." >&2
+    exit 1
+  fi
+  if [[ "$_dq" -eq 0 ]]; then
+    printf '{"skipped": true, "reason": "no_diff_against_base", "base": "%s"}\n' "$base" > "$out/run.meta.json"
+    echo "no diff against $base — skipping reviewers" >&2
+    exit 0
+  fi
 fi
 
 # Repeat-pass guard. A pass >= 2 that reuses the previous pass's base re-reads

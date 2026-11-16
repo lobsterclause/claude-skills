@@ -533,29 +533,57 @@ if [[ -f "$run_dir/context.json" ]]; then
   wrapper_branch_val="$(jq -r '.wrapper_branch // empty' "$run_dir/context.json" 2>/dev/null)"
 fi
 
-# paths / paths_hash / paths_mode: a --paths round's scope, from context.json
-# (worktree.sh start) or, failing that, the first lane meta.json that carries
-# them. Additive and optional -- absent on every full-diff round, and readers
-# treat absence as "the whole diff" (ledger schema-version policy: additive
-# fields do not bump SCHEMA_VERSION).
+# paths / paths_hash / paths_mode: a --paths round's scope. Additive and
+# optional -- absent on every full-diff round, and readers treat absence as
+# "the whole diff" (ledger schema-version policy: additive fields do not bump
+# SCHEMA_VERSION).
+#
+# Two sources, read the way post_comment.sh reads them so the run log and the
+# posted record name the same scope with the same hash:
+#   1. context.json, when worktree.sh start recorded a scope there.
+#   2. Otherwise the lanes. run_reviewers.sh takes --paths on its own and then
+#      the only record is the `paths` array in each lane's meta.json. The scope
+#      is the union of what the lanes carry, and its hash is computed here with
+#      the shared hasher (lib_paths.sh), since no lane stores one.
+# This used to copy paths_hash and paths_mode from the first lane file that
+# had `paths`. A lane has no paths_hash, and its paths_mode is the LANE's
+# (`explicit_prompt` for codex), so a run_reviewers-only round was logged with
+# no hash and a round mode of "explicit_prompt". The round's mode is only ever
+# "filtered", or "mixed" when a lane reviewed the unfiltered diff.
+. "$(dirname "$0")/lib_paths.sh" || {
+  echo "FATAL: lib_paths.sh missing beside $0 -- nothing written" >&2; exit 1; }
 paths_json="null"; paths_hash_val=""; paths_mode_val=""
-for _pf in "$run_dir/context.json" "$run_dir"/raw/*.meta.json "$run_dir"/*.meta.json; do
-  [[ -f "$_pf" ]] || continue
-  _pj="$(jq -c 'if (.paths | type) == "array" and (.paths | length) > 0 then .paths else empty end' "$_pf" 2>/dev/null)"
+_lane_metas=()
+for _lm in "$run_dir"/raw/*.meta.json "$run_dir"/*.meta.json; do [[ -f "$_lm" ]] && _lane_metas+=("$_lm"); done
+if [[ -f "$run_dir/context.json" ]]; then
+  _pj="$(jq -c 'if (.paths | type) == "array" and (.paths | length) > 0 then .paths else empty end' "$run_dir/context.json" 2>/dev/null)"
   if [[ -n "$_pj" ]]; then
     paths_json="$_pj"
-    paths_hash_val="$(jq -r '.paths_hash // empty' "$_pf" 2>/dev/null)"
-    paths_mode_val="$(jq -r '.paths_mode // empty' "$_pf" 2>/dev/null)"
-    # context.json says "filtered" (the round's intent); a lane that could not
-    # honour it (codex forced onto --base) makes the round "mixed".
-    _lane_metas=()
-    for _lm in "$run_dir"/raw/*.meta.json "$run_dir"/*.meta.json; do [[ -f "$_lm" ]] && _lane_metas+=("$_lm"); done
-    if [[ ${#_lane_metas[@]} -gt 0 ]] && jq -e -s 'map(select(.paths_mode == "base_unfiltered")) | length > 0' "${_lane_metas[@]}" >/dev/null 2>&1; then
-      paths_mode_val="mixed"
-    fi
-    break
+    paths_hash_val="$(jq -r '.paths_hash // empty' "$run_dir/context.json" 2>/dev/null)"
   fi
-done
+fi
+if [[ "$paths_json" == "null" && ${#_lane_metas[@]} -gt 0 ]]; then
+  _lane_paths=""
+  for _lm in "${_lane_metas[@]}"; do
+    _lp="$(jq -r '(.paths? // empty) | arrays | .[] | strings' "$_lm" 2>/dev/null)" || continue
+    [[ -n "$_lp" ]] && _lane_paths+="$_lp"$'\n'
+  done
+  _lane_paths="$(printf '%s' "$_lane_paths" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u)"
+  if [[ -n "$_lane_paths" ]]; then
+    paths_json="$(printf '%s\n' "$_lane_paths" | cr_paths_json)"
+  fi
+fi
+if [[ "$paths_json" != "null" ]]; then
+  # A context.json written by hand or by an older copy may carry paths without
+  # a hash; the lanes never carry one. Same derivation either way.
+  [[ -n "$paths_hash_val" ]] || paths_hash_val="$(jq -r '.[]' <<<"$paths_json" | cr_paths_hash)"
+  paths_mode_val="filtered"
+  # A lane that could not honour the filter (codex forced onto --base) makes
+  # the round "mixed".
+  if [[ ${#_lane_metas[@]} -gt 0 ]] && jq -e -s 'map(select(.paths_mode == "base_unfiltered")) | length > 0' "${_lane_metas[@]}" >/dev/null 2>&1; then
+    paths_mode_val="mixed"
+  fi
+fi
 
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
