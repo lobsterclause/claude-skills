@@ -46,7 +46,7 @@ assert_not_contains() {
 # checkout lives. ──────────────────────────────────────────────────────────
 SKILL="$T/skill"
 mkdir -p "$SKILL/scripts" "$SKILL/references"
-cp "$S/worktree.sh" "$S/append_runlog.sh" "$S/lib_append_lock.sh" "$S/analyze_runlog.sh" "$S/post_comment.sh" "$SKILL/scripts/"
+cp "$S/worktree.sh" "$S/lib_paths.sh" "$S/append_runlog.sh" "$S/lib_append_lock.sh" "$S/analyze_runlog.sh" "$S/post_comment.sh" "$SKILL/scripts/"
 cp "$SKILL_DIR/references/reviewer_profiles.json" "$SKILL/references/reviewer_profiles.json" 2>/dev/null || echo '{}' >"$SKILL/references/reviewer_profiles.json"
 chmod +x "$SKILL/scripts/"*.sh
 
@@ -142,7 +142,7 @@ assert_eq "worktree.sh start: wrapper_dirty is false again (clean checkout of fe
 echo "── worktree.sh start: skill dir is NOT a git checkout -> wrapper fields are null, start still succeeds (#144) ──"
 NOGIT_SKILL="$T/skill-nogit"
 mkdir -p "$NOGIT_SKILL/scripts"
-cp "$SKILL/scripts/worktree.sh" "$NOGIT_SKILL/scripts/"
+cp "$SKILL/scripts/worktree.sh" "$SKILL/scripts/lib_paths.sh" "$NOGIT_SKILL/scripts/"
 OUT_D="$(cd "$TARGET" && CROSS_REVIEW_WORKTREE_ROOT="$WT_ROOT" CROSS_REVIEW_RUN_ROOT="$RUN_ROOT" \
   bash "$NOGIT_SKILL/scripts/worktree.sh" start --ref HEAD --id wrap-d --base HEAD 2>"$T/wt-d.err")"
 assert_eq "worktree.sh start: non-git skill dir -> wrapper_sha is JSON null" \
@@ -152,7 +152,7 @@ assert_eq "worktree.sh start: non-git skill dir -> wrapper_sha is JSON null" \
 # ~/.dotfiles must not report the dotfiles' HEAD, nor read as dirty).
 NEST="$T/nest"; mkdir -p "$NEST"; git -C "$NEST" init -q -b main 2>/dev/null || git -C "$NEST" init -q
 git -C "$NEST" -c user.email=t@t -c user.name=t commit -q --allow-empty -m outer
-mkdir -p "$NEST/skill/scripts"; cp "$S/worktree.sh" "$NEST/skill/scripts/"
+mkdir -p "$NEST/skill/scripts"; cp "$S/worktree.sh" "$S/lib_paths.sh" "$NEST/skill/scripts/"
 OUT_E="$(cd "$TARGET" && CROSS_REVIEW_WORKTREE_ROOT="$WT_ROOT" CROSS_REVIEW_RUN_ROOT="$RUN_ROOT" \
   bash "$NEST/skill/scripts/worktree.sh" start --ref HEAD --id wrap-e --base HEAD 2>"$T/wt-e.err")"
 assert_eq "worktree.sh start: untracked skill dir inside another repo -> wrapper_sha is JSON null" \

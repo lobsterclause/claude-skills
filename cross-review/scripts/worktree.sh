@@ -3,10 +3,23 @@
 #
 # Subcommands:
 #   start --ref <branch-or-sha> --id <slug> [--base <branch>]
+#         [--paths <pathspec[,pathspec...]>] [--path <pathspec>]...
+#         [--allow-empty-paths] [--allow-non-ancestor-base]
 #     Creates $HOME/.cross-review/worktrees/cr-<slug>-<ts>-<pid>/ (detached worktree at <ref>)
 #     Creates $HOME/.cross-review/runs/<repo>-<slug>-<ts>-<pid>/ (stable output dir)
 #     Runs size + secret-path checks, emits a single JSON line, and writes that
 #     same line to $run_dir/context.json.
+#
+#     --paths restricts the round to a set of git pathspecs (also repeatable
+#     --path, or CROSS_REVIEW_PATHS). size_files/size_lines/warn_*/risky_files
+#     are then computed over the FILTERED diff only, the normalised list is
+#     recorded in context.json, and start FAILS LOUDLY (exit 3, nothing created)
+#     when the filtered diff is empty or when --base is a descendant of (or
+#     unrelated to) --ref -- the three-dot diff of such a base is silently empty,
+#     and a round that reviews nothing must not look like a round that found
+#     nothing. --allow-empty-paths / --allow-non-ancestor-base (or
+#     CROSS_REVIEW_ALLOW_EMPTY_PATHS=1 / CROSS_REVIEW_ALLOW_NON_ANCESTOR_BASE=1)
+#     downgrade those two failures to a stderr warning.
 #
 #   end --worktree <path>
 #     Tears down the worktree. Idempotent. Run dir is NOT touched.
@@ -64,10 +77,13 @@ owns_worktree() {
   [[ -f "$1/.git" ]] && grep -q '^gitdir: .*/worktrees/cr-' "$1/.git" 2>/dev/null
 }
 
+# shellcheck source=lib_paths.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_paths.sh"
+
 usage() {
   cat <<EOF >&2
 usage:
-  $0 start --ref <branch-or-sha> --id <slug> [--base <branch>]
+  $0 start --ref <branch-or-sha> --id <slug> [--base <branch>] [--paths <a,b>] [--path <p>]... [--allow-empty-paths] [--allow-non-ancestor-base]
   $0 end --worktree <path>
   $0 sweep [--older-than-hours N]
 EOF
@@ -92,15 +108,36 @@ case "$cmd" in
     ref=""
     id=""
     base=""
+    paths_raw=()
+    allow_empty_paths="${CROSS_REVIEW_ALLOW_EMPTY_PATHS:-0}"
+    allow_non_ancestor="${CROSS_REVIEW_ALLOW_NON_ANCESTOR_BASE:-0}"
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --ref)  need_val --ref  "$#"; ref="$2";  shift 2 ;;
         --id)   need_val --id   "$#"; id="$2";   shift 2 ;;
         --base) need_val --base "$#"; base="$2"; shift 2 ;;
+        # --paths is a comma list; --path is ONE pathspec, comma and all (see
+        # lib_paths.sh). paths_raw holds newline-separated pathspecs either way.
+        --paths) need_val "$1" "$#"; paths_raw+=("$(cr_paths_csv "$2")"); shift 2 ;;
+        --path)  need_val "$1" "$#"; paths_raw+=("$2"); shift 2 ;;
+        --allow-empty-paths) allow_empty_paths=1; shift ;;
+        --allow-non-ancestor-base) allow_non_ancestor=1; shift ;;
         *) echo "unknown arg: $1" >&2; usage ;;
       esac
     done
     [[ -n "$ref" && -n "$id" ]] || usage
+    # Flags win over the environment (an explicit --paths is a decision, the
+    # env var is a default).
+    if [[ ${#paths_raw[@]} -eq 0 && -n "${CROSS_REVIEW_PATHS:-}" ]]; then
+      paths_raw=("$(cr_paths_csv "$CROSS_REVIEW_PATHS")")
+    fi
+    paths_list=""
+    ps_args=()
+    if [[ ${#paths_raw[@]} -gt 0 ]]; then
+      paths_list="$(cr_paths_normalise_lines "${paths_raw[@]}")" || exit 2
+      while IFS= read -r _pp; do ps_args+=("$_pp"); done <<<"$paths_list"
+      ps_args=(-- "${ps_args[@]}")
+    fi
 
     # Must be inside a git repo — we anchor the worktree and size check against it.
     if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
@@ -128,6 +165,77 @@ case "$cmd" in
       echo "invalid or unknown base ref: $base" >&2
       echo "  hint: try 'git fetch origin' or pass --base <ref> explicitly" >&2
       exit 1
+    fi
+
+    # No merge base at all: unrelated histories, or a shallow clone cut off
+    # below the fork point. The three-dot diff (merge-base...ref) cannot be
+    # computed then -- git exits 128 -- and nothing can be reviewed. This is not
+    # the descendant-base trap below and --allow-non-ancestor-base does not
+    # cover it: that flag accepts an EMPTY diff, and here there is no diff to
+    # be empty. Checked before anything is created; the size pipeline further
+    # down used to die on it under `set -e`, after the worktree and run dir
+    # existed, with nothing on stdout.
+    _ref_sha="$(git -C "$repo_root" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null || true)"
+    _base_sha0="$(git -C "$repo_root" rev-parse "$base^{commit}")"
+    if [[ -n "$_ref_sha" ]] && ! git -C "$repo_root" merge-base "$_base_sha0" "$_ref_sha" >/dev/null 2>&1; then
+      echo "ERROR: --base ($base) and --ref ($ref) have no merge base, so the three-dot diff (merge-base...ref) cannot be computed and there is nothing to review." >&2
+      echo "  Pass a --base that shares history with --ref. In a shallow clone, fetch more history first (git fetch --unshallow)." >&2
+      exit 3
+    fi
+
+    # --paths guards, BEFORE anything is created (a refusal must leave no
+    # worktree or run dir behind).
+    #
+    # The descendant-base trap: the diff below is three-dot (merge-base...HEAD).
+    # If --base is a DESCENDANT of --ref the merge-base IS the ref, so the diff
+    # is empty -- size_files 0, size_lines 0 -- and nothing says why. That is
+    # exactly how a hand-built "synthetic base" round once reached its reviewers
+    # with no input. A base that merely diverged (main moved on) is the normal
+    # PR shape and three-dot handles it correctly, so that case is only noted.
+    base_is_ancestor_json="null"
+    if [[ -n "$paths_list" ]]; then
+      if [[ -n "$_ref_sha" ]]; then
+        if git -C "$repo_root" merge-base --is-ancestor "$_base_sha0" "$_ref_sha" 2>/dev/null; then
+          base_is_ancestor_json="true"
+        else
+          base_is_ancestor_json="false"
+          # A merge base exists (checked above), so the only shape left that
+          # empties the diff is a base that descends from the ref.
+          _mb="$(git -C "$repo_root" merge-base "$_base_sha0" "$_ref_sha" 2>/dev/null || true)"
+          if [[ "$_mb" == "$_ref_sha" ]]; then
+            _why="--base ($base) is a descendant of --ref ($ref)"
+            if [[ "$allow_non_ancestor" == 1 ]]; then
+              echo "WARN: $_why — the three-dot diff will be empty (allowed by --allow-non-ancestor-base)" >&2
+            else
+              echo "ERROR: $_why, so the three-dot diff (merge-base...ref) is EMPTY and reviewers would run on nothing." >&2
+              echo "  Pass a --base that is an ancestor of --ref (e.g. the commit the change starts from)," >&2
+              echo "  or --allow-non-ancestor-base to proceed anyway." >&2
+              exit 3
+            fi
+          else
+            echo "NOTE: --base ($base) is not an ancestor of --ref ($ref); using the merge-base diff (normal for a branch whose base moved on)" >&2
+          fi
+        fi
+        # git's exit status is read on its own. Piped straight into `wc`, a
+        # failing diff aborted the script under pipefail with no message, and
+        # without pipefail it would have counted as "0 files match".
+        if ! _filtered_names="$(git -C "$repo_root" diff --name-only "$base"..."$_ref_sha" "${ps_args[@]}" 2>/dev/null)"; then
+          echo "ERROR: git could not compute the filtered diff ($base...$ref with --paths). git said:" >&2
+          { git -C "$repo_root" diff --name-only "$base"..."$_ref_sha" "${ps_args[@]}" 2>&1 >/dev/null | head -3 >&2; } || true
+          exit 1
+        fi
+        _n_filtered="$(printf '%s\n' "$_filtered_names" | sed '/^$/d' | wc -l | tr -d ' ')"
+        if [[ "${_n_filtered:-0}" -eq 0 ]]; then
+          if [[ "$allow_empty_paths" == 1 ]]; then
+            echo "WARN: no changed files match --paths ($(printf '%s' "$paths_list" | tr '\n' ',' | sed 's/,$//')) between $base and $ref (allowed by --allow-empty-paths)" >&2
+          else
+            echo "ERROR: no changed files match --paths ($(printf '%s' "$paths_list" | tr '\n' ',' | sed 's/,$//')) between $base and $ref — the filtered diff is empty, so a review round would review nothing." >&2
+            echo "  Check the pathspecs against: git diff --name-only $base...$ref" >&2
+            echo "  (--allow-empty-paths overrides.)" >&2
+            exit 3
+          fi
+        fi
+      fi
     fi
 
     # UTC, not local (#118): append_runlog.sh's round_wall_s takes "now" on
@@ -161,9 +269,9 @@ case "$cmd" in
       >"$worktree/.cross-review-worktree"
 
     # Size check — run inside the worktree.
-    size_files=$(git -C "$worktree" diff --name-only "$base"...HEAD | wc -l | tr -d ' ')
+    size_files=$(git -C "$worktree" diff --name-only "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} | wc -l | tr -d ' ')
     # grep can return non-zero on empty/rename-only diffs; tolerate under pipefail.
-    size_lines=$(git -C "$worktree" diff --shortstat "$base"...HEAD \
+    size_lines=$(git -C "$worktree" diff --shortstat "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} \
       | { grep -oE '[0-9]+ insertion|[0-9]+ deletion' || true; } \
       | awk '{s+=$1} END{print s+0}')
     [[ "$size_files" =~ ^[0-9]+$ ]] || size_files=0
@@ -183,7 +291,7 @@ case "$cmd" in
     # false-positive-tolerant, and catches the cases that matter most.
     secret_pattern='\.env($|\.|/)|\.envrc|credentials|[Ss]ecret|\.pem$|\.key$|\.p12$|\.pfx$|id_rsa|id_ed25519|\.keystore|\.jks'
     # grep returns 1 when no matches — explicitly tolerate that under `set -e`.
-    risky_files=$({ git -C "$worktree" diff --name-only "$base"...HEAD 2>/dev/null \
+    risky_files=$({ git -C "$worktree" diff --name-only "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null \
       | grep -E "$secret_pattern" || true; } | head -5 | tr '\n' ',' | sed 's/,$//')
     warn_secrets=false
     if [[ -n "$risky_files" ]]; then
@@ -219,7 +327,7 @@ case "$cmd" in
       # mistaken for content; a deleted file's `+++ /dev/null` header falls
       # back to the `---` line for the real filename instead of leaving the
       # literal header text as the filename.
-      content_hits=$(git -C "$worktree" diff --no-color -U0 --diff-filter=ACMRD "$base"...HEAD 2>/dev/null \
+      content_hits=$(git -C "$worktree" diff --no-color -U0 --diff-filter=ACMRD "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null \
         | awk '
             /^diff --git / { file=""; next }
             /^--- / {
@@ -330,6 +438,12 @@ case "$cmd" in
       "$(jsonesc "$base")" "$base_sha" "$head_sha" "$(jsonesc "$ref")" "$(jsonesc "$id")" \
       "$origin_slug" "$ts" "$warn_large" "$warn_secrets" "$(jsonesc "$risky_files")" \
       "$wrapper_sha_json" "$wrapper_dirty_json" "$wrapper_branch_json")"
+
+    # --paths record: only when set, so a full-diff round's context.json stays
+    # byte-identical to what every existing consumer already reads.
+    if [[ -n "$paths_list" ]]; then
+      json="${json%\}}, \"paths\": $(printf '%s\n' "$paths_list" | cr_paths_json), \"paths_hash\": \"$(printf '%s\n' "$paths_list" | cr_paths_hash)\", \"paths_mode\": \"filtered\", \"base_is_ancestor\": $base_is_ancestor_json}"
+    fi
 
     # Same bytes to both, so the caller's copy and the on-disk record can never
     # disagree about what was reviewed.

@@ -224,6 +224,22 @@ export PATH
 
 base=""
 target_ref=""
+# --paths (see the "PATH-SCOPED ROUNDS" block after argument parsing). ps_args
+# is spliced after every `git diff <base>...HEAD`; empty = the whole diff.
+paths_raw=()
+no_paths=0
+ps_args=()
+paths_list=""
+paths_hash=""
+paths_note=""
+allow_empty_paths="${CROSS_REVIEW_ALLOW_EMPTY_PATHS:-0}"
+allow_non_ancestor="${CROSS_REVIEW_ALLOW_NON_ANCESTOR_BASE:-0}"
+# codex cannot be path-filtered through `codex exec review --base`. With paths
+# set it runs an explicit prompt that embeds the filtered diff ("prompt");
+# CROSS_REVIEW_CODEX_FORCE_BASE=1 / --codex-force-base restores the old
+# unfiltered --base run ("base"), recorded as paths_mode=base_unfiltered.
+codex_paths_mode="prompt"
+[[ "${CROSS_REVIEW_CODEX_FORCE_BASE:-0}" == 1 ]] && codex_paths_mode="base"
 allow_full_rereview="${CROSS_REVIEW_ALLOW_FULL_REREVIEW:-0}"
 out=""
 # Empty default: no per-reviewer snapshots. When set via --snapshot-dir, a
@@ -301,6 +317,10 @@ model_backed_reviewers=(gemini-pro glm-coding glm deepseek mimo
 # fleet the runner will not dispatch. See lib_flags.sh for each flag.
 # shellcheck source=lib_flags.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib_flags.sh"
+# --paths: parsing / normalisation / hashing shared with worktree.sh and
+# plan_rounds.sh (one definition of "the same set of paths").
+# shellcheck source=lib_paths.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_paths.sh"
 # shellcheck source=lib_agy_routes.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib_agy_routes.sh"
 
@@ -336,12 +356,20 @@ while [[ $# -gt 0 ]]; do
     --snapshot-dir)       need_val --snapshot-dir       "$#"; snapshot_dir="$2";       shift 2 ;;
     --context-mode)       need_val --context-mode       "$#"; context_mode="$2";       shift 2 ;;
     --tool-mode)          need_val --tool-mode          "$#"; tool_mode="$2";          shift 2 ;;
+    # --paths is a comma list; --path is ONE pathspec, comma and all (see
+    # lib_paths.sh). paths_raw holds newline-separated pathspecs either way.
+    --paths)              need_val "$1"                 "$#"; paths_raw+=("$(cr_paths_csv "$2")"); shift 2 ;;
+    --path)               need_val "$1"                 "$#"; paths_raw+=("$2");       shift 2 ;;
+    --no-paths)           no_paths=1;                                                  shift ;;
+    --allow-empty-paths)  allow_empty_paths=1;                                         shift ;;
+    --allow-non-ancestor-base) allow_non_ancestor=1;                                   shift ;;
+    --codex-force-base)   codex_paths_mode="base";                                     shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <ref> --out <dir> [--target-ref refs/remotes/<remote>/<branch>] [--reviewers codex,glm-coding,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff]" >&2
+  echo "usage: $0 --base <ref> --out <dir> [--target-ref refs/remotes/<remote>/<branch>] [--reviewers codex,glm-coding,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff] [--paths <a,b>] [--path <p>]...  [--no-paths] [--allow-empty-paths] [--allow-non-ancestor-base] [--codex-force-base]" >&2
   exit 2
 fi
 case "$context_mode" in
@@ -564,15 +592,154 @@ if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
   exit 1
 fi
 
+# A base that resolves can still have no merge base with HEAD: unrelated
+# histories, or a shallow clone cut off below the fork point. Every diff below
+# is three-dot (merge-base...HEAD), and without a merge base git exits 128 on
+# each of them. `git diff --quiet` returning 128 was read as "has a diff", so
+# the round was dispatched and every lane got an empty diff. Refused for
+# full-diff and path-scoped rounds alike; --allow-non-ancestor-base does not
+# cover it (that flag accepts an EMPTY diff, and here there is none to be
+# empty).
+_pb="$(git rev-parse "$base^{commit}")"; _ph="$(git rev-parse HEAD)"
+if ! git merge-base "$_pb" "$_ph" >/dev/null 2>&1; then
+  printf '{"skipped": true, "reason": "base_no_merge_base", "base": "%s"}\n' "$base" > "$out/run.meta.json"
+  echo "ERROR: --base ($base) and HEAD have no merge base, so the three-dot diff (merge-base...HEAD) cannot be computed and reviewers would run on nothing. Pass a --base that shares history with HEAD; in a shallow clone, fetch more history first (git fetch --unshallow)." >&2
+  exit 4
+fi
+
 # Empty-diff short-circuit: burning 5 min + tens of thousands of tokens on a
 # no-op branch produces nothing real (and sometimes invites hallucinated
 # findings). Reviewers also can't diff what they can't see.
-# (Base is validated above, so `git diff --quiet` here returns 0 (no diff) or
-# 1 (has diff) cleanly, never 128.)
-if git diff --quiet "$base"...HEAD; then
-  printf '{"skipped": true, "reason": "no_diff_against_base", "base": "%s"}\n' "$base" > "$out/run.meta.json"
-  echo "no diff against $base — skipping reviewers" >&2
-  exit 0
+# (`git diff --quiet` answers 0 for no diff and 1 for a diff. Anything higher
+# is git failing, and is treated as that below, never as "has a diff".)
+# ── PATH-SCOPED ROUNDS (--paths) ────────────────────────────────────────────
+# A round may be restricted to a set of git pathspecs so a huge change can be
+# reviewed in focused rounds (plan_rounds.sh suggests the split). Precedence:
+# --paths/--path flags, then CROSS_REVIEW_PATHS, then the `paths` that
+# worktree.sh start recorded in context.json (read from --out or its parent,
+# i.e. a run dir). --no-paths turns the last two off: it asks for the full diff
+# whatever the environment says, and in a run dir that was started with a scope
+# it is refused (see ONE RUN DIR, ONE SCOPE below). Resolved ONCE here into ps_args, which is
+# spliced after every `git diff <base>...HEAD` below -- the inlined <diff>, the
+# whole-file block, --stat, doc_narrative_risk and the agy/codex prompts all
+# read the same filtered set, so no lane can see a file another lane was told
+# is out of scope.
+#
+# The scope the run dir was started with, if any, is read first and kept: it is
+# both the default and what this dispatch is checked against further down.
+_ctx_file=""; _ctx_paths=""
+for _cj in "$out/context.json" "$out/../context.json"; do
+  if [[ -f "$_cj" ]] && _cj_paths="$(jq -r 'if (.paths | type) == "array" and (.paths | length) > 0 then (.paths | join("\n")) else empty end' "$_cj" 2>/dev/null)" && [[ -n "$_cj_paths" ]]; then
+    _ctx_file="$_cj"; _ctx_paths="$_cj_paths"
+    break
+  fi
+done
+if [[ "$no_paths" != 1 && ${#paths_raw[@]} -eq 0 && -n "${CROSS_REVIEW_PATHS:-}" ]]; then
+  paths_raw=("$(cr_paths_csv "$CROSS_REVIEW_PATHS")")
+fi
+if [[ "$no_paths" != 1 && ${#paths_raw[@]} -eq 0 && -n "$_ctx_paths" ]]; then
+  paths_raw=("$_ctx_paths")
+  echo "paths: using the pathspecs recorded in $_ctx_file" >&2
+fi
+if [[ ${#paths_raw[@]} -gt 0 ]]; then
+  # _lines, not the comma-splitting entry point: every element is already one
+  # pathspec per line, and the context.json route above hands back recorded
+  # pathspecs that may legitimately contain a comma.
+  paths_list="$(cr_paths_normalise_lines "${paths_raw[@]}")" || exit 2
+fi
+
+# ONE RUN DIR, ONE SCOPE. A run dir that `worktree.sh start --paths A` created
+# is scoped to A for good: the size and secret pre-flight covered the filtered
+# diff only, and post_comment.sh and append_runlog.sh describe the whole run
+# dir by the scope in its context.json. A dispatch into it with another scope
+# (`--no-paths`, `--paths B`, or a CROSS_REVIEW_PATHS that differs) sent
+# reviewers files nobody screened and was then recorded as a review of A. So
+# it is refused here, before a reviewer is spent. The recorded list is put
+# through the same normaliser when it parses, and compared as written when it
+# does not (a context.json from an older copy), so the same set always matches.
+if [[ -n "$_ctx_paths" ]]; then
+  _ctx_list="$(cr_paths_normalise_lines "$_ctx_paths" 2>/dev/null)" \
+    || _ctx_list="$(printf '%s\n' "$_ctx_paths" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u)"
+  if [[ "$_ctx_list" != "$paths_list" ]]; then
+    _ctx_csv="$(printf '%s' "$_ctx_list" | tr '\n' ',' | sed 's/,$//')"
+    if [[ -n "$paths_list" ]]; then
+      _this_scope="the paths $(printf '%s' "$paths_list" | tr '\n' ',' | sed 's/,$//')"
+    else
+      _this_scope="the full diff"
+    fi
+    echo "ERROR: this run dir is scoped to $_ctx_csv (recorded in $_ctx_file), and this dispatch would review $_this_scope." >&2
+    echo "  One run dir holds one scope: its pre-flight (size, secret paths) covered the recorded paths only, and the posted record and the run log describe the run dir by them." >&2
+    echo "  For a different scope start a new run dir (worktree.sh start, with the --paths you want or none), or pass an --out that is not inside this one." >&2
+    exit 2
+  fi
+fi
+
+if [[ -n "$paths_list" ]]; then
+  while IFS= read -r _pp; do ps_args+=("$_pp"); done <<<"$paths_list"
+  ps_args=(-- "${ps_args[@]}")
+  paths_hash="$(printf '%s\n' "$paths_list" | cr_paths_hash)"
+
+  # The descendant-base trap (see worktree.sh): the diff is three-dot, so a
+  # --base that is a DESCENDANT of HEAD has merge-base == HEAD and an empty
+  # diff. Without this the empty-diff short-circuit below read it as "nothing
+  # to review" and exited 0.
+  # (No merge base at all was refused above, for every round.)
+  if ! git merge-base --is-ancestor "$_pb" "$_ph" 2>/dev/null; then
+    _mb="$(git merge-base "$_pb" "$_ph" 2>/dev/null || true)"
+    if [[ "$_mb" == "$_ph" ]]; then
+      _why="--base ($base) is a descendant of HEAD"
+      if [[ "$allow_non_ancestor" == 1 ]]; then
+        echo "WARN: $_why — the three-dot diff will be empty (allowed by --allow-non-ancestor-base)" >&2
+      else
+        printf '{"skipped": true, "reason": "base_not_ancestor", "base": "%s"}\n' "$base" > "$out/run.meta.json"
+        echo "ERROR: $_why, so the three-dot diff (merge-base...HEAD) is EMPTY and reviewers would run on nothing. Pass a --base that is an ancestor of HEAD, or --allow-non-ancestor-base." >&2
+        exit 4
+      fi
+    fi
+  fi
+  git diff --quiet "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"}; _dq=$?
+  if [[ "$_dq" -gt 1 ]]; then
+    echo "ERROR: git diff failed (exit $_dq) for $base...HEAD with --paths, so there is no telling what the round would review. Not dispatching." >&2
+    exit 1
+  fi
+  if [[ "$_dq" -eq 0 ]]; then
+    if [[ "$allow_empty_paths" == 1 ]]; then
+      echo "WARN: no changed files match --paths against $base (allowed by --allow-empty-paths) — skipping reviewers" >&2
+      printf '{"skipped": true, "reason": "no_diff_in_paths", "base": "%s"}\n' "$base" > "$out/run.meta.json"
+      exit 0
+    fi
+    printf '{"skipped": true, "reason": "no_diff_in_paths", "base": "%s"}\n' "$base" > "$out/run.meta.json"
+    echo "ERROR: no changed files match --paths ($(printf '%s' "$paths_list" | tr '\n' ',' | sed 's/,$//')) against $base — the filtered diff is empty. Exiting non-zero rather than reviewing nothing (--allow-empty-paths to override)." >&2
+    exit 4
+  fi
+
+  # The scope statement every text lane (and codex's explicit prompt) carries.
+  # Tool-armed lanes may still READ any tracked file for surrounding context --
+  # what is scoped is where a FINDING may land -- so the in-scope files are
+  # listed by name, capped so a huge round cannot bloat the prompt.
+  _scope_files="$(git -c core.quotePath=false diff --name-only "$base"...HEAD "${ps_args[@]}" 2>/dev/null)"
+  _scope_n="$(printf '%s\n' "$_scope_files" | sed '/^$/d' | wc -l | tr -d ' ')"
+  _scope_list="$(printf '%s\n' "$_scope_files" | sed '/^$/d' | head -60 | sed 's/^/  - /')"
+  [[ "$_scope_n" -gt 60 ]] && _scope_list="$_scope_list
+  - ... and $((_scope_n - 60)) more"
+  paths_note="SCOPE: this is a PATH-SCOPED review round. Review ONLY changes in these paths; other files are context.
+Pathspecs:
+$(printf '%s\n' "$paths_list" | sed 's/^/  - /')
+Changed files in scope ($_scope_n):
+$_scope_list
+Report findings only about changes in these paths. You may read or cite code outside them as evidence for a finding about an in-scope change, but do not report problems whose primary location is outside the scope, and do not assume the diff you were given is the whole change. If a code-context snapshot is supplied instead of the diff, apply the same rule: files in it that are not in scope are context only."
+  echo "paths: round scoped to $_scope_n file(s) via $(printf '%s' "$paths_list" | tr '\n' ',' | sed 's/,$//') (hash $paths_hash)" >&2
+else
+  git diff --quiet "$base"...HEAD; _dq=$?
+  if [[ "$_dq" -gt 1 ]]; then
+    echo "ERROR: git diff failed (exit $_dq) for $base...HEAD, so there is no telling what the round would review. Not dispatching." >&2
+    exit 1
+  fi
+  if [[ "$_dq" -eq 0 ]]; then
+    printf '{"skipped": true, "reason": "no_diff_against_base", "base": "%s"}\n' "$base" > "$out/run.meta.json"
+    echo "no diff against $base — skipping reviewers" >&2
+    exit 0
+  fi
 fi
 
 # Repeat-pass guard. A pass >= 2 that reuses the previous pass's base re-reads
@@ -633,6 +800,11 @@ codex_config_effort() {
 
 _guard_id_args=()
 [[ -n "$subject_id" ]] && _guard_id_args=(--branch "$subject_id")
+# A path-scoped round is a different review from the full diff of the same
+# subject (and from a round over other paths): scope the guard's state key, and
+# with it the codex effort ladder's pass count, by the pathspec digest. Only
+# when paths are set -- every full-diff key is unchanged.
+[[ -n "$paths_hash" ]] && _guard_id_args+=(--paths-hash "$paths_hash")
 
 _guard="$(cd "$(dirname "$0")" && pwd)/check_repeat_pass.sh"
 _base_sha="$(git rev-parse --verify --quiet "$base^{commit}" 2>/dev/null || echo "")"
@@ -803,7 +975,9 @@ elif [[ -n "$(profile_path gemini-pro '.router.pass1')" ]]; then
     # A failed `git diff` must read as "size unknown" (-> router.pass1), not as
     # 0 lines (-> pass1_small): `| wc -l` would print 0 and hide the failure.
     # (gemini-pro, #196 pass 3.)
-    if _gp_d="$(git diff "$base"...HEAD 2>/dev/null)"; then
+    # ps_args: on a --paths round, size the diff the seat is sent, not the
+    # whole branch.
+    if _gp_d="$(git diff "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null)"; then
       gemini_pro_diff_lines="$(printf '%s' "$_gp_d" | wc -l | tr -d ' ')"
       [[ -n "$_gp_d" ]] && gemini_pro_diff_lines=$(( gemini_pro_diff_lines + 1 ))
     else
@@ -904,8 +1078,8 @@ if [[ "$context_mode" == "files" ]]; then
   # whatever core.quotePath says, and a quoted name cannot be `git show`n.
   # NUL-delimited output is never quoted; NUL→LF keeps the rest of this loop
   # line-based (a path containing a newline is the one shape not supported).
-  _ctx_paths="$(git -c core.quotePath=false diff -z --name-only --diff-filter=d "$base"...HEAD 2>/dev/null | tr '\0' '\n' || true)"
-  _ctx_order="$(git -c core.quotePath=false diff --numstat "$base"...HEAD 2>/dev/null \
+  _ctx_paths="$(git -c core.quotePath=false diff -z --name-only --diff-filter=d "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | tr '\0' '\n' || true)"
+  _ctx_order="$(git -c core.quotePath=false diff --numstat "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null \
     | awk -F'\t' '$1 != "-" { print ($1 + $2) "\t" $3 }' | sort -t $'\t' -k1,1nr | cut -f2- || true)"
   # Walk churn order first, then anything --name-only knows that numstat did
   # not surface in a resolvable form (renames); a path is embedded once.
@@ -1596,6 +1770,12 @@ if [[ -f "$prompt_file" ]]; then
 else
   review_prompt="$default_prompt"
 fi
+# The scope statement rides in review_prompt, which every lane that builds its
+# own prompt (kimi, the agy laps, the OpenRouter/Moonshot/Z.ai pool, codex's
+# explicit prompt) already starts from.
+[[ -n "$paths_note" ]] && review_prompt="$review_prompt
+
+$paths_note"
 
 # Review worktrees are `git worktree add` checkouts with no install step, so a
 # JS repo here has no node_modules. Agentic reviewers do not know that and will
@@ -1761,13 +1941,46 @@ run_codex() {
   if [[ -n "$codex_model" ]]; then
     codex_model_args=(-m "$codex_model")
   fi
-  run_with_timeout "$codex_timeout" codex exec review \
-    --base "$base" \
-    -c 'approval_policy="never"' -c 'sandbox_mode="workspace-write"' \
-    ${codex_model_args[@]+"${codex_model_args[@]}"} \
-    ${codex_cfg[@]+"${codex_cfg[@]}"} \
-    >"$out/codex.stdout" 2>&1
-  rc=$?
+  if [[ -n "$paths_list" && "$codex_paths_mode" == "prompt" ]]; then
+    # PATH-SCOPED ROUND. `codex exec review --base` does its own diffing and
+    # cannot be path-filtered, and --base and a positional PROMPT are mutually
+    # exclusive. So: drop --base, embed the FILTERED diff (same 8000-line cap
+    # as the other lanes) in an explicit prompt and feed it on stdin (`-`), the
+    # pattern SKILL.md / cli_flags.md describe. Workspace access is unchanged:
+    # same sandbox/approval config, so codex still reads surrounding files.
+    local cx_diff cx_total cx_note="" cx_prompt_file
+    cx_diff="$(git diff "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | head -n 8000 || true)"
+    cx_total="$(git diff "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "${cx_total:-0}" -gt 8000 ]]; then
+      cx_note="
+
+[WARNING: diff truncated to first 8000 of $cx_total lines. Read the remaining in-scope changes yourself with: git diff $base...HEAD ${ps_args[*]}]"
+    fi
+    cx_diff="${cx_diff//<\/diff>/< /diff>}"
+    cx_prompt_file="$(mktemp)"
+    printf '%s\n\nYou are reviewing the branch at HEAD against the base %s (merge-base diff). Base your review on the filtered diff below, checking it against the surrounding code in the workspace.\n\n<diff>\n%s\n</diff>%s\n\nChanged files (diff --stat against %s, path-filtered):\n%s\n\nRank findings [P1]/[P2]/[P3] (P1 most severe).\n' \
+      "$review_prompt" "$base" "$cx_diff" "$cx_note" "$base" "$(git diff --stat "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | head -50 || true)" >"$cx_prompt_file"
+    run_with_timeout "$codex_timeout" codex exec review \
+      -c 'approval_policy="never"' -c 'sandbox_mode="workspace-write"' \
+      ${codex_model_args[@]+"${codex_model_args[@]}"} \
+      ${codex_cfg[@]+"${codex_cfg[@]}"} \
+      - <"$cx_prompt_file" \
+      >"$out/codex.stdout" 2>&1
+    rc=$?
+    cp "$cx_prompt_file" "$out/codex.prompt.txt" 2>/dev/null || true
+    rm -f "$cx_prompt_file"
+  else
+    if [[ -n "$paths_list" ]]; then
+      echo "codex: --paths is set but codex is forced onto 'exec review --base' (CROSS_REVIEW_CODEX_FORCE_BASE / --codex-force-base) — it will review the UNFILTERED diff" >&2
+    fi
+    run_with_timeout "$codex_timeout" codex exec review \
+      --base "$base" \
+      -c 'approval_policy="never"' -c 'sandbox_mode="workspace-write"' \
+      ${codex_model_args[@]+"${codex_model_args[@]}"} \
+      ${codex_cfg[@]+"${codex_cfg[@]}"} \
+      >"$out/codex.stdout" 2>&1
+    rc=$?
+  fi
   end=$(date +%s)
   local timed_out="false"
   [[ $rc -eq 124 || $rc -eq 137 ]] && timed_out="true"  # 137 = timeout -k SIGKILL escalation (codex P2, PR #18 pass 3)
@@ -1945,7 +2158,7 @@ run_openrouter_reviewer() {
   local start end rc
   start=$(date +%s)
   local diff_summary diff_full total_lines truncation_note truncated
-  diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
+  diff_summary="$(git diff --stat "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | head -50 || true)"
   # Same line-based cap as run_kimi, for the same reasons (UTF-8 safety,
   # context budget). GLM 5.2 and the OpenRouter Gemini models all take 200k+
   # tokens; 8000 diff lines stays well inside that.
@@ -1962,8 +2175,8 @@ run_openrouter_reviewer() {
     truncated=false
     truncation_note=""
   else
-    diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -n "$diff_line_cap" || true)"
-    total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
+    diff_full="$(git diff "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | head -n "$diff_line_cap" || true)"
+    total_lines="$(git diff "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
       truncated=true
       truncation_note="
@@ -2036,6 +2249,9 @@ run_openrouter_reviewer() {
       context_intro="Base your review on the diff below. The changed files are NOT pasted — read the surrounding code with your tools before relying on anything outside a hunk."
     fi
     tools_intro="You have tools: read_file (a range of any tracked file, post-change), search (git grep -E across the repo) and list_files. Before reporting anything that depends on code outside a hunk — an unhandled case, a missing check, a caller you assume exists, a portability claim — READ the surrounding code or SEARCH for it and cite what you found; if the code already handles it, do not report it. Keep tool use focused: a few targeted reads beat reading every file. Your tool budget is limited; when it runs out, answer with what you have and mark unverified claims as such."
+    if [[ -n "$paths_note" ]]; then
+      tools_intro="$tools_intro Your tools can read ANY tracked file for surrounding context, but this round is path-scoped: report findings only about changes in the in-scope paths listed in the SCOPE note above; code outside them is context, not a review target."
+    fi
     if [[ "$tl_mode" == "check" ]]; then
       tools_intro="$tools_intro You also have run_check, which runs this repository's own verification entrypoint once (cached for the round): call it at most once, only when a finding turns on runtime behaviour (\"this breaks the tests\", \"this fails to compile\"), and report what it actually printed."
     fi
@@ -2046,7 +2262,7 @@ run_openrouter_reviewer() {
   # doc_narrative_risk's comment for why --name-status, not the capped/
   # brace-compressing --stat display used for the prompt body, nor
   # --name-only (which drops a rename's source path).
-  doc_file_list="$(git diff --name-status "$base"...HEAD 2>/dev/null || true)"
+  doc_file_list="$(git diff --name-status "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null || true)"
   doc_note="$(doc_narrative_note "$doc_file_list")"
   # PROMPT ORDER IS A CACHE DECISION. Every host that prompt-caches does so
   # on the exact request prefix, so the stable text goes first and anything
@@ -2450,7 +2666,7 @@ run_agy_reviewer() {
   local repo_root
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   local diff_summary diff_full
-  diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
+  diff_summary="$(git diff --stat "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | head -50 || true)"
   local snapshot_path="" using_snapshot=false
   if snapshot_path="$(snapshot_for "$slug")"; then
     using_snapshot=true
@@ -2499,7 +2715,7 @@ run_agy_reviewer() {
     # a reviewer that still wants more (a file's surrounding code, imports)
     # can use its native Read/Glob tools — those are a different permission
     # category than "command" and aren't gated the same way in headless mode.
-    diff_full="$(git diff --unified=50 "$base"...HEAD 2>/dev/null || true)"
+    diff_full="$(git diff --unified=50 "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null || true)"
     # Defuse a literal </diff> inside untrusted patch content — same guard as
     # run_kimi/run_openrouter_reviewer.
     diff_full="${diff_full//<\/diff>/< /diff>}"
@@ -2786,7 +3002,7 @@ run_kimi() {
   # kimi reads stdin as the prompt when --print is set and no -p is given
   # (confirmed: `echo "..." | kimi --print --quiet` works).
   local diff_summary diff_full diff_line_cap truncation_note truncated
-  diff_summary="$(git diff --stat "$base"...HEAD 2>/dev/null | head -50 || true)"
+  diff_summary="$(git diff --stat "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | head -50 || true)"
   # Line-based cap (not byte-based). head -c can split mid-codepoint and
   # produce invalid UTF-8; head -n respects line boundaries. 8000 lines keeps
   # us well under k2.5's 256K-token context even for verbose diffs.
@@ -2804,8 +3020,8 @@ run_kimi() {
     truncated=false
     truncation_note=""
   else
-    diff_full="$(git diff "$base"...HEAD 2>/dev/null | head -n "$diff_line_cap" || true)"
-    total_lines="$(git diff "$base"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
+    diff_full="$(git diff "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | head -n "$diff_line_cap" || true)"
+    total_lines="$(git diff "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "${total_lines:-0}" -gt "$diff_line_cap" ]]; then
       truncated=true
       truncation_note="
@@ -2858,7 +3074,7 @@ run_kimi() {
   # doc_narrative_risk's comment for why --name-status, not the capped/
   # brace-compressing --stat display used for the prompt body, nor
   # --name-only (which drops a rename's source path).
-  doc_file_list="$(git diff --name-status "$base"...HEAD 2>/dev/null || true)"
+  doc_file_list="$(git diff --name-status "$base"...HEAD ${ps_args[@]+"${ps_args[@]}"} 2>/dev/null || true)"
   doc_note="$(doc_narrative_note "$doc_file_list")"
   local full_prompt
   # Stable text first, per-round text after the diff — same cache reasoning
@@ -3231,6 +3447,41 @@ for r in "${requested[@]}"; do
   esac
 done
 
+# A full-diff round into an --out that an earlier path-scoped round used.
+# post_comment.sh posts a run dir as scoped when any lane in it carries `paths`
+# (it cannot tell a leftover from a deliberate single-lane re-run), so such a
+# round is kept off the merge gate by a lane it never ran.
+#
+# stale_scoped_lanes prints those lanes, comma-separated. It looks where
+# post_comment.sh looks: with `--out <run-dir>/raw` that is --out and its
+# parent, with `--out <run-dir>` it is --out and raw/ under it.
+stale_scoped_lanes() {
+  local d pre mf found=""
+  local dirs=("$out|" "$out/raw|raw/")
+  [[ "$(basename "$out")" == raw ]] && dirs+=("$(dirname "$out")|../")
+  for d in "${dirs[@]}"; do
+    pre="${d#*|}"; d="${d%|*}"
+    for mf in "$d"/*.meta.json; do
+      [[ -f "$mf" ]] || continue
+      jq -e '(.paths? // empty) | arrays | length > 0' "$mf" >/dev/null 2>&1 || continue
+      found="${found:+$found, }$pre$(basename "$mf")"
+    done
+  done
+  printf '%s' "$found"
+}
+# Said here, before any reviewer is launched, because this is the last point at
+# which the round can still be stopped and pointed at a fresh --out. It names
+# the roster's own lanes too: a roster lane's name on a file does not mean this
+# round replaces it (the lane may be skipped or die before writing, and an
+# attempt file outlives a run that needs no retry), so nothing is assumed
+# replaced. The check after the round says what was actually left.
+if [[ -z "$paths_list" ]]; then
+  _stale_scoped="$(stale_scoped_lanes)"
+  if [[ -n "$_stale_scoped" ]]; then
+    echo "WARN: $out holds lane output from a path-scoped round ($_stale_scoped). Whatever this full-diff round does not rewrite makes post_comment.sh post the run as path-scoped, off the merge gate. For a full-diff record, stop and dispatch into a fresh --out." >&2
+  fi
+fi
+
 # Install the PreToolUse gate before dispatch if the Gemini seat is in the
 # roster.
 for r in "${requested[@]}"; do
@@ -3368,6 +3619,36 @@ for i in "${!pids[@]}"; do
     esac
   fi
 done
+
+# Stamp `paths` / `paths_mode` into every lane's meta.json (attempt files and
+# the fallback's primary-failed copy included) so analyze_runlog / leaderboard /
+# append_runlog can tell a path-scoped round from a full-diff one. Only when
+# --paths is set: a full-diff round's meta.json stays byte-identical.
+#   paths_mode: filtered        the lane saw only the filtered diff
+#               explicit_prompt codex, filtered diff embedded in its own prompt
+#               base_unfiltered codex forced onto `exec review --base`
+if [[ -n "$paths_list" ]]; then
+  _paths_json="$(printf '%s\n' "$paths_list" | cr_paths_json)"
+  for _mf in "$out"/*.meta.json; do
+    [[ -f "$_mf" ]] || continue
+    case "$(basename "$_mf")" in context.files.meta.json|run.meta.json) continue ;; esac
+    case "$(basename "$_mf")" in
+      codex.*) if [[ "$codex_paths_mode" == "prompt" ]]; then _pm="explicit_prompt"; else _pm="base_unfiltered"; fi ;;
+      *)       _pm="filtered" ;;
+    esac
+    jq -c --argjson p "$_paths_json" --arg m "$_pm" '. + {paths: $p, paths_mode: $m}' "$_mf" >"$_mf.tmp" 2>/dev/null \
+      && mv -f "$_mf.tmp" "$_mf" || rm -f "$_mf.tmp"
+  done
+else
+  # The same check as before dispatch, now over what is actually on disk: this
+  # round's own lanes were just rewritten without `paths`, so anything still
+  # scoped is a lane this round did not replace (a leftover, an attempt file,
+  # or a roster lane that died before writing its meta.json).
+  _stale_scoped="$(stale_scoped_lanes)"
+  if [[ -n "$_stale_scoped" ]]; then
+    echo "WARN: $out still holds lane output from a path-scoped round ($_stale_scoped). post_comment.sh will post this run as path-scoped, off the merge gate. For a full-diff record, dispatch into a fresh --out." >&2
+  fi
+fi
 
 # Record this round for the repeat-pass guard now that a reviewer has actually
 # reviewed something. A round where every lane failed leaves no record, so the

@@ -10,6 +10,11 @@ SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 S="$SKILL_DIR/scripts"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
+# The repeat-pass guard keeps its records under the skill's own state/ unless
+# told otherwise. Point it at this run's temp dir: a fixture round must not
+# write into the live state, and a record left by another test (same fixture
+# repo name and branch, different history) makes the guard refuse this one.
+export CROSS_REVIEW_STATE_DIR="$T/state"
 PASS=0; FAIL=0
 ok()  { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }

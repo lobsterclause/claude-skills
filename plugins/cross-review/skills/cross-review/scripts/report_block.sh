@@ -11,7 +11,11 @@
 #     --record <path> --next <stop|re-review|ask-user|apply-fixes> \
 #     [--pr-url <url>] [--notes <text>] \
 #     [--profiles <reviewer_profiles.json>] \
-#     [--roster-decision <roster_decision.json>]
+#     [--roster-decision <roster_decision.json>] [--paths <csv>]
+#
+# --paths (optional) names the pathspecs a path-scoped round covered; it adds
+# one `Paths:   <csv>` line right after the Top line. Without it the
+# block is byte-identical to before.
 #
 # findings JSON shape (step 4 / step 4.5):
 #   { "findings": [ {severity, file, line, claim, sources:[...],
@@ -54,7 +58,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULT_PROFILES="$SCRIPT_DIR/../references/reviewer_profiles.json"
 
 findings="" ; pass="" ; verdict="" ; record="" ; next=""
-pr_url="" ; notes="" ; profiles="$DEFAULT_PROFILES" ; roster_decision=""
+paths_csv="" ; pr_url="" ; notes="" ; profiles="$DEFAULT_PROFILES" ; roster_decision=""
 
 need_val() { [[ "$2" -lt 2 ]] && { echo "missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
@@ -68,11 +72,12 @@ while [[ $# -gt 0 ]]; do
     --notes)            need_val "$1" "$#"; notes="$2";            shift 2 ;;
     --profiles)         need_val "$1" "$#"; profiles="$2";         shift 2 ;;
     --roster-decision)  need_val "$1" "$#"; roster_decision="$2";  shift 2 ;;
+    --paths)            need_val "$1" "$#"; paths_csv="$2";        shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-usage="usage: $0 --findings <json> --pass <N> --verdict <CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED> --record <path> --next <stop|re-review|ask-user|apply-fixes> [--pr-url <url>] [--notes <text>] [--profiles <json>] [--roster-decision <json>]"
+usage="usage: $0 --findings <json> --pass <N> --verdict <CLEAN|FIXES_APPLIED|NEEDS_DECISION|BLOCKED> --record <path> --next <stop|re-review|ask-user|apply-fixes> [--pr-url <url>] [--notes <text>] [--profiles <json>] [--roster-decision <json>] [--paths <csv>]"
 
 [[ -z "$findings" || -z "$pass" || -z "$verdict" || -z "$record" || -z "$next" ]] && {
   echo "$usage" >&2; exit 2;
@@ -156,6 +161,7 @@ printf -- '── cross-review pass %s/3 ──\n' "$pass"
 printf 'Verdict: %s\n' "$verdict"
 printf 'Counts:  C:%s H:%s M:%s L:%s  (convergent: %s)\n' "$n_c" "$n_h" "$n_m" "$n_l" "$n_convergent"
 printf 'Top:     %s\n' "$top_line"
+[[ -n "$paths_csv" ]] && printf 'Paths:   %s  (path-scoped round, not the whole diff)\n' "$paths_csv"
 printf 'Record:  %s  (posted to PR: %s)\n' "$record" "$posted_pr"
 printf 'Next:    %s\n' "$next"
 printf 'Notes:   %s\n' "$notes"

@@ -325,7 +325,12 @@ reviewer_obj() {
                        elif .failure_kind == "no_verdict_output" then "no_verdict"
                        elif .exit_code == 0 and (.output_bytes // 0) > 0 then "ok"
                        elif .exit_code == 0 then "empty"
-                       else "failed" end)}' "$meta" 2>/dev/null \
+                       else "failed" end)}
+        # `paths` (the pathspec array) is stamped on every lane meta.json by a
+        # --paths round; the ENTRY carries it once (top level), so the per-lane
+        # rows keep only the small `paths_mode` and a 20-lane row does not
+        # repeat it 20 times.
+        | del(.paths)' "$meta" 2>/dev/null \
     || echo '{"status":"failed","reason":"meta_unparseable"}'
 }
 
@@ -528,6 +533,73 @@ if [[ -f "$run_dir/context.json" ]]; then
   wrapper_branch_val="$(jq -r '.wrapper_branch // empty' "$run_dir/context.json" 2>/dev/null)"
 fi
 
+# paths / paths_hash / paths_mode: a --paths round's scope. Additive and
+# optional -- absent on every full-diff round, and readers treat absence as
+# "the whole diff" (ledger schema-version policy: additive fields do not bump
+# SCHEMA_VERSION).
+#
+# Two sources, read the way post_comment.sh reads them so the run log and the
+# posted record name the same scope with the same hash:
+#   1. context.json, when worktree.sh start recorded a scope there.
+#   2. Otherwise the lanes. run_reviewers.sh takes --paths on its own and then
+#      the only record is the `paths` array in each lane's meta.json. The scope
+#      is the union of what the lanes carry, and its hash is computed here with
+#      the shared hasher (lib_paths.sh), since no lane stores one.
+# This used to copy paths_hash and paths_mode from the first lane file that
+# had `paths`. A lane has no paths_hash, and its paths_mode is the LANE's
+# (`explicit_prompt` for codex), so a run_reviewers-only round was logged with
+# no hash and a round mode of "explicit_prompt". The round's mode is only ever
+# "filtered", or "mixed" when a lane reviewed the unfiltered diff.
+. "$(dirname "$0")/lib_paths.sh" || {
+  echo "FATAL: lib_paths.sh missing beside $0 -- nothing written" >&2; exit 1; }
+paths_json="null"; paths_hash_val=""; paths_mode_val=""
+_lane_metas=()
+for _lm in "$run_dir"/raw/*.meta.json "$run_dir"/*.meta.json; do [[ -f "$_lm" ]] && _lane_metas+=("$_lm"); done
+if [[ -f "$run_dir/context.json" ]]; then
+  _pj="$(jq -c 'if (.paths | type) == "array" and (.paths | length) > 0 then .paths else empty end' "$run_dir/context.json" 2>/dev/null)"
+  if [[ -n "$_pj" ]]; then
+    paths_json="$_pj"
+    paths_hash_val="$(jq -r '.paths_hash // empty' "$run_dir/context.json" 2>/dev/null)"
+  fi
+fi
+if [[ "$paths_json" == "null" && ${#_lane_metas[@]} -gt 0 ]]; then
+  _lane_paths=""
+  for _lm in "${_lane_metas[@]}"; do
+    _lp="$(jq -r '(.paths? // empty) | arrays | .[] | strings' "$_lm" 2>/dev/null)" || continue
+    [[ -n "$_lp" ]] && _lane_paths+="$_lp"$'\n'
+  done
+  _lane_paths="$(printf '%s' "$_lane_paths" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u)"
+  if [[ -n "$_lane_paths" ]]; then
+    paths_json="$(printf '%s\n' "$_lane_paths" | cr_paths_json)"
+  fi
+fi
+if [[ "$paths_json" != "null" ]]; then
+  # A context.json written by hand or by an older copy may carry paths without
+  # a hash; the lanes never carry one. The hasher digests its input as given,
+  # so a list that is not in normal form (["b","a"], ["a","b","a"], "./a")
+  # would log a different hash for the same scope. The list is therefore put
+  # through the normaliser first, and only sorted and de-duplicated when the
+  # normaliser refuses it (a scope this script cannot parse is still a scope).
+  # The logged `paths` is that same list, so the two fields always agree. For
+  # the lanes' union, already normalised by run_reviewers.sh, this changes
+  # nothing.
+  if [[ -z "$paths_hash_val" ]]; then
+    _hp="$(jq -r '.[] | strings' <<<"$paths_json" 2>/dev/null)"
+    _hn="$(cr_paths_normalise_lines "$_hp" 2>/dev/null)" \
+      || _hn="$(printf '%s\n' "$_hp" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u)"
+    if [[ -n "$_hn" ]]; then
+      paths_json="$(printf '%s\n' "$_hn" | cr_paths_json)"
+      paths_hash_val="$(printf '%s\n' "$_hn" | cr_paths_hash)"
+    fi
+  fi
+  paths_mode_val="filtered"
+  # A lane that could not honour the filter (codex forced onto --base) makes
+  # the round "mixed".
+  if [[ ${#_lane_metas[@]} -gt 0 ]] && jq -e -s 'map(select(.paths_mode == "base_unfiltered")) | length > 0' "${_lane_metas[@]}" >/dev/null 2>&1; then
+    paths_mode_val="mixed"
+  fi
+fi
+
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 entry=$(jq -nc \
@@ -573,6 +645,9 @@ entry=$(jq -nc \
   --arg wrapper_sha "$wrapper_sha_val" \
   --arg wrapper_dirty "$wrapper_dirty_val" \
   --arg wrapper_branch "$wrapper_branch_val" \
+  --argjson paths "$paths_json" \
+  --arg paths_hash "$paths_hash_val" \
+  --arg paths_mode "$paths_mode_val" \
   '{codex: $codex, antigravity: $antigravity, "gemini-pro": $gemini_pro, kimi: $kimi, "glm-coding": $glm_coding, glm: $glm,
     deepseek: $deepseek, mimo: $mimo, minimax: $minimax, qwen: $qwen,
     devstral: $devstral, laguna: $laguna, kat: $kat, north: $north, nemotron: $nemotron,
@@ -608,7 +683,10 @@ entry=$(jq -nc \
   + (if $synthetic then {synthetic: true} else {} end)
   + (if $wrapper_sha == "" then {} else {wrapper_sha: $wrapper_sha} end)
   + (if $wrapper_dirty == "" then {} else {wrapper_dirty: ($wrapper_dirty == "true")} end)
-  + (if $wrapper_branch == "" then {} else {wrapper_branch: $wrapper_branch} end)')
+  + (if $wrapper_branch == "" then {} else {wrapper_branch: $wrapper_branch} end)
+  + (if $paths == null then {} else {paths: $paths} end)
+  + (if $paths == null or $paths_hash == "" then {} else {paths_hash: $paths_hash} end)
+  + (if $paths == null then {} else {paths_mode: (if $paths_mode == "" then "filtered" else $paths_mode end)} end)')
 
 # JSONL — one line, append-only, under the shared ledger lock. Rows are ~7KB,
 # far past PIPE_BUF, and an unlocked append on macOS (no flock) spliced two

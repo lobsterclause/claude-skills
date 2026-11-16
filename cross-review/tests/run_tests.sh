@@ -25,6 +25,11 @@ SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 S="$SKILL_DIR/scripts"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
+# The repeat-pass guard keeps its records under the skill's own state/ unless
+# told otherwise. Point it at this run's temp dir: a fixture round must not
+# write into the live state, and a record left by another test (same fixture
+# repo name and branch, different history) makes the guard refuse this one.
+export CROSS_REVIEW_STATE_DIR="$T/state"
 
 PASS=0
 FAIL=0
@@ -1488,6 +1493,13 @@ echo "── delisted OpenRouter slugs are caught before the round ──"
 val_home="$T/valhome"
 mkdir -p "$val_home/.cross-review/cache"
 printf 'z-ai/glm-5.2\npoolside/laguna-s-2.1\n' >"$val_home/.cross-review/cache/or_models.txt"
+# Seed the catalog cache too. The validator refetches when EITHER cache file is
+# missing, and https://openrouter.ai/api/v1/models answers without a real key —
+# so with only or_models.txt here this block silently replaced the fixture with
+# the live catalog and asserted against whatever OpenRouter listed that day
+# (2026-11-14: `.missing` came back 2, not 1). An empty catalog keeps the run
+# offline and gives the pricing-drift pass nothing to report.
+printf '[]\n' >"$val_home/.cross-review/cache/or_catalog.json"
 cat >"$T/val_profiles.json" <<'JSON'
 {
   "glm":    { "cli": "openrouter", "model": "z-ai/glm-5.2" },
@@ -3131,7 +3143,9 @@ for f in "$SKILL_DIR"/tests/test_*.sh; do
   done
   [[ "$skip" -eq 1 ]] && continue
   STANDALONE_LOG="$T/standalone-$base.log"
-  if bash "$f" >"$STANDALONE_LOG" 2>&1; then
+  # A state dir of its own per file: a test that forgets to set one neither
+  # reads another file's repeat-pass records nor leaves its own for the next.
+  if CROSS_REVIEW_STATE_DIR="$T/state-$base" bash "$f" >"$STANDALONE_LOG" 2>&1; then
     ok "$(basename "$f") ($(tail -1 "$STANDALONE_LOG"))"
   else
     bad "$(basename "$f") — tail: $(tail -3 "$STANDALONE_LOG" | tr '\n' ' ')"
