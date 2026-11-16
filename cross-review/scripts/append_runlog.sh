@@ -575,8 +575,23 @@ if [[ "$paths_json" == "null" && ${#_lane_metas[@]} -gt 0 ]]; then
 fi
 if [[ "$paths_json" != "null" ]]; then
   # A context.json written by hand or by an older copy may carry paths without
-  # a hash; the lanes never carry one. Same derivation either way.
-  [[ -n "$paths_hash_val" ]] || paths_hash_val="$(jq -r '.[]' <<<"$paths_json" | cr_paths_hash)"
+  # a hash; the lanes never carry one. The hasher digests its input as given,
+  # so a list that is not in normal form (["b","a"], ["a","b","a"], "./a")
+  # would log a different hash for the same scope. The list is therefore put
+  # through the normaliser first, and only sorted and de-duplicated when the
+  # normaliser refuses it (a scope this script cannot parse is still a scope).
+  # The logged `paths` is that same list, so the two fields always agree. For
+  # the lanes' union, already normalised by run_reviewers.sh, this changes
+  # nothing.
+  if [[ -z "$paths_hash_val" ]]; then
+    _hp="$(jq -r '.[] | strings' <<<"$paths_json" 2>/dev/null)"
+    _hn="$(cr_paths_normalise_lines "$_hp" 2>/dev/null)" \
+      || _hn="$(printf '%s\n' "$_hp" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u)"
+    if [[ -n "$_hn" ]]; then
+      paths_json="$(printf '%s\n' "$_hn" | cr_paths_json)"
+      paths_hash_val="$(printf '%s\n' "$_hn" | cr_paths_hash)"
+    fi
+  fi
   paths_mode_val="filtered"
   # A lane that could not honour the filter (codex forced onto --base) makes
   # the round "mixed".

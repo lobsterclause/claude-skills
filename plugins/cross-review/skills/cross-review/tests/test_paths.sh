@@ -488,6 +488,20 @@ printf '{"started_at":"20260101T000000","paths":["src/"]}\n' >"$RUN_H/context.js
 cp "$T/o1/kimi.meta.json" "$RUN_H/raw/kimi.meta.json"
 CROSS_REVIEW_RUNLOG="$T/runlog4.jsonl" bash "$S/append_runlog.sh" --run-dir "$RUN_H" --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
 assert_eq "context.json paths with no hash: the hash is computed" "$(tail -1 "$T/runlog4.jsonl" | jq -r .paths_hash)" "$(jq -r .paths_hash <<<"$FILT")"
+# …and from the NORMALISED list: the same scope written out of order, with a
+# duplicate and a leading "./", must log the hash worktree.sh would record for
+# it, and the `paths` beside that hash is the list it was computed from.
+printf '{"started_at":"20260101T000000","paths":["src/","./docs/","src/"]}\n' >"$RUN_H/context.json"
+CROSS_REVIEW_RUNLOG="$T/runlog4.jsonl" bash "$S/append_runlog.sh" --run-dir "$RUN_H" --project p --base main --pr - --pass 2 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+EH="$(tail -1 "$T/runlog4.jsonl")"
+assert_eq "context.json paths with no hash, not in normal form: paths is normalised" "$(jq -c .paths <<<"$EH")" '["docs/","src/"]'
+assert_eq "…and the hash is the one for the normalised list" "$(jq -r .paths_hash <<<"$EH")" "$(printf 'docs/\nsrc/\n' | cr_paths_hash)"
+# A list the normaliser refuses is still logged as a scope, sorted and de-duplicated.
+printf '{"started_at":"20260101T000000","paths":["src/","/abs","src/"]}\n' >"$RUN_H/context.json"
+CROSS_REVIEW_RUNLOG="$T/runlog4.jsonl" bash "$S/append_runlog.sh" --run-dir "$RUN_H" --project p --base main --pr - --pass 3 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
+EH="$(tail -1 "$T/runlog4.jsonl")"
+assert_eq "context.json paths the normaliser refuses: still logged, sorted and de-duplicated" "$(jq -c .paths <<<"$EH")" '["/abs","src/"]'
+assert_eq "…with a hash for that list" "$(jq -r .paths_hash <<<"$EH")" "$(printf '/abs\nsrc/\n' | cr_paths_hash)"
 RUN_N="$T/run-n"; mkdir -p "$RUN_N/raw"; cp "$T/o0/kimi.meta.json" "$RUN_N/raw/kimi.meta.json"
 CROSS_REVIEW_RUNLOG="$T/runlog2.jsonl" bash "$S/append_runlog.sh" --run-dir "$RUN_N" --project p --base main --pr - --pass 1 --verdict CLEAN --convergent 0 --top "-" >/dev/null 2>&1
 assert_eq "a full-diff entry has no paths keys" "$(tail -1 "$T/runlog2.jsonl" | jq -r 'has("paths") or has("paths_mode")')" "false"
