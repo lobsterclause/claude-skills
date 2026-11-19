@@ -5,7 +5,7 @@
 # FEATURE FLAGS (lib_flags.sh — read that file, not this paragraph, for the
 # authoritative contract):
 #   CROSS_REVIEW_GLM_BASELINE=1   glm-coding (GLM Coding Plan) is a baseline
-#   CROSS_REVIEW_KIMI_BASELINE=0  the kimi CLI baseline, off since 2026-09-07
+#   CROSS_REVIEW_KIMI_BASELINE=1  the kimi CLI baseline (Kimi Code subscription), on since 2026-11-18
 #   CROSS_REVIEW_OPENROUTER=0     the whole OpenRouter lane, pool AND the
 #                                 or_fallback rescue, off since 2026-09-07
 #
@@ -1307,7 +1307,7 @@ run_with_timeout() {
 #      2026-07-01 policy existed to prevent.
 #
 # Opt-in per seat, in reviewer_profiles.json:
-#     "or_fallback": { "enabled": true, "model": "openai/gpt-5.6-sol" }
+#     "or_fallback": { "enabled": true, "model": "openai/gpt-6.2-sol" }
 # Per-seat and not global on purpose: a fallback moves the diff onto a US
 # router that the direct lane did not involve. That is a fine trade for this
 # repo and possibly not for someone else's, so it is a visible decision made

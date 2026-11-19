@@ -2600,7 +2600,7 @@ echo "── Moonshot consolidation: K3 + the code variant (2026-08-22) ──"
 # antigravity on Gemini 3.5 for weeks. cli_model_alias pins it here.
 assert_eq "the kimi baseline's model is pinned in the repo, not just in ~/.kimi" \
   "$(jq -r '.kimi.cli_model_alias // ""' "$SKILL_DIR/references/reviewer_profiles.json")" \
-  "kimi-k27-code"
+  "kimi-code/k3.1-pro"
 if grep -q 'profile_get kimi cli_model_alias' "$S/run_reviewers.sh"; then
   ok "run_reviewers.sh passes the pinned alias to the kimi CLI"
 else

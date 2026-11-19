@@ -25,11 +25,13 @@
 #   flat-rate, so this seat costs the same whether it reviews once a day or
 #   thirty times.
 #
-# CROSS_REVIEW_KIMI_BASELINE  (default 0 -- OFF)
-#   The kimi CLI baseline. Retired from the default roster by the flag above,
-#   NOT deleted: the lane, its profile, its leaderboard history and its tests
-#   all still work, and `CROSS_REVIEW_KIMI_BASELINE=1` puts it straight back.
-#   Set BOTH baseline flags to 1 to run kimi and glm-coding together.
+# CROSS_REVIEW_KIMI_BASELINE  (default 1 -- ON since 2026-11-18)
+#   The kimi CLI baseline. It was OFF from 2026-09-07 to 2026-11-18 because the
+#   lane ran on the metered Moonshot platform key. On 2026-11-18 the seat moved
+#   to the Kimi Code subscription (cli_model_alias kimi-code/k3.1-pro, the
+#   kimi CLI's managed provider), which is flat-rate like the GLM Coding Plan,
+#   so it is a fixed baseline again alongside glm-coding.
+#   `CROSS_REVIEW_KIMI_BASELINE=0` takes it back out.
 #
 # CROSS_REVIEW_OPENROUTER     (default 0 -- OFF)
 #   The whole OpenRouter implementation: the 15-seat rotation pool (glm,
@@ -42,7 +44,8 @@
 #   is the opposite of what "disabled" means. `CROSS_REVIEW_OPENROUTER=1`
 #   restores every OpenRouter behaviour unchanged.
 #
-# Restoring the pre-2026-09-07 fleet exactly:
+# Restoring the pre-2026-09-07 fleet (kimi then ran on the metered key; the
+# seat's model pin lives in reviewer_profiles.json, not in a flag):
 #   CROSS_REVIEW_KIMI_BASELINE=1 CROSS_REVIEW_GLM_BASELINE=0 \
 #   CROSS_REVIEW_OPENROUTER=1 <command>
 # ---------------------------------------------------------------------------
@@ -74,7 +77,7 @@ cr_glm_baseline_on() {
   [[ "$v" == 1 ]]
 }
 cr_kimi_baseline_on() {
-  local v; v="$(cr_flag CROSS_REVIEW_KIMI_BASELINE 0)" || exit 2
+  local v; v="$(cr_flag CROSS_REVIEW_KIMI_BASELINE 1)" || exit 2
   [[ "$v" == 1 ]]
 }
 cr_openrouter_on() {

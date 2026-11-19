@@ -68,7 +68,8 @@ echo "── lib_flags.sh: parsing and defaults ──"
 . "$S/lib_flags.sh"
 
 assert_eq "glm baseline defaults ON"  "$(cr_flag CROSS_REVIEW_GLM_BASELINE 1)"  "1"
-assert_eq "kimi baseline defaults OFF" "$(cr_flag CROSS_REVIEW_KIMI_BASELINE 0)" "0"
+assert_eq "kimi baseline defaults ON (Kimi Code subscription, 2026-11-18)" "$(cr_kimi_baseline_on && echo 1 || echo 0)" "1"
+assert_eq "kimi baseline can be switched off" "$(CROSS_REVIEW_KIMI_BASELINE=0 cr_baseline_names)" "codex glm-coding"
 assert_eq "openrouter defaults OFF"    "$(cr_flag CROSS_REVIEW_OPENROUTER 0)"    "0"
 assert_eq "'true' parses as on"   "$(CROSS_REVIEW_OPENROUTER=true  cr_flag CROSS_REVIEW_OPENROUTER 0)" "1"
 assert_eq "'OFF' parses as off"   "$(CROSS_REVIEW_GLM_BASELINE=OFF cr_flag CROSS_REVIEW_GLM_BASELINE 1)" "0"
@@ -82,13 +83,13 @@ rc=0; (CROSS_REVIEW_OPENROUTER=ture cr_flag CROSS_REVIEW_OPENROUTER 0 >/dev/null
 assert_eq "a malformed flag returns 2" "$rc" "2"
 assert_contains "a malformed flag explains itself" "$FLAG_ERR" "must be 1|0"
 
-assert_eq "default baselines are codex + glm-coding" "$(cr_baseline_names)" "codex glm-coding"
+assert_eq "default baselines are codex + glm-coding + kimi" "$(cr_baseline_names)" "codex glm-coding kimi"
 assert_eq "kimi flag adds kimi as a second baseline" \
   "$(CROSS_REVIEW_KIMI_BASELINE=1 cr_baseline_names)" "codex glm-coding kimi"
 assert_eq "the old fleet is one flag pair away" \
   "$(CROSS_REVIEW_GLM_BASELINE=0 CROSS_REVIEW_KIMI_BASELINE=1 cr_baseline_names)" "codex kimi"
 assert_eq "flag state is stampable as JSON" \
-  "$(cr_flags_json | jq -c '[.glm_baseline, .kimi_baseline, .openrouter]')" "[true,false,false]"
+  "$(cr_flags_json | jq -c '[.glm_baseline, .kimi_baseline, .openrouter]')" "[true,true,false]"
 
 echo "── detect_reviewers.sh under the new defaults ──"
 DET="$(bash "$S/detect_reviewers.sh" 2>"$T/det.err")"; det_rc=$?
@@ -121,7 +122,9 @@ FIXLOG="$T/runlog.jsonl"; : >"$FIXLOG"
 ROSTER="$(CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 99 2>/dev/null)"
 assert_contains "codex is still a baseline" "$ROSTER" "codex"
 assert_contains "glm-coding is the second baseline" "$ROSTER" "glm-coding"
-refute_contains "kimi is not drafted by default" ",kimi" ",$ROSTER,"
+assert_contains "kimi is a baseline by default" ",$ROSTER," ",kimi,"
+ROSTER_NOKIMI="$(CROSS_REVIEW_KIMI_BASELINE=0 CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 99 2>/dev/null)"
+refute_contains "CROSS_REVIEW_KIMI_BASELINE=0 takes kimi out" ",$ROSTER_NOKIMI," ",kimi,"
 for or_seat in glm deepseek minimax qwen grok; do
   refute_contains "OR seat '$or_seat' is not drawn while the lane is off" ",$ROSTER," ",$or_seat,"
 done
