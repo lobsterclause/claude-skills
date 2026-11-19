@@ -221,6 +221,31 @@ ROSTER_NOALIAS="$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_old.toml" CROSS_REVIEW_RUNLO
 assert_eq "select_roster.sh agrees: kimi is not drafted without the alias" \
   "$([[ ",$ROSTER_NOALIAS," == *",kimi,"* ]] && echo drafted || echo left-out)" "left-out"
 
+echo "── kimi: the alias check reads the config the way the CLI does ──"
+alias_ready() { ( source "$S/lib_flags.sh"; cr_kimi_alias_ready ) >/dev/null 2>&1 && echo ready || echo not-ready; }
+printf '# [models."kimi-code/k3.1-pro"]\n[models."kimi-k27-code"]\n' >"$T/kimi_commented.toml"
+assert_eq "a commented-out header is not a configured model" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_commented.toml" alias_ready)" "not-ready"
+printf "  [ models . 'kimi-code/k3.1-pro' ]   # subscription\n" >"$T/kimi_variant.toml"
+assert_eq "single quotes, inner whitespace and a trailing comment still match" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_variant.toml" alias_ready)" "ready"
+printf '[models."kimi-code/k3.1-pro-max"]\n' >"$T/kimi_prefix.toml"
+assert_eq "a longer alias sharing the prefix does not match" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_prefix.toml" alias_ready)" "not-ready"
+mkdir -p "$T/share"; cp "$SKILL_DIR/tests/fixtures/kimi_config.toml" "$T/share/config.toml"
+assert_eq "KIMI_SHARE_DIR is where the config is looked for when set" \
+  "$(env -u CROSS_REVIEW_KIMI_CONFIG KIMI_SHARE_DIR="$T/share" bash -c 'source "$0/lib_flags.sh"; cr_kimi_alias_ready && echo ready || echo not-ready' "$S")" "ready"
+assert_eq "…and an empty KIMI_SHARE_DIR dir is not ready" \
+  "$(mkdir -p "$T/share_empty"; env -u CROSS_REVIEW_KIMI_CONFIG KIMI_SHARE_DIR="$T/share_empty" bash -c 'source "$0/lib_flags.sh"; cr_kimi_alias_ready && echo ready || echo not-ready' "$S")" "not-ready"
+printf '{ not json' >"$T/bad_profiles.json"
+assert_eq "a malformed profile file fails closed" \
+  "$(CROSS_REVIEW_PROFILES_FILE="$T/bad_profiles.json" alias_ready)" "not-ready"
+assert_eq "a missing profile file fails closed" \
+  "$(CROSS_REVIEW_PROFILES_FILE="$T/nope.json" alias_ready)" "not-ready"
+printf '{"kimi":{}}' >"$T/nopin_profiles.json"
+assert_eq "a readable profile with no pinned alias has nothing to check" \
+  "$(CROSS_REVIEW_PROFILES_FILE="$T/nopin_profiles.json" CROSS_REVIEW_KIMI_CONFIG="$T/does-not-exist.toml" alias_ready)" "ready"
+
 echo "── kimi: inherited KIMI_* overrides cannot move the pinned model ──"
 printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "base=%%s model=%%s key=%%s\\n" "${KIMI_BASE_URL:-unset}" "${KIMI_MODEL_NAME:-unset}" "${KIMI_API_KEY:-unset}" >"%s/kimi.env"\nprintf "## Findings\\nNo Critical, High, Medium or Low findings. Verdict: CLEAN.\\n"\n' "$T" >"$T/bin/kimi"; chmod +x "$T/bin/kimi"
 KIMI_BASE_URL=https://elsewhere.example/v1 KIMI_MODEL_NAME=some-other-model KIMI_API_KEY=sk-test-shim \
@@ -228,6 +253,8 @@ KIMI_BASE_URL=https://elsewhere.example/v1 KIMI_MODEL_NAME=some-other-model KIMI
 assert_eq "the kimi CLI sees none of the inherited overrides" \
   "$(cat "$T/kimi.env" 2>/dev/null)" "base=unset model=unset key=unset"
 assert_contains "…and the run says it dropped them" "$(cat "$T/o_env.err")" "ignoring inherited KIMI_BASE_URL"
+assert_eq "no subshell wraps the kimi call (cleanup_pids must reach the CLI)" \
+  "$(awk '/^run_kimi\(\)/,/^}/' "$S/run_reviewers.sh" | grep -c 'run_with_timeout "\$kimi_budget" env ')" "1"
 
 echo "── run_reviewers.sh: a malformed flag stops the round ──"
 BAD_RC=0

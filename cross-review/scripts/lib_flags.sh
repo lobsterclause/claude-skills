@@ -93,14 +93,37 @@ cr_openrouter_on() {
 # with "LLM not set" -- a fixed baseline that contributes no review while
 # preflight said it was fine (codex P2 + kimi Low, PR #202). So availability is
 # "binary AND alias in the config". No pinned alias -> nothing to check.
-# CROSS_REVIEW_KIMI_CONFIG overrides the config path (tests; non-default homes).
+#
+# Three details, each a pass-2 finding on PR #202:
+#   - the lookup FAILS CLOSED: an unreadable/malformed profile file is "not
+#     ready", not "no alias pinned" -- only a successful read with the key
+#     absent means there is nothing to check;
+#   - only an ACTIVE table header counts. A commented-out `# [models."x"]`
+#     is not a configured model, and TOML allows `[models.'x']` and
+#     `[ models . "x" ]`, which are;
+#   - the config lives where the CLI reads it: $KIMI_SHARE_DIR/config.toml
+#     when that is set (kimi_cli/share.py), else ~/.kimi/config.toml.
+# CROSS_REVIEW_KIMI_CONFIG overrides the config path (tests).
 cr_kimi_alias_ready() {
   local profiles alias cfg
   profiles="${CROSS_REVIEW_PROFILES_FILE:-$(dirname "${BASH_SOURCE[0]}")/../references/reviewer_profiles.json}"
-  alias="$(jq -r '.kimi.cli_model_alias // empty' "$profiles" 2>/dev/null)"
+  [[ -r "$profiles" ]] || return 1
+  alias="$(jq -er 'if type == "object" then (.kimi.cli_model_alias // "") else error("not an object") end' "$profiles" 2>/dev/null)" || return 1
   [[ -z "$alias" ]] && return 0
-  cfg="${CROSS_REVIEW_KIMI_CONFIG:-$HOME/.kimi/config.toml}"
-  [[ -r "$cfg" ]] && grep -qF "[models.\"$alias\"]" "$cfg"
+  cfg="${CROSS_REVIEW_KIMI_CONFIG:-${KIMI_SHARE_DIR:-$HOME/.kimi}/config.toml}"
+  [[ -r "$cfg" ]] || return 1
+  CR_KIMI_ALIAS="$alias" awk '
+    BEGIN { a = ENVIRON["CR_KIMI_ALIAS"]; dq = "[models.\"" a "\"]"; sq = "[models.\047" a "\047]" }
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (substr(line, 1, 1) != "[") next
+      sub(/[ \t]*(#.*)?$/, "", line)
+      gsub(/[ \t]/, "", line)
+      if (line == dq || line == sq) found = 1
+    }
+    END { exit found ? 0 : 1 }
+  ' "$cfg"
 }
 
 # cr_baseline_names: the round's fixed baselines, in dispatch order, space

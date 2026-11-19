@@ -3130,23 +3130,26 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # interactive shell they would send the diff to another endpoint or run
   # another model while meta.json still names the pinned alias (codex P2,
   # PR #202). A pin that an env var can move is not a pin: drop them for this
-  # one invocation, in a subshell so the caller's environment is untouched.
-  (
-    if [[ -n "$kimi_alias" ]]; then
-      for _kv in KIMI_BASE_URL KIMI_API_KEY KIMI_MODEL_NAME KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES; do
-        if [[ -n "${!_kv:-}" ]]; then
-          echo "kimi: ignoring inherited $_kv for this review (the seat is pinned to $kimi_alias)" >&2
-          unset "$_kv"
-        fi
-      done
-    fi
-    run_with_timeout "$kimi_budget" kimi \
-      "${kimi_model_args[@]}" \
-      --plan \
-      --print \
-      --quiet \
-      >"$out/kimi.stdout" 2>"$out/kimi.stderr" <<<"$full_prompt"
-  )
+  # one invocation. Via `env -u`, NOT a subshell: env execs the CLI, so the
+  # process tree stays worker -> timeout -> kimi and cleanup_pids (which kills
+  # the worker's immediate children) still stops the review on INT/TERM. A
+  # subshell here put kimi one level deeper and orphaned it (codex P2 + kimi
+  # Medium, PR #202 pass 2).
+  local kimi_env_drop=() _kv
+  if [[ -n "$kimi_alias" ]]; then
+    for _kv in KIMI_BASE_URL KIMI_API_KEY KIMI_MODEL_NAME KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES; do
+      if [[ -n "${!_kv:-}" ]]; then
+        echo "kimi: ignoring inherited $_kv for this review (the seat is pinned to $kimi_alias)" >&2
+        kimi_env_drop+=(-u "$_kv")
+      fi
+    done
+  fi
+  run_with_timeout "$kimi_budget" env ${kimi_env_drop[@]+"${kimi_env_drop[@]}"} kimi \
+    "${kimi_model_args[@]}" \
+    --plan \
+    --print \
+    --quiet \
+    >"$out/kimi.stdout" 2>"$out/kimi.stderr" <<<"$full_prompt"
   rc=$?
   end=$(date +%s)
   # truncated is reported in metadata so downstream synthesizers don't treat a
