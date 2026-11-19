@@ -232,6 +232,15 @@ assert_eq "single quotes, inner whitespace and a trailing comment still match" \
 printf '[models."kimi-code/k3.1-pro-max"]\n' >"$T/kimi_prefix.toml"
 assert_eq "a longer alias sharing the prefix does not match" \
   "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_prefix.toml" alias_ready)" "not-ready"
+printf '[models."kimi-code/k3.1-pro"]\r\nprovider = "x"\r\n' >"$T/kimi_crlf.toml"
+assert_eq "a CRLF config is the same config" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_crlf.toml" alias_ready)" "ready"
+printf '[models."kimi-code/k3.1-pro "]\n' >"$T/kimi_padded.toml"
+assert_eq "whitespace inside the quoted key makes it a different key" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_padded.toml" alias_ready)" "not-ready"
+mkdir -p "$T/share_old"; cp "$T/kimi_old.toml" "$T/share_old/config.toml"
+assert_contains "the warning names the config that was actually checked" \
+  "$(env -u CROSS_REVIEW_KIMI_CONFIG KIMI_SHARE_DIR="$T/share_old" bash "$S/detect_reviewers.sh" 2>&1 >/dev/null)" "$T/share_old/config.toml"
 mkdir -p "$T/share"; cp "$SKILL_DIR/tests/fixtures/kimi_config.toml" "$T/share/config.toml"
 assert_eq "KIMI_SHARE_DIR is where the config is looked for when set" \
   "$(env -u CROSS_REVIEW_KIMI_CONFIG KIMI_SHARE_DIR="$T/share" bash -c 'source "$0/lib_flags.sh"; cr_kimi_alias_ready && echo ready || echo not-ready' "$S")" "ready"

@@ -104,23 +104,30 @@ cr_openrouter_on() {
 #   - the config lives where the CLI reads it: $KIMI_SHARE_DIR/config.toml
 #     when that is set (kimi_cli/share.py), else ~/.kimi/config.toml.
 # CROSS_REVIEW_KIMI_CONFIG overrides the config path (tests).
+# cr_kimi_config_path is that resolution, shared with the warning that names it.
+cr_kimi_config_path() {
+  printf '%s\n' "${CROSS_REVIEW_KIMI_CONFIG:-${KIMI_SHARE_DIR:-$HOME/.kimi}/config.toml}"
+}
+
 cr_kimi_alias_ready() {
   local profiles alias cfg
   profiles="${CROSS_REVIEW_PROFILES_FILE:-$(dirname "${BASH_SOURCE[0]}")/../references/reviewer_profiles.json}"
   [[ -r "$profiles" ]] || return 1
   alias="$(jq -er 'if type == "object" then (.kimi.cli_model_alias // "") else error("not an object") end' "$profiles" 2>/dev/null)" || return 1
   [[ -z "$alias" ]] && return 0
-  cfg="${CROSS_REVIEW_KIMI_CONFIG:-${KIMI_SHARE_DIR:-$HOME/.kimi}/config.toml}"
+  cfg="$(cr_kimi_config_path)"
   [[ -r "$cfg" ]] || return 1
+  # Whitespace is ignored only OUTSIDE the quoted key (`[models."x "]` is a
+  # different key), and a CRLF file is the same file (both pass 3, PR #202).
   CR_KIMI_ALIAS="$alias" awk '
-    BEGIN { a = ENVIRON["CR_KIMI_ALIAS"]; dq = "[models.\"" a "\"]"; sq = "[models.\047" a "\047]" }
+    BEGIN { a = ENVIRON["CR_KIMI_ALIAS"]; dq = "\"" a "\""; sq = "\047" a "\047"; n = length(dq) }
     {
       line = $0
-      sub(/^[ \t]+/, "", line)
-      if (substr(line, 1, 1) != "[") next
-      sub(/[ \t]*(#.*)?$/, "", line)
-      gsub(/[ \t]/, "", line)
-      if (line == dq || line == sq) found = 1
+      sub(/\r$/, "", line)
+      if (!sub(/^[ \t]*\[[ \t]*models[ \t]*\.[ \t]*/, "", line)) next
+      key = substr(line, 1, n)
+      if (key != dq && key != sq) next
+      if (substr(line, n + 1) ~ /^[ \t]*\][ \t]*(#.*)?$/) found = 1
     }
     END { exit found ? 0 : 1 }
   ' "$cfg"

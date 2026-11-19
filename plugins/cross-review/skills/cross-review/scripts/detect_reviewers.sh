@@ -112,7 +112,7 @@ if has kimi; then
   if cr_kimi_alias_ready; then
     kimi=true
   else
-    printf 'WARNING: kimi is on PATH but its pinned model alias is not in %s -- run `kimi login` once (Kimi Code subscription), or set CROSS_REVIEW_KIMI_BASELINE=0 to take the seat out.\n' "${CROSS_REVIEW_KIMI_CONFIG:-$HOME/.kimi/config.toml}" >&2
+    printf 'WARNING: kimi is on PATH but its pinned model alias is not in %s -- run `kimi login` once (Kimi Code subscription), or set CROSS_REVIEW_KIMI_BASELINE=0 to take the seat out.\n' "$(cr_kimi_config_path)" >&2
   fi
 fi
 
