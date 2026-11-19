@@ -5,7 +5,7 @@
 # FEATURE FLAGS (lib_flags.sh — read that file, not this paragraph, for the
 # authoritative contract):
 #   CROSS_REVIEW_GLM_BASELINE=1   glm-coding (GLM Coding Plan) is a baseline
-#   CROSS_REVIEW_KIMI_BASELINE=0  the kimi CLI baseline, off since 2026-09-07
+#   CROSS_REVIEW_KIMI_BASELINE=1  the kimi CLI baseline (Kimi Code subscription), on since 2026-11-18
 #   CROSS_REVIEW_OPENROUTER=0     the whole OpenRouter lane, pool AND the
 #                                 or_fallback rescue, off since 2026-09-07
 #
@@ -1307,7 +1307,7 @@ run_with_timeout() {
 #      2026-07-01 policy existed to prevent.
 #
 # Opt-in per seat, in reviewer_profiles.json:
-#     "or_fallback": { "enabled": true, "model": "openai/gpt-5.6-sol" }
+#     "or_fallback": { "enabled": true, "model": "openai/gpt-6.2-sol" }
 # Per-seat and not global on purpose: a fallback moves the diff onto a US
 # router that the direct lane did not involve. That is a fine trade for this
 # repo and possibly not for someone else's, so it is a visible decision made
@@ -3124,7 +3124,27 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   if [[ -n "$kimi_alias" ]]; then
     kimi_model_args=(-m "$kimi_alias")
   fi
-  run_with_timeout "$kimi_budget" kimi \
+  # The kimi CLI applies KIMI_BASE_URL / KIMI_API_KEY / KIMI_MODEL_NAME (and the
+  # two KIMI_MODEL_* shape vars) AFTER resolving `-m`, for any provider of type
+  # "kimi" -- which the managed Kimi Code provider is. Inherited from an
+  # interactive shell they would send the diff to another endpoint or run
+  # another model while meta.json still names the pinned alias (codex P2,
+  # PR #202). A pin that an env var can move is not a pin: drop them for this
+  # one invocation. Via `env -u`, NOT a subshell: env execs the CLI, so the
+  # process tree stays worker -> timeout -> kimi and cleanup_pids (which kills
+  # the worker's immediate children) still stops the review on INT/TERM. A
+  # subshell here put kimi one level deeper and orphaned it (codex P2 + kimi
+  # Medium, PR #202 pass 2).
+  local kimi_env_drop=() _kv
+  if [[ -n "$kimi_alias" ]]; then
+    for _kv in KIMI_BASE_URL KIMI_API_KEY KIMI_MODEL_NAME KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES; do
+      if [[ -n "${!_kv:-}" ]]; then
+        echo "kimi: ignoring inherited $_kv for this review (the seat is pinned to $kimi_alias)" >&2
+        kimi_env_drop+=(-u "$_kv")
+      fi
+    done
+  fi
+  run_with_timeout "$kimi_budget" env ${kimi_env_drop[@]+"${kimi_env_drop[@]}"} kimi \
     "${kimi_model_args[@]}" \
     --plan \
     --print \

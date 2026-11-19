@@ -106,7 +106,15 @@ if has agy; then
     gemini_pro=true
   fi
 fi
-has kimi && kimi=true
+# kimi: the binary alone is not enough -- the pinned subscription alias must be
+# in the kimi config too (cr_kimi_alias_ready, lib_flags.sh).
+if has kimi; then
+  if cr_kimi_alias_ready; then
+    kimi=true
+  else
+    printf 'WARNING: kimi is on PATH but its pinned model alias is not in %s -- run `kimi login` once (Kimi Code subscription), or set CROSS_REVIEW_KIMI_BASELINE=0 to take the seat out.\n' "$(cr_kimi_config_path)" >&2
+  fi
+fi
 
 # glm-coding: the GLM Coding Plan baseline. No CLI — it is a curl lane against
 # Z.ai's coding endpoint — so availability is "curl + a key", exactly like the

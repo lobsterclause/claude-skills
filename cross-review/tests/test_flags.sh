@@ -59,6 +59,8 @@ printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export HOME="$T/home"; mkdir -p "$HOME"
+# The kimi seat needs its pinned alias in the kimi config, not just a binary.
+export CROSS_REVIEW_KIMI_CONFIG="$SKILL_DIR/tests/fixtures/kimi_config.toml"
 export OPENROUTER_API_KEY="sk-or-test-shim"
 export ZAI_API_KEY="sk-zai-test-shim"
 unset MOONSHOT_API_KEY Z_AI_API_KEY
@@ -68,7 +70,8 @@ echo "── lib_flags.sh: parsing and defaults ──"
 . "$S/lib_flags.sh"
 
 assert_eq "glm baseline defaults ON"  "$(cr_flag CROSS_REVIEW_GLM_BASELINE 1)"  "1"
-assert_eq "kimi baseline defaults OFF" "$(cr_flag CROSS_REVIEW_KIMI_BASELINE 0)" "0"
+assert_eq "kimi baseline defaults ON (Kimi Code subscription, 2026-11-18)" "$(cr_kimi_baseline_on && echo 1 || echo 0)" "1"
+assert_eq "kimi baseline can be switched off" "$(CROSS_REVIEW_KIMI_BASELINE=0 cr_baseline_names)" "codex glm-coding"
 assert_eq "openrouter defaults OFF"    "$(cr_flag CROSS_REVIEW_OPENROUTER 0)"    "0"
 assert_eq "'true' parses as on"   "$(CROSS_REVIEW_OPENROUTER=true  cr_flag CROSS_REVIEW_OPENROUTER 0)" "1"
 assert_eq "'OFF' parses as off"   "$(CROSS_REVIEW_GLM_BASELINE=OFF cr_flag CROSS_REVIEW_GLM_BASELINE 1)" "0"
@@ -82,13 +85,13 @@ rc=0; (CROSS_REVIEW_OPENROUTER=ture cr_flag CROSS_REVIEW_OPENROUTER 0 >/dev/null
 assert_eq "a malformed flag returns 2" "$rc" "2"
 assert_contains "a malformed flag explains itself" "$FLAG_ERR" "must be 1|0"
 
-assert_eq "default baselines are codex + glm-coding" "$(cr_baseline_names)" "codex glm-coding"
+assert_eq "default baselines are codex + glm-coding + kimi" "$(cr_baseline_names)" "codex glm-coding kimi"
 assert_eq "kimi flag adds kimi as a second baseline" \
   "$(CROSS_REVIEW_KIMI_BASELINE=1 cr_baseline_names)" "codex glm-coding kimi"
 assert_eq "the old fleet is one flag pair away" \
   "$(CROSS_REVIEW_GLM_BASELINE=0 CROSS_REVIEW_KIMI_BASELINE=1 cr_baseline_names)" "codex kimi"
 assert_eq "flag state is stampable as JSON" \
-  "$(cr_flags_json | jq -c '[.glm_baseline, .kimi_baseline, .openrouter]')" "[true,false,false]"
+  "$(cr_flags_json | jq -c '[.glm_baseline, .kimi_baseline, .openrouter]')" "[true,true,false]"
 
 echo "── detect_reviewers.sh under the new defaults ──"
 DET="$(bash "$S/detect_reviewers.sh" 2>"$T/det.err")"; det_rc=$?
@@ -121,7 +124,9 @@ FIXLOG="$T/runlog.jsonl"; : >"$FIXLOG"
 ROSTER="$(CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 99 2>/dev/null)"
 assert_contains "codex is still a baseline" "$ROSTER" "codex"
 assert_contains "glm-coding is the second baseline" "$ROSTER" "glm-coding"
-refute_contains "kimi is not drafted by default" ",kimi" ",$ROSTER,"
+assert_contains "kimi is a baseline by default" ",$ROSTER," ",kimi,"
+ROSTER_NOKIMI="$(CROSS_REVIEW_KIMI_BASELINE=0 CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 99 2>/dev/null)"
+refute_contains "CROSS_REVIEW_KIMI_BASELINE=0 takes kimi out" ",$ROSTER_NOKIMI," ",kimi,"
 for or_seat in glm deepseek minimax qwen grok; do
   refute_contains "OR seat '$or_seat' is not drawn while the lane is off" ",$ROSTER," ",$or_seat,"
 done
@@ -201,6 +206,64 @@ CROSS_REVIEW_OPENROUTER=1 bash "$S/run_reviewers.sh" --base main --out "$T/o_fb2
 assert_eq "control: with the lane on it does fall back" \
   "$([[ -f "$T/o_fb2/kimi.fallback.warning" ]] && echo fell-back || echo stayed-down)" "fell-back"
 rm -f "$T/bin/curl"
+
+echo "── kimi: the binary without the subscription alias is not a ready baseline ──"
+printf '[models."kimi-k27-code"]\nprovider = "kimi-moonshot"\n' >"$T/kimi_old.toml"
+NOALIAS="$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_old.toml" bash "$S/detect_reviewers.sh" 2>"$T/noalias.err")"; noalias_rc=$?
+assert_eq "a config without the pinned alias reports kimi unavailable" "$(jq -r .kimi <<<"$NOALIAS")" "false"
+assert_eq "…and detection fails closed on the missing baseline" "$noalias_rc" "1"
+assert_contains "…and says how to fix it" "$(cat "$T/noalias.err")" "kimi login"
+assert_eq "no kimi config at all is the same answer" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/does-not-exist.toml" bash "$S/detect_reviewers.sh" 2>/dev/null | jq -r .kimi)" "false"
+assert_eq "with the baseline flagged off, a missing alias blocks nothing" \
+  "$(CROSS_REVIEW_KIMI_BASELINE=0 CROSS_REVIEW_KIMI_CONFIG="$T/kimi_old.toml" bash "$S/detect_reviewers.sh" >/dev/null 2>&1; echo $?)" "0"
+ROSTER_NOALIAS="$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_old.toml" CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 99 2>/dev/null)"
+assert_eq "select_roster.sh agrees: kimi is not drafted without the alias" \
+  "$([[ ",$ROSTER_NOALIAS," == *",kimi,"* ]] && echo drafted || echo left-out)" "left-out"
+
+echo "── kimi: the alias check reads the config the way the CLI does ──"
+alias_ready() { ( source "$S/lib_flags.sh"; cr_kimi_alias_ready ) >/dev/null 2>&1 && echo ready || echo not-ready; }
+printf '# [models."kimi-code/k3.1-pro"]\n[models."kimi-k27-code"]\n' >"$T/kimi_commented.toml"
+assert_eq "a commented-out header is not a configured model" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_commented.toml" alias_ready)" "not-ready"
+printf "  [ models . 'kimi-code/k3.1-pro' ]   # subscription\n" >"$T/kimi_variant.toml"
+assert_eq "single quotes, inner whitespace and a trailing comment still match" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_variant.toml" alias_ready)" "ready"
+printf '[models."kimi-code/k3.1-pro-max"]\n' >"$T/kimi_prefix.toml"
+assert_eq "a longer alias sharing the prefix does not match" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_prefix.toml" alias_ready)" "not-ready"
+printf '[models."kimi-code/k3.1-pro"]\r\nprovider = "x"\r\n' >"$T/kimi_crlf.toml"
+assert_eq "a CRLF config is the same config" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_crlf.toml" alias_ready)" "ready"
+printf '[models."kimi-code/k3.1-pro "]\n' >"$T/kimi_padded.toml"
+assert_eq "whitespace inside the quoted key makes it a different key" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_padded.toml" alias_ready)" "not-ready"
+mkdir -p "$T/share_old"; cp "$T/kimi_old.toml" "$T/share_old/config.toml"
+assert_contains "the warning names the config that was actually checked" \
+  "$(env -u CROSS_REVIEW_KIMI_CONFIG KIMI_SHARE_DIR="$T/share_old" bash "$S/detect_reviewers.sh" 2>&1 >/dev/null)" "$T/share_old/config.toml"
+mkdir -p "$T/share"; cp "$SKILL_DIR/tests/fixtures/kimi_config.toml" "$T/share/config.toml"
+assert_eq "KIMI_SHARE_DIR is where the config is looked for when set" \
+  "$(env -u CROSS_REVIEW_KIMI_CONFIG KIMI_SHARE_DIR="$T/share" bash -c 'source "$0/lib_flags.sh"; cr_kimi_alias_ready && echo ready || echo not-ready' "$S")" "ready"
+assert_eq "…and an empty KIMI_SHARE_DIR dir is not ready" \
+  "$(mkdir -p "$T/share_empty"; env -u CROSS_REVIEW_KIMI_CONFIG KIMI_SHARE_DIR="$T/share_empty" bash -c 'source "$0/lib_flags.sh"; cr_kimi_alias_ready && echo ready || echo not-ready' "$S")" "not-ready"
+printf '{ not json' >"$T/bad_profiles.json"
+assert_eq "a malformed profile file fails closed" \
+  "$(CROSS_REVIEW_PROFILES_FILE="$T/bad_profiles.json" alias_ready)" "not-ready"
+assert_eq "a missing profile file fails closed" \
+  "$(CROSS_REVIEW_PROFILES_FILE="$T/nope.json" alias_ready)" "not-ready"
+printf '{"kimi":{}}' >"$T/nopin_profiles.json"
+assert_eq "a readable profile with no pinned alias has nothing to check" \
+  "$(CROSS_REVIEW_PROFILES_FILE="$T/nopin_profiles.json" CROSS_REVIEW_KIMI_CONFIG="$T/does-not-exist.toml" alias_ready)" "ready"
+
+echo "── kimi: inherited KIMI_* overrides cannot move the pinned model ──"
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "base=%%s model=%%s key=%%s\\n" "${KIMI_BASE_URL:-unset}" "${KIMI_MODEL_NAME:-unset}" "${KIMI_API_KEY:-unset}" >"%s/kimi.env"\nprintf "## Findings\\nNo Critical, High, Medium or Low findings. Verdict: CLEAN.\\n"\n' "$T" >"$T/bin/kimi"; chmod +x "$T/bin/kimi"
+KIMI_BASE_URL=https://elsewhere.example/v1 KIMI_MODEL_NAME=some-other-model KIMI_API_KEY=sk-test-shim \
+  bash "$S/run_reviewers.sh" --base main --out "$T/o_env" --reviewers kimi >/dev/null 2>"$T/o_env.err" || true
+assert_eq "the kimi CLI sees none of the inherited overrides" \
+  "$(cat "$T/kimi.env" 2>/dev/null)" "base=unset model=unset key=unset"
+assert_contains "…and the run says it dropped them" "$(cat "$T/o_env.err")" "ignoring inherited KIMI_BASE_URL"
+assert_eq "no subshell wraps the kimi call (cleanup_pids must reach the CLI)" \
+  "$(awk '/^run_kimi\(\)/,/^}/' "$S/run_reviewers.sh" | grep -c 'run_with_timeout "\$kimi_budget" env ')" "1"
 
 echo "── run_reviewers.sh: a malformed flag stops the round ──"
 BAD_RC=0

@@ -1,0 +1,6 @@
+# Fixture: a kimi CLI config that has the subscription alias the kimi seat pins
+# (reviewer_profiles.json kimi.cli_model_alias). Tests point
+# CROSS_REVIEW_KIMI_CONFIG here so a kimi PATH shim counts as a ready seat.
+[models."kimi-code/k3.1-pro"]
+provider = "managed:kimi-code"
+model = "k3.1-pro"

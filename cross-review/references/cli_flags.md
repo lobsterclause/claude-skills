@@ -131,7 +131,7 @@ api_key = "sk-..."
 
 Valid model IDs on the Moonshot endpoint (as of 2026-04): `kimi-k2.5`, `kimi-k2-thinking`, `kimi-k2-thinking-turbo`, `kimi-k2-0905-preview`, `kimi-k2-turbo-preview`, `kimi-k2-0711-preview`, `moonshot-v1-{8k,32k,128k}`, `moonshot-v1-auto`, plus `-vision-preview` variants. `kimi-k2.5` (256K ctx, thinking mode default) is the best reviewer.
 
-If the user has a `code.kimi.com/coding/v1` subscription key instead of a Moonshot platform key, run `kimi login` interactively once — kimi-cli handles that provider natively (`type = "kimi"`, no manual config needed).
+**The `kimi` baseline runs on the Kimi Code subscription as of 2026-11-18**: `reviewer_profiles.json` pins `cli_model_alias` to `kimi-code/k3.1-pro`, an alias `kimi login` writes into `~/.kimi/config.toml` under the `managed:kimi-code` provider (`type = "kimi"`, `https://api.kimi.com/coding/v1`, OAuth). The Moonshot-platform config above is the old metered lane. If the user has a `code.kimi.com/coding/v1` subscription key instead of a Moonshot platform key, run `kimi login` interactively once — kimi-cli handles that provider natively (`type = "kimi"`, no manual config needed).
 
 ## glm-coding (GLM Coding Plan — no CLI)
 

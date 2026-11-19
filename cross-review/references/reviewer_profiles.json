@@ -5,9 +5,9 @@
   "codex": {
     "or_fallback": {
       "enabled": true,
-      "model": "openai/gpt-5.6-sol"
+      "model": "openai/gpt-6.2-sol"
     },
-    "cli_model": "gpt-5.6-sol",
+    "cli_model": "gpt-6.2-sol",
     "timeout_s": 900,
     "provider": "openai",
     "baseline": true,
@@ -93,9 +93,9 @@
   "kimi": {
     "or_fallback": {
       "enabled": true,
-      "model": "moonshotai/kimi-k2.7-code"
+      "model": "moonshotai/kimi-k3.1-pro"
     },
-    "cli_model_alias": "kimi-k27-code",
+    "cli_model_alias": "kimi-code/k3.1-pro",
     "timeout_s": 600,
     "provider": "moonshot",
     "baseline": true,
@@ -109,11 +109,11 @@
     },
     "synthesis_weight": 0.85,
     "pricing": {
-      "prompt_per_m": 0.66,
-      "completion_per_m": 3.4
+      "prompt_per_m": 0,
+      "completion_per_m": 0
     },
-    "specialization": "single-turn correctness, race conditions, defensive guards; reasons on the diff as given without tools",
-    "notes": "Strong on the diff-as-given. Frequent Low/nit output is skip-worthy unless convergent. China-origin provider — surface for security-sensitive repos."
+    "specialization": "single-turn correctness, race conditions, defensive guards; Kimi K3.1 Pro on the Kimi Code subscription (flat-rate), through the kimi CLI's managed provider",
+    "notes": "MOVED TO THE KIMI CODE SUBSCRIPTION 2026-11-18 (per Gabriel: \"add the kimi subscription\"). cli_model_alias kimi-k27-code (metered Moonshot platform key, provider kimi-moonshot) -> kimi-code/k3.1-pro (provider managed:kimi-code, api.kimi.com/coding/v1, OAuth from `kimi login`). Flat-rate, so pricing is 0/0 like glm-coding, and CROSS_REVIEW_KIMI_BASELINE now defaults ON (lib_flags.sh) -- the metered bill was the only reason it was off. The alias is one `kimi login` writes into ~/.kimi/config.toml; on a machine without the subscription the lane fails fast with \"LLM not set\". Probed 2026-11-18 on kimi 1.48.0: kimi-code/k3.1-pro answered a one-word prompt in 28s, kimi-code/kimi-for-coding (K2.8 Preview) in 12s -- and a real two-finding review of a 5-line diff through run_reviewers.sh took 40s. timeout_s stays 600 (run_reviewers.sh scales it by diff size on a rate measured on k2.5); revisit from duration_s runlog rows. or_fallback moved with it (moonshotai/kimi-k3.1-pro) so a fallback still re-runs the same model; note that fallback is METERED OpenRouter spend and only fires with CROSS_REVIEW_OPENROUTER=1. Subscription quota is shared with interactive kimi use; a quota wall should surface as failure_kind in kimi.meta.json. Pre-subscription notes follow. Strong on the diff-as-given. Frequent Low/nit output is skip-worthy unless convergent. China-origin provider — surface for security-sensitive repos."
   },
   "kimi27": {
     "timeout_s": 600,

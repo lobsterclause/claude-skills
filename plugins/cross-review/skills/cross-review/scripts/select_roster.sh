@@ -136,7 +136,9 @@ for _b in $(cr_baseline_names); do
     glm-coding)
       if has_zai; then BASELINES+=(glm-coding); else missing_baselines+=(glm-coding); fi ;;
     kimi)
-      if command -v kimi >/dev/null 2>&1; then BASELINES+=(kimi); else missing_baselines+=(kimi); fi ;;
+      # Binary AND the pinned subscription alias (cr_kimi_alias_ready) -- the
+      # same answer detect_reviewers.sh gives.
+      if command -v kimi >/dev/null 2>&1 && cr_kimi_alias_ready; then BASELINES+=(kimi); else missing_baselines+=(kimi); fi ;;
   esac
 done
 
