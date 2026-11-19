@@ -50,6 +50,8 @@ printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.8 Flash (High)\
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export HOME="$T/home"; mkdir -p "$HOME"
+# The kimi seat needs its pinned alias in the kimi config, not just a binary.
+export CROSS_REVIEW_KIMI_CONFIG="$SKILL_DIR/tests/fixtures/kimi_config.toml"
 export ZAI_API_KEY="sk-zai-test-shim"
 
 # row <minutes-ago> <reviewer> <status> [wall_over_budget]

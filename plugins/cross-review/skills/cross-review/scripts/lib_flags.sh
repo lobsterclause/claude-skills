@@ -85,6 +85,24 @@ cr_openrouter_on() {
   [[ "$v" == 1 ]]
 }
 
+# cr_kimi_alias_ready: is the kimi seat's pinned model alias actually configured
+# on this machine? The seat pins `kimi.cli_model_alias` (kimi-code/k3.1-pro, an
+# alias `kimi login` writes for the Kimi Code subscription). A `kimi` binary on
+# PATH says nothing about that: an install set up only for the Moonshot platform
+# key, or one never logged in, passes a PATH check and then dies at dispatch
+# with "LLM not set" -- a fixed baseline that contributes no review while
+# preflight said it was fine (codex P2 + kimi Low, PR #202). So availability is
+# "binary AND alias in the config". No pinned alias -> nothing to check.
+# CROSS_REVIEW_KIMI_CONFIG overrides the config path (tests; non-default homes).
+cr_kimi_alias_ready() {
+  local profiles alias cfg
+  profiles="${CROSS_REVIEW_PROFILES_FILE:-$(dirname "${BASH_SOURCE[0]}")/../references/reviewer_profiles.json}"
+  alias="$(jq -r '.kimi.cli_model_alias // empty' "$profiles" 2>/dev/null)"
+  [[ -z "$alias" ]] && return 0
+  cfg="${CROSS_REVIEW_KIMI_CONFIG:-$HOME/.kimi/config.toml}"
+  [[ -r "$cfg" ]] && grep -qF "[models.\"$alias\"]" "$cfg"
+}
+
 # cr_baseline_names: the round's fixed baselines, in dispatch order, space
 # separated. codex is unconditional; the other seat is whichever baseline flags
 # are on. Callers that enforce baselines (detect_reviewers.sh, select_roster.sh)

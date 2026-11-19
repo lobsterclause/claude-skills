@@ -63,7 +63,7 @@ Prints JSON like `{"codex": true, "gemini-pro": true, "kimi": true, "glm-coding"
 
 - codex: `brew install codex-cli`
 - gemini-pro (via `agy`): `curl -fsSL https://antigravity.google/cli/install.sh | bash`, then `agy login` once
-- kimi: `curl -L code.kimi.com/install.sh | bash`
+- kimi: `curl -L code.kimi.com/install.sh | bash`, then `kimi login` once (Kimi Code subscription). The login is what writes the pinned alias (`kimi-code/k3.1-pro`) into `~/.kimi/config.toml`; without it the seat is reported unavailable even with the binary on PATH.
 - glm-coding (GLM Coding Plan baseline — a key, not a CLI): `export ZAI_API_KEY=...` or `mkdir -p ~/.config/zai && (umask 077; printf '%s\n' '...' > ~/.config/zai/key)`. Endpoint override if the plan moves: `CROSS_REVIEW_ZAI_ENDPOINT`.
 - OpenRouter pool (glm/deepseek/mimo/minimax/qwen/devstral/laguna/kat/north/nemotron/spark/seed/grok/longcat/inkling): create a key at openrouter.ai, then `export OPENROUTER_API_KEY=...` or `mkdir -p ~/.config/openrouter && (umask 077; printf '%s\n' 'sk-or-...' > ~/.config/openrouter/key)`
 - kimi27 + kimi3 (Kimi k2.7-code and Kimi K3, direct Moonshot): `export MOONSHOT_API_KEY=...` or `mkdir -p ~/.config/moonshot && (umask 077; printf '%s\n' 'sk-...' > ~/.config/moonshot/key)` — same platform key the kimi baseline bills against

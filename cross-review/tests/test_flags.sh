@@ -59,6 +59,8 @@ printf '#!/bin/sh\nif [ "$1" = "models" ]; then printf "Gemini 3.5 Flash (High)\
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 export HOME="$T/home"; mkdir -p "$HOME"
+# The kimi seat needs its pinned alias in the kimi config, not just a binary.
+export CROSS_REVIEW_KIMI_CONFIG="$SKILL_DIR/tests/fixtures/kimi_config.toml"
 export OPENROUTER_API_KEY="sk-or-test-shim"
 export ZAI_API_KEY="sk-zai-test-shim"
 unset MOONSHOT_API_KEY Z_AI_API_KEY
@@ -204,6 +206,28 @@ CROSS_REVIEW_OPENROUTER=1 bash "$S/run_reviewers.sh" --base main --out "$T/o_fb2
 assert_eq "control: with the lane on it does fall back" \
   "$([[ -f "$T/o_fb2/kimi.fallback.warning" ]] && echo fell-back || echo stayed-down)" "fell-back"
 rm -f "$T/bin/curl"
+
+echo "── kimi: the binary without the subscription alias is not a ready baseline ──"
+printf '[models."kimi-k27-code"]\nprovider = "kimi-moonshot"\n' >"$T/kimi_old.toml"
+NOALIAS="$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_old.toml" bash "$S/detect_reviewers.sh" 2>"$T/noalias.err")"; noalias_rc=$?
+assert_eq "a config without the pinned alias reports kimi unavailable" "$(jq -r .kimi <<<"$NOALIAS")" "false"
+assert_eq "…and detection fails closed on the missing baseline" "$noalias_rc" "1"
+assert_contains "…and says how to fix it" "$(cat "$T/noalias.err")" "kimi login"
+assert_eq "no kimi config at all is the same answer" \
+  "$(CROSS_REVIEW_KIMI_CONFIG="$T/does-not-exist.toml" bash "$S/detect_reviewers.sh" 2>/dev/null | jq -r .kimi)" "false"
+assert_eq "with the baseline flagged off, a missing alias blocks nothing" \
+  "$(CROSS_REVIEW_KIMI_BASELINE=0 CROSS_REVIEW_KIMI_CONFIG="$T/kimi_old.toml" bash "$S/detect_reviewers.sh" >/dev/null 2>&1; echo $?)" "0"
+ROSTER_NOALIAS="$(CROSS_REVIEW_KIMI_CONFIG="$T/kimi_old.toml" CROSS_REVIEW_RUNLOG="$FIXLOG" bash "$S/select_roster.sh" --seed 99 2>/dev/null)"
+assert_eq "select_roster.sh agrees: kimi is not drafted without the alias" \
+  "$([[ ",$ROSTER_NOALIAS," == *",kimi,"* ]] && echo drafted || echo left-out)" "left-out"
+
+echo "── kimi: inherited KIMI_* overrides cannot move the pinned model ──"
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\nprintf "base=%%s model=%%s key=%%s\\n" "${KIMI_BASE_URL:-unset}" "${KIMI_MODEL_NAME:-unset}" "${KIMI_API_KEY:-unset}" >"%s/kimi.env"\nprintf "## Findings\\nNo Critical, High, Medium or Low findings. Verdict: CLEAN.\\n"\n' "$T" >"$T/bin/kimi"; chmod +x "$T/bin/kimi"
+KIMI_BASE_URL=https://elsewhere.example/v1 KIMI_MODEL_NAME=some-other-model KIMI_API_KEY=sk-test-shim \
+  bash "$S/run_reviewers.sh" --base main --out "$T/o_env" --reviewers kimi >/dev/null 2>"$T/o_env.err" || true
+assert_eq "the kimi CLI sees none of the inherited overrides" \
+  "$(cat "$T/kimi.env" 2>/dev/null)" "base=unset model=unset key=unset"
+assert_contains "…and the run says it dropped them" "$(cat "$T/o_env.err")" "ignoring inherited KIMI_BASE_URL"
 
 echo "── run_reviewers.sh: a malformed flag stops the round ──"
 BAD_RC=0

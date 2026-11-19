@@ -12,3 +12,6 @@
 export CROSS_REVIEW_KIMI_BASELINE=1
 export CROSS_REVIEW_GLM_BASELINE=0
 export CROSS_REVIEW_OPENROUTER=1
+# The kimi seat is "binary AND pinned alias in the kimi config"
+# (cr_kimi_alias_ready). These fixtures shim the binary; this is the config.
+export CROSS_REVIEW_KIMI_CONFIG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fixtures/kimi_config.toml"

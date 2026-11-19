@@ -3124,12 +3124,29 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   if [[ -n "$kimi_alias" ]]; then
     kimi_model_args=(-m "$kimi_alias")
   fi
-  run_with_timeout "$kimi_budget" kimi \
-    "${kimi_model_args[@]}" \
-    --plan \
-    --print \
-    --quiet \
-    >"$out/kimi.stdout" 2>"$out/kimi.stderr" <<<"$full_prompt"
+  # The kimi CLI applies KIMI_BASE_URL / KIMI_API_KEY / KIMI_MODEL_NAME (and the
+  # two KIMI_MODEL_* shape vars) AFTER resolving `-m`, for any provider of type
+  # "kimi" -- which the managed Kimi Code provider is. Inherited from an
+  # interactive shell they would send the diff to another endpoint or run
+  # another model while meta.json still names the pinned alias (codex P2,
+  # PR #202). A pin that an env var can move is not a pin: drop them for this
+  # one invocation, in a subshell so the caller's environment is untouched.
+  (
+    if [[ -n "$kimi_alias" ]]; then
+      for _kv in KIMI_BASE_URL KIMI_API_KEY KIMI_MODEL_NAME KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES; do
+        if [[ -n "${!_kv:-}" ]]; then
+          echo "kimi: ignoring inherited $_kv for this review (the seat is pinned to $kimi_alias)" >&2
+          unset "$_kv"
+        fi
+      done
+    fi
+    run_with_timeout "$kimi_budget" kimi \
+      "${kimi_model_args[@]}" \
+      --plan \
+      --print \
+      --quiet \
+      >"$out/kimi.stdout" 2>"$out/kimi.stderr" <<<"$full_prompt"
+  )
   rc=$?
   end=$(date +%s)
   # truncated is reported in metadata so downstream synthesizers don't treat a
