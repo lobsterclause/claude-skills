@@ -102,7 +102,17 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
     while IFS= read -r -d '' ent; do
       mode=${ent%% *}; path=${ent#*$'\t'}
       if [ "$mode" = 160000 ]; then
-        [ -e "$dir/$path/.git" ] || continue
+        # A symlink where a submodule belongs would ship another checkout
+        # (perhaps outside the worktree) under this path. git status refuses
+        # this layout too, so refuse it rather than verify a different tree.
+        if [ -L "$dir/$path" ]; then
+          printf 'submodule %q is a symlink; refusing to ship through it\n' "$pre$path" >&2
+          rc=1; break
+        fi
+        if [ ! -e "$dir/$path/.git" ]; then
+          [ "$kind" = cached ] && printf 'note: submodule %q has no checkout; not shipped\n' "$pre$path" >&2
+          continue
+        fi
         list_tree "$dir/$path" "$pre$path/" "$kind" || { rc=1; break; }
       elif [ "$kind" = cached ]; then
         printf '%s%s\0' "$pre" "$path"
@@ -116,7 +126,9 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   else
     UNTR=$(mktemp) || finish 99
     list_tree . "" others > "$UNTR" || { rm -f "$UNTR"; echo "listing untracked files failed"; finish 99; }
-    n=$(tr -cd '\0' < "$UNTR" | wc -c | tr -d ' ')
+    # LC_ALL=C: count bytes, so a filename invalid in the caller's locale
+    # can't stop tr early and hide the warning.
+    n=$(LC_ALL=C tr -cd '\0' < "$UNTR" | wc -c | tr -d ' ')
     if [ "$n" != 0 ]; then
       echo "WARN: not shipping $n untracked path(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"
       while IFS= read -r -d '' f; do printf '  %q\n' "$f"; done < "$UNTR"

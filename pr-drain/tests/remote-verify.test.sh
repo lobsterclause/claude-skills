@@ -20,6 +20,8 @@
 # Pass-7: submodule WARN/opt-in, git listing failure, relative RV_OUT_DIR
 # (red against 5807820).
 # Pass-8: inactive submodule, nested repository note (red against fdfd5b1).
+# Pass-9: symlinked submodule, submodule without a checkout, locale-safe
+# WARN count (red against d831fdb); 98/97 early-failure codes.
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -159,6 +161,34 @@ mkdir -p "$R2/local-repo"; git -C "$R2/local-repo" init -q; echo n > "$R2/local-
 REPO="$R2" OUTDIR="$T/out19" run 0 "$T/ship19" RV_INCLUDE_UNTRACKED=1 >/dev/null
 grep -q "not shipping local-repo/" "$T/out19/rverify-probe.log"; check "nested repository named in the log" 0 $?
 rm -rf "$R2/local-repo"
+
+# Pass-9: a symlink where a submodule belongs is refused (it used to ship the
+# link target's checkout, here outside the worktree), and a submodule with no
+# checkout is named in the log (red against d831fdb).
+R4="$T/repo4"; cp -R "$R2" "$R4"; rm -rf "$R4/vendor"; ln -s "$S3" "$R4/vendor"
+REPO="$R4" OUTDIR="$T/out20" run 0 "$T/ship20" >/dev/null; check "symlinked submodule exits 99" 99 $?
+check "symlinked submodule's target not shipped" 1 "$(exists "$T/ship20/vendor/s.txt")"
+grep -q "submodule vendor is a symlink" "$T/out20/rverify-probe.log"; check "symlinked submodule named in the log" 0 $?
+R5="$T/repo5"; cp -R "$R2" "$R5"; rm -rf "$R5/vendor"; mkdir "$R5/vendor"
+REPO="$R5" OUTDIR="$T/out21" run 0 "$T/ship21" >/dev/null; check "submodule without a checkout still exits 0" 0 $?
+grep -q "note: submodule vendor has no checkout" "$T/out21/rverify-probe.log"; check "submodule without a checkout named in the log" 0 $?
+
+# Pass-9: a filename that isn't valid in the caller's locale can't hide the
+# untracked WARN (BSD tr stopped on it). Needs a non-UTF-8 locale installed.
+if locale -a 2>/dev/null | grep -qx 'ja_JP.SJIS'; then
+  R6="$T/repo6"; cp -R "$R" "$R6"; rm -rf "$R6/pkg"; touch "$R6/$(printf '\342\230\203')"
+  REPO="$R6" OUTDIR="$T/out22" run 0 "$T/ship22" LC_ALL=ja_JP.SJIS >/dev/null
+  grep -q "WARN: not shipping 1 untracked path" "$T/out22/rverify-probe.log"; check "WARN survives a filename invalid in the locale" 0 $?
+else
+  echo "skip WARN survives a filename invalid in the locale (no ja_JP.SJIS locale)"
+fi
+
+# Pass-9: early failures with a writable .out record their own code: 98 when
+# the box setup fails, 97 when the worktree can't be entered.
+OUTDIR="$T/out23" FAKE_SETUP_FAIL=1 run 0 "$T/ship23" >/dev/null; check "box setup failure exits 98" 98 $?
+check "box setup failure .out" "verify exit=98" "$(cat "$T/out23/rv-probe.out" 2>/dev/null)"
+REPO="$T/no-such-worktree" OUTDIR="$T/out24" run 0 "$T/ship24" >/dev/null 2>&1; check "missing worktree exits 97" 97 $?
+check "missing worktree .out" "verify exit=97" "$(cat "$T/out24/rv-probe.out" 2>/dev/null)"
 
 # A local tar failure is 99, not masked by ssh's 0. A tar stub that writes a
 # good stream and then exits 2 keeps this independent of file permissions.
