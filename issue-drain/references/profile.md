@@ -1,6 +1,6 @@
 # The repo profile
 
-One TOML file per repo, `profiles/<owner>__<repo>.toml`. `ISSUE_DRAIN_PROFILE` points at a different file when set.
+One TOML file per repo, `profiles/<owner>__<repo>.toml`. The name is matched without regard to case. `ISSUE_DRAIN_PROFILE` points at a different file when set.
 
 A repo with no profile stops every command. The hold labels and protected paths are the profile, and running on guesses is how an agent ends up editing a workflow file. An unknown key also stops the command, so a misspelt `protected_path_re` cannot quietly fall back to the default.
 

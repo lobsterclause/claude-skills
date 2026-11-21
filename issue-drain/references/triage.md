@@ -147,7 +147,7 @@ $ID tracker publish
 
 It creates the tracker issue with the profile's tracker label, records it in `tracker.json`, and prints the URL. A run publishes once; a second call is refused. In a dry run it prints the call it would make and creates nothing, and `tracker.md` is the deliverable.
 
-Before it creates anything it lists your own open issues with the tracker label. If one already carries this run's marker line (a publish that was cut off after GitHub created the issue), it records that issue and creates no second one. If the list cannot be read, it exits 1 and creates nothing.
+Before it creates anything it lists your own open issues with the tracker label. If one already carries this run's marker line (a publish that was cut off after GitHub created the issue), and its body is the `tracker.md` rendered now, it records that issue and creates no second one. If the body differs (the run was rendered again after the cut-off publish), it is refused (exit 3): close that issue and publish again. If the list cannot be read, it exits 1 and creates nothing.
 
 `publish.lock` in the run folder exists while a publish runs. A publish that finds it is refused. If no publish is running (the process was killed), remove the file and run it again.
 
@@ -175,9 +175,13 @@ gh issue view <number> --repo <owner>/<repo> --json state,labels,closedByPullReq
 gh pr list --repo <owner>/<repo> --state open --search "<number> in:title,body" --json number,title
 gh api "repos/<owner>/<repo>/issues/<number>/timeline" --paginate \
   --jq '.[] | select(.event == "labeled" and .label.name == "<claim label>") | .created_at'
+gh api "repos/<owner>/<repo>/issues/<number>/timeline" --paginate \
+  --jq '.[] | select(.event == "cross-referenced" and .source.issue.pull_request != null and .source.issue.state == "open") | .source.issue.number'
 ```
 
-Release it only when the issue is open, still carries the claim label, has no open PR, and the last date the third command prints is the `labeled_at` that `queue.json` holds for it under `stale_claims`. A later date means the label came off and someone claimed the issue again after the tracker was rendered: that claim is not stale. If someone picked it up again, leave the label and tell the user. Then remove the claim label and nothing else:
+The fourth command lists open PRs that mention the issue anywhere, including in a comment, which the search in the second does not find.
+
+Release it only when the issue is open, still carries the claim label, has no open PR (the second and fourth commands print nothing), and the last date the third command prints is the `labeled_at` that `queue.json` holds for it under `stale_claims`. A later date means the label came off and someone claimed the issue again after the tracker was rendered: that claim is not stale. If someone picked it up again, leave the label and tell the user. Then remove the claim label and nothing else:
 
 ```
 $ID gh-write remove-label <number> <claim label>

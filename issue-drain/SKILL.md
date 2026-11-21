@@ -101,11 +101,15 @@ An issue is closed only when all of this is true at the moment of closing:
 - the run offered it as a closure and its box is ticked on the published tracker
 - the tracker is open, has no `STOP` line, and has no ticked line the run never offered, read when the run starts and again for each issue after its evidence check
 - the evidence check, run again on the base branch as it is now, still says `already_fixed` and closable, and names the same fixing commit the tracker showed
+- every file the closure quotes is the same on the base branch now as at the commit the tracker was rendered at
 - the issue is open and carries no hold label and no claim label, read before the evidence check and again right before the comment
+- the issue's title and body are the ones intake saved
+
+The file comparison covers the quoted files only. A change somewhere else that undoes the fix (a caller removed, a flag turned off) is not seen, which is one reason a bug that only shows in the running app is never offered for closing.
 
 It posts the comment first, then closes, then reads the issue back. Run again after an interruption, it finishes the job without posting the comment twice.
 
-Outside a dry run it takes no `--body-file`, `--ref` or `--no-fetch`: the tick it acts on is one a person made on GitHub, and the code it checks is the base branch it has just fetched. For that, `ISSUE_DRAIN_REPO_DIR` must be a checkout whose `origin` is the repo being drained. Those three options exist for dry runs and tests.
+Outside a dry run it takes no `--body-file`, `--ref` or `--no-fetch`: the tick it acts on is one a person made on GitHub, and the code it checks is the base branch it has just fetched. For that, `ISSUE_DRAIN_REPO_DIR` must be a checkout whose `origin` is the repo being drained, with one URL or several that all name that repo. A folder inside the checkout works the same as its root. Those three options exist for dry runs and tests.
 
 Its lines: `closed #N (fixed by <sha>)`, `skipped #N: already closed`, `refused #N: <why>`. A refusal is the tool working. Report it; do not try another way to close the issue.
 
