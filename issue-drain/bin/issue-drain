@@ -1,0 +1,28 @@
+#!/bin/bash
+# issue-drain launcher. The skill is installed as a symlink, so follow links to
+# find the crate, build it (a no-op when nothing changed), then run the binary.
+# Works in bash 3.2 and when called by any path.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+crate="$(cd -P "$(dirname "$src")/.." && pwd)"
+
+export ISSUE_DRAIN_SKILL_DIR="${ISSUE_DRAIN_SKILL_DIR:-$crate}"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "issue-drain: cargo is not installed; install Rust from https://rustup.rs" >&2
+  exit 1
+fi
+
+# Build output goes to stderr only: stdout belongs to the subcommand.
+if ! cargo build --release --locked --quiet --manifest-path "$crate/Cargo.toml" >&2; then
+  echo "issue-drain: the build failed; run cargo build --release --manifest-path $crate/Cargo.toml to see why" >&2
+  exit 1
+fi
+
+exec "${CARGO_TARGET_DIR:-$crate/target}/release/issue-drain" "$@"
