@@ -105,6 +105,18 @@ pub fn git(dir: &Path, args: &[&str], limit: Duration, log: &Path) -> Res<Ran> {
     run("git", &all, dir, limit, log)
 }
 
+/// The program to start in `dir`. A relative path to a script in the repo (it
+/// has a `/`) is relative to `dir`; std leaves open whether it is relative to
+/// that or to this process's folder, so it is made absolute here. A bare name
+/// is looked up on PATH, as it always was.
+pub fn program_in(program: &str, dir: &Path) -> String {
+    if program.contains('/') && !program.starts_with('/') {
+        dir.join(program).display().to_string()
+    } else {
+        program.to_string()
+    }
+}
+
 /// The words of a profile command with `{name}` placeholders filled in. The
 /// command is split like a shell would split it, but no shell runs it, so a
 /// value with a space or a quote in it stays one argument.
@@ -137,6 +149,15 @@ mod tests {
         assert_eq!(words, ["sh", "-c", "echo a b", "c d"]);
         assert!(expand("sh 'oops", &[]).is_err());
         assert!(expand("   ", &[]).is_err());
+    }
+
+    #[test]
+    fn a_relative_path_is_made_relative_to_the_folder_and_a_bare_name_is_left_alone() {
+        let dir = Path::new("/work/tree");
+        assert_eq!(program_in("scripts/stamp.sh", dir), "/work/tree/scripts/stamp.sh");
+        assert_eq!(program_in("./stamp.sh", dir), "/work/tree/./stamp.sh");
+        assert_eq!(program_in("/usr/bin/env", dir), "/usr/bin/env");
+        assert_eq!(program_in("pnpm", dir), "pnpm");
     }
 
     #[test]

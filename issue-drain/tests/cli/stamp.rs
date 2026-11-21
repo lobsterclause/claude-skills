@@ -322,3 +322,52 @@ fn bad_arguments_and_missing_inputs_are_usage_errors() {
     assert_eq!(out.code, 2, "{}", out.stderr);
     assert!(out.stderr.contains("unit-prepare"), "{}", out.stderr);
 }
+
+/// A stamp command that is a path in the repo, as unit-prepare's bootstrap may
+/// be, is relative to the unit worktree and not to wherever the driver runs.
+#[test]
+fn a_stamp_command_given_as_a_relative_path_runs_from_the_worktree() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut c = case_with("full_verify_command = \"pnpm verify\"\nstamp_command = \"tools/stamp.sh {tree}\"\n");
+    let script = c.wt.join("tools/stamp.sh");
+    fs::create_dir_all(script.parent().expect("a parent")).expect("the folder");
+    fs::write(&script, format!("#!/bin/sh\necho \"$1\" >> {}\n", c.stamped.display())).expect("the script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    git(&c.wt, &["add", "tools/stamp.sh"]);
+    git(
+        &c.wt,
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "stamp script",
+        ],
+    );
+    c.head = git(&c.wt, &["rev-parse", "HEAD"]);
+    c.tree = git(&c.wt, &["rev-parse", "HEAD^{tree}"]);
+    // Run from a folder that has no tools/stamp.sh.
+    let elsewhere = c.env.dir.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the folder");
+    let log = c.log(GOOD_LOG);
+    let out = c.env.run_in(
+        Some(&elsewhere),
+        &[
+            "stamp-remote-pass",
+            "--unit",
+            "3",
+            "--log",
+            &log.display().to_string(),
+            "--head",
+            &c.head,
+        ],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        fs::read_to_string(&c.stamped).expect("the stamp command ran").trim(),
+        c.tree
+    );
+}

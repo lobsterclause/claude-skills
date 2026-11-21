@@ -1,15 +1,30 @@
 //! `issue-drain claim take|release|check --unit <n>`: the claim label on a
 //! unit's issues, and the record of whose claim it is.
 //!
-//! A label alone does not say who put it there, so `take` also posts a comment
-//! whose first line is a machine marker naming the run's tracker issue and the
-//! unit. A claim is ours when the label is on the issue, the newest claim
-//! marker on the issue (of any tracker and unit) is ours, and the issue's
-//! timeline shows the label was not taken off after that comment. So an old
-//! marker of ours does not make a later run's claim, or a label a stranger
-//! added after our release, ours; `take` posts a fresh marker when the old one
-//! no longer counts. Anything else carrying the label is someone else's, and is
-//! never taken over, released or written to.
+//! A label alone does not say who put it there, so `take` adds the label and
+//! then posts a comment whose first line is a machine marker naming the run's
+//! tracker issue and the unit. The label goes first: a label call that fails
+//! leaves no marker behind for a stranger's later label to borrow, and a marker
+//! that fails to post takes the label back off.
+//!
+//! A claim is ours only when all of these hold, read from the issue's labels
+//! and its timeline (one paginated source, so an issue with more than 100
+//! comments is read whole):
+//!   - the claim label is on the issue now;
+//!   - the newest claim marker (any tracker, any unit) is ours;
+//!   - that marker was created at or after the latest `labeled` event of the
+//!     claim label, so the label it describes is the one on the issue; a label
+//!     with no `labeled` event is not ours;
+//!   - no `unlabeled` event of the claim label is at or after the marker.
+//!
+//! So an old marker of ours does not make a later run's claim, or a label a
+//! stranger added after our release or after our label call failed, ours;
+//! `take` posts a fresh marker when the old one no longer counts. Anything else
+//! carrying the label is someone else's, and is never taken over, released or
+//! written to.
+//!
+//! Two runs taking the same issue at the same moment are not excluded here: the
+//! driver's one-per-repo lock is what prevents that.
 //!
 //! The claim label is written only through `gh::write`, so a dry run prints
 //! `WOULD: ...` and writes nothing. These are the driver's commands: a unit
@@ -72,12 +87,21 @@ fn is_any_marker(body: &str) -> bool {
     body.lines().next().is_some_and(|first| ANY.is_match(first.trim_end()))
 }
 
-/// Whether the issue's timeline shows the claim label removed at or after
-/// `since` (epoch seconds). A claim ends when its label is taken off: a label
-/// found on the issue later was put there by someone else, or by a later claim
-/// that posts a marker of its own. Equal times count as after, so a doubt
-/// about the order is a refusal to call the claim ours.
-fn unlabeled_since(repo: &str, number: u64, label: &str, since: i64) -> Res<bool> {
+/// What the issue's timeline says about claims.
+#[derive(Default)]
+struct Timeline {
+    /// Each claim marker comment: when, its place in the timeline, its body.
+    markers: Vec<(i64, usize, String)>,
+    /// The latest time the claim label was added; `None` when it never was.
+    labeled: Option<i64>,
+    /// When the claim label was taken off, each time.
+    unlabeled: Vec<i64>,
+}
+
+/// The issue's whole timeline, every page. A time that cannot be read counts as
+/// the latest possible for a label event, so a doubt about the order is a
+/// refusal to call the claim ours.
+fn read_timeline(repo: &str, number: u64, label: &str) -> Res<Timeline> {
     let url = format!("repos/{repo}/issues/{number}/timeline?per_page=100");
     let raw = gh::read(&["api", &url, "--paginate"]).map_err(|rc| {
         Fail::failed(format!(
@@ -85,42 +109,67 @@ fn unlabeled_since(repo: &str, number: u64, label: &str, since: i64) -> Res<bool
         ))
     })?;
     let unreadable = |what: &str| Fail::failed(format!("could not read the timeline of #{number}: {what}"));
+    let mut found = Timeline::default();
+    let mut index = 0;
     // `--paginate` prints one JSON array per page, one after the other.
-    let mut ended = false;
     for page in serde_json::Deserializer::from_str(&raw).into_iter::<Value>() {
         let page = page.map_err(|_| unreadable("gh answered with something else than JSON"))?;
         let events = page
             .as_array()
             .ok_or_else(|| unreadable("a page is not a list of events"))?;
         for event in events {
+            index += 1;
             let kind = event["event"]
                 .as_str()
                 .ok_or_else(|| unreadable("an event has no name"))?;
-            if kind != "unlabeled" {
-                continue;
-            }
-            let named = event["label"]["name"]
-                .as_str()
-                .ok_or_else(|| unreadable("an unlabeled event has no label name"))?;
-            if !same_label(named, label) {
-                continue;
-            }
-            // A removal whose time cannot be read is taken to be after the marker.
             let at = event["created_at"].as_str().and_then(parse_rfc3339);
-            ended |= at.is_none_or(|at| at >= since);
+            match kind {
+                // shortcut: a comment is "ours" by its text alone, not by who wrote it; anyone who can comment can forge the marker. Check the author against `gh api user` if that ever matters.
+                "commented" => {
+                    let Some(body) = event["body"].as_str().filter(|body| is_any_marker(body)) else {
+                        continue;
+                    };
+                    let at = at.ok_or_else(|| unreadable("a claim marker comment has no creation time"))?;
+                    found.markers.push((at, index, body.to_string()));
+                }
+                "labeled" | "unlabeled" => {
+                    let named = event["label"]["name"]
+                        .as_str()
+                        .ok_or_else(|| unreadable("a label event has no label name"))?;
+                    if !same_label(named, label) {
+                        continue;
+                    }
+                    let at = at.unwrap_or(i64::MAX);
+                    if kind == "labeled" {
+                        found.labeled = found.labeled.max(Some(at));
+                    } else {
+                        found.unlabeled.push(at);
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    Ok(ended)
+    Ok(found)
+}
+
+/// Whether the claim on the issue is ours: see the module header. The newest
+/// marker is the latest by creation time, a tie going to the later in the
+/// timeline. Equal times count against the claim wherever it is a question of
+/// order, except that a marker may share the second of the label it follows.
+fn is_ours(timeline: &Timeline, marker: &str) -> bool {
+    let Some((at, _, body)) = timeline.markers.iter().max_by_key(|(at, i, _)| (*at, *i)) else {
+        return false;
+    };
+    is_marker(body, marker)
+        && timeline.labeled.is_some_and(|labeled| *at >= labeled)
+        && timeline.unlabeled.iter().all(|off| off < at)
 }
 
 /// What GitHub shows on the issue now.
-///
-/// The claim is ours when the newest claim marker on the issue, of any tracker
-/// and unit, is ours, and the claim label has not been taken off since that
-/// comment was posted.
 fn read_issue(ctx: &Ctx, repo: &str, number: u64, marker: &str) -> Res<Seen> {
     let n = number.to_string();
-    let raw = gh::read(&["issue", "view", &n, "--repo", repo, "--json", "labels,comments"]).map_err(|rc| {
+    let raw = gh::read(&["issue", "view", &n, "--repo", repo, "--json", "labels"]).map_err(|rc| {
         Fail::failed(format!(
             "could not read #{number} (gh exit {rc}); a failed read is not taken to mean it is unclaimed"
         ))
@@ -132,36 +181,15 @@ fn read_issue(ctx: &Ctx, repo: &str, number: u64, marker: &str) -> Res<Seen> {
     };
     let view: Value = serde_json::from_str(&raw).map_err(|_| unreadable())?;
     let labels = view["labels"].as_array().ok_or_else(unreadable)?;
-    let comments = view["comments"].as_array().ok_or_else(unreadable)?;
     let names: Vec<String> = labels
         .iter()
         .filter_map(|l| l["name"].as_str().map(str::to_string))
         .collect();
-    // shortcut: a comment is "ours" by its text alone, not by who wrote it; anyone who can comment can forge the marker. Check the author against `gh api user` if that ever matters.
-    // The newest marker by creation time; a tie goes to the later in the list.
-    let mut newest: Option<(i64, usize, &str)> = None;
-    for (i, comment) in comments.iter().enumerate() {
-        let Some(body) = comment["body"].as_str().filter(|body| is_any_marker(body)) else {
-            continue;
-        };
-        let at = comment["createdAt"].as_str().and_then(parse_rfc3339).ok_or_else(|| {
-            Fail::failed(format!(
-                "could not read #{number}: a claim marker comment has no creation time"
-            ))
-        })?;
-        if newest.is_none_or(|(t, j, _)| (at, i) > (t, j)) {
-            newest = Some((at, i, body));
-        }
-    }
-    let ours = match newest {
-        Some((since, _, body)) if is_marker(body, marker) => {
-            !unlabeled_since(repo, number, &ctx.profile.claim_label, since)?
-        }
-        _ => false,
-    };
+    let labelled = ctx.profile.has_claim(&names);
+    let timeline = read_timeline(repo, number, &ctx.profile.claim_label)?;
     Ok(Seen {
-        labelled: ctx.profile.has_claim(&names),
-        ours,
+        labelled,
+        ours: labelled && is_ours(&timeline, marker),
     })
 }
 
@@ -258,10 +286,10 @@ impl Run<'_> {
                     gh::write(self.ctx, &Write::EnsureLabel { label: self.label() })?;
                     label_ready = true;
                 }
-                // The comment first: a label with no marker looks like someone else's.
-                if !seen.ours {
-                    self.post_marker(number)?;
-                }
+                // The label first, so a marker is never left for a stranger's
+                // later label to borrow. A marker that cannot be posted takes
+                // the label back off: a label with no marker looks like
+                // someone else's.
                 gh::write(
                     self.ctx,
                     &Write::AddLabel {
@@ -269,6 +297,9 @@ impl Run<'_> {
                         label: self.label(),
                     },
                 )?;
+                if let Err(e) = self.post_marker(number) {
+                    return Err(self.roll_back(&[number], e));
+                }
                 Ok("taken")
             })();
             match step {

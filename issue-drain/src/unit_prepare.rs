@@ -120,11 +120,7 @@ fn bootstrap(ctx: &Ctx, worktree: &Path, log: &Path) -> Res<()> {
         .map_err(|e| Fail::usage(format!("profile key bootstrap_command: {e}")))?;
     let program = words.remove(0);
     // A relative path to a script in the repo is relative to the worktree.
-    let program = if program.contains('/') && !program.starts_with('/') {
-        worktree.join(&program).display().to_string()
-    } else {
-        program
-    };
+    let program = exec::program_in(&program, worktree);
     let limit = Duration::from_secs(p.bootstrap_timeout_secs);
     let ran = exec::run(&program, &words, worktree, limit, log)?;
     if ran.ok() {

@@ -183,7 +183,8 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     } else {
         let mut words = exec::expand(&p.stamp_command, &[("tree", &tree), ("head", &head)])
             .map_err(|e| Fail::usage(format!("profile key stamp_command: {e}")))?;
-        let program = words.remove(0);
+        // A relative path to a script in the repo is relative to the worktree.
+        let program = exec::program_in(&words.remove(0), worktree);
         let log_file = ctx.path(&format!("units/{unit}/stamp-command.log"));
         let ran = exec::run(&program, &words, worktree, STAMP_LIMIT, &log_file)?;
         if !ran.ok() {

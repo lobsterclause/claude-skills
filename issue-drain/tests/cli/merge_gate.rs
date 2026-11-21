@@ -25,9 +25,10 @@ fn pr_view(state: &str, labels: &[&str], body: &str) -> Value {
     let labels: Vec<Value> = labels.iter().map(|l| json!({"name": l})).collect();
     json!({
         "state": state, "headRefOid": HEAD, "baseRefName": "develop", "body": body,
-        "labels": labels, "closingIssuesReferences": [closing(5, "example", "tidepool")], "changedFiles": 2,
+        "labels": labels, "mergeCommit": null, "changedFiles": 2,
+        "closingIssuesReferences": [closing(103, "example", "tidepool"), closing(106, "example", "tidepool")],
         "statusCheckRollup": [
-            {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-11-21T01:00:00Z"},
+            {"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-11-21T01:00:00Z"},
             {"__typename": "StatusContext", "context": "lint", "state": "SUCCESS", "startedAt": "2026-11-21T01:00:00Z"},
             {"__typename": "CheckRun", "name": "docs", "status": "COMPLETED", "conclusion": "CANCELLED", "startedAt": "2026-11-21T01:00:00Z"}
         ]
@@ -83,7 +84,13 @@ fn ready() -> Env {
             "pageInfo": {"hasNextPage": false, "endCursor": null},
             "nodes": [{"isResolved": true}]}}}}}),
     );
-    put(&env, "issue-view-5.json", &json!({"labels": [{"name": "bug"}]}));
+    for n in [103, 106] {
+        put(
+            &env,
+            &format!("issue-view-{n}.json"),
+            &json!({"labels": [{"name": "bug"}]}),
+        );
+    }
     clean_preflight(&mut env);
     proof(
         &env,
@@ -209,13 +216,16 @@ fn a_thread_read_that_does_not_parse_refuses() {
 #[test]
 fn an_already_merged_pr_exits_0_without_a_merge_call() {
     let env = ready();
-    put(&env, "pr-view-12.json", &pr_view("MERGED", &[], ""));
+    let mut view = pr_view("MERGED", &[], "");
+    view["mergeCommit"] = json!({"oid": "fedcba9876543210fedcba9876543210fedcba98"});
+    put(&env, "pr-view-12.json", &view);
     let out = env.run(&ARGS);
     assert_eq!(out.code, 0, "{}", out.stderr);
     let r = result(&out);
     assert_eq!(r["merged"], true);
     assert_eq!(r["already"], true);
     assert_eq!(r["head"], HEAD);
+    assert_eq!(r["merge_commit"], "fedcba9876543210fedcba9876543210fedcba98");
     assert!(merged_calls(&env).is_empty());
     assert_eq!(env.gh_calls().len(), 1, "only the PR was read");
 }
@@ -354,7 +364,7 @@ fn a_hold_label_on_the_issue_the_pr_closes_refuses() {
     let env = ready();
     put(
         &env,
-        "issue-view-5.json",
+        "issue-view-103.json",
         &json!({"labels": [{"name": "ready-for-human"}]}),
     );
     let out = env.run(&ARGS);
@@ -525,7 +535,7 @@ fn a_read_that_fails_after_the_merge_call_says_the_merge_may_have_happened() {
 fn an_issue_the_pr_closes_in_another_repository_refuses_naming_it() {
     let env = ready();
     let mut view = pr_view("OPEN", &["bug"], "Fixes #5");
-    view["closingIssuesReferences"] = json!([closing(5, "example", "tidepool"), closing(7, "other", "elsewhere")]);
+    view["closingIssuesReferences"] = json!([closing(103, "example", "tidepool"), closing(7, "other", "elsewhere")]);
     put(&env, "pr-view-12.json", &view);
     put(&env, "issue-view-7.json", &json!({"labels": [{"name": "bug"}]}));
     let out = env.run(&ARGS);
@@ -549,5 +559,160 @@ fn a_closing_issue_with_no_repository_does_not_parse() {
     let out = env.run(&ARGS);
     assert_eq!(out.code, 3, "{}", out.stderr);
     assert!(codes(&result(&out)).contains(&"read_error".to_string()));
+    assert!(merged_calls(&env).is_empty());
+}
+
+/// A ruleset's `required_status_checks` rule, as `rules/branches/<b>` lists it.
+fn ruleset_requiring(contexts: &[&str]) -> Value {
+    let checks: Vec<Value> = contexts
+        .iter()
+        .map(|c| json!({"context": c, "integration_id": 15368}))
+        .collect();
+    json!([
+        {"type": "deletion", "ruleset_source_type": "Repository", "ruleset_source": REPO, "ruleset_id": 1},
+        {"type": "required_status_checks", "ruleset_source_type": "Repository", "ruleset_source": REPO,
+         "ruleset_id": 1, "parameters": {"strict_required_status_checks_policy": false,
+         "required_status_checks": checks}}
+    ])
+}
+
+#[test]
+fn a_check_a_ruleset_requires_is_required_beside_classic_protection() {
+    let env = ready();
+    put(&env, "rules.json", &ruleset_requiring(&["e2e"]));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["required_check"]);
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("'e2e'"));
+    assert!(merged_calls(&env).is_empty());
+    assert!(
+        env.gh_calls()
+            .iter()
+            .any(|c| c.starts_with("api repos/example/tidepool/rules/branches/develop") && c.contains("--paginate")),
+        "{:?}",
+        env.gh_calls()
+    );
+    // control: a ruleset requirement that the PR meets
+    put(&env, "rules.json", &ruleset_requiring(&["build"]));
+    assert_eq!(env.run(&ARGS).code, 0);
+}
+
+#[test]
+fn a_branch_with_a_ruleset_and_no_classic_protection_is_judged_by_the_ruleset() {
+    let env = ready();
+    env.stub_file("protection.unprotected", "");
+    put(&env, "rules.json", &ruleset_requiring(&["e2e"]));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["required_check"]);
+
+    put(&env, "rules.json", &ruleset_requiring(&["build"]));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+}
+
+#[test]
+fn no_classic_protection_is_no_requirement_only_when_the_rules_were_read() {
+    let env = ready();
+    env.stub_file("protection.unprotected", "");
+    env.stub_file("fail-rules", "");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["read_error"]);
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("branch rules"));
+    assert!(merged_calls(&env).is_empty());
+
+    // The rules read fails beside classic protection that was read: still a refusal.
+    let env = ready();
+    env.stub_file("fail-rules", "");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["read_error"]);
+
+    // Rules that do not parse.
+    let env = ready();
+    env.stub_file("rules.json", "{\"message\":\"Not Found\"}");
+    assert_eq!(env.run(&ARGS).code, 3);
+}
+
+#[test]
+fn a_protection_read_that_fails_for_another_reason_is_not_no_protection() {
+    let env = ready();
+    fs::remove_file(env.stub.join("protection.json")).expect("remove");
+    put(&env, "rules.json", &ruleset_requiring(&["build"]));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(
+        result(&out)["refusals"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("branch protection")
+    );
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_same_named_check_of_another_workflow_that_failed_is_not_hidden_by_a_later_success() {
+    let env = ready();
+    let mut view = pr_view("OPEN", &["bug"], "Fixes #103");
+    view["statusCheckRollup"] = json!([
+        {"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-11-21T02:00:00Z"},
+        {"__typename": "CheckRun", "name": "build", "workflowName": "Nightly", "status": "COMPLETED", "conclusion": "FAILURE", "startedAt": "2026-11-21T01:00:00Z"},
+        {"__typename": "StatusContext", "context": "lint", "state": "SUCCESS", "startedAt": "2026-11-21T01:00:00Z"}
+    ]);
+    put(&env, "pr-view-12.json", &view);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["required_check"]);
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_review_record_with_no_head_refuses() {
+    let mut env = ready();
+    preflight(&mut env, &json!({"status": "clear", "verdict": "CLEAN"}).to_string(), 0);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["review"]);
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_hold_label_on_an_issue_of_the_unit_that_the_pr_does_not_close_refuses() {
+    let env = ready();
+    let mut view = pr_view("OPEN", &["bug"], "Fixes #103");
+    view["closingIssuesReferences"] = json!([closing(103, "example", "tidepool")]);
+    put(&env, "pr-view-12.json", &view);
+    put(
+        &env,
+        "issue-view-106.json",
+        &json!({"labels": [{"name": "needs-human"}]}),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["hold_label"]);
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("issue #106"));
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_pr_that_closes_an_issue_the_unit_does_not_carry_refuses() {
+    let env = ready();
+    let mut view = pr_view("OPEN", &["bug"], "Fixes #999");
+    view["closingIssuesReferences"] = json!([
+        closing(103, "example", "tidepool"),
+        closing(106, "example", "tidepool"),
+        closing(999, "example", "tidepool")
+    ]);
+    put(&env, "pr-view-12.json", &view);
+    put(&env, "issue-view-999.json", &json!({"labels": [{"name": "bug"}]}));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["closing_issue_unit"]);
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("#999"));
     assert!(merged_calls(&env).is_empty());
 }

@@ -7,6 +7,16 @@
 //! rule is reported, not the first. A git call that fails is an error (exit 1),
 //! never an `ok: true`.
 //!
+//! Scope is the queue's `files`: a path equal to one, or under one that is a
+//! folder. A test file the implementer adds is not in that list, so a path also
+//! counts as in scope when it is a test file beside a scoped file or under a
+//! `__tests__`, `tests` or `test` folder that sits in a scoped file's folder or
+//! at the repo root (`is_test_path`). Protected and frozen paths still apply to
+//! it, and `deliver.json` lists such paths as `test_paths`.
+//!
+//! When `units/<n>/unit.json` exists the check must run in the worktree it
+//! names, or it refuses (exit 2): git reads whatever folder it is started in.
+//!
 //! `deliver.json` records `merge_base`, the commit the diff started from.
 //! `merge-gate` refuses a report whose `merge_base` is not the PR's merge base
 //! with the live base branch, so run it without `--base` before a merge.
@@ -85,6 +95,8 @@ pub struct Failure {
 #[derive(Debug, Default)]
 pub struct Verdict {
     pub failures: Vec<Failure>,
+    /// Paths in scope only as test files of the unit's files.
+    pub test_paths: Vec<String>,
     pub new_dependency: Vec<String>,
     pub shortcuts: Vec<AddedLine>,
 }
@@ -96,6 +108,33 @@ fn failure(code: &'static str, message: String) -> Failure {
 fn is_manifest(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     MANIFESTS.contains(&name) || (name.starts_with("requirements") && name.ends_with(".txt"))
+}
+
+/// Whether `path` is a test file of the unit: beside a scoped file with
+/// `.test.`, `.spec.` or `_test.` in its name, or anywhere under a `__tests__`,
+/// `tests` or `test` folder that sits in a scoped file's folder or at the repo
+/// root. A scope entry with a trailing slash is a folder, any other a file, whose
+/// folder is its parent.
+pub fn is_test_path(path: &str, scope: &[String]) -> bool {
+    let folders: Vec<&str> = scope
+        .iter()
+        .map(|entry| match entry.strip_suffix('/') {
+            Some(folder) => folder,
+            None => entry.rsplit_once('/').map_or("", |(parent, _)| parent),
+        })
+        .collect();
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let named_as_test = [".test.", ".spec.", "_test."].iter().any(|m| name.contains(m));
+    if named_as_test && folders.contains(&parent) {
+        return true;
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    (0..parts.len().saturating_sub(1)).any(|i| {
+        matches!(parts[i], "__tests__" | "tests" | "test") && {
+            let above = parts[..i].join("/");
+            above.is_empty() || folders.contains(&above.as_str())
+        }
+    })
 }
 
 /// Every rule, none stopping at the first. No I/O.
@@ -110,11 +149,18 @@ pub fn judge(input: &Input, is_protected: &dyn Fn(&str) -> bool, is_frozen: &dyn
     }
     let acceptance = input.acceptance.as_deref().unwrap_or_default();
     if let Some(scope) = &input.scope {
-        let outside: Vec<&str> = paths
-            .iter()
-            .copied()
-            .filter(|p| !scope.iter().chain(acceptance).any(|entry| path_within(p, entry)))
-            .collect();
+        let (mut outside, mut tests) = (Vec::new(), Vec::new());
+        for p in paths.iter().copied() {
+            if scope.iter().chain(acceptance).any(|entry| path_within(p, entry)) {
+                continue;
+            }
+            if is_test_path(p, scope) {
+                tests.push(p.to_string());
+            } else {
+                outside.push(p);
+            }
+        }
+        v.test_paths = tests;
         if !outside.is_empty() {
             v.failures.push(failure(
                 "out_of_scope",
@@ -273,9 +319,31 @@ fn unit_rules(ctx: &Ctx, unit: u64) -> Res<(Paths, Paths)> {
     Ok((list("files"), list("acceptance_tests")))
 }
 
+/// With a `units/<n>/unit.json`, `dir` must be inside the worktree it names:
+/// the diff is of the folder git is started in, not of the unit's branch.
+fn in_the_units_worktree(ctx: &Ctx, unit: u64, dir: &Path) -> Res<()> {
+    let unit_file = ctx.path(&format!("units/{unit}/unit.json"));
+    if !unit_file.exists() {
+        return Ok(());
+    }
+    let named = read_json::<Value>(&unit_file)
+        .and_then(|u| u["worktree"].as_str().map(str::to_string))
+        .ok_or_else(|| Fail::usage(format!("{} names no worktree", unit_file.display())))?;
+    let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+    let top = git::out(dir, &["rev-parse", "--show-toplevel"]).and_then(|top| canonical(Path::new(top.trim())));
+    match (canonical(Path::new(&named)), top) {
+        (Some(wanted), Some(top)) if wanted == top => Ok(()),
+        (_, top) => Err(Fail::usage(format!(
+            "unit {unit}'s worktree is {named}, but this folder is in {}; run deliver-check there",
+            top.map_or("no git checkout".to_string(), |t| t.display().to_string())
+        ))),
+    }
+}
+
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let dir = Path::new(".");
     let unit = args.unit;
+    in_the_units_worktree(ctx, unit, dir)?;
     let (scope, acceptance) = unit_rules(ctx, unit)?;
     let head = resolve(dir, args.head.as_deref().unwrap_or("HEAD"), "--head")?;
     let base = match &args.base {
@@ -342,6 +410,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         "additions": added,
         "deletions": deleted,
         "scope_checked": input.scope.is_some(),
+        "test_paths": verdict.test_paths,
         "acceptance_checked": input.acceptance.is_some(),
         "failures": failures,
         "flags": {"new_dependency": verdict.new_dependency, "shortcuts": shortcuts},
@@ -445,6 +514,56 @@ mod tests {
         assert_eq!(codes(&judge_plain(&i)), ["acceptance_missing"]);
         i.changes.push(change("tests/timer.test.ts", 9, 0));
         assert!(judge_plain(&i).failures.is_empty());
+    }
+
+    #[test]
+    fn a_test_file_beside_or_in_a_tests_folder_of_a_scoped_file_is_in_scope() {
+        let scope = vec!["src/timer/countdown.ts".to_string(), "package.json".to_string()];
+        for yes in [
+            "src/timer/countdown.test.ts",
+            "src/timer/countdown.spec.js",
+            "src/timer/countdown_test.go",
+            "src/timer/__tests__/a.ts",
+            "src/timer/tests/deep/a.ts",
+            "src/timer/test/a.ts",
+            "tests/timer.ts",
+            "test/timer/a.ts",
+            "__tests__/a.ts",
+            "countdown.test.ts",
+        ] {
+            assert!(is_test_path(yes, &scope), "{yes}");
+        }
+        for no in [
+            "src/timer/other.ts",
+            "src/timer/mytests/a.ts",
+            "src/ui/badge.test.ts",
+            "src/ui/tests/a.ts",
+            "src/timer/sub/countdown.test.ts",
+            "src/tests/a.ts",
+            "src/timer/contest.ts",
+            "src/timer/tests",
+        ] {
+            assert!(!is_test_path(no, &scope), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_unit_test_path_passes_scope_is_listed_and_still_meets_the_path_rules() {
+        let mut i = input(vec![]);
+        i.scope = Some(vec!["src/timer/countdown.ts".into()]);
+        i.changes = vec![
+            change("src/timer/countdown.ts", 3, 1),
+            change("src/timer/countdown.test.ts", 9, 0),
+        ];
+        let v = judge_plain(&i);
+        assert!(v.failures.is_empty(), "{:?}", v.failures);
+        assert_eq!(v.test_paths, ["src/timer/countdown.test.ts"]);
+        // Another folder's test is out of scope, and a frozen or protected one still fails.
+        i.changes = vec![change("src/ui/badge.test.ts", 1, 0), change("vendor/x.test.js", 1, 0)];
+        i.scope = Some(vec!["vendor/x.js".into()]);
+        let v = judge_plain(&i);
+        assert_eq!(codes(&v), ["out_of_scope", "frozen_path"]);
+        assert_eq!(v.test_paths, ["vendor/x.test.js"]);
     }
 
     #[test]

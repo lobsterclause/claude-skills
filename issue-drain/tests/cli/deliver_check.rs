@@ -166,6 +166,82 @@ fn a_path_outside_the_unit_files_is_refused() {
 }
 
 #[test]
+fn a_test_file_the_implementer_adds_is_in_scope_and_recorded() {
+    let c = case_with(json!({"files": ["src/timer/countdown.ts"]}));
+    commit(
+        &c.repo,
+        &[
+            ("src/timer/countdown.ts", "x\n"),
+            ("src/timer/countdown.test.ts", "t\n"),
+            ("tests/timer.test.ts", "t\n"),
+        ],
+        "fix with tests",
+    );
+    let out = c.check(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        c.deliver()["test_paths"],
+        json!(["src/timer/countdown.test.ts", "tests/timer.test.ts"])
+    );
+    // controls: a source file the unit does not own, and a test of another folder
+    c.refuses(&[("src/timer/other.ts", "x\n")], "out_of_scope");
+    c.refuses(&[("src/ui/badge.test.ts", "x\n")], "out_of_scope");
+}
+
+#[test]
+fn a_test_file_under_a_frozen_or_protected_path_is_still_refused() {
+    let c = case_with(json!({"files": ["vendor/x.js", ".github/workflows/ci.yml"]}));
+    c.refuses(
+        &[("vendor/x.test.js", "x\n"), (".github/workflows/ci.test.yml", "x\n")],
+        "frozen_path",
+    );
+    assert_eq!(c.failure_codes(), ["protected_path", "frozen_path"]);
+    assert_eq!(
+        c.deliver()["test_paths"],
+        json!([".github/workflows/ci.test.yml", "vendor/x.test.js"])
+    );
+}
+
+#[test]
+fn with_a_unit_json_the_check_runs_only_in_the_worktree_it_names() {
+    let c = case();
+    commit(&c.repo, &[("src/timer/countdown.ts", "x\n")], "fix");
+    let worktree = c.repo.display().to_string();
+    let unit_json = |worktree: Value| {
+        c.env.write(
+            "units/3/unit.json",
+            &json!({"unit": 3, "worktree": worktree}).to_string(),
+        )
+    };
+    let run_in = |dir: &Path| {
+        c.env
+            .run_in(Some(dir), &["deliver-check", "--unit", "3", "--base", "develop"])
+    };
+
+    // Another checkout, and a folder that is no checkout, are refused before git reads either.
+    let other = c.env.dir.path().join("other");
+    fs::create_dir_all(&other).expect("the folder");
+    let plain = c.env.dir.path().join("plain");
+    fs::create_dir_all(&plain).expect("the folder");
+    git(&other, &["init", "-q"]);
+    unit_json(json!(worktree));
+    for dir in [&other, &plain] {
+        let out = run_in(dir);
+        assert_eq!(out.code, 2, "{}: {}", dir.display(), out.stderr);
+        assert!(!c.env.workdir.join("units/3/deliver.json").exists());
+    }
+    // The worktree itself, and a folder inside it, are fine.
+    assert_eq!(run_in(&c.repo).code, 0);
+    assert_eq!(run_in(&c.repo.join("src/timer")).code, 0);
+
+    // A unit.json that names no worktree refuses too; with none, `.` is used as before.
+    unit_json(Value::Null);
+    assert_eq!(run_in(&c.repo).code, 2);
+    fs::remove_file(c.env.workdir.join("units/3/unit.json")).expect("remove");
+    assert_eq!(run_in(&c.repo).code, 0);
+}
+
+#[test]
 fn a_protected_path_is_refused() {
     case().refuses(&[(".github/workflows/ci.yml", "x\n")], "protected_path");
 }

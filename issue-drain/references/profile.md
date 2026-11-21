@@ -37,6 +37,6 @@ To add a repo, copy an existing profile, then check each label against `gh label
 | `codegraph_init` | `false` | When true and a `codegraph` program is on PATH, `unit-prepare` runs `codegraph init -i` in the worktree. A failure or a missing program is recorded in `unit.json`, never an error |
 | `codegraph_timeout_secs` | 300 | The same limit for `codegraph init` |
 | `full_verify_command` | none | The command a homelab verify must have run for `stamp-remote-pass` to stamp (`pnpm verify`). Empty means nothing is ever stamped |
-| `stamp_command` | none | Run in the unit worktree to record the repo's verify stamp. `{tree}` is `HEAD^{tree}` and `{head}` is HEAD. Empty means `stamp-remote-pass` records `stamped: false` and does nothing else |
+| `stamp_command` | none | Run in the unit worktree to record the repo's verify stamp (a relative path with a `/` is relative to the worktree, as for `bootstrap_command`). `{tree}` is `HEAD^{tree}` and `{head}` is HEAD. Empty means `stamp-remote-pass` records `stamped: false` and does nothing else |
 
 Both path patterns are regular expressions matched against repo-relative paths, ignoring case. Labels are compared ignoring case, as GitHub does. The base branch and the three single labels are checked for shape, because they become `git` and `gh` arguments.

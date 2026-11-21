@@ -5,6 +5,8 @@ use std::fs;
 use crate::common::*;
 use serde_json::{Value, json};
 
+const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
 fn ready() -> Env {
     let env = Env::new();
     env.seed(&["queue.json"]);
@@ -49,7 +51,7 @@ fn walk(env: &Env, unit: &str, path: &[&str]) {
     for to in path {
         match *to {
             "pr_open" => ok(env, &[unit, to, "--pr", "7"]),
-            "merged" => ok(env, &[unit, to, "--head", "abc123"]),
+            "merged" => ok(env, &[unit, to, "--head", SHA]),
             _ => ok(env, &[unit, to]),
         }
     }
@@ -172,6 +174,17 @@ fn init_refuses_a_parse_where_the_user_called_the_run_off_or_something_is_unknow
 }
 
 #[test]
+fn init_refuses_the_saved_parse_of_another_run() {
+    let (env, out) = init_from(&parsed_json(json!(["U1"]), json!({"run": "other-run"})), false);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("other-run"), "{}", out.stderr);
+    assert!(state_events(&env).is_empty());
+    // control: this run's own parse goes through
+    let (_, out) = init_from(&parsed_json(json!(["U1"]), json!({"run": "run"})), false);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+}
+
+#[test]
 fn init_takes_a_null_tracker_state_only_in_a_dry_run() {
     let parsed = parsed_json(json!(["U1"]), json!({"tracker_state": null}));
     let (_, out) = init_from(&parsed, true);
@@ -180,7 +193,7 @@ fn init_takes_a_null_tracker_state_only_in_a_dry_run() {
 
 #[test]
 fn init_refuses_a_parse_that_leaves_out_what_decides_whether_to_go_on() {
-    for key in ["stop", "tracker_state", "unknown"] {
+    for key in ["run", "stop", "tracker_state", "unknown"] {
         let mut parsed: Value = serde_json::from_str(&parsed_json(json!(["U1"]), json!({}))).unwrap();
         parsed.as_object_mut().unwrap().remove(key);
         let (_, out) = init_from(&parsed.to_string(), true);
@@ -195,7 +208,7 @@ fn a_unit_walks_the_happy_path_to_done() {
     assert_eq!(unit_state(&env, 1), "done");
     let snap = snapshot(&env);
     assert_eq!(snap["units"][0]["pr"], 7);
-    assert_eq!(snap["units"][0]["head"], "abc123");
+    assert_eq!(snap["units"][0]["head"], SHA);
     assert_eq!(snap["units"][0]["base_syncs"], 0);
     assert_eq!(snap["units"][0]["repairs"], 0);
     assert_eq!(snap["units"][0]["updated"], "2026-11-21T03:53:00Z");
@@ -219,7 +232,7 @@ fn an_event_carries_its_note() {
 #[test]
 fn an_illegal_move_names_the_unit_the_state_and_the_target() {
     let env = ready();
-    let out = ev(&env, &["1", "merged", "--head", "abc"]);
+    let out = ev(&env, &["1", "merged", "--head", SHA]);
     assert_eq!(out.code, 3);
     for needle in ["unit 1", "queued", "merged"] {
         assert!(out.stderr.contains(needle), "{}", out.stderr);
@@ -263,7 +276,7 @@ fn pr_open_needs_a_pr_and_merged_needs_a_head() {
     let out = ev(&env, &["1", "merged"]);
     assert_eq!(out.code, 3);
     assert!(out.stderr.contains("--head"), "{}", out.stderr);
-    ok(&env, &["1", "merged", "--head", "abc"]);
+    ok(&env, &["1", "merged", "--head", SHA]);
 }
 
 #[test]
@@ -444,6 +457,53 @@ fn rebuild_names_an_illegal_transition_in_the_log() {
 #[test]
 fn rebuild_without_a_log_is_a_usage_error() {
     assert_eq!(Env::new().run(&["state", "rebuild"]).code, 2);
+}
+
+#[test]
+fn a_head_that_is_not_a_commit_sha_is_a_usage_error() {
+    let env = ready();
+    let to_gate = [
+        "claimed",
+        "prepared",
+        "implementing",
+        "pr_open",
+        "reviewing",
+        "ci_wait",
+        "gate",
+    ];
+    walk(&env, "1", &to_gate);
+    for bad in [
+        "abc",
+        "not a sha",
+        "--squash",
+        "\u{e9}123456789abcdef0123456789abcdef0123456",
+    ] {
+        let out = ev(&env, &["1", "merged", "--head", bad]);
+        assert_eq!(out.code, 2, "{bad}: {}", out.stderr);
+    }
+    assert_eq!(unit_state(&env, 1), "gate");
+}
+
+/// An old log can hold a head that is not ASCII; `show` must not cut it inside a character.
+#[test]
+fn show_cuts_a_stored_head_on_a_character_boundary() {
+    let env = ready();
+    let path = env.workdir.join("events.jsonl");
+    let mut text = fs::read_to_string(&path).unwrap();
+    for (from, to) in [("queued", "claimed"), ("claimed", "prepared"), ("prepared", "skipped")] {
+        let head = if to == "skipped" {
+            ",\"head\":\"abcdefgh\u{e9}\u{e9}\u{e9}\""
+        } else {
+            ""
+        };
+        text.push_str(&format!(
+            "{{\"ts\":\"2026-11-21T03:53:00Z\",\"unit\":1,\"from\":\"{from}\",\"to\":\"{to}\"{head}}}\n"
+        ));
+    }
+    fs::write(&path, text).unwrap();
+    let out = env.run(&["state", "show"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("abcdefgh"), "{}", out.stdout);
 }
 
 #[test]

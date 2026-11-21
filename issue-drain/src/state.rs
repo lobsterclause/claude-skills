@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use crate::ctx::{Ctx, read_json, rfc3339, write_json};
 use crate::error::{Fail, Res};
+use crate::merge_gate::is_sha;
 use crate::model::Queue;
 
 /// Base syncs (gate back to ci_wait) one unit may take.
@@ -417,7 +418,7 @@ pub struct EventArgs {
     /// The PR's number. Required on the move to pr_open.
     #[arg(long)]
     pr: Option<u64>,
-    /// The merge commit. Required on the move to merged.
+    /// The merge commit, a full 40 or 64 digit SHA. Required on the move to merged.
     #[arg(long)]
     head: Option<String>,
 }
@@ -469,13 +470,17 @@ fn unit_number(id: &str) -> Option<u64> {
 /// has no STOP line, and holds nothing the run never offered. A saved parse
 /// that does not say all three is not the output of `tracker parse`. A null
 /// `tracker_state` means the body came from a file, which only a dry run does.
-fn called_off(parsed: &Value, path: &std::path::Path, dry_run: bool) -> Res<()> {
+fn called_off(parsed: &Value, path: &std::path::Path, dry_run: bool, run: &str) -> Res<()> {
     let missing = |key: &str| {
         Fail::usage(format!(
             "{} has no \"{key}\"; it is not what `tracker parse` prints",
             path.display()
         ))
     };
+    let parsed_run = parsed
+        .get("run")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing("run"))?;
     let stop = parsed
         .get("stop")
         .and_then(Value::as_bool)
@@ -489,6 +494,12 @@ fn called_off(parsed: &Value, path: &std::path::Path, dry_run: bool) -> Res<()> 
         Some(Value::Null) => None,
         _ => return Err(missing("tracker_state")),
     };
+    if parsed_run != run {
+        return Err(Fail::refused(format!(
+            "{} is the parse of run '{parsed_run}', not of this run '{run}'",
+            path.display()
+        )));
+    }
     if stop {
         return Err(Fail::refused(
             "the tracker has a STOP line: the user called the run off",
@@ -551,7 +562,7 @@ fn init(ctx: &Ctx, args: &InitArgs) -> Res<()> {
             .get("units")
             .and_then(Value::as_array)
             .ok_or_else(|| Fail::usage(format!("{} has no \"units\" list", path.display())))?;
-        called_off(&parsed, path, ctx.dry_run)?;
+        called_off(&parsed, path, ctx.dry_run, &queue.run)?;
         let mut ordered = Vec::new();
         for id in listed {
             let id = id.as_str().unwrap_or_default();
@@ -595,6 +606,13 @@ fn event(ctx: &Ctx, args: &EventArgs) -> Res<()> {
             names.join(", ")
         ))
     })?;
+    if let Some(head) = &args.head {
+        if !is_sha(head) {
+            return Err(Fail::usage(format!(
+                "--head must be a full 40 or 64 digit commit SHA (got '{head}')"
+            )));
+        }
+    }
     let Replay { mut snapshot, text, .. } = started(ctx)?;
     let Some(unit) = snapshot.unit(args.unit) else {
         return Err(Fail::refused(format!(
@@ -635,7 +653,9 @@ fn show(ctx: &Ctx, args: &ShowArgs) -> Res<()> {
             format!("U{}", unit.unit),
             unit.state.as_str(),
             unit.pr.map_or("-".to_string(), |n| format!("#{n}")),
-            unit.head.as_deref().map_or("-", |h| &h[..h.len().min(9)]),
+            unit.head
+                .as_deref()
+                .map_or("-".to_string(), |h| h.chars().take(9).collect::<String>()),
             unit.base_syncs,
             unit.repairs,
             unit.updated,

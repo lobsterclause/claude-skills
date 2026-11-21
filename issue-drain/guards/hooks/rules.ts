@@ -119,7 +119,7 @@ function ghApiDeny(args: string[], command: string): string | undefined {
     const a = args[i]!
     const m = /^(?:-X|--method=?)(.*)$/.exec(a)
     if (m) method = (m[1] || args[++i] || '').toUpperCase()
-    else if (/^(-f|-F|--field|--raw-field|--input)(=|$)/.test(a)) hasBody = true
+    else if (/^(-[fF]|--field$|--field=|--raw-field$|--raw-field=|--input$|--input=)/.test(a)) hasBody = true
   }
   if (args.some(a => /\/merges?(\/|\?|$)/.test(a)))
     return `${P} gh api merge endpoints: merges are the driver's job; write result.json and exit`
@@ -147,10 +147,15 @@ function gitDeny(args: string[], branch: string): string | undefined {
       return `${P} git rebase rewrites pushed commits; the driver syncs the branch with a merge of the base`
     case 'worktree':
       return `${P} git worktree: the driver manages worktrees`
-    case 'checkout':
     case 'switch':
-      // `git checkout -- <path>` (or `HEAD -- <path>`) restores a file and stays.
-      return rest.includes('--') ? undefined : `${P} git ${verb} would leave the unit's branch; stay on it`
+      return `${P} git switch would leave the unit's branch; stay on it`
+    case 'checkout': {
+      // Only a file restore stays: `-- <path>...` or `HEAD -- <path>...`, nothing else before `--`.
+      const at = rest[0] === 'HEAD' ? 1 : 0
+      return rest[at] === '--' && rest.length > at + 1
+        ? undefined
+        : `${P} git checkout would leave the unit's branch; stay on it (only \`git checkout [HEAD] -- <path>\` is allowed)`
+    }
     case 'branch':
       return flags.some(f => /^-[dDmMcCf]$|^--(delete|move|copy|force)$/.test(f))
         ? `${P} git branch -d/-D/-m/-f changes shared branches; leave them`
