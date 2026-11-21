@@ -236,10 +236,31 @@ fn list_numbers(args: &Args, repo: &str, cap: usize) -> Res<Vec<u64>> {
     Ok(out.lines().filter_map(|l| parse_number(l.trim())).collect())
 }
 
-fn fetch(repo: &str, claim: &str, n: u64) -> Option<Fetched> {
-    let (owner, name) = repo.split_once('/')?;
+/// GitHub's own answer that the repo has no issue with that number (it may be
+/// a PR, or nothing). Any other error is a request that failed.
+fn no_such_issue(raw: &str) -> bool {
+    let Ok(answer) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    let errors = answer.get("errors").and_then(Value::as_array);
+    errors.is_some_and(|errors| {
+        !errors.is_empty()
+            && errors
+                .iter()
+                .all(|e| text_at(e, &["type"]) == "NOT_FOUND" && e.get("path") == Some(&json!(["repository", "issue"])))
+    })
+}
+
+/// The issue, or `None` when GitHub says the number is not an issue of this
+/// repo. A request that failed is an error, never `None`: a number skipped
+/// because gh was rate-limited would look the same as a PR number.
+fn fetch(repo: &str, claim: &str, n: u64) -> Res<Option<Fetched>> {
+    let failed = |why: String| Fail::failed(format!("{why}: reading #{n} of {repo}"));
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| Fail::usage(format!("'{repo}' is not owner/repo")))?;
     let query = format!("query={QUERY}");
-    let raw = gh::read(&[
+    let (rc, raw) = gh::read_raw(&[
         "api",
         "graphql",
         "-f",
@@ -250,12 +271,19 @@ fn fetch(repo: &str, claim: &str, n: u64) -> Option<Fetched> {
         &format!("name={name}"),
         "-F",
         &format!("number={n}"),
-    ])
-    .ok()?;
-    normalise(&raw, repo, claim).filter(|f| match f {
-        Fetched::Whole(i) => i.number == n,
-        Fetched::Partial { .. } => true,
-    })
+    ]);
+    if rc != 0 {
+        return if no_such_issue(&raw) {
+            Ok(None)
+        } else {
+            Err(failed(format!("gh failed (exit {rc})")))
+        };
+    }
+    match normalise(&raw, repo, claim) {
+        Some(Fetched::Whole(i)) if i.number != n => Err(failed(format!("gh answered with #{}", i.number))),
+        Some(fetched) => Ok(Some(fetched)),
+        None => Err(failed("gh answered with something that is not an issue".into())),
+    }
 }
 
 /// The profile's classifier, run in the repo checkout with the issue's text in
@@ -418,7 +446,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                 .find(|i| i.number == n)
                 .cloned()
                 .map(|i| Fetched::Whole(Box::new(i))),
-            None => fetch(&repo, &p.claim_label, n),
+            None => fetch(&repo, &p.claim_label, n)?,
         };
         let issue = match fetched {
             Some(Fetched::Whole(issue)) => *issue,
@@ -433,10 +461,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                 continue;
             }
             None => {
-                // A failed fetch is skipped even if an earlier run left a file for that number.
+                // Skipped even if an earlier run left a file for that number.
                 rows.push(unread(
                     String::new(),
-                    "could not be read as an issue (a PR number, or a gh error)".into(),
+                    format!("is not an issue in {repo} (a PR number, or no such number)"),
                 ));
                 continue;
             }

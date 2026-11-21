@@ -5,7 +5,11 @@
 #
 # Files in $GH_STUB_DIR steer it:
 #   fail                  every call exits 1
-#   graphql-<n>.json      answer to `gh api graphql ... -F number=<n>`
+#   graphql-<n>.json      answer to `gh api graphql ... -F number=<n>`; without
+#                         the file the answer is GitHub's NOT_FOUND body and
+#                         exit 1, as gh gives for a number that is no issue
+#   graphql-<n>.err.json  printed for that call, which then exits 1 (a request
+#                         that failed; the file may be empty)
 #   issue-list.txt        answer to `gh issue list`
 #   tracker-list.json     answer to `gh issue list ... --json number,url,body`
 #                         (publish looking for a tracker it already made);
@@ -23,9 +27,11 @@
 # GH_STUB_CLOSE_NOOP=1    `gh issue close` exits 0 but closes nothing
 #
 # A call it does not know exits 9, so a test cannot pass on a call nobody
-# thought about.
+# thought about. A call made with GH_HOST other than github.com exits 8: the
+# repo is named owner/repo, and only a pinned host says which GitHub that is.
 dir="${GH_STUB_DIR:?the gh stub needs GH_STUB_DIR}"
 if [ -n "${GH_STUB_LOG:-}" ]; then printf '%s\n' "$*" >> "$GH_STUB_LOG"; fi
+if [ "${GH_HOST:-}" != "github.com" ]; then echo "gh stub: GH_HOST is '${GH_HOST:-}'" >&2; exit 8; fi
 if [ -e "$dir/fail" ]; then echo "gh stub: told to fail" >&2; exit 1; fi
 
 answer() { # answer <file>: print it, or fail the way gh does for a missing thing
@@ -38,7 +44,14 @@ case "${1:-} ${2:-}" in
     for arg in "$@"; do
       case "$arg" in number=*) n="${arg#number=}" ;; esac
     done
-    answer "graphql-$n.json" ;;
+    if [ -f "$dir/graphql-$n.err.json" ]; then
+      cat "$dir/graphql-$n.err.json"; exit 1
+    elif [ -f "$dir/graphql-$n.json" ]; then
+      cat "$dir/graphql-$n.json"
+    else
+      printf '%s\n' '{"data":{"repository":{"issue":null}},"errors":[{"type":"NOT_FOUND","path":["repository","issue"],"message":"Could not resolve to an Issue."}]}'
+      exit 1
+    fi ;;
   "issue list")
     if [ -e "$dir/fail-list" ]; then echo "gh stub: list failed" >&2; exit 1; fi
     case "$*" in

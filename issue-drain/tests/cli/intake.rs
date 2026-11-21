@@ -286,7 +286,7 @@ fn the_live_path_reads_graphql_and_normalises_it() {
     };
     env.stub_file("graphql-31.json", &answer(31, "Other repo's PR", "example/other"));
     env.stub_file("graphql-32.json", &answer(32, "This repo's PR", REPO));
-    // #33 and #40 have no answer file: the stub fails for them, as gh does for a missing issue.
+    // #33 and #40 have no answer file: the stub answers NOT_FOUND and exits 1, as gh does for a missing issue.
     let out = env.run(&["intake", "--label", "bug", "--limit", "5", "40"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     let calls = env.gh_calls();
@@ -316,7 +316,10 @@ fn the_live_path_reads_graphql_and_normalises_it() {
     );
     for n in [33, 40] {
         let reason = skipped_reason(&intake, n).unwrap();
-        assert!(reason.starts_with("could not be read as an issue"), "#{n}: {reason}");
+        assert!(
+            reason.starts_with("is not an issue in example/tidepool"),
+            "#{n}: {reason}"
+        );
     }
     assert_eq!(intake["stale_claims"], json!([]));
     assert_eq!(intake["skipped"].as_array().unwrap().len(), 4);
@@ -411,6 +414,36 @@ fn the_list_asks_for_more_than_the_cap_and_reading_stops_when_it_is_full() {
 }
 
 #[test]
+fn a_gh_failure_reading_one_issue_is_exit_1_and_not_a_skipped_row() {
+    // A request that failed says nothing about the issue. Only GitHub's own
+    // "no such issue" answer makes a skipped row.
+    let not_the_issue = json!({"data": {"repository": null}, "errors": [
+        {"type": "NOT_FOUND", "path": ["repository"], "message": "Could not resolve to a Repository"}]});
+    let limited = json!({"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]});
+    for body in [String::new(), limited.to_string(), not_the_issue.to_string()] {
+        let env = Env::new();
+        env.stub_file("issue-list.txt", "5\n");
+        env.stub_file("graphql-5.err.json", &body);
+        let out = env.run(&["intake", "--label", "bug"]);
+        assert_eq!(out.code, 1, "{body}: {}", out.stderr);
+        assert!(out.stderr.contains("reading #5 of example/tidepool"), "{}", out.stderr);
+        assert!(!env.workdir.join("intake.json").exists(), "{body}");
+    }
+}
+
+#[test]
+fn a_gh_host_in_the_environment_does_not_move_the_calls() {
+    // The stub exits 8 for any call whose GH_HOST is not github.com.
+    let mut env = Env::new();
+    env.set("GH_HOST", "ghe.example");
+    env.stub_file("issue-list.txt", "5\n");
+    let out = env.run(&["intake", "--label", "bug"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let out = env.run(&["gh-write", "add-label", "7", "agent-in-progress"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+}
+
+#[test]
 fn a_gh_failure_listing_the_issues_is_exit_1_and_the_control_passes() {
     let env = Env::new();
     env.stub_file("fail", "");
@@ -427,14 +460,14 @@ fn a_gh_failure_listing_the_issues_is_exit_1_and_the_control_passes() {
 }
 
 #[test]
-fn a_failed_fetch_of_one_issue_is_skipped_and_never_reuses_an_old_file() {
+fn a_number_that_is_no_issue_is_skipped_and_never_reuses_an_old_file() {
     let env = Env::new();
     env.write("issues/9.json", &issue(9, &["bug"]).to_string());
     let out = env.run(&["intake", "9"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     let intake = intake_of(&env);
     assert_eq!(intake["eligible"], json!([]));
-    assert!(skipped_reason(&intake, 9).unwrap().starts_with("could not be read"));
+    assert!(skipped_reason(&intake, 9).unwrap().starts_with("is not an issue in"));
 }
 
 #[test]

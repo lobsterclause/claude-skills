@@ -68,18 +68,32 @@ pub struct Written {
     pub stdout: String,
 }
 
-/// Run gh for a read. stdout on exit 0, else gh's exit code. gh's stderr is
-/// dropped: every caller turns a failure into its own message.
+/// gh, with the host pinned. A repo is named `owner/repo`, and the checkout's
+/// origin is checked to be on github.com; a GH_HOST left in the environment
+/// would send the same `owner/repo` to another GitHub.
+fn gh() -> Command {
+    let mut command = Command::new("gh");
+    command.env("GH_HOST", "github.com").stdin(Stdio::null());
+    command
+}
+
+/// Run gh for a read: its exit code and its stdout, whatever the code. gh's
+/// stderr is dropped: every caller turns a failure into its own message.
+pub fn read_raw(args: &[&str]) -> (i32, String) {
+    match gh().args(args).stderr(Stdio::null()).output() {
+        Ok(out) => (
+            out.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        ),
+        Err(_) => (127, String::new()),
+    }
+}
+
+/// Run gh for a read. stdout on exit 0, else gh's exit code.
 pub fn read(args: &[&str]) -> Result<String, i32> {
-    match Command::new("gh")
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
-        Ok(out) => Err(out.status.code().unwrap_or(1)),
-        Err(_) => Err(127),
+    match read_raw(args) {
+        (0, stdout) => Ok(stdout),
+        (rc, _) => Err(rc),
     }
 }
 
@@ -264,11 +278,7 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
 
     // stdout is captured (issue-create prints the new URL there); stderr goes
     // straight through, so gh's own error reaches the person running this.
-    let run = Command::new("gh")
-        .args(&argv)
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output();
+    let run = gh().args(&argv).stderr(Stdio::inherit()).output();
     let (rc, stdout) = match run {
         Ok(out) => (
             out.status.code().unwrap_or(1),
