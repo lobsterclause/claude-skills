@@ -13,7 +13,8 @@
 # prints a WARN naming every untracked path left out. RV_INCLUDE_UNTRACKED=1
 # restores the old behaviour (ship untracked-not-ignored files too).
 #
-# Exit status is the remote verify's exit code (same N as the .out file).
+# Exit status is the remote verify's exit code (same N as the .out file), or
+# 94 if the .out file could not be written.
 # Before #204 the script always exited 0, so a background caller saw success
 # on a failed verify.
 #
@@ -52,17 +53,18 @@ IMAGE="${RV_IMAGE:-kma-verify:22-java}"
 IMAGE_DOCKERFILE='FROM node:22-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends jq shellcheck ripgrep zsh bsdmainutils && rm -rf /var/lib/apt/lists/*'
 case "$HOSTK" in
-  firebird)    SSH="ssh -i $HOME/firebird-handoff/id_ed25519 -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 admin@100.119.118.118"; BASE=/srv/ci/work/rverify; LIM="--cpus=14 --memory=16g";;
-  thunderbird) SSH="ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 thunderbird"; BASE=/home/admin/rverify; LIM="--cpus=14 --memory=12g";;
+  firebird)    SSH=(ssh -i "$HOME/firebird-handoff/id_ed25519" -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 admin@100.119.118.118); BASE=/srv/ci/work/rverify; LIM="--cpus=14 --memory=16g";;
+  thunderbird) SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 thunderbird); BASE=/home/admin/rverify; LIM="--cpus=14 --memory=12g";;
   *) echo "unknown host '$HOSTK'" >&2; exit 2;;
 esac
-SSH="${RV_SSH:-$SSH}"
+# RV_SSH is one executable path (may contain spaces), never word-split.
+[ -n "${RV_SSH:-}" ] && SSH=("$RV_SSH")
 D=$BASE/$N; LOG=$OUTD/rverify-$N.log; OUT=$OUTD/rv-$N.out; rm -f "$OUT"
-if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | $SSH "docker build -q -t kma-verify:22 -"; exit $?; fi
+if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | "${SSH[@]}" "docker build -q -t kma-verify:22 -"; exit $?; fi
 {
   cd "$WT" || { echo "verify exit=97" > "$OUT"; exit 97; }
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
-  $SSH "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || { echo "verify exit=98" > "$OUT"; exit 98; }
+  "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || { echo "verify exit=98" > "$OUT"; exit 98; }
   LSF="--cached"
   if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then LSF="--cached --others --exclude-standard"
   else
@@ -70,19 +72,20 @@ if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | $SSH
     [ -n "$UNTR" ] && { echo "WARN: not shipping $(printf '%s\n' "$UNTR" | wc -l | tr -d ' ') untracked file(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"; printf '%s\n' "$UNTR" | sed 's/^/  /'; }
   fi
   # shellcheck disable=SC2086 # LSF is a deliberate flag list
-  /usr/bin/git ls-files -z $LSF | COPYFILE_DISABLE=1 tar --null -T - -czf - 2>/dev/null | $SSH "tar -xzf - -C $D/w" || { echo "verify exit=99" > "$OUT"; exit 99; }
+  /usr/bin/git ls-files -z $LSF | COPYFILE_DISABLE=1 tar --null -T - -czf - 2>/dev/null | "${SSH[@]}" "tar -xzf - -C $D/w" || { echo "verify exit=99" > "$OUT"; exit 99; }
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""
   if [ "${RV_GH_TOKEN:-0}" = 1 ]; then
-    { printf 'NODE_AUTH_TOKEN='; gh auth token; } | $SSH "umask 077; cat > $D/tok.env" || { echo "verify exit=96" > "$OUT"; exit 96; }
+    { printf 'NODE_AUTH_TOKEN='; gh auth token; } | "${SSH[@]}" "umask 077; cat > $D/tok.env" || { echo "verify exit=96" > "$OUT"; exit 96; }
     ENVF="--env-file $D/tok.env"
   fi
   # RV_INSTALL overrides the install step (default: pnpm frozen install at the repo root).
-  $SSH "cd $D/w && docker run --rm $LIM $ENVF --user \$(id -u):\$(id -g) --name rv-$N -v $D:/m -w /m/w -e HOME=/tmp -e TMPDIR=/m/tmp -e CI=1 -e COREPACK_HOME=/tmp/.corepack $IMAGE bash -c 'set -e; git config --global --add safe.directory /m/w; git init -q; git -c user.email=v@v -c user.name=v add -A; git -c user.email=v@v -c user.name=v commit -q -m snap; mkdir -p /tmp/bin; corepack enable --install-directory /tmp/bin; export PATH=/tmp/bin:\$PATH; ${RV_INSTALL:-pnpm install --frozen-lockfile} 2>&1 | tail -3; ${RV_CMD:-pnpm verify} 2>&1'"
+  "${SSH[@]}" "cd $D/w && docker run --rm $LIM $ENVF --user \$(id -u):\$(id -g) --name rv-$N -v $D:/m -w /m/w -e HOME=/tmp -e TMPDIR=/m/tmp -e CI=1 -e COREPACK_HOME=/tmp/.corepack $IMAGE bash -c 'set -e; git config --global --add safe.directory /m/w; git init -q; git -c user.email=v@v -c user.name=v add -A; git -c user.email=v@v -c user.name=v commit -q -m snap; mkdir -p /tmp/bin; corepack enable --install-directory /tmp/bin; export PATH=/tmp/bin:\$PATH; ${RV_INSTALL:-pnpm install --frozen-lockfile} 2>&1 | tail -3; ${RV_CMD:-pnpm verify} 2>&1'"
   rc=$?
   echo "remote rc=$rc"
-  $SSH "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N"
-  echo "verify exit=$rc" > "$OUT"
+  "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N"
+  # A caller polls for $OUT: never report success when it could not be written.
+  echo "verify exit=$rc" > "$OUT" || { echo "cannot write $OUT"; rc=94; }
 } > "$LOG" 2>&1
 exit "$rc"

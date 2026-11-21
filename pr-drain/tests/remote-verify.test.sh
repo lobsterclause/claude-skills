@@ -9,7 +9,9 @@
 #
 # Red control (run 2026-11-21 against the pre-#204 script with an RV_SSH seam
 # added): 3 of 8 fail ("exit code = 1 on failed verify", "untracked file
-# not shipped", "log WARNs about the untracked file").
+# not shipped", "log WARNs about the untracked file"). Pass-1 review cases
+# (ssh path with a space, inherited RV_INCLUDE_UNTRACKED, unwritable .out):
+# 8 of 10 fail against the first #205 commit.
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -29,7 +31,9 @@ git -C "$R" add a.txt
 git -C "$R" -c user.email=t@t -c user.name=t commit -q -m init
 mkdir -p "$R/pkg/.vitest/json" && echo '{}' > "$R/pkg/.vitest/json/output.json"
 
-cat > "$T/fake-ssh" <<'FAKE'
+mkdir -p "$T/sp ace"
+FSSH="$T/sp ace/fake-ssh" # a space in the path: RV_SSH must not be word-split
+cat > "$FSSH" <<'FAKE'
 #!/bin/bash
 cmd="$*"
 case "$cmd" in
@@ -38,11 +42,12 @@ case "$cmd" in
   *) exit 0 ;;
 esac
 FAKE
-chmod +x "$T/fake-ssh"
+chmod +x "$FSSH"
 
 run() { # rc ship-dir [env...]
   local rc=$1 ship=$2; shift 2
-  env RV_SSH="$T/fake-ssh" RV_OUT_DIR="$T/out" SHIP="$ship" FAKE_RC="$rc" "$@" \
+  # Pin the knobs a caller's shell may have exported; cases override after.
+  env RV_INCLUDE_UNTRACKED=0 RV_BUILD_IMAGE=0 RV_SSH="$FSSH" RV_OUT_DIR="${OUTDIR:-$T/out}" SHIP="$ship" FAKE_RC="$rc" "$@" \
     bash "$S/remote-verify.sh" "$R" probe firebird
 }
 
@@ -57,5 +62,13 @@ run 0 "$T/ship2"; check "exit code = 0 on passed verify" 0 $?
 
 run 0 "$T/ship3" RV_INCLUDE_UNTRACKED=1; check "opt-in run exits 0" 0 $?
 [ -f "$T/ship3/pkg/.vitest/json/output.json" ]; check "RV_INCLUDE_UNTRACKED=1 ships untracked" 0 $?
+
+# Inherited knobs are pinned: an exported RV_INCLUDE_UNTRACKED=1 must not leak in.
+RV_INCLUDE_UNTRACKED=1 run 0 "$T/ship4" >/dev/null
+[ -f "$T/ship4/pkg/.vitest/json/output.json" ]; check "inherited RV_INCLUDE_UNTRACKED ignored" 1 $?
+
+# A passed verify whose .out cannot be written is not reported as success.
+mkdir -p "$T/out5/rv-probe.out"
+OUTDIR="$T/out5" run 0 "$T/ship5"; check "unwritable .out exits 94" 94 $?
 
 exit $fail
