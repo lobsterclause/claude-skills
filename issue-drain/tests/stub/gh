@@ -7,6 +7,10 @@
 #   fail                  every call exits 1
 #   graphql-<n>.json      answer to `gh api graphql ... -F number=<n>`
 #   issue-list.txt        answer to `gh issue list`
+#   tracker-list.json     answer to `gh issue list ... --json number,url,body`
+#                         (publish looking for a tracker it already made);
+#                         without the file the answer is []
+#   fail-list             `gh issue list` exits 1
 #   issue-view-<n>.json   answer to `gh issue view <n>`
 #   issue-view-<n>.next.json  the answer from the second view of <n> onward
 #                         (someone edited it after the first read)
@@ -36,7 +40,13 @@ case "${1:-} ${2:-}" in
     done
     answer "graphql-$n.json" ;;
   "issue list")
-    if [ -f "$dir/issue-list.txt" ]; then cat "$dir/issue-list.txt"; fi ;;
+    if [ -e "$dir/fail-list" ]; then echo "gh stub: list failed" >&2; exit 1; fi
+    case "$*" in
+      *"--json number,url,body"*)
+        if [ -f "$dir/tracker-list.json" ]; then cat "$dir/tracker-list.json"; else echo "[]"; fi ;;
+      *)
+        if [ -f "$dir/issue-list.txt" ]; then cat "$dir/issue-list.txt"; fi ;;
+    esac ;;
   "issue view")
     if [ -e "$dir/closed-$3" ] && [ -f "$dir/issue-view-$3.json" ]; then
       sed 's/"state" *: *"[A-Z]*"/"state":"CLOSED"/' "$dir/issue-view-$3.json"

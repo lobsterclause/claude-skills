@@ -8,6 +8,8 @@
 //!   - [`parse_body`]: a body and the queue in, a [`Parsed`] out; no I/O;
 //!   - [`fetch_tracker`]: reads the live tracker through gh, then the same.
 
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -124,8 +126,13 @@ pub fn parse_body(body: &str, queue: &Queue) -> Res<Parsed> {
     parse_body_for(body, queue, &queue.run)
 }
 
+/// The lines of a body, with or without CRLF endings.
+fn lines_of(body: &str) -> Vec<&str> {
+    body.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect()
+}
+
 fn parse_body_for(body: &str, queue: &Queue, run: &str) -> Res<Parsed> {
-    let lines: Vec<&str> = body.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let lines = lines_of(body);
 
     let marker = captures(&lines, &MARKER).first().copied();
     if marker != Some(run) {
@@ -204,7 +211,102 @@ fn load_queue(ctx: &Ctx) -> Res<Queue> {
             ctx.workdir.display()
         )));
     }
-    read_json(&path).ok_or_else(|| Fail::usage(format!("{} is not a queue", path.display())))
+    let queue: Queue = read_json(&path).ok_or_else(|| Fail::usage(format!("{} is not a queue", path.display())))?;
+    // A queue is published to, and read against, the repo it was rendered for.
+    // GitHub does not tell owner and repo names apart by case.
+    let repo = ctx.repo()?;
+    if !queue.repo.eq_ignore_ascii_case(&repo) {
+        return Err(Fail::usage(format!(
+            "this queue was rendered for {}, and ISSUE_DRAIN_REPO is {repo}",
+            queue.repo
+        )));
+    }
+    Ok(queue)
+}
+
+/// Held while a publish runs, so two cannot both create a tracker. The file
+/// is removed when the publish returns.
+struct Lock(PathBuf);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn lock(ctx: &Ctx) -> Res<Lock> {
+    let path = ctx.path("publish.lock");
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(_) => Ok(Lock(path)),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(Fail::refused(format!(
+            "another publish of this run is in progress ({} exists); if none is, remove that file",
+            path.display()
+        ))),
+        Err(e) => Err(Fail::failed(format!("cannot create {}: {e}", path.display()))),
+    }
+}
+
+/// An open tracker issue this run already created: the viewer's own, carrying
+/// the tracker label and this run's marker line. A publish that died between
+/// `gh issue create` and tracker.json leaves one, and a second create would
+/// leave two trackers for one queue.
+fn existing(ctx: &Ctx, run: &str) -> Res<Option<(u64, String)>> {
+    let repo = ctx.repo()?;
+    let unreadable = || {
+        Fail::failed(format!(
+            "could not list the open trackers of {repo}, so nothing was created"
+        ))
+    };
+    let raw = gh::read(&[
+        "issue",
+        "list",
+        "--repo",
+        &repo,
+        "--label",
+        &ctx.profile.tracker_label,
+        "--author",
+        "@me",
+        "--state",
+        "open",
+        "--limit",
+        "100",
+        "--json",
+        "number,url,body",
+    ])
+    .map_err(|_| unreadable())?;
+    let issues: Vec<Value> = serde_json::from_str(&raw).map_err(|_| unreadable())?;
+    Ok(issues.iter().find_map(|issue| {
+        let lines = lines_of(issue["body"].as_str()?);
+        if captures(&lines, &MARKER).first().copied() != Some(run) {
+            return None;
+        }
+        Some((issue["number"].as_u64()?, issue["url"].as_str()?.to_string()))
+    }))
+}
+
+/// Write tracker.json and the `tracker-<n>` link, log `event` and print the URL.
+fn record(ctx: &Ctx, event: &str, number: u64, url: &str, run: String) -> Res<()> {
+    let published = Published {
+        number,
+        url: url.to_string(),
+        run,
+        published_at: rfc3339(ctx.now()),
+    };
+    write_json(&ctx.path("tracker.json"), &published)?;
+
+    // Find the run by its tracker number later: <repo folder>/tracker-<n> -> this run.
+    if let Some(parent) = ctx.workdir.parent() {
+        let link = parent.join(format!("tracker-{number}"));
+        let _ = fs::remove_file(&link);
+        let _ = std::os::unix::fs::symlink(&ctx.workdir, link);
+    }
+    ctx.event(
+        event,
+        json!({"number": published.number, "url": published.url, "run": published.run,
+               "published_at": published.published_at}),
+    )?;
+    println!("{url}");
+    Ok(())
 }
 
 pub fn publish(ctx: &Ctx, _args: &PublishArgs) -> Res<()> {
@@ -215,11 +317,21 @@ pub fn publish(ctx: &Ctx, _args: &PublishArgs) -> Res<()> {
             "nothing to publish; run `issue-drain tracker render` first",
         ));
     }
+    // The lock comes first: the check below is only true for as long as no
+    // other publish can write tracker.json.
+    let _lock = lock(ctx)?;
     if saved.exists() {
         let url = read_json::<Published>(&saved).map(|p| p.url).unwrap_or_default();
         return Err(Fail::refused(format!("already published: {url}")));
     }
     let queue = load_queue(ctx)?;
+
+    // A dry run reads nothing from GitHub, as everywhere else.
+    if !ctx.dry_run
+        && let Some((number, url)) = existing(ctx, &run)?
+    {
+        return record(ctx, "tracker_adopted", number, &url, run);
+    }
 
     gh::write(
         ctx,
@@ -249,27 +361,7 @@ pub fn publish(ctx: &Ctx, _args: &PublishArgs) -> Res<()> {
             made.stdout.trim()
         )));
     };
-    let published = Published {
-        number,
-        url: url.to_string(),
-        run,
-        published_at: rfc3339(ctx.now()),
-    };
-    write_json(&saved, &published)?;
-
-    // Find the run by its tracker number later: <repo folder>/tracker-<n> -> this run.
-    if let Some(parent) = ctx.workdir.parent() {
-        let link = parent.join(format!("tracker-{number}"));
-        let _ = std::fs::remove_file(&link);
-        let _ = std::os::unix::fs::symlink(&ctx.workdir, link);
-    }
-    ctx.event(
-        "tracker_published",
-        json!({"number": published.number, "url": published.url, "run": published.run,
-               "published_at": published.published_at}),
-    )?;
-    println!("{url}");
-    Ok(())
+    record(ctx, "tracker_published", number, url, run)
 }
 
 pub fn parse(ctx: &Ctx, args: &ParseArgs) -> Res<()> {
@@ -282,8 +374,7 @@ pub fn parse(ctx: &Ctx, args: &ParseArgs) -> Res<()> {
             if !file.is_file() {
                 return Err(Fail::usage(format!("no body file at {}", file.display())));
             }
-            let bytes =
-                std::fs::read(file).map_err(|e| Fail::failed(format!("cannot read {}: {e}", file.display())))?;
+            let bytes = fs::read(file).map_err(|e| Fail::failed(format!("cannot read {}: {e}", file.display())))?;
             (String::from_utf8_lossy(&bytes).into_owned(), None)
         }
     };

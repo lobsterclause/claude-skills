@@ -391,14 +391,15 @@ fn publish_ensures_the_label_then_creates_the_issue() {
 
     let body = env.workdir.join("tracker.md").display().to_string();
     let calls = env.gh_calls();
-    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    assert_eq!(calls[0], tracker_list_call());
     assert!(
-        calls[0].starts_with(&format!("label list --repo {REPO} --search issue-drain")),
+        calls[1].starts_with(&format!("label list --repo {REPO} --search issue-drain")),
         "{calls:?}"
     );
-    assert_eq!(calls[1], format!("label create issue-drain --repo {REPO}"));
+    assert_eq!(calls[2], format!("label create issue-drain --repo {REPO}"));
     assert_eq!(
-        calls[2],
+        calls[3],
         format!(
             "issue create --repo {REPO} --title {} --body-file {body} --label issue-drain",
             title()
@@ -430,9 +431,140 @@ fn publish_leaves_an_existing_label_alone() {
     let out = env.run(&["tracker", "publish"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     let calls = env.gh_calls();
-    assert_eq!(calls.len(), 2, "{calls:?}");
-    assert!(calls[0].starts_with("label list"));
-    assert!(calls[1].starts_with("issue create"));
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(calls[0].starts_with("issue list"));
+    assert!(calls[1].starts_with("label list"));
+    assert!(calls[2].starts_with("issue create"));
+}
+
+fn tracker_list_call() -> String {
+    format!("issue list --repo {REPO} --label issue-drain --author @me --state open --limit 100 --json number,url,body")
+}
+
+fn listed(env: &Env, number: u64, body: &str) {
+    let url = format!("https://github.com/{REPO}/issues/{number}");
+    env.stub_file(
+        "tracker-list.json",
+        &json!([
+            {"number": 7, "url": "https://github.com/example/tidepool/issues/7", "body": "some other issue"},
+            {"number": number, "url": url, "body": body},
+        ])
+        .to_string(),
+    );
+}
+
+#[test]
+fn a_tracker_this_run_already_created_is_adopted_and_not_created_again() {
+    // A publish that died after `gh issue create` left an issue and no tracker.json.
+    let env = publish_env();
+    listed(&env, 4100, &tracker_md().replace('\n', "\r\n"));
+    let out = env.run(&["tracker", "publish"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stdout, "https://github.com/example/tidepool/issues/4100\n");
+    assert_eq!(env.gh_calls(), [tracker_list_call()]);
+    assert_eq!(json(&env.workdir.join("tracker.json"))["number"], 4100);
+    assert_eq!(
+        fs::read_link(env.dir.path().join("tracker-4100")).expect("a symlink"),
+        env.workdir
+    );
+    assert_eq!(env.events_named("tracker_adopted")[0]["number"], 4100);
+    assert!(env.events_named("tracker_published").is_empty());
+}
+
+#[test]
+fn another_runs_tracker_is_not_adopted() {
+    let env = publish_env();
+    listed(&env, 4100, &tracker_md().replace("run=run", "run=other"));
+    let out = env.run(&["tracker", "publish"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(json(&env.workdir.join("tracker.json"))["number"], 900);
+    assert!(env.events_named("tracker_adopted").is_empty());
+    assert_eq!(env.events_named("tracker_published").len(), 1);
+}
+
+#[test]
+fn a_publish_that_cannot_list_the_trackers_creates_nothing() {
+    let env = publish_env();
+    env.stub_file("fail-list", "");
+    let out = env.run(&["tracker", "publish"]);
+    assert_eq!(out.code, 1);
+    assert!(
+        out.stderr.contains("could not list the open trackers"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(env.gh_calls().len(), 1);
+    assert!(!env.workdir.join("tracker.json").exists());
+    assert!(!env.workdir.join("publish.lock").exists(), "the lock is released");
+
+    env.stub_file("tracker-list.json", "not json");
+    fs::remove_file(env.stub.join("fail-list")).expect("remove fail-list");
+    assert_eq!(env.run(&["tracker", "publish"]).code, 1);
+    assert!(!env.workdir.join("tracker.json").exists());
+
+    // Control: a list that reads lets the publish through.
+    fs::remove_file(env.stub.join("tracker-list.json")).expect("remove the list");
+    assert_eq!(env.run(&["tracker", "publish"]).code, 0);
+}
+
+#[test]
+fn a_publish_while_another_holds_the_lock_is_refused_before_any_gh_call() {
+    let env = publish_env();
+    let lock = env.write("publish.lock", "");
+    let out = env.run(&["tracker", "publish"]);
+    assert_eq!(out.code, 3);
+    assert!(
+        out.stderr.contains("another publish of this run is in progress"),
+        "{}",
+        out.stderr
+    );
+    assert!(env.gh_calls().is_empty());
+    assert!(lock.exists(), "a lock someone else holds is left alone");
+
+    // Control: with the lock gone the publish runs, and leaves no lock behind.
+    fs::remove_file(&lock).expect("remove the lock");
+    assert_eq!(env.run(&["tracker", "publish"]).code, 0);
+    assert!(!lock.exists());
+}
+
+#[test]
+fn a_queue_rendered_for_another_repo_is_not_published_or_parsed() {
+    let mut env = publish_env();
+    let body = env.write("body.md", &tracker_md()).display().to_string();
+    env.set("ISSUE_DRAIN_REPO", "example/other");
+    for args in [
+        vec!["tracker", "publish"],
+        vec!["tracker", "parse", "--body-file", &body],
+    ] {
+        let out = env.run(&args);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr
+                .contains("this queue was rendered for example/tidepool, and ISSUE_DRAIN_REPO is example/other"),
+            "{}",
+            out.stderr
+        );
+    }
+    assert!(env.gh_calls().is_empty());
+    assert!(!env.workdir.join("publish.lock").exists());
+
+    // Control: the same repo in another case is the same repo.
+    env.set("ISSUE_DRAIN_REPO", "Example/Tidepool");
+    assert_eq!(env.run(&["tracker", "parse", "--body-file", &body]).code, 0);
+}
+
+#[test]
+fn a_run_reached_through_its_tracker_link_keeps_its_run_id() {
+    // publish leaves <repo folder>/tracker-<n> -> the run folder. The run id
+    // is the real folder's name, not the link's.
+    let mut env = Env::new();
+    let body = with_body(&env, &tracker_md());
+    let link = env.dir.path().join("tracker-900");
+    std::os::unix::fs::symlink(&env.workdir, &link).expect("a symlink");
+    env.set("ISSUE_DRAIN_WORKDIR", &link.display().to_string());
+    let out = env.run(&["tracker", "parse", "--body-file", &body]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(parsed(&out)["run"], "run");
 }
 
 #[test]

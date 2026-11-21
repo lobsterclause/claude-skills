@@ -129,9 +129,11 @@ impl Ctx {
     }
 
     /// The run id is the run folder's name. It goes into the tracker's marker
-    /// line, so its shape is checked.
+    /// line, so its shape is checked. The name is the real folder's: a run
+    /// reached through its `tracker-<n>` link, or as `<run>/.`, is the same run.
     pub fn run_id(&self) -> Res<String> {
-        let name = self.workdir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let real = fs::canonicalize(&self.workdir).unwrap_or_else(|_| self.workdir.clone());
+        let name = real.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         if is_slug(name) {
             Ok(name.to_string())
         } else {
