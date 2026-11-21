@@ -81,7 +81,7 @@ finish() { echo "verify exit=$1" > "$OUT" || { echo "cannot write $OUT"; exit 94
 exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
 {
   cd "$WT" || finish 97
-  echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
+  echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain --ignore-submodules=none | wc -l | tr -d ' ')"
   # Which command this run is for. issue-drain's stamp-remote-pass reads it: a
   # run of one test file must not count as the full verify.
   echo "cmd=${RV_CMD:-pnpm verify}"
@@ -220,7 +220,7 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   # computed like the header: a stamp must be for the tree that was shipped,
   # not the one the header saw before the stream ran.
   UNSHIPPED=$(count_unshipped .) || { echo "counting unshipped submodules failed"; fail_clean 99; }
-  echo "shipped head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ') unshipped=$UNSHIPPED"
+  echo "shipped head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain --ignore-submodules=none | wc -l | tr -d ' ') unshipped=$UNSHIPPED"
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""

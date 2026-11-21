@@ -18,7 +18,7 @@ struct Case {
     stamped: PathBuf,
 }
 
-const GOOD_LOG: &str = "host=firebird head={head} dirty=0\ncmd=pnpm verify\nshipped head={head} dirty=0 unshipped=0\nsome verify output\nverify passed\nremote rc=0\nverify exit=0\n";
+const GOOD_LOG: &str = "host=firebird head={head} dirty=0\ncmd=pnpm verify\nshipped head={head} dirty=0 unshipped=0\nsome verify output\nverify passed\nremote rc=0\n";
 
 fn case_with(extra: &str) -> Case {
     let mut env = Env::new();
@@ -58,6 +58,8 @@ impl Case {
         let text = text.replace("{head}", &self.head);
         let path = self.env.dir.path().join("rverify-x.log");
         fs::write(&path, text).expect("the log");
+        // The wrapper's own result, written beside the log when it finishes.
+        fs::write(self.env.dir.path().join("rv-x.out"), "verify exit=0\n").expect("the out file");
         path
     }
 
@@ -105,13 +107,17 @@ fn a_full_verify_that_passed_at_the_head_is_stamped() {
 }
 
 #[test]
-fn the_exit_line_may_be_in_the_out_file_beside_the_log() {
+fn a_run_cut_short_with_an_exit_line_printed_by_the_command_is_not_stamped() {
     let c = case();
+    // The command printed `verify exit=0` and `remote rc=0` itself; the wrapper
+    // never got to write its result, so there is no .out file.
     let log = c.log(
-        "host=firebird head={head} dirty=0\ncmd=pnpm verify\nshipped head={head} dirty=0 unshipped=0\nverify output\n",
+        "host=firebird head={head} dirty=0\ncmd=pnpm verify\nshipped head={head} dirty=0 unshipped=0\nverify exit=0\nremote rc=0\n",
     );
+    fs::remove_file(c.env.dir.path().join("rv-x.out")).expect("remove the out file");
     let out = c.stamp(&log, &c.head.clone());
-    c.refused(&out, "verify exit");
+    c.refused(&out, ".out file");
+    // With the wrapper's result beside it, the same log is stamped.
     fs::write(c.env.dir.path().join("rv-x.out"), "verify exit=0\n").expect("the out file");
     let out = c.stamp(&log, &c.head.clone());
     assert_eq!(out.code, 0, "{}", out.stderr);
@@ -236,14 +242,11 @@ fn a_profile_that_names_no_full_verify_command_refuses_everything() {
 
 #[test]
 fn a_nonzero_verify_exit_is_refused() {
-    for tail in [
-        "remote rc=1\nverify exit=1\n",
-        "remote rc=0\nverify exit=1\n",
-        "remote rc=1\nverify exit=0\n",
-    ] {
+    for (rc, exit) in [("1", "1"), ("0", "1"), ("1", "0")] {
         let c = case();
-        let log = GOOD_LOG.replace("remote rc=0\nverify exit=0\n", tail);
-        let out = c.stamp(&c.log(&log), &c.head.clone());
+        let log = c.log(&GOOD_LOG.replace("remote rc=0", &format!("remote rc={rc}")));
+        fs::write(c.env.dir.path().join("rv-x.out"), format!("verify exit={exit}\n")).expect("the out file");
+        let out = c.stamp(&log, &c.head.clone());
         c.refused(&out, "exit");
     }
 }
@@ -251,11 +254,8 @@ fn a_nonzero_verify_exit_is_refused() {
 #[test]
 fn a_log_with_no_exit_line_is_refused() {
     let c = case();
-    let out = c.stamp(
-        &c.log(&GOOD_LOG.replace("remote rc=0\nverify exit=0\n", "")),
-        &c.head.clone(),
-    );
-    c.refused(&out, "verify exit");
+    let out = c.stamp(&c.log(&GOOD_LOG.replace("remote rc=0\n", "")), &c.head.clone());
+    c.refused(&out, "remote rc");
 }
 
 #[test]
@@ -310,6 +310,56 @@ fn a_dirty_worktree_is_refused() {
     for (name, text) in [("untracked.txt", "x\n"), ("README.md", "changed\n")] {
         let c = case();
         fs::write(c.wt.join(name), text).expect("the file");
+        let out = c.stamp(&c.log(GOOD_LOG), &c.head.clone());
+        c.refused(&out, "not clean");
+    }
+}
+
+#[test]
+fn a_modified_file_in_a_submodule_that_git_is_told_to_ignore_is_refused() {
+    for ignore in ["dirty", "all"] {
+        let mut c = case();
+        let dir = c.env.dir.path().to_path_buf();
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).expect("the submodule dir");
+        git(&sub, &["init", "-q"]);
+        fs::write(sub.join("s.txt"), "s\n").expect("the file");
+        git(&sub, &["add", "s.txt"]);
+        let who = ["-c", "user.name=T", "-c", "user.email=t@example.invalid"];
+        let commit = |repo: &Path, msg: &'static str| {
+            let mut args = who.to_vec();
+            args.extend(["commit", "-q", "-m", msg]);
+            git(repo, &args);
+        };
+        commit(&sub, "s");
+        git(
+            &c.wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "-q",
+                "add",
+                &sub.display().to_string(),
+                "vendor",
+            ],
+        );
+        commit(&c.wt, "add the submodule");
+        c.head = git(&c.wt, &["rev-parse", "HEAD"]);
+        c.tree = git(&c.wt, &["rev-parse", "HEAD^{tree}"]);
+        // Clean at first.
+        let out = c.stamp(&c.log(GOOD_LOG), &c.head.clone());
+        assert_eq!(out.code, 0, "{ignore}: {}", out.stderr);
+        fs::remove_file(&c.stamped).expect("reset");
+        fs::remove_file(c.stamp_file()).expect("reset");
+        // A tracked file inside it changes while git is told not to look.
+        git(&c.wt, &["config", "submodule.vendor.ignore", ignore]);
+        fs::write(c.wt.join("vendor/s.txt"), "changed\n").expect("the file");
+        assert_eq!(
+            git(&c.wt, &["status", "--porcelain"]),
+            "",
+            "{ignore}: plain status is blind to it"
+        );
         let out = c.stamp(&c.log(GOOD_LOG), &c.head.clone());
         c.refused(&out, "not clean");
     }

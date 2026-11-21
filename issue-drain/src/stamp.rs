@@ -22,10 +22,16 @@
 //!     would otherwise be verified remotely and stamped for the clean tree;
 //!   - the log records the command that ran, as a `cmd=<command>` line among its
 //!     first lines, and it is the profile's `full_verify_command`, word for word;
-//!   - every exit it shows is 0: `verify exit=N` and `remote rc=N` lines in the
-//!     log, and the same lines in the `rv-<name>.out` file that
-//!     `rverify-<name>.log` is written beside. At least one must exist;
-//!   - the unit worktree's HEAD is `--head` and its tree is clean;
+//!   - the wrapper's own result says 0: the `rv-<name>.out` file that
+//!     `rverify-<name>.log` is written beside must exist and hold exactly one
+//!     `verify exit=0`, and the log must hold exactly one `remote rc=` line,
+//!     equal to it. The verify command's output is streamed into the log, so
+//!     an exit line there proves nothing and is not read; a run cut short
+//!     before the wrapper finished has no `.out` file (it is removed at the
+//!     start of each run and written last);
+//!   - the unit worktree's HEAD is `--head` and its tree is clean, where clean
+//!     is `git status --ignore-submodules=none`: a modified file in a
+//!     submodule counts even when git is told to ignore it;
 //!   - the tree hash (`HEAD^{tree}`) and HEAD are the same after the stamp
 //!     command as before it, and the tree is still clean.
 //!
@@ -150,20 +156,46 @@ pub fn judge_log(log: &str, out_file: Option<&str>, head: &str, full_command: &s
         }
     }
 
-    let exits: Vec<&str> = log
-        .lines()
-        .chain(out_file.unwrap_or_default().lines())
-        .filter_map(|line| {
-            let line = line.trim_end();
-            line.strip_prefix("verify exit=")
-                .or_else(|| line.strip_prefix("remote rc="))
-        })
-        .collect();
-    if exits.is_empty() {
-        failed.push("no `verify exit=` line in the log or in the .out file beside it".to_string());
-    }
-    for code in exits.iter().filter(|code| **code != "0") {
-        failed.push(format!("the verify exited {code}, not 0"));
+    // The result is the wrapper's own: its `.out` file, written last and never
+    // streamed, and its one `remote rc=` line. The command's output sits in the
+    // log between the `shipped` line and `remote rc=`, so a line there such as
+    // `verify exit=0` proves nothing, and a run cut short before the wrapper
+    // wrote its result has no .out file. Exit lines in the log are ignored.
+    match out_file {
+        None => failed.push(
+            "no .out file beside the log (rv-<name>.out), so the wrapper never wrote its result: the run was cut short or the file is gone"
+                .to_string(),
+        ),
+        Some(out) => {
+            let exits: Vec<&str> = out
+                .lines()
+                .filter_map(|line| line.trim_end().strip_prefix("verify exit="))
+                .collect();
+            let rcs: Vec<&str> = log
+                .lines()
+                .filter_map(|line| line.trim_end().strip_prefix("remote rc="))
+                .collect();
+            match exits.as_slice() {
+                [] => failed.push("the .out file has no `verify exit=` line".to_string()),
+                [code] => {
+                    if *code != "0" {
+                        failed.push(format!("the verify exited {code}, not 0"));
+                    }
+                    match rcs.as_slice() {
+                        [rc] if rc == code => {}
+                        [rc] => failed.push(format!(
+                            "the log says `remote rc={rc}` but the .out file says `verify exit={code}`"
+                        )),
+                        [] => failed.push("the log has no `remote rc=` line, so it is cut short".to_string()),
+                        many => failed.push(format!(
+                            "the log has {} `remote rc=` lines, not exactly one (the command's output may have printed one)",
+                            many.len()
+                        )),
+                    }
+                }
+                many => failed.push(format!("the .out file has {} `verify exit=` lines, not one", many.len())),
+            }
+        }
     }
     failed
 }
@@ -186,7 +218,19 @@ fn state(dir: &Path) -> Res<(String, String, bool)> {
     Ok((
         git_text(dir, &["rev-parse", "HEAD"])?,
         git_text(dir, &["rev-parse", "HEAD^{tree}"])?,
-        git_text(dir, &["status", "--porcelain", "--untracked-files=all"])?.is_empty(),
+        // `--ignore-submodules=none` overrides `submodule.<name>.ignore`,
+        // `.gitmodules` and `diff.ignoreSubmodules`, which can all hide a
+        // modified file inside a submodule that the verify box was sent.
+        git_text(
+            dir,
+            &[
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+        )?
+        .is_empty(),
     ))
 }
 
@@ -270,6 +314,8 @@ mod tests {
     use super::*;
 
     const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+    /// The wrapper's own result file for a verify that passed.
+    const OK: &str = "verify exit=0\n";
 
     fn good() -> String {
         format!(
@@ -279,45 +325,45 @@ mod tests {
 
     #[test]
     fn a_good_log_has_no_failed_condition() {
-        assert_eq!(judge_log(&good(), None, HEAD, "pnpm verify"), Vec::<String>::new());
-        let no_exit =
+        assert_eq!(judge_log(&good(), Some(OK), HEAD, "pnpm verify"), Vec::<String>::new());
+        let cut =
             format!("host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nshipped head={HEAD} dirty=0 unshipped=0\n");
-        assert!(judge_log(&no_exit, Some("verify exit=0\n"), HEAD, "pnpm verify").is_empty());
+        assert!(judge_log(&cut, Some(OK), HEAD, "pnpm verify")[0].contains("remote rc"));
     }
 
     #[test]
     fn the_shipped_line_is_required_exactly_once_for_the_head_and_clean() {
         let line = format!("shipped head={HEAD} dirty=0 unshipped=0\n");
         let none = good().replace(&line, "");
-        let failed = judge_log(&none, None, HEAD, "pnpm verify");
+        let failed = judge_log(&none, Some(OK), HEAD, "pnpm verify");
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(failed[0].contains("shipped"));
         let twice = good().replace(&line, &format!("{line}{line}"));
-        assert!(judge_log(&twice, None, HEAD, "pnpm verify")[0].contains("not exactly one"));
+        assert!(judge_log(&twice, Some(OK), HEAD, "pnpm verify")[0].contains("not exactly one"));
         let dirty = good().replace(&line, &format!("shipped head={HEAD} dirty=1 unshipped=0\n"));
-        assert!(judge_log(&dirty, None, HEAD, "pnpm verify")[0].contains("dirty"));
+        assert!(judge_log(&dirty, Some(OK), HEAD, "pnpm verify")[0].contains("dirty"));
         let other = good().replace(&line, &format!("shipped head={} dirty=0 unshipped=0\n", "f".repeat(40)));
-        assert!(judge_log(&other, None, HEAD, "pnpm verify")[0].contains("not 0123"));
+        assert!(judge_log(&other, Some(OK), HEAD, "pnpm verify")[0].contains("not 0123"));
         let junk = good().replace(&line, &format!("shipped head={HEAD} dirty=0 unshipped=0 extra=1\n"));
-        assert!(judge_log(&junk, None, HEAD, "pnpm verify")[0].contains("malformed"));
+        assert!(judge_log(&junk, Some(OK), HEAD, "pnpm verify")[0].contains("malformed"));
         // Anchored at the start of the line: an indented copy is no line.
         let indented = good().replace(&line, &format!(" {line}"));
-        assert!(judge_log(&indented, None, HEAD, "pnpm verify")[0].contains("no `shipped"));
+        assert!(judge_log(&indented, Some(OK), HEAD, "pnpm verify")[0].contains("no `shipped"));
     }
 
     #[test]
     fn a_submodule_that_never_reached_the_box_or_a_missing_field_is_refused() {
         let line = format!("shipped head={HEAD} dirty=0 unshipped=0\n");
         let some = good().replace(&line, &format!("shipped head={HEAD} dirty=0 unshipped=2\n"));
-        let failed = judge_log(&some, None, HEAD, "pnpm verify");
+        let failed = judge_log(&some, Some(OK), HEAD, "pnpm verify");
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(failed[0].contains("never reached the box"), "{failed:?}");
         let old_script = good().replace(&line, &format!("shipped head={HEAD} dirty=0\n"));
-        let failed = judge_log(&old_script, None, HEAD, "pnpm verify");
+        let failed = judge_log(&old_script, Some(OK), HEAD, "pnpm verify");
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(failed[0].contains("malformed"), "{failed:?}");
         let junk = good().replace(&line, &format!("shipped head={HEAD} dirty=0 unshipped=x\n"));
-        assert!(judge_log(&junk, None, HEAD, "pnpm verify")[0].contains("never reached the box"));
+        assert!(judge_log(&junk, Some(OK), HEAD, "pnpm verify")[0].contains("never reached the box"));
     }
 
     #[test]
@@ -325,7 +371,7 @@ mod tests {
         let late = format!(
             "host=f head={HEAD} dirty=0\nshipped head={HEAD} dirty=0 unshipped=0\nb\nc\nd\ncmd=pnpm verify\nremote rc=0\n"
         );
-        let failed = judge_log(&late, None, HEAD, "pnpm verify");
+        let failed = judge_log(&late, Some(OK), HEAD, "pnpm verify");
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(failed[0].contains("cmd="));
     }
@@ -339,7 +385,7 @@ mod tests {
             String::new(),
         ] {
             let log = format!("{header}\ncmd=pnpm verify\nshipped head={HEAD} dirty=0 unshipped=0\nremote rc=0\n");
-            let failed = judge_log(&log, None, HEAD, "pnpm verify");
+            let failed = judge_log(&log, Some(OK), HEAD, "pnpm verify");
             assert!(
                 failed.iter().any(|f| f.contains("no head recorded")),
                 "{header:?}: {failed:?}"
@@ -348,18 +394,50 @@ mod tests {
     }
 
     #[test]
-    fn an_exit_line_in_either_place_that_is_not_zero_fails() {
+    fn a_result_that_is_not_zero_or_disagrees_between_log_and_out_file_fails() {
         let log = good();
-        assert_eq!(judge_log(&log, Some("verify exit=3\n"), HEAD, "pnpm verify").len(), 1);
-        assert_eq!(
+        let failed = judge_log(&log, Some("verify exit=3\n"), HEAD, "pnpm verify");
+        assert!(failed.iter().any(|f| f.contains("exited 3")), "{failed:?}");
+        let failed = judge_log(&log.replace("rc=0", "rc=1"), Some(OK), HEAD, "pnpm verify");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        let failed = judge_log(
+            &log.replace("rc=0", "rc=3"),
+            Some("verify exit=3\n"),
+            HEAD,
+            "pnpm verify",
+        );
+        assert_eq!(failed.len(), 1, "{failed:?}");
+    }
+
+    #[test]
+    fn only_the_wrappers_own_result_counts_not_lines_the_command_printed() {
+        // A run cut short before the wrapper wrote its result: the command's
+        // own output carries a forged exit line, and there is no .out file.
+        let cut = format!(
+            "host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nshipped head={HEAD} dirty=0 unshipped=0\nverify exit=0\nremote rc=0\n"
+        );
+        let failed = judge_log(&cut, None, HEAD, "pnpm verify");
+        assert!(failed.iter().any(|f| f.contains(".out")), "{failed:?}");
+        // A log with only a forged exit line and an .out that says it failed.
+        let forged = format!(
+            "host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nshipped head={HEAD} dirty=0 unshipped=0\nverify exit=0\n"
+        );
+        assert!(!judge_log(&forged, Some("verify exit=1\n"), HEAD, "pnpm verify").is_empty());
+        // The wrapper's `remote rc=` line is exactly one, and agrees with the .out file.
+        assert!(!judge_log(&forged, Some("verify exit=0\n"), HEAD, "pnpm verify").is_empty());
+        let twice = format!("{}remote rc=0\n", good());
+        assert!(!judge_log(&twice, Some("verify exit=0\n"), HEAD, "pnpm verify").is_empty());
+        let one_exit_forged = good().replace("remote rc=0\n", "remote rc=1\n");
+        assert!(!judge_log(&one_exit_forged, Some("verify exit=0\n"), HEAD, "pnpm verify").is_empty());
+        // An exit line in the log is ignored: it cannot make a failed .out pass or fail a good one.
+        assert!(
             judge_log(
-                &log.replace("rc=0", "rc=1"),
+                &format!("{}verify exit=1\n", good()),
                 Some("verify exit=0\n"),
                 HEAD,
                 "pnpm verify"
             )
-            .len(),
-            1
+            .is_empty()
         );
     }
 

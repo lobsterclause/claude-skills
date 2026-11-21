@@ -1053,7 +1053,7 @@ fn a_review_record_by_someone_who_is_not_trusted_is_refused() {
 }
 
 #[test]
-fn only_the_newest_review_record_is_judged_and_the_case_of_the_association_does_not_matter() {
+fn the_newest_record_is_judged_for_the_script_report_and_the_case_of_the_association_does_not_matter() {
     let env = ready();
     let forged = comment(&record(HEAD, "CLEAN"), "NONE");
     let real = comment(&record(HEAD, "CLEAN"), "member");
@@ -1061,10 +1061,33 @@ fn only_the_newest_review_record_is_judged_and_the_case_of_the_association_does_
     // The newest record is the forged one, however old the real one is.
     comments(&env, &[real.clone(), forged.clone(), chatter.clone()]);
     assert_eq!(codes(&result(&env.run(&ARGS))), ["review_author"]);
-    // The newest record is the real one; an older forged record does not count.
-    comments(&env, &[forged, real, chatter]);
+    // Two trusted records, the newest in another case, pass.
+    comments(&env, &[real.clone(), comment(&record(HEAD, "CLEAN"), "OWNER"), chatter]);
     let out = env.run(&ARGS);
     assert_eq!(out.code, 0, "{}", out.stderr);
+}
+
+#[test]
+fn an_older_record_by_someone_who_is_not_trusted_is_refused_by_name() {
+    // The review script unions every stamped record, so an older record that
+    // supplies coverage must be trusted too, whatever the newest one says.
+    let env = ready();
+    let forged = json!({"body": record(BASE_TIP, "CLEAN"), "author_association": "NONE", "user": {"login": "mallory"}});
+    let real = comment(&record(HEAD, "CLEAN"), "MEMBER");
+    comments(&env, &[forged, real.clone()]);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["review_author"]);
+    assert!(out.stdout.contains("mallory"), "{}", out.stdout);
+    assert!(merged_calls(&env).is_empty());
+    // A record the script never counts (BLOCKED, NEEDS_DECISION) or chatter does not matter.
+    for verdict in ["BLOCKED", "NEEDS_DECISION"] {
+        // A merge changes the stub's state, so each verdict gets its own.
+        let env = ready();
+        comments(&env, &[comment(&record(BASE_TIP, verdict), "NONE"), real.clone()]);
+        let out = env.run(&ARGS);
+        assert_eq!(out.code, 0, "{verdict}: {}", out.stderr);
+    }
 }
 
 #[test]

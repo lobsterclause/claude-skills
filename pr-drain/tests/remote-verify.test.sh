@@ -318,4 +318,26 @@ check "deleted tracked file is dirty, not unshipped" "shipped head=$H16 dirty=1 
 REPO="$R2" OUTDIR="$T/out42" run 0 "$T/ship42" >/dev/null
 check "ordinary deleted tracked file is not unshipped" 1 "$(grep -c '^shipped head=.* unshipped=0$' "$T/out42/rverify-probe.log")"
 
+# Pass-6: a submodule configured ignore=dirty or ignore=all (or a global
+# diff.ignoreSubmodules) makes plain `git status` read clean while a modified
+# tracked file inside it is shipped; dirty must count it.
+R17="$T/repo17"; S17="$T/sub17"; mkdir -p "$R17" "$S17"
+git -C "$S17" init -q; echo s > "$S17/s.txt"; git -C "$S17" add s.txt
+git -C "$S17" -c user.email=t@t -c user.name=t commit -q -m s
+git -C "$R17" init -q; echo a > "$R17/a.txt"; git -C "$R17" add a.txt
+git -C "$R17" -c protocol.file.allow=always submodule -q add "$S17" vendor 2>/dev/null
+git -C "$R17" -c user.email=t@t -c user.name=t commit -q -m sub
+H17=$(git -C "$R17" rev-parse HEAD)
+echo changed > "$R17/vendor/s.txt"
+for mode in dirty all; do
+  git -C "$R17" config submodule.vendor.ignore $mode
+  REPO="$R17" OUTDIR="$T/out50$mode" run 0 "$T/ship50$mode" >/dev/null
+  check "submodule ignore=$mode: header counts the modified file" "host=firebird head=$H17 dirty=1" "$(sed -n 1p "$T/out50$mode/rverify-probe.log")"
+  check "submodule ignore=$mode: shipped line counts it" "shipped head=$H17 dirty=1 unshipped=0" "$(grep '^shipped head=' "$T/out50$mode/rverify-probe.log")"
+done
+git -C "$R17" config --unset submodule.vendor.ignore
+git -C "$R17" config diff.ignoreSubmodules all
+REPO="$R17" OUTDIR="$T/out50g" run 0 "$T/ship50g" >/dev/null
+check "diff.ignoreSubmodules=all: header counts the modified file" "host=firebird head=$H17 dirty=1" "$(sed -n 1p "$T/out50g/rverify-probe.log")"
+
 exit $fail

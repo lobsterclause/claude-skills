@@ -60,7 +60,13 @@
 //! has an `author_association` in the profile's `trusted_associations` (the list
 //! that decides whose issue text agents see; case does not matter, an empty
 //! list trusts no one) and its stamp names the commit and the CLEAN verdict the
-//! script reported. No record, or comments that cannot be read, refuse too.
+//! script reported. The script also clears a moved head by combining every
+//! stamped record, so an older record can supply coverage the newest lacks; the
+//! gate does not redo that range arithmetic, and refuses (`review_author`,
+//! naming the author) when any older stamped record other than a BLOCKED or
+//! NEEDS_DECISION one was written by an untrusted author. A person must then
+//! merge the PR or remove that comment.
+//! No record, or comments that cannot be read, refuse too.
 //! GitHub's association is what the gate can read; a login is not compared.
 //!
 //! Within one check name and source, the newest entry is kept per workflow run,
@@ -230,6 +236,12 @@ pub struct ReviewRecord {
     pub verdict: String,
 }
 
+/// Whether an `author_association` is in the profile's trusted list (case
+/// does not matter; an empty association or list trusts no one).
+fn is_trusted(trusted: &[String], association: &str) -> bool {
+    !association.is_empty() && trusted.iter().any(|t| t.eq_ignore_ascii_case(association))
+}
+
 /// A required check: the context, and the app it is pinned to (classic
 /// protection `app_id`, ruleset `integration_id`) when it is pinned.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -310,6 +322,9 @@ pub struct Facts {
     /// The newest cross-review record comment on the PR and who wrote it;
     /// `None` when the PR has none.
     pub review_record: Read<Option<ReviewRecord>>,
+    /// Every stamped record comment before the newest one. The script can
+    /// count any of them toward coverage, so each must be trusted too.
+    pub review_earlier: Vec<ReviewRecord>,
     /// The profile's `trusted_associations`: whose record comment counts.
     pub trusted_authors: Vec<String>,
     /// Whether the PR is already in the merge queue.
@@ -602,11 +617,7 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
             format!("PR #{n} has no cross-review record comment"),
         )),
         Ok(Some(rec)) => {
-            let trusted = !rec.association.is_empty()
-                && f.trusted_authors
-                    .iter()
-                    .any(|t| t.eq_ignore_ascii_case(&rec.association));
-            if !trusted {
+            if !is_trusted(&f.trusted_authors, &rec.association) {
                 out.push(refusal(
                     "review_author",
                     format!(
@@ -634,6 +645,33 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                 }
             }
         }
+    }
+
+    // 4c. the older records. The script unions every stamped record it does
+    // not skip (BLOCKED and NEEDS_DECISION cover nothing), so an older record
+    // can supply the coverage the newest lacks. Which commits each one covers
+    // is the script's range arithmetic, not repeated here: any record that
+    // could count must have a trusted author.
+    for older in f
+        .review_earlier
+        .iter()
+        .filter(|r| !matches!(r.verdict.as_str(), "BLOCKED" | "NEEDS_DECISION"))
+        .filter(|r| !is_trusted(&f.trusted_authors, &r.association))
+    {
+        out.push(refusal(
+            "review_author",
+            format!(
+                "an older cross-review record on PR #{n}, stamped at '{}', was written by '{}' ({}), who is not a trusted author; \
+                 the review script may count it toward coverage, so a person must merge the PR or remove that comment",
+                older.sha,
+                older.author,
+                if older.association.is_empty() {
+                    "no association"
+                } else {
+                    &older.association
+                }
+            ),
+        ));
     }
 
     // 5. who reviewed. The proof is for the head; on the preflight path that
@@ -1342,7 +1380,12 @@ fn stamp_of(body: &str) -> Option<(String, String)> {
 /// that is not a list, is an unreadable answer; a body that is absent is just
 /// not a record.
 pub fn parse_review_record(raw: &str) -> Read<Option<ReviewRecord>> {
-    let mut newest = None;
+    parse_review_records(raw).map(|mut all| all.pop())
+}
+
+/// Every stamped record comment, oldest first (the newest is the last).
+pub fn parse_review_records(raw: &str) -> Read<Vec<ReviewRecord>> {
+    let mut all = Vec::new();
     let mut pages = 0;
     for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
         let page = page.map_err(|_| "the answer is not JSON".to_string())?;
@@ -1361,7 +1404,7 @@ pub fn parse_review_record(raw: &str) -> Read<Option<ReviewRecord>> {
                         .unwrap_or_default()
                         .to_string()
                 };
-                newest = Some(ReviewRecord {
+                all.push(ReviewRecord {
                     author: word("/user/login"),
                     association: word("/author_association"),
                     sha,
@@ -1373,7 +1416,7 @@ pub fn parse_review_record(raw: &str) -> Read<Option<ReviewRecord>> {
     if pages == 0 {
         return Err("the answer is empty".into());
     }
-    Ok(newest)
+    Ok(all)
 }
 
 const QUEUE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){isInMergeQueue}}}";
@@ -1424,13 +1467,13 @@ fn threads(repo: &str, pr: u64) -> Read<usize> {
 }
 
 /// The newest cross-review record comment on the PR, and who wrote it.
-fn review_record(repo: &str, pr: u64) -> Read<Option<ReviewRecord>> {
+fn review_records(repo: &str, pr: u64) -> Read<Vec<ReviewRecord>> {
     read_gh(&[
         "api",
         &format!("repos/{repo}/issues/{pr}/comments?per_page=100"),
         "--paginate",
     ])
-    .and_then(|raw| parse_review_record(&raw))
+    .and_then(|raw| parse_review_records(&raw))
     .map_err(|e| format!("the comments of PR #{pr} ({e})"))
 }
 
@@ -1579,6 +1622,15 @@ fn gather(
         _ => None,
     };
 
+    let mut records = review_records(repo, pr);
+    let review_record = records.clone().map(|mut all| all.pop());
+    let review_earlier = records
+        .as_mut()
+        .map(|all| {
+            all.pop();
+            std::mem::take(all)
+        })
+        .unwrap_or_default();
     Facts {
         unit,
         pr,
@@ -1590,7 +1642,8 @@ fn gather(
         required,
         app_runs,
         preflight,
-        review_record: review_record(repo, pr),
+        review_record,
+        review_earlier,
         trusted_authors: ctx.profile.trusted_associations.clone(),
         in_merge_queue: in_merge_queue(repo, pr),
         reviewed_ancestry,
@@ -1904,6 +1957,7 @@ mod tests {
                 head: HEAD.into(),
                 reviewed: HEAD.into(),
             }),
+            review_earlier: Vec::new(),
             review_record: Ok(Some(ReviewRecord {
                 author: "gabe".into(),
                 association: "OWNER".into(),
