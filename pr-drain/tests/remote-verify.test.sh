@@ -16,6 +16,7 @@
 # pass-1 fix commit. Pass-4 cases (stale .out after an image build, tar
 # recursion, masked tar failure, FIFO log): checked red against c6d811c.
 # Pass-5: submodule contents (red against b2c919e's --no-recursion).
+# Pass-6: a submodule's untracked file (red against 4b38fbc).
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -116,8 +117,10 @@ S3="$T/sub"; mkdir -p "$S3"; git -C "$S3" init -q; echo s > "$S3/s.txt"
 git -C "$S3" add s.txt; git -C "$S3" -c user.email=t@t -c user.name=t commit -q -m s
 git -C "$R2" -c protocol.file.allow=always submodule -q add "$S3" vendor 2>/dev/null
 git -C "$R2" -c user.email=t@t -c user.name=t commit -q -m sub
+echo stray > "$R2/vendor/stray.txt"
 REPO="$R2" run 0 "$T/ship13" >/dev/null
 check "submodule contents shipped" 0 "$(exists "$T/ship13/vendor/s.txt")"
+check "untracked file inside a submodule not shipped" 1 "$(exists "$T/ship13/vendor/stray.txt")"
 
 # A local tar failure is 99, not masked by ssh's 0. A tar stub that writes a
 # good stream and then exits 2 keeps this independent of file permissions.

@@ -78,24 +78,28 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   cd "$WT" || finish 97
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || finish 98
-  LSF="--cached"
-  if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then LSF="--cached --others --exclude-standard"
+  INCL=0
+  if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then INCL=1
   else
     UNTR=$(/usr/bin/git ls-files --others --exclude-standard)
     [ -n "$UNTR" ] && { echo "WARN: not shipping $(printf '%s\n' "$UNTR" | wc -l | tr -d ' ') untracked file(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"; printf '%s\n' "$UNTR" | sed 's/^/  /'; }
   fi
-  # Ship git's list as it stands in the working copy. Tracked files deleted
-  # locally are skipped (the box sees what you see). A directory is shipped
-  # only if it is a submodule checkout (tar recurses into it); a directory
-  # that replaced a tracked file is skipped, so its untracked contents stay
-  # home. pipefail: a local git or tar failure is not masked by ssh's status.
-  # shellcheck disable=SC2086 # LSF is a deliberate flag list
+  # Ship git's file list as it stands in the working copy, and nothing else.
+  # --recurse-submodules lists the tracked files inside initialized
+  # submodules, so tar never recurses (--no-recursion): a submodule's
+  # untracked files stay home, and so does a directory that replaced a
+  # tracked file. Tracked files deleted locally are skipped (the box sees
+  # what you see). RV_INCLUDE_UNTRACKED=1 adds the superproject's untracked
+  # files (git can't list --others across submodules). pipefail: a local
+  # git or tar failure is not masked by ssh's status.
   ( set -o pipefail
-    /usr/bin/git ls-files -z $LSF \
+    { /usr/bin/git ls-files -z --cached --recurse-submodules
+      if [ "$INCL" = 1 ]; then /usr/bin/git ls-files -z --others --exclude-standard; fi
+    } \
       | while IFS= read -r -d '' f; do
-          if [ -L "$f" ] || [ -f "$f" ] || { [ -d "$f" ] && [ -e "$f/.git" ]; }; then printf '%s\0' "$f"; fi
+          if [ -L "$f" ] || [ -f "$f" ]; then printf '%s\0' "$f"; fi
         done \
-      | COPYFILE_DISABLE=1 tar --null -T - -czf - \
+      | COPYFILE_DISABLE=1 tar --null --no-recursion -T - -czf - \
       | "${SSH[@]}" "tar -xzf - -C $D/w"
   ) || { echo "shipping the tree failed (git ls-files, tar or ssh)"; finish 99; }
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
