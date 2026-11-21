@@ -191,9 +191,13 @@ pub fn parse_body(body: &str, queue: &Queue) -> Res<Parsed> {
     parse_body_for(body, queue, &queue.run)
 }
 
-/// The lines of a body, with or without CRLF endings.
+/// The lines of a body as GitHub splits them: a line ends at LF, CRLF or a
+/// lone CR, and a byte order mark at the start of the body is not text.
 fn lines_of(body: &str) -> Vec<&str> {
-    body.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect()
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
+    body.split('\n')
+        .flat_map(|l| l.strip_suffix('\r').unwrap_or(l).split('\r'))
+        .collect()
 }
 
 fn parse_body_for(body: &str, queue: &Queue, run: &str) -> Res<Parsed> {

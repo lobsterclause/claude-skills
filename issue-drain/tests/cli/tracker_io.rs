@@ -766,4 +766,22 @@ fn a_comment_marker_inside_a_line_hides_nothing() {
     let out = parse_body(&env, &body);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert_eq!(parsed(&out)["approved_closures"], json!([]));
+
+    // A lone carriage return ends a line for GitHub, and a byte order mark
+    // at the start of the body is not text. A comment after either starts a
+    // line.
+    let body = format!("{}\ntext\r<!-- a note\n{TICKED_CLOSURE} pasted\n", tracker_md());
+    let out = parse_body(&env, &body);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(parsed(&out)["approved_closures"], json!([]));
+
+    let body = format!("\u{feff}<!-- a note\n{TICKED_CLOSURE} pasted\n-->\n{}", tracker_md());
+    let out = parse_body(&env, &body);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(parsed(&out)["approved_closures"], json!([]));
+
+    // Control: a byte order mark before a clean body changes nothing.
+    let out = parse_body(&env, &format!("\u{feff}{}", tracker_md()));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]));
 }
