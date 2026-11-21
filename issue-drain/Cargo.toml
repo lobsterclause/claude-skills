@@ -1,0 +1,31 @@
+[package]
+name = "issue-drain"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Triage a set of GitHub issues and carry each one through to a merged PR"
+publish = false
+
+[lib]
+name = "issue_drain"
+path = "src/lib.rs"
+
+[[bin]]
+name = "issue-drain"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+clap = { version = "4.6.9", features = ["derive"] }
+percent-encoding = "2.3.2"
+regex = "1.13.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+shlex = "2.0.1"
+time = { version = "0.3.45", features = ["parsing", "formatting"] }
+toml = "1.2.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

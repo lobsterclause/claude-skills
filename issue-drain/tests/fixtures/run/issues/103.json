@@ -1,0 +1,17 @@
+{
+  "number": 103,
+  "title": "Countdown shows 1:5 instead of 1:05",
+  "body": "With 65 seconds left the countdown label reads `1:5`. It should read `1:05`.\n\n`countdownLabel` in `src/timer/countdown.ts` builds the string by hand.",
+  "state": "OPEN",
+  "url": "https://example.invalid/tidepool/issues/103",
+  "createdAt": "2026-10-01T09:10:00Z",
+  "updatedAt": "2026-10-01T09:10:00Z",
+  "author": "maintainer",
+  "authorAssociation": "MEMBER",
+  "labels": [
+    "bug",
+    "p1"
+  ],
+  "open_prs": [],
+  "claim_labeled_at": null
+}

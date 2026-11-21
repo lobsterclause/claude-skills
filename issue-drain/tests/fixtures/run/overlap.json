@@ -1,0 +1,68 @@
+{
+  "pairs": [
+    {
+      "a": 103,
+      "b": 106,
+      "relation": "duplicate",
+      "shared_files": [
+        "src/timer/countdown.ts"
+      ],
+      "shared_symbols": [
+        "countdownLabel"
+      ],
+      "note": null
+    },
+    {
+      "a": 104,
+      "b": 105,
+      "relation": "cluster_candidate",
+      "shared_files": [
+        "src/list/paginate.ts"
+      ],
+      "shared_symbols": [
+        "pageCount"
+      ],
+      "note": null
+    }
+  ],
+  "groups": [
+    {
+      "issues": [
+        103,
+        106
+      ],
+      "live": [
+        103
+      ],
+      "files": [
+        "src/timer/countdown.ts"
+      ],
+      "est_lines": 50,
+      "over_cap": false,
+      "over_lines": false,
+      "risk": false
+    },
+    {
+      "issues": [
+        104,
+        105
+      ],
+      "live": [
+        104,
+        105
+      ],
+      "files": [
+        "src/list/paginate.ts",
+        "src/list/render.ts"
+      ],
+      "est_lines": 100,
+      "over_cap": false,
+      "over_lines": false,
+      "risk": false
+    }
+  ],
+  "singles": [
+    108,
+    111
+  ]
+}

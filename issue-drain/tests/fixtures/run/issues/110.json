@@ -1,0 +1,16 @@
+{
+  "number": 110,
+  "title": "App feels slow sometimes",
+  "body": "It was laggy this morning. Not sure what I was doing. Can someone look?",
+  "state": "OPEN",
+  "url": "https://example.invalid/tidepool/issues/110",
+  "createdAt": "2026-10-01T09:45:00Z",
+  "updatedAt": "2026-10-01T09:45:00Z",
+  "author": "someuser",
+  "authorAssociation": "NONE",
+  "labels": [
+    "bug"
+  ],
+  "open_prs": [],
+  "claim_labeled_at": null
+}

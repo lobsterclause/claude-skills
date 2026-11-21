@@ -1,0 +1,41 @@
+{
+  "units": [
+    {
+      "issues": [103, 106],
+      "title": "Zero-pad the countdown seconds with formatDuration",
+      "model": "haiku",
+      "effort": "low",
+      "est_minutes": 30,
+      "test_command": "pnpm vitest run src/timer"
+    },
+    {
+      "issues": [104, 105],
+      "title": "Fix pageCount for totals that divide evenly",
+      "model": "sonnet",
+      "effort": "medium",
+      "est_minutes": 45,
+      "test_command": "pnpm vitest run src/list"
+    },
+    {
+      "issues": [111],
+      "title": "Keep focus in the search box while typing",
+      "model": "sonnet",
+      "effort": "medium",
+      "est_minutes": 45,
+      "test_command": "pnpm vitest run src/search"
+    },
+    {
+      "issues": [108],
+      "title": "Match crisis phrases typed with a curly apostrophe",
+      "model": "sonnet",
+      "effort": "medium",
+      "est_minutes": 60,
+      "test_command": "pnpm vitest run src/crisis",
+      "waits_for": "clinical review"
+    }
+  ],
+  "confirmed_closures": [
+    { "number": 101, "note": "Re-read logout(): the reset is unconditional and nothing else caches the count." }
+  ],
+  "left_out": []
+}

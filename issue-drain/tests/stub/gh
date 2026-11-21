@@ -1,0 +1,57 @@
+#!/bin/sh
+# A stand-in for gh in the CLI tests. The harness puts this folder first on
+# PATH. Every call is appended to $GH_STUB_LOG, one line of arguments each, so
+# a test can assert what was called, and that nothing was.
+#
+# Files in $GH_STUB_DIR steer it:
+#   fail                  every call exits 1
+#   graphql-<n>.json      answer to `gh api graphql ... -F number=<n>`
+#   issue-list.txt        answer to `gh issue list`
+#   issue-view-<n>.json   answer to `gh issue view <n>`
+#   closed-<n>            written by `gh issue close <n>`; from then on
+#                         `gh issue view <n>` reports the state CLOSED
+#   fail-create           `gh issue create` exits 1
+#   fail-comment          `gh issue comment` exits 1
+#   labels.txt            answer to `gh label list`, one name per line
+# GH_STUB_NEW_ISSUE       the number `gh issue create` reports (default 900)
+# GH_STUB_CLOSE_NOOP=1    `gh issue close` exits 0 but closes nothing
+#
+# A call it does not know exits 9, so a test cannot pass on a call nobody
+# thought about.
+dir="${GH_STUB_DIR:?the gh stub needs GH_STUB_DIR}"
+if [ -n "${GH_STUB_LOG:-}" ]; then printf '%s\n' "$*" >> "$GH_STUB_LOG"; fi
+if [ -e "$dir/fail" ]; then echo "gh stub: told to fail" >&2; exit 1; fi
+
+answer() { # answer <file>: print it, or fail the way gh does for a missing thing
+  if [ -f "$dir/$1" ]; then cat "$dir/$1"; else echo "gh stub: no $1" >&2; exit 1; fi
+}
+
+case "${1:-} ${2:-}" in
+  "api graphql")
+    n=""
+    for arg in "$@"; do
+      case "$arg" in number=*) n="${arg#number=}" ;; esac
+    done
+    answer "graphql-$n.json" ;;
+  "issue list")
+    if [ -f "$dir/issue-list.txt" ]; then cat "$dir/issue-list.txt"; fi ;;
+  "issue view")
+    if [ -e "$dir/closed-$3" ] && [ -f "$dir/issue-view-$3.json" ]; then
+      sed 's/"state" *: *"[A-Z]*"/"state":"CLOSED"/' "$dir/issue-view-$3.json"
+    else
+      answer "issue-view-$3.json"
+    fi ;;
+  "issue create")
+    if [ -e "$dir/fail-create" ]; then echo "gh stub: create failed" >&2; exit 1; fi
+    echo "https://github.com/example/tidepool/issues/${GH_STUB_NEW_ISSUE:-900}" ;;
+  "issue close")
+    if [ "${GH_STUB_CLOSE_NOOP:-}" != "1" ]; then : > "$dir/closed-$3"; fi ;;
+  "issue comment")
+    if [ -e "$dir/fail-comment" ]; then echo "gh stub: comment failed" >&2; exit 1; fi ;;
+  "issue edit" | "label create") ;;
+  "label list")
+    if [ -f "$dir/labels.txt" ]; then cat "$dir/labels.txt"; fi ;;
+  *)
+    echo "gh stub: unexpected call: $*" >&2
+    exit 9 ;;
+esac

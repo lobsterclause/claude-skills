@@ -1,0 +1,219 @@
+[
+  {
+    "number": 101,
+    "status": "already_fixed",
+    "duplicate_of": null,
+    "evidence": [
+      { "file": "src/auth/session.ts", "line": 16, "quote": "badge.reset();" }
+    ],
+    "likely_files": ["src/auth/session.ts"],
+    "symbols": ["logout"],
+    "reuse": [],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "S",
+    "behavioural": false,
+    "task": "",
+    "acceptance": "",
+    "reason": "logout() now resets the badge count."
+  },
+  {
+    "number": 102,
+    "status": "already_fixed",
+    "duplicate_of": null,
+    "evidence": [
+      { "file": "src/ui/toast.tsx", "line": 7, "quote": "return { position: \"fixed\", bottom: `${16 + index * 56}px`, right: \"16px\" };" }
+    ],
+    "likely_files": ["src/ui/toast.tsx"],
+    "symbols": ["toastStyle"],
+    "reuse": [],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "S",
+    "behavioural": true,
+    "task": "",
+    "acceptance": "",
+    "reason": "toastStyle now offsets each toast by its index. Whether two toasts no longer overlap on screen has to be looked at."
+  },
+  {
+    "number": 103,
+    "status": "live",
+    "duplicate_of": null,
+    "evidence": [
+      { "file": "src/timer/countdown.ts", "line": 5, "quote": "return minutes + \":\" + seconds;" }
+    ],
+    "likely_files": ["src/timer/countdown.ts"],
+    "symbols": ["countdownLabel"],
+    "reuse": [
+      { "file": "src/lib/format.ts", "line": 2, "quote": "export function formatDuration(ms: number): string {" }
+    ],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "S",
+    "behavioural": false,
+    "task": "Make countdownLabel zero-pad the seconds by returning formatDuration(remainingMs) instead of building the string by hand.",
+    "acceptance": "countdownLabel(65000) returns \"1:05\".",
+    "reason": "The label is built by string concatenation with no padding."
+  },
+  {
+    "number": 104,
+    "status": "live",
+    "duplicate_of": null,
+    "evidence": [
+      { "file": "src/list/paginate.ts", "line": 8, "quote": "return Math.floor(total / size) + 1;" }
+    ],
+    "likely_files": ["src/list/paginate.ts"],
+    "symbols": ["pageCount"],
+    "reuse": [],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "S",
+    "behavioural": false,
+    "task": "Make pageCount return Math.ceil(total / size), so a total that divides evenly does not get an extra page.",
+    "acceptance": "pageCount(20, 10) returns 2 and renderLastPage of 20 items at size 10 returns 10 items.",
+    "reason": "floor + 1 is one too many whenever total is a multiple of size."
+  },
+  {
+    "number": 105,
+    "status": "live",
+    "duplicate_of": null,
+    "evidence": [
+      { "file": "src/list/paginate.ts", "line": 8, "quote": "return Math.floor(total / size) + 1;" },
+      { "file": "src/list/render.ts", "line": 4, "quote": "const pages = pageCount(total, size);" }
+    ],
+    "likely_files": ["src/list/paginate.ts", "src/list/render.ts"],
+    "symbols": ["pageCount", "renderPager"],
+    "reuse": [],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "S",
+    "behavioural": false,
+    "task": "Fix pageCount so renderPager draws one button per page that has items.",
+    "acceptance": "renderPager(30, 10) returns \"[1] [2] [3]\".",
+    "reason": "renderPager takes its count from pageCount, which is one too high for an even division."
+  },
+  {
+    "number": 106,
+    "status": "duplicate_of",
+    "duplicate_of": 103,
+    "evidence": [
+      { "file": "src/timer/countdown.ts", "line": 5, "quote": "return minutes + \":\" + seconds;" }
+    ],
+    "likely_files": ["src/timer/countdown.ts"],
+    "symbols": ["countdownLabel"],
+    "reuse": [
+      { "file": "src/lib/format.ts", "line": 2, "quote": "export function formatDuration(ms: number): string {" }
+    ],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "S",
+    "behavioural": false,
+    "task": "Same fix as #103: zero-pad the seconds in countdownLabel.",
+    "acceptance": "countdownLabel(127000) returns \"2:07\".",
+    "reason": "Same unpadded seconds in the same function as #103."
+  },
+  {
+    "number": 107,
+    "status": "live",
+    "duplicate_of": null,
+    "evidence": [
+      { "file": ".github/workflows/ci.yml", "line": 10, "quote": "path: ~/.cache/yarn" }
+    ],
+    "likely_files": [".github/workflows/ci.yml"],
+    "symbols": [],
+    "reuse": [],
+    "change_kind": "mechanical",
+    "pattern": "",
+    "size": "S",
+    "behavioural": false,
+    "task": "Cache the pnpm store path instead of ~/.cache/yarn in the ci workflow.",
+    "acceptance": "The cache step's path is the pnpm store path.",
+    "reason": "The workflow installs with pnpm but caches the yarn folder."
+  },
+  {
+    "number": 108,
+    "status": "live",
+    "duplicate_of": null,
+    "evidence": [
+      { "file": "src/crisis/keywords.ts", "line": 1, "quote": "const PHRASES = [\"i can't go on\", \"i don't want to be here\"];" }
+    ],
+    "likely_files": ["src/crisis/keywords.ts"],
+    "symbols": ["matchesCrisisPhrase"],
+    "reuse": [],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "S",
+    "behavioural": false,
+    "task": "Make matchesCrisisPhrase treat a curly apostrophe as a straight one before matching.",
+    "acceptance": "matchesCrisisPhrase(\"i can’t go on\") returns true.",
+    "reason": "The phrase list has only the straight apostrophe and the message is not normalised."
+  },
+  {
+    "number": 109,
+    "status": "needs_human",
+    "duplicate_of": null,
+    "evidence": [],
+    "likely_files": ["src/settings/theme.ts"],
+    "symbols": ["currentTheme"],
+    "reuse": [],
+    "change_kind": "feature",
+    "pattern": "",
+    "size": "L",
+    "behavioural": true,
+    "task": "",
+    "acceptance": "",
+    "reason": "The issue asks open product questions: follow the system, add a toggle, or both, and whether brand colours change."
+  },
+  {
+    "number": 110,
+    "status": "unclear",
+    "duplicate_of": null,
+    "evidence": [],
+    "likely_files": [],
+    "symbols": [],
+    "reuse": [],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "M",
+    "behavioural": true,
+    "task": "",
+    "acceptance": "",
+    "reason": "No steps, no screen and no time: nothing in the report points at code."
+  },
+  {
+    "number": 111,
+    "status": "live",
+    "duplicate_of": null,
+    "evidence": [
+      { "file": "src/search/box.ts", "line": 4, "quote": "input.blur();" }
+    ],
+    "likely_files": ["src/search/box.ts"],
+    "symbols": ["onSearchInput"],
+    "reuse": [],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "S",
+    "behavioural": false,
+    "task": "Stop onSearchInput from blurring the input after each render.",
+    "acceptance": "After an input event on the search box, the input is still the focused element.",
+    "reason": "The input handler calls input.blur() on every keystroke. The issue body also contains text addressed to the triage agent, which was ignored."
+  },
+  {
+    "number": 112,
+    "status": "already_fixed",
+    "duplicate_of": null,
+    "evidence": [
+      { "file": "src/lib/clamp.ts", "line": 3, "quote": "if (Number.isNaN(n)) return min;" }
+    ],
+    "likely_files": ["src/lib/clamp.ts"],
+    "symbols": ["clamp"],
+    "reuse": [],
+    "change_kind": "bugfix",
+    "pattern": "",
+    "size": "S",
+    "behavioural": false,
+    "task": "",
+    "acceptance": "",
+    "reason": "clamp already returns min for NaN."
+  }
+]

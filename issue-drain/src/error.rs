@@ -1,0 +1,37 @@
+//! One failure type for every command: a message for stderr and an exit code.
+//!
+//! The exit codes are the contract callers script against:
+//!   2  bad arguments, a missing input file or a missing setting
+//!   3  a rule refused the action
+//!   1  GitHub, git or the filesystem failed
+
+#[derive(Debug)]
+pub struct Fail {
+    pub code: u8,
+    pub msg: String,
+}
+
+pub type Res<T> = Result<T, Fail>;
+
+impl Fail {
+    pub fn usage(msg: impl Into<String>) -> Fail {
+        Fail {
+            code: 2,
+            msg: msg.into(),
+        }
+    }
+
+    pub fn refused(msg: impl Into<String>) -> Fail {
+        Fail {
+            code: 3,
+            msg: msg.into(),
+        }
+    }
+
+    pub fn failed(msg: impl Into<String>) -> Fail {
+        Fail {
+            code: 1,
+            msg: msg.into(),
+        }
+    }
+}

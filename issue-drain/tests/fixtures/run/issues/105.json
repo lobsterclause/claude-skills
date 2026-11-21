@@ -1,0 +1,17 @@
+{
+  "number": 105,
+  "title": "Pager shows one page too many",
+  "body": "30 items, 10 per page. The pager draws `[1] [2] [3] [4]`. There are only three pages of items; the fourth button leads to an empty page.",
+  "state": "OPEN",
+  "url": "https://example.invalid/tidepool/issues/105",
+  "createdAt": "2026-10-01T09:20:00Z",
+  "updatedAt": "2026-10-01T09:20:00Z",
+  "author": "maintainer",
+  "authorAssociation": "MEMBER",
+  "labels": [
+    "bug",
+    "p2"
+  ],
+  "open_prs": [],
+  "claim_labeled_at": null
+}

@@ -1,0 +1,358 @@
+//! Every call to `gh`, and the one path by which issue-drain writes to GitHub.
+//!
+//! Why one write path: pr-drain's poller once merged 12 PRs with 11 review
+//! threads still open, because the thread gate only watched Claude's own Bash
+//! calls. A rule that lives in the one write path cannot be skipped by a
+//! second path. Three rules live in `write`:
+//!   - dry-run is one switch: with ISSUE_DRAIN_DRY_RUN=1 every write prints
+//!     "WOULD: ..." and calls nothing;
+//!   - labels are limited to the three the drain owns (claim, blocked,
+//!     tracker), and only the claim label can be removed;
+//!   - a unit process (ISSUE_DRAIN_MODE=unit) can comment and nothing else.
+//!     Claims, hold labels and closures belong to the driver and the session.
+//!
+//! Bodies come from a file, never from an argument, so issue text never meets
+//! argument parsing.
+
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use serde_json::json;
+
+use crate::ctx::{Ctx, Mode};
+use crate::error::{Fail, Res};
+use crate::text::parse_number;
+
+pub enum Write<'a> {
+    /// Create the tracker issue, labelled with the tracker label.
+    IssueCreate {
+        title: &'a str,
+        body_file: &'a Path,
+    },
+    Comment {
+        number: u64,
+        body_file: &'a Path,
+    },
+    EnsureLabel {
+        label: &'a str,
+    },
+    AddLabel {
+        number: u64,
+        label: &'a str,
+    },
+    RemoveLabel {
+        number: u64,
+        label: &'a str,
+    },
+    CloseIssue {
+        number: u64,
+    },
+}
+
+impl Write<'_> {
+    fn verb(&self) -> &'static str {
+        match self {
+            Write::IssueCreate { .. } => "issue-create",
+            Write::Comment { .. } => "comment",
+            Write::EnsureLabel { .. } => "ensure-label",
+            Write::AddLabel { .. } => "add-label",
+            Write::RemoveLabel { .. } => "remove-label",
+            Write::CloseIssue { .. } => "close-issue",
+        }
+    }
+}
+
+pub struct Written {
+    /// False in a dry run, and when `ensure-label` found the label in place.
+    pub called: bool,
+    pub stdout: String,
+}
+
+/// Run gh for a read. stdout on exit 0, else gh's exit code. gh's stderr is
+/// dropped: every caller turns a failure into its own message.
+pub fn read(args: &[&str]) -> Result<String, i32> {
+    match Command::new("gh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(out) => Err(out.status.code().unwrap_or(1)),
+        Err(_) => Err(127),
+    }
+}
+
+fn refuse(ctx: &Ctx, verb: &str, mode: Mode, why: String) -> Fail {
+    let logged = ctx.event(
+        "gh_write_refused",
+        json!({"verb": verb, "why": why, "mode": mode.as_str()}),
+    );
+    match logged {
+        Ok(()) => Fail::refused(format!("refused: {why}")),
+        Err(e) => e,
+    }
+}
+
+fn need_body(file: &Path) -> Res<()> {
+    match std::fs::metadata(file) {
+        Ok(meta) if meta.is_file() && meta.len() > 0 => Ok(()),
+        _ => Err(Fail::usage(format!(
+            "body file is missing or empty: {}",
+            file.display()
+        ))),
+    }
+}
+
+pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
+    let repo = ctx.repo()?;
+    let mode = ctx.mode()?;
+    let p = &ctx.profile;
+    let verb = w.verb();
+    if mode == Mode::Unit && !matches!(w, Write::Comment { .. }) {
+        return Err(refuse(
+            ctx,
+            verb,
+            mode,
+            format!("a unit process may only comment (asked for '{verb}')"),
+        ));
+    }
+
+    let own = |s: &str| s.to_string();
+    let (what, argv): (String, Vec<String>) = match w {
+        Write::IssueCreate { title, body_file } => {
+            need_body(body_file)?;
+            if title.is_empty() {
+                return Err(Fail::usage("issue-create needs --title"));
+            }
+            (
+                "tracker issue".into(),
+                vec![
+                    own("issue"),
+                    own("create"),
+                    own("--repo"),
+                    repo,
+                    own("--title"),
+                    own(title),
+                    own("--body-file"),
+                    body_file.display().to_string(),
+                    own("--label"),
+                    p.tracker_label.clone(),
+                ],
+            )
+        }
+        Write::Comment { number, body_file } => {
+            need_body(body_file)?;
+            (
+                format!("comment on #{number}"),
+                vec![
+                    own("issue"),
+                    own("comment"),
+                    number.to_string(),
+                    own("--repo"),
+                    repo,
+                    own("--body-file"),
+                    body_file.display().to_string(),
+                ],
+            )
+        }
+        Write::EnsureLabel { label } => {
+            if ![&p.claim_label, &p.blocked_label, &p.tracker_label]
+                .iter()
+                .any(|l| l == label)
+            {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!(
+                        "'{label}' is not a label the drain owns ({}, {}, {})",
+                        p.claim_label, p.blocked_label, p.tracker_label
+                    ),
+                ));
+            }
+            if !ctx.dry_run {
+                let listed = read(&[
+                    "label", "list", "--repo", &repo, "--search", label, "--json", "name", "--jq", ".[].name",
+                ])
+                .map_err(|rc| Fail::failed(format!("could not list the labels of {repo} (gh exit {rc})")))?;
+                if listed.lines().any(|name| crate::profile::same_label(name, label)) {
+                    return Ok(Written {
+                        called: false,
+                        stdout: String::new(),
+                    });
+                }
+            }
+            // No --force: an existing label keeps the colour and text its owner gave it.
+            (
+                format!("label {label}"),
+                vec![own("label"), own("create"), own(label), own("--repo"), repo],
+            )
+        }
+        Write::AddLabel { number, label } => {
+            if *label != p.claim_label && *label != p.blocked_label {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!(
+                        "may only add '{}' or '{}' (asked for '{label}')",
+                        p.claim_label, p.blocked_label
+                    ),
+                ));
+            }
+            (
+                format!("add {label} to #{number}"),
+                vec![
+                    own("issue"),
+                    own("edit"),
+                    number.to_string(),
+                    own("--repo"),
+                    repo,
+                    own("--add-label"),
+                    own(label),
+                ],
+            )
+        }
+        Write::RemoveLabel { number, label } => {
+            if *label != p.claim_label {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!("may only remove '{}' (asked for '{label}')", p.claim_label),
+                ));
+            }
+            (
+                format!("remove {label} from #{number}"),
+                vec![
+                    own("issue"),
+                    own("edit"),
+                    number.to_string(),
+                    own("--repo"),
+                    repo,
+                    own("--remove-label"),
+                    own(label),
+                ],
+            )
+        }
+        Write::CloseIssue { number } => (
+            format!("close #{number}"),
+            vec![
+                own("issue"),
+                own("close"),
+                number.to_string(),
+                own("--repo"),
+                repo,
+                own("--reason"),
+                own("completed"),
+            ],
+        ),
+    };
+
+    if ctx.dry_run {
+        let mut words = vec!["gh"];
+        words.extend(argv.iter().map(String::as_str));
+        let printable = shlex::try_join(words).unwrap_or_else(|_| format!("gh {}", argv.join(" ")));
+        println!("WOULD: {printable}");
+        ctx.event("gh_write", json!({"verb": verb, "what": what, "dry_run": true}))?;
+        return Ok(Written {
+            called: false,
+            stdout: String::new(),
+        });
+    }
+
+    // stdout is captured (issue-create prints the new URL there); stderr goes
+    // straight through, so gh's own error reaches the person running this.
+    let run = Command::new("gh")
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output();
+    let (rc, stdout) = match run {
+        Ok(out) => (
+            out.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        ),
+        Err(_) => (127, String::new()),
+    };
+    ctx.event(
+        "gh_write",
+        json!({"verb": verb, "what": what, "dry_run": false, "rc": rc}),
+    )?;
+    if rc != 0 {
+        return Err(Fail::failed(format!("gh failed (exit {rc}): {what}")));
+    }
+    Ok(Written { called: true, stdout })
+}
+
+const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|close-issue>";
+
+/// `issue-drain gh-write <verb> ...`. The verb and its options are read by
+/// hand, not by clap, so that a unit process asking for a forbidden verb is
+/// refused, and the refusal logged, before anything else about the call is
+/// looked at.
+pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
+    ctx.repo()?;
+    let mode = ctx.mode()?;
+    let Some(verb) = argv.first().map(String::as_str).filter(|v| !v.is_empty()) else {
+        return Err(Fail::usage(format!("usage: issue-drain gh-write {VERBS} ...")));
+    };
+    if mode == Mode::Unit && verb != "comment" {
+        return Err(refuse(
+            ctx,
+            verb,
+            mode,
+            format!("a unit process may only comment (asked for '{verb}')"),
+        ));
+    }
+
+    let mut body_file = String::new();
+    let mut title = String::new();
+    let mut args: Vec<&str> = Vec::new();
+    let mut rest = argv[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--body-file" => body_file = rest.next().cloned().unwrap_or_default(),
+            "--title" => title = rest.next().cloned().unwrap_or_default(),
+            option if option.starts_with("--") => return Err(Fail::usage(format!("unknown option {option}"))),
+            other => args.push(other),
+        }
+    }
+    let arg = |i: usize| args.get(i).copied().unwrap_or_default();
+    let number = || {
+        parse_number(arg(0))
+            .ok_or_else(|| Fail::usage(format!("{verb} needs an issue or PR number (got '{}')", arg(0))))
+    };
+    let body = || {
+        if body_file.is_empty() {
+            Err(Fail::usage(format!("{verb} needs --body-file <file>")))
+        } else {
+            Ok(Path::new(&body_file))
+        }
+    };
+
+    let w = match verb {
+        "issue-create" => Write::IssueCreate {
+            body_file: body()?,
+            title: &title,
+        },
+        "comment" => Write::Comment {
+            number: number()?,
+            body_file: body()?,
+        },
+        "ensure-label" => Write::EnsureLabel { label: arg(0) },
+        "add-label" => Write::AddLabel {
+            number: number()?,
+            label: arg(1),
+        },
+        "remove-label" => Write::RemoveLabel {
+            number: number()?,
+            label: arg(1),
+        },
+        "close-issue" => Write::CloseIssue { number: number()? },
+        other => return Err(Fail::usage(format!("unknown verb '{other}'"))),
+    };
+    print!("{}", write(ctx, &w)?.stdout);
+    Ok(())
+}
