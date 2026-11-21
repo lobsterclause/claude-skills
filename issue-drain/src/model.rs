@@ -109,11 +109,15 @@ pub struct Quote {
     pub ok: bool,
     /// Why it failed; null when `ok`.
     pub reason: Option<String>,
-    /// The commit that last changed the line, from git blame.
+    /// The commit that last changed the line, from git blame. Absent when the
+    /// quote failed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub commit: String,
-    /// That commit's committer time, seconds since the epoch; null when the
-    /// quote was not found.
+    /// That commit's committer time, seconds since the epoch; absent when the
+    /// quote failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subject: String,
 }
 

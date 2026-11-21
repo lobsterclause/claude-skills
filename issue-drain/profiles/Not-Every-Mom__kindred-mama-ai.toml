@@ -1,0 +1,55 @@
+# issue-drain profile: Not-Every-Mom/kindred-mama-ai
+# Every key is explained in references/profile.md.
+
+base_branch = "develop"
+
+# An issue carrying any of these is left out at intake, with the label as the reason.
+hold_labels = [
+  "needs-human",
+  "agent-needs-human",
+  "ready-for-human",
+  "needs-product-input",
+  "needs-discussion",
+  "design-needed",
+  "blocked",
+  "belongs-in-nem-app",
+  "epic",
+  "wont-fix",
+  "wontfix",
+  "duplicate",
+  "invalid",
+  "question",
+]
+
+claim_label = "agent-in-progress"
+blocked_label = "needs-human"
+tracker_label = "issue-drain"
+
+# Highest priority first. An issue with none of these sorts last.
+priority_labels = ["p0", "CRITICAL", "p1", "priority/high", "HIGH", "p2", "priority/medium", "MEDIUM", "p3", "LOW"]
+
+# Matched against repo-relative paths, ignoring case.
+# Protected: an issue whose fix lives here goes to "needs a person" and no unit runs.
+protected_path_re = '^(\.github/(workflows|actions)/|\.husky/|\.claude/|infra/|ci/)|^(firestore|storage)\.rules$'
+# Risk: the unit runs, opens its PR, then waits for a named reviewer. Never clustered.
+risk_path_re = '(^|/)[^/]*(crisis|clinical|billing|stripe|auth)[^/]*(/|$)'
+
+trusted_associations = ["OWNER", "MEMBER", "COLLABORATOR"]
+
+intake_cap = 40
+stale_claim_days = 3
+
+# Run in the checkout with ISSUE_TITLE and ISSUE_BODY set; prints JSON with
+# "verdict" (app | mixed | kma | none) and "appPaths". "app" means every path
+# the issue names has moved to Not-Every-Mom/nem-app, so the issue is left out.
+issue_classifier = "node scripts/split-issue-triage.cjs"
+
+cluster_max_issues = 4
+cluster_max_lines = 400
+
+evidence_line_slack = 3
+evidence_min_quote = 8
+
+# Shown in the tracker header. Units arrive with the unit-and-gate build;
+# until then triage is the only part that runs.
+unit_permissions = "triage readers: Read, Grep, Glob only. Units: not built yet"
