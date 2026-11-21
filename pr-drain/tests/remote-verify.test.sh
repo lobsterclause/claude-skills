@@ -11,14 +11,20 @@
 # added): 3 of 8 fail ("exit code = 1 on failed verify", "untracked file
 # not shipped", "log WARNs about the untracked file"). Pass-1 review cases
 # (ssh path with a space, inherited RV_INCLUDE_UNTRACKED, unwritable .out):
-# 8 of 10 fail against the first #205 commit.
+# 8 of 10 fail against the first #205 commit. Pass-2 cases (early failure
+# with unwritable .out, unopenable log, relative RV_SSH): 4 fail against the
+# pass-1 fix commit.
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
 S=${PROBE_S:-"$(cd "$(dirname "$0")/../scripts" && pwd)"}
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
+# Keep the caller's git config out (a global excludes file listing .vitest/
+# would make the fixture's stray file ignored instead of untracked).
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 XDG_CONFIG_HOME="$T/xdg"
 fail=0
+exists() { if [ -f "$1" ]; then echo 0; else echo 1; fi; }
 check() { # name expected actual
   if [ "$2" = "$3" ]; then echo "ok   $1 ($3)"; else echo "FAIL $1 expected $2 got $3"; fail=1; fi
 }
@@ -39,6 +45,7 @@ cmd="$*"
 case "$cmd" in
   *"tar -xzf -"*) mkdir -p "$SHIP" && tar -xzf - -C "$SHIP" ;;
   *"git init -q"*) exit "$FAKE_RC" ;;
+  *"mkdir -p $"*|*"mkdir -p /"*) [ -n "${FAKE_SETUP_FAIL:-}" ] && exit 1; exit 0 ;;
   *) exit 0 ;;
 esac
 FAKE
@@ -53,22 +60,34 @@ run() { # rc ship-dir [env...]
 
 run 1 "$T/ship1"; check "exit code = 1 on failed verify" 1 $?
 check ".out records the failure" "verify exit=1" "$(cat "$T/out/rv-probe.out")"
-[ -f "$T/ship1/pkg/.vitest/json/output.json" ]; check "untracked file not shipped" 1 $?
-[ -f "$T/ship1/a.txt" ]; check "tracked file shipped" 0 $?
+check "untracked file not shipped" 1 "$(exists "$T/ship1/pkg/.vitest/json/output.json")"
+check "tracked file shipped" 0 "$(exists "$T/ship1/a.txt")"
 grep -q "WARN: not shipping 1 untracked file" "$T/out/rverify-probe.log"; check "log WARNs about the untracked file" 0 $?
 
 # Passing control: a script that always failed would pass the checks above.
 run 0 "$T/ship2"; check "exit code = 0 on passed verify" 0 $?
 
 run 0 "$T/ship3" RV_INCLUDE_UNTRACKED=1; check "opt-in run exits 0" 0 $?
-[ -f "$T/ship3/pkg/.vitest/json/output.json" ]; check "RV_INCLUDE_UNTRACKED=1 ships untracked" 0 $?
+check "RV_INCLUDE_UNTRACKED=1 ships untracked" 0 "$(exists "$T/ship3/pkg/.vitest/json/output.json")"
 
 # Inherited knobs are pinned: an exported RV_INCLUDE_UNTRACKED=1 must not leak in.
 RV_INCLUDE_UNTRACKED=1 run 0 "$T/ship4" >/dev/null
-[ -f "$T/ship4/pkg/.vitest/json/output.json" ]; check "inherited RV_INCLUDE_UNTRACKED ignored" 1 $?
+check "inherited RV_INCLUDE_UNTRACKED ignored" 1 "$(exists "$T/ship4/pkg/.vitest/json/output.json")"
 
 # A passed verify whose .out cannot be written is not reported as success.
 mkdir -p "$T/out5/rv-probe.out"
 OUTDIR="$T/out5" run 0 "$T/ship5"; check "unwritable .out exits 94" 94 $?
+
+# Same for an early failure: setup fails (98) and .out can't be written.
+mkdir -p "$T/out6/rv-probe.out"
+OUTDIR="$T/out6" FAKE_SETUP_FAIL=1 run 0 "$T/ship6" 2>/dev/null; check "early failure with unwritable .out exits 94" 94 $?
+
+# The log can't be opened: fail with 93, not a stale status.
+mkdir -p "$T/out7/rverify-probe.log"
+OUTDIR="$T/out7" run 0 "$T/ship7" 2>/dev/null; check "unopenable log exits 93" 93 $?
+check "unopenable log still writes .out" "verify exit=93" "$(cat "$T/out7/rv-probe.out")"
+
+# A relative RV_SSH resolves from the caller's directory, not the worktree.
+( cd "$T/sp ace" && env GIT_CONFIG_GLOBAL=/dev/null RV_INCLUDE_UNTRACKED=0 RV_BUILD_IMAGE=0 RV_SSH=./fake-ssh RV_OUT_DIR="$T/out8" SHIP="$T/ship8" FAKE_RC=0 bash "$S/remote-verify.sh" "$R" probe firebird ); check "relative RV_SSH resolves from caller dir" 0 $?
 
 exit $fail

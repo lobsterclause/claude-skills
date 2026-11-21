@@ -13,8 +13,8 @@
 # prints a WARN naming every untracked path left out. RV_INCLUDE_UNTRACKED=1
 # restores the old behaviour (ship untracked-not-ignored files too).
 #
-# Exit status is the remote verify's exit code (same N as the .out file), or
-# 94 if the .out file could not be written.
+# Exit status is the remote verify's exit code (same N as the .out file), 93
+# if the log could not be opened, or 94 if the .out file could not be written.
 # Before #204 the script always exited 0, so a background caller saw success
 # on a failed verify.
 #
@@ -58,13 +58,24 @@ case "$HOSTK" in
   *) echo "unknown host '$HOSTK'" >&2; exit 2;;
 esac
 # RV_SSH is one executable path (may contain spaces), never word-split.
-[ -n "${RV_SSH:-}" ] && SSH=("$RV_SSH")
+# A relative path is resolved now, before the `cd "$WT"` below; a bare name
+# still goes through PATH.
+if [ -n "${RV_SSH:-}" ]; then
+  case "$RV_SSH" in /*) ;; */*) RV_SSH="$PWD/$RV_SSH";; esac
+  SSH=("$RV_SSH")
+fi
 D=$BASE/$N; LOG=$OUTD/rverify-$N.log; OUT=$OUTD/rv-$N.out; rm -f "$OUT"
+# Every exit after this point writes the result a caller polls for. If that
+# write fails, exit 94: never report a result nobody can read.
+finish() { echo "verify exit=$1" > "$OUT" || { echo "cannot write $OUT"; exit 94; }; exit "$1"; }
+# The block's output goes to $LOG; if that can't be opened, the block never
+# runs, so fail here instead of exiting with whatever status came before.
+: > "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
 if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | "${SSH[@]}" "docker build -q -t kma-verify:22 -"; exit $?; fi
 {
-  cd "$WT" || { echo "verify exit=97" > "$OUT"; exit 97; }
+  cd "$WT" || finish 97
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
-  "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || { echo "verify exit=98" > "$OUT"; exit 98; }
+  "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || finish 98
   LSF="--cached"
   if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then LSF="--cached --others --exclude-standard"
   else
@@ -72,12 +83,12 @@ if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | "${S
     [ -n "$UNTR" ] && { echo "WARN: not shipping $(printf '%s\n' "$UNTR" | wc -l | tr -d ' ') untracked file(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"; printf '%s\n' "$UNTR" | sed 's/^/  /'; }
   fi
   # shellcheck disable=SC2086 # LSF is a deliberate flag list
-  /usr/bin/git ls-files -z $LSF | COPYFILE_DISABLE=1 tar --null -T - -czf - 2>/dev/null | "${SSH[@]}" "tar -xzf - -C $D/w" || { echo "verify exit=99" > "$OUT"; exit 99; }
+  /usr/bin/git ls-files -z $LSF | COPYFILE_DISABLE=1 tar --null -T - -czf - 2>/dev/null | "${SSH[@]}" "tar -xzf - -C $D/w" || finish 99
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""
   if [ "${RV_GH_TOKEN:-0}" = 1 ]; then
-    { printf 'NODE_AUTH_TOKEN='; gh auth token; } | "${SSH[@]}" "umask 077; cat > $D/tok.env" || { echo "verify exit=96" > "$OUT"; exit 96; }
+    { printf 'NODE_AUTH_TOKEN='; gh auth token; } | "${SSH[@]}" "umask 077; cat > $D/tok.env" || finish 96
     ENVF="--env-file $D/tok.env"
   fi
   # RV_INSTALL overrides the install step (default: pnpm frozen install at the repo root).
@@ -85,7 +96,5 @@ if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | "${S
   rc=$?
   echo "remote rc=$rc"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N"
-  # A caller polls for $OUT: never report success when it could not be written.
-  echo "verify exit=$rc" > "$OUT" || { echo "cannot write $OUT"; rc=94; }
+  finish "$rc"
 } > "$LOG" 2>&1
-exit "$rc"
