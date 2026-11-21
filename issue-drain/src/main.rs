@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use issue_drain::ctx::Ctx;
 use issue_drain::error::Res;
-use issue_drain::{close, evalscore, evidence, gh, intake, overlap, tracker};
+use issue_drain::{close, evalscore, evidence, gh, intake, overlap, state, tracker};
 
 /// Triage a set of GitHub issues and carry each one through to a merged PR.
 ///
@@ -38,6 +38,9 @@ enum Command {
     },
     /// Score a triage run against the fixture's expected answers.
     EvalScore(evalscore::Args),
+    /// Where each unit of the drain is, kept as a log of moves.
+    #[command(subcommand)]
+    State(state::Command),
 }
 
 fn name(command: &Command) -> &'static str {
@@ -51,6 +54,13 @@ fn name(command: &Command) -> &'static str {
         Command::CloseVerified(_) => "close-verified",
         Command::GhWrite { .. } => "gh-write",
         Command::EvalScore(_) => "eval-score",
+        Command::State(state::Command::Init(_)) => "state init",
+        Command::State(state::Command::Event(_)) => "state event",
+        Command::State(state::Command::Stop(_)) => "state stop",
+        Command::State(state::Command::Resume) => "state resume",
+        Command::State(state::Command::Show(_)) => "state show",
+        Command::State(state::Command::Next) => "state next",
+        Command::State(state::Command::Rebuild) => "state rebuild",
     }
 }
 
@@ -64,6 +74,7 @@ fn run(command: &Command) -> Res<()> {
         Command::CloseVerified(args) => close::run(&ctx, args),
         Command::GhWrite { args } => gh::cli(&ctx, args),
         Command::EvalScore(args) => evalscore::run(&ctx, args),
+        Command::State(command) => state::run(&ctx, command),
     }
 }
 
