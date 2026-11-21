@@ -19,7 +19,7 @@ To add a repo, copy an existing profile, then check each label against `gh label
 | `protected_path_re` | workflows, `.husky`, `.claude` | A fix on a matching path becomes `needs_human`; no unit touches it |
 | `frozen_paths` | none | Files or folders (trailing slash optional) a unit's diff may not touch; `deliver-check` fails with `frozen_path` |
 | `risk_path_re` | none | A unit touching a matching path is never clustered with another live issue, must name its reviewer in `waits_for`, and waits for that person after opening its PR. `merge-gate` never merges such a unit; that person does. `deliver-check` also matches every path of the delivered diff against it and records the matches as `risk_paths_touched`; `merge-gate` refuses (`risk_path`) a unit with any, even one planned without risk paths |
-| `trusted_associations` | `OWNER`, `MEMBER`, `COLLABORATOR` | Author associations whose issue text may be shown to agents with write tools |
+| `trusted_associations` | `OWNER`, `MEMBER`, `COLLABORATOR` | Author associations whose issue text may be shown to agents with write tools. `merge-gate` also uses it for the review record: the newest `## Cross-review` comment on the PR counts only when its author's association is in this list (case-insensitive), so an empty list means no PR is ever merged by the gate (`review_author`) |
 | `intake_cap` | 40 | The most issues one run takes in |
 | `stale_claim_days` | 3 | Age at which a claim is listed for release |
 | `issue_classifier` | none | A command run in the checkout with `ISSUE_TITLE` and `ISSUE_BODY` set. It prints JSON with `verdict` and `appPaths`; a verdict of `app` leaves the issue out |

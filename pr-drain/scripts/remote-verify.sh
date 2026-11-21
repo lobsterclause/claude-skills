@@ -153,23 +153,31 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
     rm -f "$idx"
     return "$rc"
   }
-  # count_unshipped <dir>: how many tracked gitlinks (submodules) never had
-  # their contents shipped: a directory without a checkout, or nothing there.
-  # A clean `git status` says nothing about these (an empty directory is
-  # clean), so the shipped line counts them. Checked-out submodules are walked
-  # into, as list_tree does; a file that replaced a gitlink ships as itself.
+  # count_unshipped <dir>: how many tracked paths never had their contents
+  # shipped: a gitlink (submodule) whose directory has no checkout or nothing
+  # there, and a file that a sparse checkout left out of the working copy
+  # (skip-worktree, tag S in `ls-files -t`, and absent). A clean `git status`
+  # says nothing about either (an empty directory is clean, and so is a sparse
+  # checkout), so the shipped line counts them. A tracked file that is simply
+  # deleted is not skip-worktree: git status reports it, so it is not counted.
+  # Checked-out submodules are walked into, as list_tree does; a file that
+  # replaced a gitlink ships as itself.
   count_unshipped() {
-    local dir=$1 ent mode path n=0 sub
+    local dir=$1 ent tag mode path n=0 sub
     while IFS= read -r -d '' ent; do
+      tag=${ent%% *}; ent=${ent#* }
       mode=${ent%% *}; path=${ent#*$'\t'}
-      [ "$mode" = 160000 ] || continue
+      if [ "$mode" != 160000 ]; then
+        if [ "$tag" = S ] && [ ! -e "$dir/$path" ] && [ ! -L "$dir/$path" ]; then n=$((n + 1)); fi
+        continue
+      fi
       if [ -L "$dir/$path" ] || [ -f "$dir/$path" ]; then continue
       elif [ -d "$dir/$path" ] && [ -e "$dir/$path/.git" ]; then
         sub=$(count_unshipped "$dir/$path") || return 1
         n=$((n + sub))
       else n=$((n + 1))
       fi
-    done < <(/usr/bin/git -C "$dir" ls-files -z -s)
+    done < <(/usr/bin/git -C "$dir" ls-files -z -s -t)
     echo "$n"
   }
   INCL=0

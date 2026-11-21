@@ -298,4 +298,24 @@ git -C "$R13" checkout -q a.txt
 REPO="$R2" OUTDIR="$T/out15" run 0 "$T/ship15" PATH="$T/badtar:$PATH" >/dev/null
 check "failed ship has no shipped line" 0 "$(grep -c '^shipped head=' "$T/out15/rverify-probe.log")"
 
+# Pass-15: a sparse checkout reads clean while tracked files are absent from
+# the working copy (skip-worktree), so they never ship: the shipped line counts
+# them, but not a file that was deleted locally (git status reports that one).
+R16="$T/repo16"; mkdir -p "$R16/a" "$R16/b"; git -C "$R16" init -q
+echo x > "$R16/a/x"; echo y > "$R16/b/y"; echo t > "$R16/top"
+git -C "$R16" add -A
+git -C "$R16" -c user.email=t@t -c user.name=t commit -q -m sparse
+git -C "$R16" sparse-checkout set --no-cone a
+H16=$(git -C "$R16" rev-parse HEAD)
+REPO="$R16" OUTDIR="$T/out40" run 0 "$T/ship40" >/dev/null
+check "sparse checkout: git status is clean" "host=firebird head=$H16 dirty=0" "$(sed -n 1p "$T/out40/rverify-probe.log")"
+check "sparse checkout: absent tracked files counted" "shipped head=$H16 dirty=0 unshipped=2" "$(grep '^shipped head=' "$T/out40/rverify-probe.log")"
+check "sparse checkout: the checked-out file still ships" 0 "$(exists "$T/ship40/a/x")"
+# Control: a locally deleted tracked file is dirty, and not unshipped.
+rm "$R16/a/x"
+REPO="$R16" OUTDIR="$T/out41" run 0 "$T/ship41" >/dev/null; check "sparse checkout with a deleted file exits 0" 0 $?
+check "deleted tracked file is dirty, not unshipped" "shipped head=$H16 dirty=1 unshipped=2" "$(grep '^shipped head=' "$T/out41/rverify-probe.log")"
+REPO="$R2" OUTDIR="$T/out42" run 0 "$T/ship42" >/dev/null
+check "ordinary deleted tracked file is not unshipped" 1 "$(grep -c '^shipped head=.* unshipped=0$' "$T/out42/rverify-probe.log")"
+
 exit $fail

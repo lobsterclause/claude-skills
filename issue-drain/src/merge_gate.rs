@@ -32,8 +32,9 @@
 //! `deliver-check --base` that audited only part of the PR is refused.
 //!
 //! The PR must be the unit's (`pr_unit`): its head branch is the `branch` in
-//! `units/<n>/unit.json` and its head repository is the profile's repo. This
-//! holds for the already-merged answer as well, which is read only after it.
+//! `units/<n>/unit.json` and its head repository is the profile's repo, and it
+//! must target the profile's base branch (`wrong_base`). This holds for the
+//! already-merged answer as well, which is read only after it.
 //! The PR must also be mergeable now (`not_mergeable`): `mergeStateStatus` is
 //! CLEAN, HAS_HOOKS or UNSTABLE (only non-required checks failing or pending,
 //! which this gate judges itself), and `reviewDecision` is neither
@@ -45,8 +46,34 @@
 //! the newest record was stamped at. They differ on purpose when the script
 //! clears a base-only sync (digest equality) or a union of records. Then the
 //! gate accepts only when `reviewed` is an ancestor of the head (GitHub's
-//! compare answer) and the review proof on disk is for the head or for
-//! `reviewed`; a record naming no `reviewed` is refused.
+//! compare answer) and the review proof on disk is for the head or, on that
+//! path only, for `reviewed` (one proof check; the second needs the ancestry
+//! shown); a record naming no `reviewed` is refused. The script asks local git
+//! about the PR's commits, so it runs in the drained repository's checkout
+//! (`ISSUE_DRAIN_REPO_DIR`), and a checkout whose origin is not the profile's
+//! repo is a `read_error`.
+//!
+//! The script takes the newest stamped `## Cross-review` comment whoever wrote
+//! it, so the gate reads the PR's comments itself (paginated) and finds that
+//! same comment: newest, starting `## Cross-review`, with a marker or the
+//! `Reviewed` prose. It refuses (`review_author`) unless that comment's author
+//! has an `author_association` in the profile's `trusted_associations` (the list
+//! that decides whose issue text agents see; case does not matter, an empty
+//! list trusts no one) and its stamp names the commit and the CLEAN verdict the
+//! script reported. No record, or comments that cannot be read, refuse too.
+//! GitHub's association is what the gate can read; a login is not compared.
+//!
+//! Within one check name and source, the newest entry is kept per workflow run,
+//! the run id being read from the entry's `detailsUrl` (`.../actions/runs/<id>/...`),
+//! and every kept entry must pass. The rollup names no workflow file or id, only
+//! a display name, so two workflow files that share a display name (and a job
+//! name) are told apart by run id: one run's failure is not hidden by another's
+//! later pass. A re-run of failed jobs keeps the run id, so it still replaces the
+//! earlier attempt. The limit: a fresh run of the same workflow at the same head
+//! (a second event, or a manual dispatch) is a second run id, so an earlier
+//! failed run keeps blocking until it is re-run itself. An entry with no
+//! parseable URL (a commit status, a pinned-app read without one) shares one
+//! bucket, as before.
 //!
 //! A required check pinned to an app (classic `app_id`, ruleset
 //! `integration_id`; null and -1 mean any app) needs a run from that app. The
@@ -56,6 +83,11 @@
 //! A unit with no file scope (`scope_checked` not true in `deliver.json`) is
 //! refused (`deliver_check`): a person merges it. The gate may not be run by a
 //! unit process (`ISSUE_DRAIN_MODE=unit`, or `ISSUE_DRAIN_UNIT_FILE` with no mode).
+//!
+//! A PR already in the merge queue is read first (`gh pr view --json` has no
+//! field for it, so it is `isInMergeQueue` through `gh api graphql`; a failed
+//! read is a `read_error`). The gate then answers queued without calling
+//! `gh pr merge`, which errors for such a PR.
 //!
 //! `gh pr merge` exiting 0 does not mean merged: on a merge-queue branch it
 //! means queued, or auto-merge armed. The PR is read again after the call
@@ -69,7 +101,8 @@
 //! condition refused, or auto-merge was armed and turned off; 1 the merge call
 //! itself failed, or the read after it did (the PR may then have been merged),
 //! or auto-merge is still armed; 4 the merge call was accepted but the PR is
-//! not merged yet (queued: `merged: false, queued: true`); 2 bad arguments.
+//! not merged yet, or was already in the merge queue (queued: `merged: false,
+//! queued: true`); 2 bad arguments.
 
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
@@ -80,7 +113,9 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, env_str, read_json};
 use crate::error::{Fail, Res};
 use crate::gh::{self, Write};
+use crate::git;
 use crate::profile::same_label;
+use regex::Regex;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -125,6 +160,9 @@ pub struct Run {
     /// What produced it: the workflow of a check run, `status` for a commit
     /// status. Two sources can use one display name; they are two checks.
     pub source: String,
+    /// The Actions workflow run this entry belongs to (from its details URL);
+    /// empty for a commit status and for an entry that names none.
+    pub run: String,
     pub outcome: Outcome,
     /// The conclusion or state as GitHub words it, for messages.
     pub word: String,
@@ -178,6 +216,18 @@ pub struct Preflight {
     /// The commit the newest review record was stamped at; it differs from the
     /// head when the script cleared a base-only sync or a union of records.
     pub reviewed: String,
+}
+
+/// A cross-review record comment: who wrote it (login and GitHub's
+/// `author_association`) and what its stamp says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewRecord {
+    pub author: String,
+    pub association: String,
+    /// The stamped commit: 40 characters from a marker, 7 to 40 from prose.
+    pub sha: String,
+    /// The marker's `verdict=`; empty when it carries none.
+    pub verdict: String,
 }
 
 /// A required check: the context, and the app it is pinned to (classic
@@ -257,6 +307,13 @@ pub struct Facts {
     /// `app:<id>`); read only when a required check is pinned to an app.
     pub app_runs: Read<Vec<Run>>,
     pub preflight: Read<Preflight>,
+    /// The newest cross-review record comment on the PR and who wrote it;
+    /// `None` when the PR has none.
+    pub review_record: Read<Option<ReviewRecord>>,
+    /// The profile's `trusted_associations`: whose record comment counts.
+    pub trusted_authors: Vec<String>,
+    /// Whether the PR is already in the merge queue.
+    pub in_merge_queue: Read<bool>,
     /// Whether `preflight.reviewed` is an ancestor of the head; `None` when it
     /// is the head and nothing was asked.
     pub reviewed_ancestry: Option<Read<bool>>,
@@ -289,10 +346,10 @@ fn refusal(code: &'static str, detail: impl Into<String>) -> Refusal {
     }
 }
 
-/// The newest run of each check, a check being a name from one source. A tie
-/// for newest keeps every tied run, so a disagreement counts against the check.
-/// A later success of one workflow does not hide a failure of a same-named
-/// check of another.
+/// The newest run of each check in each workflow run, a check being a name from
+/// one source. A tie for newest keeps every tied run, so a disagreement counts
+/// against the check. A later success of one workflow does not hide a failure of
+/// a same-named check of another, nor of a same-named workflow (another run id).
 fn newest(runs: &[Run]) -> BTreeMap<(&str, &str), Vec<&Run>> {
     let mut by_check: BTreeMap<(&str, &str), Vec<&Run>> = BTreeMap::new();
     for run in runs {
@@ -302,13 +359,17 @@ fn newest(runs: &[Run]) -> BTreeMap<(&str, &str), Vec<&Run>> {
             .push(run);
     }
     for group in by_check.values_mut() {
-        let latest = group
-            .iter()
-            .map(|r| r.started.as_str())
-            .max()
-            .unwrap_or_default()
-            .to_string();
-        group.retain(|r| r.started == latest);
+        // Newest per workflow run: two workflow files can share a display name,
+        // and a later success of one must not hide a failure of the other. A
+        // run id tells them apart; entries with none share one bucket.
+        let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
+        for r in group.iter().copied() {
+            let at = latest.entry(r.run.as_str()).or_default();
+            if r.started.as_str() > *at {
+                *at = r.started.as_str();
+            }
+        }
+        group.retain(|r| latest.get(r.run.as_str()) == Some(&r.started.as_str()));
     }
     by_check
 }
@@ -332,11 +393,18 @@ fn same_commit(short: &str, full: &str) -> bool {
     short.len() >= 7 && full.len() >= short.len() && full[..short.len()].eq_ignore_ascii_case(short)
 }
 
-/// The PR must be the unit's: its head branch is the one `unit.json` names and
-/// it is in the profile's repository. Nothing else ties `--pr` to `--unit`, so
+/// The PR must be the unit's: it is aimed at the profile's base branch, its head
+/// branch is the one `unit.json` names and it is in the profile's repository.
+/// Nothing else ties `--pr` to `--unit`, so
 /// the already-merged answer needs it as much as a merge does.
-fn binding(repo: &str, unit: u64, pr: u64, view: &PrView, branch: &Read<String>) -> Vec<Refusal> {
+fn binding(repo: &str, base: &str, unit: u64, pr: u64, view: &PrView, branch: &Read<String>) -> Vec<Refusal> {
     let mut out = Vec::new();
+    if view.base_ref != base {
+        out.push(refusal(
+            "wrong_base",
+            format!("PR #{pr} targets '{}', not '{base}'", view.base_ref),
+        ));
+    }
     match branch {
         Err(what) => out.push(refusal("pr_unit", what.clone())),
         Ok(branch) if branch.is_empty() || *branch != view.head_ref => out.push(refusal(
@@ -385,13 +453,7 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
             PrState::Merged => out.push(refusal("not_open", format!("PR #{n} is already merged"))),
             PrState::Other => out.push(refusal("not_open", format!("PR #{n} is not open"))),
         }
-        if v.base_ref != f.base {
-            out.push(refusal(
-                "wrong_base",
-                format!("PR #{n} targets '{}', not '{}'", v.base_ref, f.base),
-            ));
-        }
-        out.extend(binding(&f.repo, f.unit, n, v, &f.unit_branch));
+        out.extend(binding(&f.repo, &f.base, f.unit, n, v, &f.unit_branch));
         // On a merge-queue branch `gh pr merge` enables auto-merge when the PR
         // is not eligible now, and GitHub then merges later with none of this
         // gate's conditions read again. So the PR must be mergeable now.
@@ -500,12 +562,12 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                     "review",
                     format!("the review record is for {}, not the head", p.head),
                 ));
-            } else if let Some(h) = head.filter(|h| !same_commit(&p.reviewed, h)) {
+            } else if head.is_some_and(|h| !same_commit(&p.reviewed, h)) {
                 // The script clears a head that moved when the records cover it
                 // (a base-only sync is cleared by digest equality on purpose),
                 // so the commit the record was stamped at is not the head.
                 // That is accepted only when the stamped commit is an ancestor
-                // of the head and the review proof is for the head or for it.
+                // of the head; section 5 then takes the proof for the head or for it.
                 if p.reviewed.is_empty() {
                     out.push(refusal("review", "the review record names no reviewed commit"));
                 } else {
@@ -524,30 +586,81 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                             "could not read whether the reviewed commit is an ancestor",
                         )),
                     }
-                    if let Ok(proof) = &f.proof {
-                        if proof.head != h && !same_commit(&p.reviewed, &proof.head) {
-                            out.push(refusal(
-                                "review_proof",
-                                format!(
-                                    "the review proof is for '{}', neither the head nor {}",
-                                    proof.head, p.reviewed
-                                ),
-                            ));
-                        }
-                    }
                 }
             }
         }
     }
 
-    // 5. who reviewed
+    // 4b. who wrote the review record. The review script takes the newest
+    // stamped record whoever wrote it, so the gate reads the PR's comments
+    // itself: that comment must be by a trusted author and say what the script
+    // reported (the commit, and CLEAN).
+    match &f.review_record {
+        Err(what) => out.push(refusal("read_error", format!("could not read {what}"))),
+        Ok(None) => out.push(refusal(
+            "review_author",
+            format!("PR #{n} has no cross-review record comment"),
+        )),
+        Ok(Some(rec)) => {
+            let trusted = !rec.association.is_empty()
+                && f.trusted_authors
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(&rec.association));
+            if !trusted {
+                out.push(refusal(
+                    "review_author",
+                    format!(
+                        "the newest cross-review record on PR #{n} was written by '{}' ({}), who is not a trusted author",
+                        rec.author,
+                        if rec.association.is_empty() {
+                            "no association"
+                        } else {
+                            &rec.association
+                        }
+                    ),
+                ));
+            } else if let Some(p) = f.preflight.as_ref().ok().filter(|p| !p.reviewed.is_empty()) {
+                // An empty `reviewed` is refused under 4 already.
+                let same = same_commit(&rec.sha, &p.reviewed) || same_commit(&p.reviewed, &rec.sha);
+                if !same || rec.verdict != "CLEAN" {
+                    out.push(refusal(
+                        "review_author",
+                        format!(
+                            "the newest cross-review record on PR #{n} is stamped at '{}' with verdict '{}', \
+                             not at '{}' with CLEAN as the review script reported",
+                            rec.sha, rec.verdict, p.reviewed
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 5. who reviewed. The proof is for the head; on the preflight path that
+    // cleared a base-only sync it may be for the stamped ancestor instead, but
+    // only once that commit is shown to be an ancestor of the head.
+    let ancestor = match (&f.preflight, head) {
+        (Ok(p), Some(h))
+            if p.status == "clear"
+                && p.verdict == "CLEAN"
+                && !p.reviewed.is_empty()
+                && !same_commit(&p.reviewed, h)
+                && matches!(f.reviewed_ancestry, Some(Ok(true))) =>
+        {
+            Some(p.reviewed.as_str())
+        }
+        _ => None,
+    };
     match &f.proof {
         Err(what) => out.push(refusal("review_proof", what.clone())),
         Ok(proof) => {
-            if head.is_some_and(|h| proof.head != h) {
+            if head.is_some_and(|h| proof.head != h && !ancestor.is_some_and(|a| same_commit(a, &proof.head))) {
                 out.push(refusal(
                     "review_proof",
-                    format!("the review proof is for '{}', not the head", proof.head),
+                    match ancestor {
+                        Some(a) => format!("the review proof is for '{}', neither the head nor {a}", proof.head),
+                        None => format!("the review proof is for '{}', not the head", proof.head),
+                    },
                 ));
             }
             match proof.reviewers.iter().find(|r| r.name.eq_ignore_ascii_case("codex")) {
@@ -640,6 +753,12 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
             "behind_base",
             format!("the PR branch is {behind} commits behind {}", f.base),
         )),
+    }
+
+    // 8b. the merge queue: `Ok(true)` is not a refusal, `run` answers it
+    // (queued) without a merge call; a read that failed is.
+    if let Err(what) = &f.in_merge_queue {
+        out.push(refusal("read_error", format!("could not read {what}")));
     }
 
     // 9. something to merge
@@ -814,13 +933,27 @@ fn parse_run(entry: &Value) -> Read<Run> {
     } else {
         String::new()
     };
+    let run = entry
+        .get("detailsUrl")
+        .and_then(Value::as_str)
+        .map(run_id_of)
+        .unwrap_or_default();
     Ok(Run {
         name,
         source,
+        run,
         outcome,
         word,
         started,
     })
+}
+
+/// The Actions workflow run id in a check's details URL
+/// (`.../actions/runs/<id>/job/<job>`); empty when the URL names none.
+fn run_id_of(url: &str) -> String {
+    url.split_once("/actions/runs/")
+        .map(|(_, rest)| rest.chars().take_while(char::is_ascii_digit).collect())
+        .unwrap_or_default()
 }
 
 fn pr_state(v: &Value) -> Read<PrState> {
@@ -1135,6 +1268,11 @@ pub fn parse_check_runs(raw: &str) -> Read<Vec<Run>> {
             runs.push(Run {
                 name,
                 source: format!("app:{id}"),
+                run: entry
+                    .get("details_url")
+                    .and_then(Value::as_str)
+                    .map(run_id_of)
+                    .unwrap_or_default(),
                 outcome,
                 word,
                 started,
@@ -1176,6 +1314,82 @@ fn parse_preflight(raw: &str) -> Read<Preflight> {
     })
 }
 
+/// What a comment's stamp says: the commit and the marker's verdict. This is
+/// the rule `merge_preflight.sh` and `read_stamp.sh` use: a record starts with
+/// `## Cross-review` and carries a marker (`<!-- cross-review: sha=<40> ...
+/// -->`, which wins) or the prose `Reviewed `<7 to 40 hex>``; a comment with
+/// neither is not a record. A verdict outside the vocabulary reads as none.
+fn stamp_of(body: &str) -> Option<(String, String)> {
+    if !body.starts_with("## Cross-review") {
+        return None;
+    }
+    let marker = Regex::new(r"<!-- cross-review: sha=([0-9a-f]{40})[^>]*-->").ok()?;
+    if let Some(found) = marker.captures(body) {
+        let verdict = Regex::new(r"\sverdict=([A-Z_]+)(?:\s|-->)")
+            .ok()
+            .and_then(|re| re.captures(&found[0]).map(|v| v[1].to_string()))
+            .filter(|v| matches!(v.as_str(), "CLEAN" | "FIXES_APPLIED" | "NEEDS_DECISION" | "BLOCKED"))
+            .unwrap_or_default();
+        return Some((found[1].to_string(), verdict));
+    }
+    let prose = Regex::new(r"Reviewed `([0-9a-f]{7,40})`").ok()?;
+    prose.captures(body).map(|found| (found[1].to_string(), String::new()))
+}
+
+/// `gh api repos/{o}/{r}/issues/{pr}/comments --paginate`: the newest comment
+/// that is a cross-review record, with its author. The pages come oldest first,
+/// one JSON array after another. A comment that is not an object, or a page
+/// that is not a list, is an unreadable answer; a body that is absent is just
+/// not a record.
+pub fn parse_review_record(raw: &str) -> Read<Option<ReviewRecord>> {
+    let mut newest = None;
+    let mut pages = 0;
+    for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
+        let page = page.map_err(|_| "the answer is not JSON".to_string())?;
+        let list = page.as_array().ok_or("a page is not a list of comments")?;
+        pages += 1;
+        for comment in list {
+            if !comment.is_object() {
+                return Err("a comment is not an object".into());
+            }
+            let body = comment.get("body").and_then(Value::as_str).unwrap_or_default();
+            if let Some((sha, verdict)) = stamp_of(body) {
+                let word = |pointer: &str| {
+                    comment
+                        .pointer(pointer)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                newest = Some(ReviewRecord {
+                    author: word("/user/login"),
+                    association: word("/author_association"),
+                    sha,
+                    verdict,
+                });
+            }
+        }
+    }
+    if pages == 0 {
+        return Err("the answer is empty".into());
+    }
+    Ok(newest)
+}
+
+const QUEUE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){isInMergeQueue}}}";
+
+/// `isInMergeQueue` of the GraphQL answer. `gh pr view --json` has no such
+/// field (gh 2.96.0), so it is read through `gh api graphql`.
+pub fn parse_in_queue(raw: &str) -> Read<bool> {
+    let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
+    if v.get("errors").is_some_and(|e| !e.is_null()) {
+        return Err("GitHub answered with errors".into());
+    }
+    v.pointer("/data/repository/pullRequest/isInMergeQueue")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "no isInMergeQueue in the answer".to_string())
+}
+
 // ---- reading ----
 
 fn read_gh(args: &[&str]) -> Read<String> {
@@ -1209,6 +1423,29 @@ fn threads(repo: &str, pr: u64) -> Read<usize> {
     Err("more than 200 pages of threads".into())
 }
 
+/// The newest cross-review record comment on the PR, and who wrote it.
+fn review_record(repo: &str, pr: u64) -> Read<Option<ReviewRecord>> {
+    read_gh(&[
+        "api",
+        &format!("repos/{repo}/issues/{pr}/comments?per_page=100"),
+        "--paginate",
+    ])
+    .and_then(|raw| parse_review_record(&raw))
+    .map_err(|e| format!("the comments of PR #{pr} ({e})"))
+}
+
+/// Whether the PR is in the merge queue.
+fn in_merge_queue(repo: &str, pr: u64) -> Read<bool> {
+    let (owner, name) = repo.split_once('/').ok_or("the repo is not owner/name")?;
+    let (query, number) = (format!("query={QUEUE_QUERY}"), format!("number={pr}"));
+    let (owner_arg, name_arg) = (format!("owner={owner}"), format!("name={name}"));
+    read_gh(&[
+        "api", "graphql", "-f", &query, "-f", &owner_arg, "-f", &name_arg, "-F", &number,
+    ])
+    .and_then(|raw| parse_in_queue(&raw))
+    .map_err(|e| format!("whether PR #{pr} is in the merge queue ({e})"))
+}
+
 fn preflight_path() -> Read<String> {
     let set = env_str("ISSUE_DRAIN_MERGE_PREFLIGHT");
     if !set.is_empty() {
@@ -1221,11 +1458,25 @@ fn preflight_path() -> Read<String> {
 }
 
 /// Run the review script and read its JSON. Its exit code is ignored: it is 0
-/// for a PR nobody reviewed.
-fn preflight(repo: &str, pr: u64) -> Read<Preflight> {
+/// for a PR nobody reviewed. The script asks local git about the PR's commits,
+/// so it runs in the drained repository's checkout (`ISSUE_DRAIN_REPO_DIR`), and
+/// only when that checkout's origin is the profile's repo.
+fn preflight(ctx: &Ctx, repo: &str, pr: u64) -> Read<Preflight> {
     let what = "merge_preflight.sh";
+    let dir = ctx.repo_dir().map_err(|e| format!("{what}: {}", e.msg))?;
+    match git::origin_repo(&dir) {
+        Some(origin) if origin.eq_ignore_ascii_case(repo) => {}
+        other => {
+            return Err(format!(
+                "{what}: the checkout {} has origin {}, not {repo}",
+                dir.display(),
+                other.as_deref().unwrap_or("none")
+            ));
+        }
+    }
     let path = preflight_path().map_err(|e| format!("{what}: {e}"))?;
     let out = Command::new(&path)
+        .current_dir(&dir)
         .args(["--pr", &pr.to_string(), "--repo", repo, "--json"])
         .env("GH_HOST", "github.com")
         .stdin(Stdio::null())
@@ -1318,7 +1569,7 @@ fn gather(
         .map_err(|e| format!("the check runs at the head ({e})")),
         _ => Ok(Vec::new()),
     };
-    let preflight = preflight(repo, pr);
+    let preflight = preflight(ctx, repo, pr);
     let reviewed_ancestry = match (&preflight, &head) {
         (Ok(p), Some(head)) if !p.reviewed.is_empty() && !same_commit(&p.reviewed, head) => Some(
             read_gh(&["api", &format!("repos/{repo}/compare/{}...{head}", p.reviewed)])
@@ -1339,6 +1590,9 @@ fn gather(
         required,
         app_runs,
         preflight,
+        review_record: review_record(repo, pr),
+        trusted_authors: ctx.profile.trusted_associations.clone(),
+        in_merge_queue: in_merge_queue(repo, pr),
         reviewed_ancestry,
         proof: unit_file(ctx, unit, "review-proof.json"),
         deliver: unit_file(ctx, unit, "deliver.json"),
@@ -1435,7 +1689,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     // merged PR: this one must be the unit's, or `--pr` could name any number.
     if let Ok(v) = &view {
         if v.state == PrState::Merged {
-            let mut refusals = binding(&repo, unit, pr, v, &unit_branch);
+            let mut refusals = binding(&repo, &ctx.profile.base_branch, unit, pr, v, &unit_branch);
             if let Err(what) = &unit_entry {
                 refusals.push(refusal("read_error", format!("could not read {what}")));
             }
@@ -1486,6 +1740,16 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         println!("{}", output(false));
         let codes: Vec<&str> = refusals.iter().map(|r| r.code).collect();
         return Err(Fail::refused(format!("PR #{pr} was not merged: {}", codes.join(", "))));
+    }
+
+    // After exit 4 the documented step is to ask again. `gh pr merge` on a PR
+    // that is already in the queue is an error, so say queued without calling it.
+    if facts.in_merge_queue == Ok(true) {
+        report(ctx, unit, pr, &head, false, &[]);
+        println!("{}", output_with(false, json!({"queued": true})));
+        return Err(Fail::queued(format!(
+            "PR #{pr} is already in the merge queue; ask again later"
+        )));
     }
 
     // The head was read at the start; the merge names it.
@@ -1586,6 +1850,7 @@ mod tests {
         Run {
             name: name.into(),
             source: source.into(),
+            run: String::new(),
             outcome,
             word: word.into(),
             started: started.into(),
@@ -1639,6 +1904,14 @@ mod tests {
                 head: HEAD.into(),
                 reviewed: HEAD.into(),
             }),
+            review_record: Ok(Some(ReviewRecord {
+                author: "gabe".into(),
+                association: "OWNER".into(),
+                sha: HEAD.into(),
+                verdict: "CLEAN".into(),
+            })),
+            trusted_authors: vec!["OWNER".into(), "MEMBER".into()],
+            in_merge_queue: Ok(false),
             proof: Ok(Proof {
                 head: HEAD.into(),
                 reviewers: vec![reviewer("codex", true), reviewer("kimi", true)],
@@ -2322,6 +2595,7 @@ mod tests {
         let reviewed = &BASE_TIP[..9];
         let mut f = clear();
         f.preflight.as_mut().unwrap().reviewed = reviewed.into();
+        f.review_record.as_mut().unwrap().as_mut().unwrap().sha = BASE_TIP.into();
         f.reviewed_ancestry = Some(Ok(true));
         assert!(codes(&f).is_empty(), "an ancestor, proof for the head");
         f.reviewed_ancestry = Some(Ok(false));
@@ -2334,19 +2608,23 @@ mod tests {
         f.proof.as_mut().unwrap().head = "e".repeat(40);
         let found = codes(&f);
         assert!(found.contains(&"review_proof"), "{found:?}");
-        // The proof for the reviewed commit itself is not the head's, and the
-        // head check still refuses it; only the new rule is relaxed by it.
+        // The proof for the reviewed ancestor is the one proof check: accepted
+        // once the ancestry is shown, and never without it.
         f.proof.as_mut().unwrap().head = BASE_TIP.into();
-        let found = judge(&f);
+        assert!(codes(&f).is_empty(), "{:?}", judge(&f));
+        f.reviewed_ancestry = Some(Ok(false));
+        let found = codes(&f);
         assert!(
-            found.iter().all(|r| !r.detail.contains("neither the head nor")),
+            found.contains(&"review") && found.contains(&"review_proof"),
             "{found:?}"
         );
+        f.reviewed_ancestry = Some(Ok(true));
         f.proof.as_mut().unwrap().head = HEAD.into();
         f.preflight.as_mut().unwrap().reviewed = String::new();
         assert_eq!(codes(&f), ["review"]);
         // The head itself, whole or abbreviated, needs no ancestry read.
         f.preflight.as_mut().unwrap().reviewed = HEAD[..9].into();
+        f.review_record.as_mut().unwrap().as_mut().unwrap().sha = HEAD.into();
         f.reviewed_ancestry = None;
         assert!(codes(&f).is_empty());
     }
@@ -2434,5 +2712,115 @@ mod tests {
             read(json!({"state": "OPEN", "mergeCommit": null})).is_err(),
             "unknown is not 'not armed'"
         );
+    }
+
+    fn record_body(sha: &str, tail: &str) -> String {
+        format!(
+            "## Cross-review\n\nReviewed `{}`\n<!-- cross-review: sha={sha} base={sha} pass=1 {tail}-->",
+            &sha[..9]
+        )
+    }
+
+    #[test]
+    fn a_stamp_is_read_the_way_the_review_script_reads_it() {
+        let marked = stamp_of(&record_body(HEAD, "verdict=CLEAN ")).unwrap();
+        assert_eq!(marked, (HEAD.to_string(), "CLEAN".to_string()));
+        // No verdict, or one outside the vocabulary, reads as none.
+        assert_eq!(stamp_of(&record_body(HEAD, "")).unwrap().1, "");
+        assert_eq!(stamp_of(&record_body(HEAD, "verdict=GREAT ")).unwrap().1, "");
+        // The prose alone is a stamp, abbreviated.
+        let prose = stamp_of("## Cross-review\n\nReviewed `0123456789`").unwrap();
+        assert_eq!(prose, ("0123456789".to_string(), String::new()));
+        // Not at the start, or no stamp at all: not a record.
+        assert_eq!(stamp_of(&format!("see\n{}", record_body(HEAD, ""))), None);
+        assert_eq!(stamp_of("## Cross-review\n\nno stamp here"), None);
+    }
+
+    #[test]
+    fn the_newest_record_across_pages_is_the_one_read() {
+        let comment =
+            |body: &str, assoc: &str| json!({"body": body, "author_association": assoc, "user": {"login": "x"}});
+        let page_one = json!([
+            comment(&record_body(BASE_TIP, "verdict=CLEAN "), "OWNER"),
+            comment("chat", "NONE")
+        ]);
+        let page_two = json!([comment(&record_body(HEAD, "verdict=CLEAN "), "NONE")]);
+        let found = parse_review_record(&format!("{page_one}{page_two}")).unwrap().unwrap();
+        assert_eq!((found.sha.as_str(), found.association.as_str()), (HEAD, "NONE"));
+        assert_eq!(parse_review_record("[]").unwrap(), None);
+        assert!(parse_review_record("").is_err(), "no page at all");
+        assert!(parse_review_record("{}").is_err());
+        assert!(parse_review_record("[1]").is_err());
+        assert!(parse_review_record("nope").is_err());
+    }
+
+    fn record(f: &mut Facts) -> &mut ReviewRecord {
+        f.review_record.as_mut().unwrap().as_mut().unwrap()
+    }
+
+    #[test]
+    fn a_review_record_must_be_trusted_and_agree_with_the_review_script() {
+        let mut f = clear();
+        record(&mut f).association = "owner".into();
+        assert!(codes(&f).is_empty(), "case does not matter");
+        record(&mut f).association = "CONTRIBUTOR".into();
+        assert_eq!(codes(&f), ["review_author"]);
+        record(&mut f).association = String::new();
+        assert_eq!(codes(&f), ["review_author"]);
+        record(&mut f).association = "OWNER".into();
+        f.trusted_authors = Vec::new();
+        assert_eq!(codes(&f), ["review_author"], "an empty list trusts no one");
+        f.trusted_authors = vec!["OWNER".into()];
+        record(&mut f).verdict = "FIXES_APPLIED".into();
+        assert_eq!(codes(&f), ["review_author"]);
+        record(&mut f).verdict = "CLEAN".into();
+        record(&mut f).sha = BASE_TIP.into();
+        assert_eq!(codes(&f), ["review_author"]);
+        f.review_record = Ok(None);
+        assert_eq!(codes(&f), ["review_author"]);
+        f.review_record = Err("the comments of PR #12 (gh exit 1)".into());
+        assert_eq!(codes(&f), ["read_error"]);
+    }
+
+    #[test]
+    fn the_merge_queue_answer_is_read_or_refused() {
+        let answer = |v: Value| json!({"data": {"repository": {"pullRequest": v}}}).to_string();
+        assert_eq!(parse_in_queue(&answer(json!({"isInMergeQueue": true}))), Ok(true));
+        assert_eq!(parse_in_queue(&answer(json!({"isInMergeQueue": false}))), Ok(false));
+        assert!(parse_in_queue(&answer(json!({}))).is_err());
+        assert!(parse_in_queue(&answer(Value::Null)).is_err());
+        assert!(parse_in_queue(&json!({"errors": [{}]}).to_string()).is_err());
+        assert!(parse_in_queue("nope").is_err());
+        let mut f = clear();
+        f.in_merge_queue = Err("whether PR #12 is in the merge queue".into());
+        assert_eq!(codes(&f), ["read_error"]);
+        f.in_merge_queue = Ok(true);
+        assert!(
+            codes(&f).is_empty(),
+            "run answers a queued PR, judge does not refuse it"
+        );
+    }
+
+    #[test]
+    fn a_workflow_run_id_is_read_from_the_details_url() {
+        assert_eq!(run_id_of("https://github.com/o/r/actions/runs/123/job/456"), "123");
+        assert_eq!(run_id_of("https://github.com/o/r/actions/runs/789"), "789");
+        assert_eq!(run_id_of("https://example.com/status/1"), "");
+        assert_eq!(run_id_of(""), "");
+    }
+
+    #[test]
+    fn a_failure_in_one_workflow_run_is_not_hidden_by_a_later_pass_in_another() {
+        let mut f = clear();
+        let mut failed = run_of("build", Outcome::Fail, "failure", "2026-11-21T01:00:00Z");
+        failed.run = "111".into();
+        let mut passed = run_of("build", Outcome::Pass, "success", "2026-11-21T02:00:00Z");
+        passed.run = "222".into();
+        view(&mut f).runs = vec![failed.clone(), passed.clone()];
+        assert_eq!(codes(&f), ["required_check"]);
+        // Inside one run the later entry is a re-run and wins.
+        passed.run = "111".into();
+        view(&mut f).runs = vec![failed, passed];
+        assert!(codes(&f).is_empty());
     }
 }

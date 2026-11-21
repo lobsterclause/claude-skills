@@ -48,6 +48,12 @@
 #                         on the view is pr-view-<n>.after-disable.json when it
 #                         exists
 #   fail-disable-auto     `gh pr merge --disable-auto` exits 1
+#   merge-queue.json      answer to the graphql read of `isInMergeQueue`; without
+#                         the file that read fails
+#   comments.json         answer to `gh api repos/<o>/<r>/issues/<n>/comments`
+#                         (one array, or several one after another, as
+#                         `--paginate` prints them); without the file the call
+#                         fails
 #   timeline-<n>.json     answer to `gh api repos/<o>/<r>/issues/<n>/timeline`
 #                         (what `--paginate` prints: one JSON array, or
 #                         several one after another); without the file, []
@@ -77,6 +83,9 @@ case "${1:-} ${2:-}" in
       *addPullRequestReviewThreadReply* | *resolveReviewThread*)
         if [ -e "$dir/fail-thread" ]; then echo "gh stub: thread call failed" >&2; exit 1; fi
         echo '{"data":{}}'; exit 0 ;;
+    esac
+    case "$*" in
+      *isInMergeQueue*) answer merge-queue.json; exit 0 ;;
     esac
     n=""
     for arg in "$@"; do
@@ -147,6 +156,7 @@ case "${1:-} ${2:-}" in
       */compare/develop...*) answer compare.json ;;
       */compare/*) answer compare-reviewed.json ;;
       */commits/*/check-runs*) answer check-runs.json ;;
+      */issues/*/comments*) answer comments.json ;;
       */issues/*/timeline*)
         if [ -e "$dir/fail-timeline" ]; then echo "gh stub: timeline failed" >&2; exit 1; fi
         t="${2#*/issues/}"

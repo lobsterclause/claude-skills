@@ -57,6 +57,24 @@ fn clean_preflight(env: &mut Env) {
     );
 }
 
+/// A cross-review record comment stamped at `sha`, as post_comment.sh writes it.
+fn record(sha: &str, verdict: &str) -> String {
+    format!(
+        "## Cross-review\n\nReviewed `{}`\n\n<!-- cross-review: sha={sha} base={BASE_TIP} pass=1 digest={} verdict={verdict} -->",
+        &sha[..9],
+        "a".repeat(64)
+    )
+}
+
+/// One comment as the REST comments endpoint prints it.
+fn comment(body: &str, association: &str) -> Value {
+    json!({"body": body, "author_association": association, "user": {"login": "someone"}})
+}
+
+fn comments(env: &Env, list: &[Value]) {
+    put(env, "comments.json", &json!(list));
+}
+
 fn proof(env: &Env, reviewers: Value) {
     env.write(
         "units/3/review-proof.json",
@@ -95,6 +113,14 @@ fn ready() -> Env {
         );
     }
     clean_preflight(&mut env);
+    comments(&env, &[comment(&record(HEAD, "CLEAN"), "OWNER")]);
+    put(
+        &env,
+        "merge-queue.json",
+        &json!({"data": {"repository": {"pullRequest": {"isInMergeQueue": false}}}}),
+    );
+    let checkout = origin_clone(env.dir.path(), fixture_repo());
+    env.set("ISSUE_DRAIN_REPO_DIR", &checkout.display().to_string());
     proof(
         &env,
         json!([
@@ -442,6 +468,7 @@ fn a_review_stamped_before_the_head_needs_an_ancestor() {
         &json!({"status": "clear", "head": HEAD, "reviewed": stamped, "verdict": "CLEAN"}).to_string(),
         0,
     );
+    comments(&env, &[comment(&record(BASE_TIP, "CLEAN"), "OWNER")]);
     put(
         &env,
         "compare-reviewed.json",
@@ -1009,4 +1036,274 @@ fn a_pr_that_closes_an_issue_the_unit_does_not_carry_refuses() {
     assert_eq!(codes(&r), ["closing_issue_unit"]);
     assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("#999"));
     assert!(merged_calls(&env).is_empty());
+}
+
+// ---- fifth review round ----
+
+#[test]
+fn a_review_record_by_someone_who_is_not_trusted_is_refused() {
+    for association in ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", ""] {
+        let env = ready();
+        comments(&env, &[comment(&record(HEAD, "CLEAN"), association)]);
+        let out = env.run(&ARGS);
+        assert_eq!(out.code, 3, "{association}: {}", out.stderr);
+        assert_eq!(codes(&result(&out)), ["review_author"], "{association}");
+        assert!(merged_calls(&env).is_empty(), "{association}");
+    }
+}
+
+#[test]
+fn only_the_newest_review_record_is_judged_and_the_case_of_the_association_does_not_matter() {
+    let env = ready();
+    let forged = comment(&record(HEAD, "CLEAN"), "NONE");
+    let real = comment(&record(HEAD, "CLEAN"), "member");
+    let chatter = comment("looks fine to me", "NONE");
+    // The newest record is the forged one, however old the real one is.
+    comments(&env, &[real.clone(), forged.clone(), chatter.clone()]);
+    assert_eq!(codes(&result(&env.run(&ARGS))), ["review_author"]);
+    // The newest record is the real one; an older forged record does not count.
+    comments(&env, &[forged, real, chatter]);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+}
+
+#[test]
+fn a_review_record_on_a_later_page_of_comments_is_found() {
+    let env = ready();
+    let filler: Vec<Value> = (0..3).map(|_| comment("noise", "NONE")).collect();
+    let page_two = json!([comment(&record(HEAD, "CLEAN"), "OWNER")]);
+    env.stub_file("comments.json", &format!("{}\n{}\n", json!(filler), page_two));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        env.gh_calls()
+            .iter()
+            .any(|c| c.starts_with("api repos/example/tidepool/issues/12/comments") && c.contains("--paginate")),
+        "{:?}",
+        env.gh_calls()
+    );
+}
+
+#[test]
+fn a_record_that_disagrees_with_the_review_script_or_is_missing_is_refused() {
+    // Stamped at another commit than the script reported.
+    let env = ready();
+    comments(&env, &[comment(&record(BASE_TIP, "CLEAN"), "OWNER")]);
+    assert_eq!(codes(&result(&env.run(&ARGS))), ["review_author"]);
+    // A verdict that is not CLEAN.
+    comments(&env, &[comment(&record(HEAD, "FIXES_APPLIED"), "OWNER")]);
+    assert_eq!(codes(&result(&env.run(&ARGS))), ["review_author"]);
+    // No record, only talk.
+    comments(&env, &[comment("not a record", "OWNER")]);
+    assert_eq!(codes(&result(&env.run(&ARGS))), ["review_author"]);
+    // The comments cannot be read.
+    fs::remove_file(env.stub.join("comments.json")).expect("remove");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(codes(&result(&out)).contains(&"read_error".to_string()));
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_profile_with_no_trusted_authors_trusts_no_review_record() {
+    let mut env = ready();
+    let text = fs::read_to_string(eval_fixtures().join("tidepool.toml")).expect("the profile");
+    let text = text.replace(
+        "trusted_associations = [\"OWNER\", \"MEMBER\", \"COLLABORATOR\"]",
+        "trusted_associations = []",
+    );
+    assert!(text.contains("trusted_associations = []"));
+    let profile = env.dir.path().join("empty-trust.toml");
+    fs::write(&profile, text).expect("the profile");
+    env.set("ISSUE_DRAIN_PROFILE", &profile.display().to_string());
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["review_author"]);
+}
+
+#[test]
+fn an_already_merged_pr_on_another_base_branch_is_not_reported() {
+    let env = ready();
+    let mut view = pr_view("MERGED", &[], "");
+    view["baseRefName"] = json!("main");
+    put(&env, "pr-view-12.json", &view);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(
+        (r["merged"].clone(), codes(&r)),
+        (json!(false), vec!["wrong_base".to_string()])
+    );
+}
+
+fn in_queue(env: &Env, queued: bool) {
+    put(
+        env,
+        "merge-queue.json",
+        &json!({"data": {"repository": {"pullRequest": {"isInMergeQueue": queued}}}}),
+    );
+}
+
+#[test]
+fn a_pr_already_in_the_merge_queue_is_reported_queued_without_a_merge_call() {
+    let env = ready();
+    in_queue(&env, true);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 4, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!((r["merged"].clone(), r["queued"].clone()), (json!(false), json!(true)));
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_merge_queue_read_that_fails_refuses_before_the_merge_call() {
+    let env = ready();
+    fs::remove_file(env.stub.join("merge-queue.json")).expect("remove");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["read_error"]);
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_review_stamped_at_an_ancestor_is_accepted_with_a_proof_for_that_ancestor() {
+    let mut env = ready();
+    let stamped = BASE_TIP;
+    preflight(
+        &mut env,
+        &json!({"status": "clear", "head": HEAD, "reviewed": stamped, "verdict": "CLEAN"}).to_string(),
+        0,
+    );
+    comments(&env, &[comment(&record(stamped, "CLEAN"), "OWNER")]);
+    put(
+        &env,
+        "compare-reviewed.json",
+        &json!({"status": "ahead", "behind_by": 0, "ahead_by": 1}),
+    );
+    env.write(
+        "units/3/review-proof.json",
+        &json!({"head": stamped, "reviewers": [{"name": "codex", "has_output": true}]}).to_string(),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    // The proof for the ancestor is not accepted when the ancestry is not shown.
+    put(
+        &env,
+        "compare-reviewed.json",
+        &json!({"status": "diverged", "behind_by": 1, "ahead_by": 1}),
+    );
+    fs::remove_file(env.stub.join("merged-12")).expect("the stub forgets the merge");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(codes(&result(&out)).contains(&"review".to_string()));
+    // A proof for some third commit is never accepted.
+    put(
+        &env,
+        "compare-reviewed.json",
+        &json!({"status": "ahead", "behind_by": 0, "ahead_by": 1}),
+    );
+    env.write(
+        "units/3/review-proof.json",
+        &json!({"head": "f".repeat(40), "reviewers": [{"name": "codex", "has_output": true}]}).to_string(),
+    );
+    assert_eq!(codes(&result(&env.run(&ARGS))), ["review_proof"]);
+}
+
+#[test]
+fn the_review_script_runs_in_the_drained_checkout_and_that_checkout_must_be_the_repo() {
+    let mut env = ready();
+    let seen = env.dir.path().join("cwd.txt");
+    let path = env.dir.path().join("pwd-preflight.sh");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\npwd > {}\ncat <<'EOF'\n{}\nEOF\n",
+            seen.display(),
+            json!({"status": "clear", "head": HEAD, "reviewed": HEAD, "verdict": "CLEAN"})
+        ),
+    )
+    .expect("the script");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    env.set("ISSUE_DRAIN_MERGE_PREFLIGHT", &path.display().to_string());
+    let from = env.dir.path().join("elsewhere");
+    fs::create_dir_all(&from).expect("a folder");
+    let out = env.run_in(Some(&from), &ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let checkout = fs::canonicalize(env.dir.path().join("checkout")).expect("the checkout");
+    let ran_in = fs::canonicalize(fs::read_to_string(&seen).expect("the script ran").trim()).expect("its folder");
+    assert_eq!(ran_in, checkout);
+
+    // A checkout whose origin is another repository is refused, and the script is not run.
+    fs::remove_file(&seen).expect("remove");
+    fs::remove_file(env.stub.join("merged-12")).expect("the stub forgets the merge");
+    git(
+        &checkout,
+        &["config", "remote.origin.url", "https://github.com/other/thing.git"],
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["read_error"]);
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("origin"));
+    assert!(!seen.exists());
+    // So is a folder that is no checkout at all.
+    env.set("ISSUE_DRAIN_REPO_DIR", &from.display().to_string());
+    assert_eq!(codes(&result(&env.run(&ARGS))), ["read_error"]);
+    assert!(!seen.exists());
+}
+
+fn check_run(name: &str, conclusion: &str, started: &str, run: u64) -> Value {
+    json!({"__typename": "CheckRun", "name": name, "workflowName": "CI", "status": "COMPLETED",
+        "conclusion": conclusion, "startedAt": started,
+        "detailsUrl": format!("https://github.com/example/tidepool/actions/runs/{run}/job/9{run}")})
+}
+
+fn with_rollup(env: &Env, entries: Vec<Value>) {
+    let mut view = pr_view("OPEN", &["bug"], "Fixes #5");
+    view["statusCheckRollup"] = json!(entries);
+    put(env, "pr-view-12.json", &view);
+}
+
+#[test]
+fn two_workflows_sharing_a_display_name_cannot_mask_each_others_failure() {
+    let env = ready();
+    let lint = json!({"__typename": "StatusContext", "context": "lint", "state": "SUCCESS", "startedAt": "2026-11-21T01:00:00Z"});
+    // Workflow file A (run 111) failed `build`; workflow file B (run 222), also
+    // named CI, passed it later.
+    with_rollup(
+        &env,
+        vec![
+            check_run("build", "FAILURE", "2026-11-21T01:00:00Z", 111),
+            check_run("build", "SUCCESS", "2026-11-21T02:00:00Z", 222),
+            lint.clone(),
+        ],
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["required_check"]);
+    assert!(merged_calls(&env).is_empty());
+    // The same failure on a check nobody requires is still a failure.
+    with_rollup(
+        &env,
+        vec![
+            check_run("build", "SUCCESS", "2026-11-21T01:00:00Z", 111),
+            check_run("docs", "FAILURE", "2026-11-21T01:00:00Z", 111),
+            check_run("docs", "SUCCESS", "2026-11-21T02:00:00Z", 222),
+            lint.clone(),
+        ],
+    );
+    assert_eq!(codes(&result(&env.run(&ARGS))), ["check_failed"]);
+    // Controls: a re-run inside one workflow run replaces its earlier failure,
+    // and two passing runs pass.
+    with_rollup(
+        &env,
+        vec![
+            check_run("build", "FAILURE", "2026-11-21T01:00:00Z", 111),
+            check_run("build", "SUCCESS", "2026-11-21T02:00:00Z", 111),
+            check_run("build", "SUCCESS", "2026-11-21T02:00:00Z", 222),
+            lint,
+        ],
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
 }
