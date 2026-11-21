@@ -31,6 +31,9 @@ priority_labels = ["p0", "CRITICAL", "p1", "priority/high", "HIGH", "p2", "prior
 # Matched against repo-relative paths, ignoring case.
 # Protected: an issue whose fix lives here goes to "needs a person" and no unit runs.
 protected_path_re = '^(\.github/(workflows|actions)/|\.husky/|\.claude/|infra/|ci/)|^(firestore|storage)\.rules$'
+# Frozen: files or folders (a trailing slash is optional) a unit's diff may not touch;
+# deliver-check fails the unit if it does. Nothing is frozen until this is filled in.
+frozen_paths = []
 # Risk: the unit runs, opens its PR, then waits for a named reviewer. Never clustered.
 risk_path_re = '(^|/)[^/]*(crisis|clinical|billing|stripe|auth)[^/]*(/|$)'
 

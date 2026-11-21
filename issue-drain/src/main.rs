@@ -3,7 +3,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use issue_drain::ctx::Ctx;
 use issue_drain::error::Res;
-use issue_drain::{close, evalscore, evidence, gh, intake, merge_gate, overlap, state, tracker};
+use issue_drain::{
+    close, deliver_check, evalscore, evidence, gh, intake, merge_gate, overlap, review_proof, state, tracker,
+};
 
 /// Triage a set of GitHub issues and carry each one through to a merged PR.
 ///
@@ -43,6 +45,10 @@ enum Command {
     State(state::Command),
     /// Judge every condition for a PR and merge it only if none refuses.
     MergeGate(merge_gate::Args),
+    /// Check a unit's diff against its scope and the profile's path rules.
+    DeliverCheck(deliver_check::Args),
+    /// Record which reviewers of a cross-review run produced output.
+    ReviewProof(review_proof::Args),
 }
 
 fn name(command: &Command) -> &'static str {
@@ -64,6 +70,8 @@ fn name(command: &Command) -> &'static str {
         Command::State(state::Command::Next) => "state next",
         Command::State(state::Command::Rebuild) => "state rebuild",
         Command::MergeGate(_) => "merge-gate",
+        Command::DeliverCheck(_) => "deliver-check",
+        Command::ReviewProof(_) => "review-proof",
     }
 }
 
@@ -82,6 +90,8 @@ fn run(command: &Command) -> Res<()> {
         Command::EvalScore(args) => evalscore::run(&ctx, args),
         Command::State(command) => state::run(&ctx, command),
         Command::MergeGate(args) => merge_gate::run(&ctx, args),
+        Command::DeliverCheck(args) => deliver_check::run(&ctx, args),
+        Command::ReviewProof(args) => review_proof::run(&ctx, args),
     }
 }
 

@@ -24,6 +24,7 @@ pub struct Profile {
     pub tracker_label: String,
     pub priority_labels: Vec<String>,
     pub protected_path_re: String,
+    pub frozen_paths: Vec<String>,
     pub risk_path_re: String,
     pub trusted_associations: Vec<String>,
     pub intake_cap: usize,
@@ -58,6 +59,7 @@ impl Default for Profile {
             tracker_label: "issue-drain".into(),
             priority_labels: Vec::new(),
             protected_path_re: r"^(\.github/workflows/|\.husky/|\.claude/)".into(),
+            frozen_paths: Vec::new(),
             risk_path_re: String::new(),
             trusted_associations: words("OWNER MEMBER COLLABORATOR"),
             intake_cap: 40,
@@ -75,6 +77,13 @@ impl Default for Profile {
             file: PathBuf::new(),
         }
     }
+}
+
+/// Whether `path` is `entry` or lies under the folder `entry` (a trailing
+/// slash on the entry is optional).
+pub fn path_within(path: &str, entry: &str) -> bool {
+    let entry = entry.trim_end_matches('/');
+    !entry.is_empty() && (path == entry || path.strip_prefix(entry).is_some_and(|rest| rest.starts_with('/')))
 }
 
 /// GitHub treats label names as case-insensitive, so `Blocked` is the hold
@@ -162,6 +171,12 @@ impl Profile {
         self.protected.as_ref().is_some_and(|re| re.is_match(path))
     }
 
+    /// A path the unit's diff may not touch: a listed file, or anything under
+    /// a listed folder.
+    pub fn is_frozen(&self, path: &str) -> bool {
+        self.frozen_paths.iter().any(|entry| path_within(path, entry))
+    }
+
     /// A path whose PR waits for a named reviewer.
     pub fn is_risk(&self, path: &str) -> bool {
         self.risk.as_ref().is_some_and(|re| re.is_match(path))
@@ -206,6 +221,18 @@ mod tests {
         let err = load("protected_paths_re = \"x\"\n").unwrap_err();
         assert_eq!(err.code, 2);
         assert!(err.msg.contains("protected_paths_re"), "{}", err.msg);
+    }
+
+    #[test]
+    fn frozen_paths_match_a_file_or_a_folder_but_not_a_name_prefix() {
+        let p = load("frozen_paths = [\"Cargo.lock\", \"vendor/\", \"docs\"]\n").unwrap();
+        assert!(p.is_frozen("Cargo.lock"));
+        assert!(p.is_frozen("vendor/a/b.rs"));
+        assert!(p.is_frozen("docs/readme.md"));
+        assert!(!p.is_frozen("docs-extra/readme.md"));
+        assert!(!p.is_frozen("src/Cargo.lock"));
+        assert!(!load("").unwrap().is_frozen("vendor/a"));
+        assert_eq!(load("frozen_path = []\n").unwrap_err().code, 2);
     }
 
     #[test]

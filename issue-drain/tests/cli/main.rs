@@ -5,6 +5,7 @@
 mod common;
 
 mod close;
+mod deliver_check;
 mod evalscore;
 mod evidence;
 mod gh_write;
@@ -13,5 +14,6 @@ mod merge_gate;
 mod overlap;
 mod packaging;
 mod render;
+mod review_proof;
 mod state;
 mod tracker_io;

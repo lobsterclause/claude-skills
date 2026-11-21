@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::ctx::{Ctx, env_str, read_json};
@@ -93,7 +93,7 @@ pub struct Preflight {
     pub head: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reviewer {
     pub name: String,
     pub has_output: bool,
@@ -101,7 +101,7 @@ pub struct Reviewer {
     pub failure_kind: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proof {
     pub head: String,
     pub reviewers: Vec<Reviewer>,
@@ -391,7 +391,7 @@ fn names(v: &Value, key: &str) -> Read<Vec<String>> {
         .collect()
 }
 
-fn is_sha(s: &str) -> bool {
+pub fn is_sha(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 

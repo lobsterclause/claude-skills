@@ -162,6 +162,11 @@ impl Env {
 
     /// Run `issue-drain <args>` with the stub gh first on PATH.
     pub fn run(&self, args: &[&str]) -> Out {
+        self.run_in(None, args)
+    }
+
+    /// `run`, started in `dir` (a command that works on the current folder).
+    pub fn run_in(&self, dir: Option<&Path>, args: &[&str]) -> Out {
         let stub_bin = manifest_dir().join("tests/stub");
         let path = format!("{}:{}", stub_bin.display(), std::env::var("PATH").unwrap_or_default());
         let mut command = Command::new(env!("CARGO_BIN_EXE_issue-drain"));
@@ -174,6 +179,9 @@ impl Env {
             .args(args)
             .env("PATH", path)
             .envs(self.vars.iter().map(|(k, v)| (k, v)));
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
         command.output().expect("the binary runs").into()
     }
 

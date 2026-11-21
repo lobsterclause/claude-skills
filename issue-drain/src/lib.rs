@@ -4,6 +4,7 @@
 
 pub mod close;
 pub mod ctx;
+pub mod deliver_check;
 pub mod error;
 pub mod evalscore;
 pub mod evidence;
@@ -14,6 +15,7 @@ pub mod merge_gate;
 pub mod model;
 pub mod overlap;
 pub mod profile;
+pub mod review_proof;
 pub mod state;
 pub mod text;
 pub mod tracker;

@@ -17,6 +17,7 @@ To add a repo, copy an existing profile, then check each label against `gh label
 | `tracker_label` | `issue-drain` | Put on the tracker issue. Created if the repo lacks it |
 | `priority_labels` | none | Highest priority first. An issue with none of these sorts last |
 | `protected_path_re` | workflows, `.husky`, `.claude` | A fix on a matching path becomes `needs_human`; no unit touches it |
+| `frozen_paths` | none | Files or folders (trailing slash optional) a unit's diff may not touch; `deliver-check` fails with `frozen_path` |
 | `risk_path_re` | none | A unit touching a matching path is never clustered with another live issue, must name its reviewer in `waits_for`, and waits for that person after opening its PR |
 | `trusted_associations` | `OWNER`, `MEMBER`, `COLLABORATOR` | Author associations whose issue text may be shown to agents with write tools |
 | `intake_cap` | 40 | The most issues one run takes in |
