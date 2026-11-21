@@ -1,0 +1,14 @@
+[
+  { "number": 101, "status": ["already_fixed"], "closable": true },
+  { "number": 102, "status": ["already_fixed"], "closable": false },
+  { "number": 103, "status": ["live"] },
+  { "number": 104, "status": ["live"] },
+  { "number": 105, "status": ["live"] },
+  { "number": 106, "status": ["duplicate_of"], "duplicate_of": 103 },
+  { "number": 107, "status": ["needs_human"] },
+  { "number": 108, "status": ["live"], "risk": true },
+  { "number": 109, "status": ["needs_human", "unclear"] },
+  { "number": 110, "status": ["unclear", "needs_human"] },
+  { "number": 111, "status": ["live"] },
+  { "number": 112, "status": ["unclear", "needs_human", "live"] }
+]

@@ -4,6 +4,7 @@
 
 mod common;
 
+mod evalscore;
 mod evidence;
 mod gh_write;
 mod intake;
