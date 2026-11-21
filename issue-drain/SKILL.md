@@ -40,9 +40,11 @@ A run has a folder that holds all of its state. There is no default: every comma
 4. Readers and the evidence check need a local checkout. Fetch the base branch in it. For the readers, make a detached worktree at the tip so they read exactly what the check will check:
 
    ```
-   git -C <checkout> fetch origin <base>
+   git -C <checkout> fetch origin "+refs/heads/<base>:refs/remotes/origin/<base>"
    git -C <checkout> worktree add --detach <run folder>/base origin/<base>
    ```
+
+   The refspec is written out because a checkout that does not track the base (a single-branch clone of something else) would fetch it and still leave `origin/<base>` where it was.
 
    Remove it with `git worktree remove` when triage is published.
 5. Write the environment to `<run folder>/env.sh` once, and source it in every call, since a shell call does not remember the last one's variables:
@@ -95,7 +97,7 @@ An issue is closed only when all of this is true at the moment of closing:
 - the run offered it as a closure and its box is ticked on the published tracker
 - the tracker is open, has no `STOP` line, and has no ticked line the run never offered
 - the evidence check, run again on the base branch as it is now, still says `already_fixed` and closable, and names the same fixing commit the tracker showed
-- the issue is open and carries no hold label and no claim label
+- the issue is open and carries no hold label and no claim label, read before the evidence check and again right before the comment
 
 It posts the comment first, then closes, then reads the issue back. Run again after an interruption, it finishes the job without posting the comment twice.
 

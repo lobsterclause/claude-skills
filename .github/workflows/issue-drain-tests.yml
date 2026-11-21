@@ -36,5 +36,11 @@ jobs:
       - name: Tests
         run: cargo test --locked --manifest-path issue-drain/Cargo.toml
 
+      - name: Builds on the declared rust-version
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' issue-drain/Cargo.toml)"
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" check --locked --all-targets --manifest-path issue-drain/Cargo.toml
+
       - name: Launcher smoke test
         run: issue-drain/bin/issue-drain --help

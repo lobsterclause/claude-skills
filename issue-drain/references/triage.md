@@ -150,7 +150,7 @@ Before it creates anything it lists your own open issues with the tracker label.
 
 `publish.lock` in the run folder exists while a publish runs. A publish that finds it is refused. If no publish is running (the process was killed), remove the file and run it again.
 
-`tracker publish` and `tracker parse` refuse a `queue.json` rendered for a repo other than `ISSUE_DRAIN_REPO` (exit 2).
+`tracker render` refuses an `intake.json` fetched from a repo other than `ISSUE_DRAIN_REPO`, and `tracker publish` and `tracker parse` refuse a `queue.json` rendered for one (exit 2). Render removes the old `tracker.md` before it writes the queue, so a render that was cut off leaves nothing to publish.
 
 Give the user the link and a short summary: how many units, how many closures offered, what needs a person, what was skipped at intake. Then stop. This is the one pause. The user edits the tracker body: deletes or reorders queue lines, ticks closures, ticks risk units, ticks claims to release, or writes `STOP`.
 
@@ -172,9 +172,11 @@ For each number in `release_claims`, look at the issue as it is now before touch
 ```
 gh issue view <number> --repo <owner>/<repo> --json state,labels,closedByPullRequestsReferences
 gh pr list --repo <owner>/<repo> --state open --search "<number> in:title,body" --json number,title
+gh api "repos/<owner>/<repo>/issues/<number>/timeline" --paginate \
+  --jq '.[] | select(.event == "labeled" and .label.name == "<claim label>") | .created_at'
 ```
 
-Release it only when the issue is open, still carries the claim label and has no open PR. If someone picked it up again, leave the label and tell the user. Then remove the claim label and nothing else:
+Release it only when the issue is open, still carries the claim label, has no open PR, and the last date the third command prints is the `labeled_at` that `queue.json` holds for it under `stale_claims`. A later date means the label came off and someone claimed the issue again after the tracker was rendered: that claim is not stale. If someone picked it up again, leave the label and tell the user. Then remove the claim label and nothing else:
 
 ```
 $ID gh-write remove-label <number> <claim label>
