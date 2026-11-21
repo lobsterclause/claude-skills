@@ -83,6 +83,9 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   cd "$WT" || finish 97
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || finish 98
+  # From here a local failure still removes what was set up on the box; the
+  # cleanup's own status never replaces the failure code.
+  fail_clean() { "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N" || true; finish "$1"; }
   # list_tree <dir> <prefix> <cached|others>: NUL-separated paths under <dir>,
   # each with <prefix> in front. It walks into every gitlink that has a
   # checkout itself, whatever git's submodule.active says, because
@@ -102,18 +105,24 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
     while IFS= read -r -d '' ent; do
       mode=${ent%% *}; path=${ent#*$'\t'}
       if [ "$mode" = 160000 ]; then
-        # A symlink where a submodule belongs would ship another checkout
-        # (perhaps outside the worktree) under this path. git status refuses
-        # this layout too, so refuse it rather than verify a different tree.
-        if [ -L "$dir/$path" ]; then
+        # What's in the working copy decides, not the index:
+        # - a symlink to a directory would ship another checkout (perhaps
+        #   outside the worktree) under this path; git status refuses this
+        #   layout too, so refuse it rather than verify a different tree;
+        # - a file or other symlink that replaced the submodule (unstaged)
+        #   is shipped as itself, like any tracked path;
+        # - a directory without .git is a submodule with no checkout: named;
+        # - nothing there: skipped, like any tracked file deleted locally.
+        if [ -L "$dir/$path" ] && [ -d "$dir/$path" ]; then
           printf 'submodule %q is a symlink; refusing to ship through it\n' "$pre$path" >&2
           rc=1; break
-        fi
-        if [ ! -e "$dir/$path/.git" ]; then
+        elif [ -L "$dir/$path" ] || [ -f "$dir/$path" ]; then
+          [ "$kind" = cached ] && printf '%s%s\0' "$pre" "$path"
+        elif [ -d "$dir/$path" ] && [ ! -e "$dir/$path/.git" ]; then
           [ "$kind" = cached ] && printf 'note: submodule %q has no checkout; not shipped\n' "$pre$path" >&2
-          continue
+        elif [ -d "$dir/$path" ]; then
+          list_tree "$dir/$path" "$pre$path/" "$kind" || { rc=1; break; }
         fi
-        list_tree "$dir/$path" "$pre$path/" "$kind" || { rc=1; break; }
       elif [ "$kind" = cached ]; then
         printf '%s%s\0' "$pre" "$path"
       fi
@@ -124,8 +133,8 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   INCL=0
   if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then INCL=1
   else
-    UNTR=$(mktemp) || finish 99
-    list_tree . "" others > "$UNTR" || { rm -f "$UNTR"; echo "listing untracked files failed"; finish 99; }
+    UNTR=$(mktemp) || fail_clean 99
+    list_tree . "" others > "$UNTR" || { rm -f "$UNTR"; echo "listing untracked files failed"; fail_clean 99; }
     # LC_ALL=C: count bytes, so a filename invalid in the caller's locale
     # can't stop tr early and hide the warning.
     n=$(LC_ALL=C tr -cd '\0' < "$UNTR" | wc -c | tr -d ' ')
@@ -154,12 +163,12 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
         done \
       | COPYFILE_DISABLE=1 tar --null --no-recursion -T - -czf - \
       | "${SSH[@]}" "tar -xzf - -C $D/w"
-  ) || { echo "shipping the tree failed (git ls-files, tar or ssh)"; finish 99; }
+  ) || { echo "shipping the tree failed (git ls-files, tar or ssh)"; fail_clean 99; }
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""
   if [ "${RV_GH_TOKEN:-0}" = 1 ]; then
-    { printf 'NODE_AUTH_TOKEN='; gh auth token; } | "${SSH[@]}" "umask 077; cat > $D/tok.env" || finish 96
+    { printf 'NODE_AUTH_TOKEN='; gh auth token; } | "${SSH[@]}" "umask 077; cat > $D/tok.env" || fail_clean 96
     ENVF="--env-file $D/tok.env"
   fi
   # RV_INSTALL overrides the install step (default: pnpm frozen install at the repo root).

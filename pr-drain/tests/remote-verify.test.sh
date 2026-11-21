@@ -22,6 +22,8 @@
 # Pass-8: inactive submodule, nested repository note (red against fdfd5b1).
 # Pass-9: symlinked submodule, submodule without a checkout, locale-safe
 # WARN count (red against d831fdb); 98/97 early-failure codes.
+# Pass-10: a file replacing a submodule, box cleanup on a local failure
+# (red against 1ddd75f).
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -55,7 +57,7 @@ case "$cmd" in
   *"tar -xzf -"*) mkdir -p "$SHIP" && "$REAL_TAR" -xzf - -C "$SHIP" ;;
   *"git init -q"*) exit "$FAKE_RC" ;;
   *"mkdir -p $"*|*"mkdir -p /"*) [ -n "${FAKE_SETUP_FAIL:-}" ] && exit 1; exit 0 ;;
-  *"rm -rf /b/"*) exit 0 ;;
+  *"rm -rf /b/"*) [ -n "${RMLOG:-}" ] && echo cleanup >> "$RMLOG"; exit 0 ;;
   *"docker build -q"*|*"tok.env"*) cat >/dev/null; exit 0 ;;
   # Anything else is a remote command the tests don't know: fail loudly.
   *) echo "fake-ssh: unexpected command: $cmd" >&2; exit 60 ;;
@@ -173,6 +175,12 @@ R5="$T/repo5"; cp -R "$R2" "$R5"; rm -rf "$R5/vendor"; mkdir "$R5/vendor"
 REPO="$R5" OUTDIR="$T/out21" run 0 "$T/ship21" >/dev/null; check "submodule without a checkout still exits 0" 0 $?
 grep -q "note: submodule vendor has no checkout" "$T/out21/rverify-probe.log"; check "submodule without a checkout named in the log" 0 $?
 
+# Pass-10: a file that replaced a submodule (unstaged) is shipped as itself
+# (red against 1ddd75f).
+R7="$T/repo7"; cp -R "$R2" "$R7"; rm -rf "$R7/vendor"; echo f > "$R7/vendor"
+REPO="$R7" OUTDIR="$T/out25" run 0 "$T/ship25" >/dev/null; check "file replacing a submodule exits 0" 0 $?
+check "file replacing a submodule shipped" 0 "$(exists "$T/ship25/vendor")"
+
 # Pass-9: a filename that isn't valid in the caller's locale can't hide the
 # untracked WARN (BSD tr stopped on it). Needs a non-UTF-8 locale installed.
 if locale -a 2>/dev/null | grep -qx 'ja_JP.SJIS'; then
@@ -194,7 +202,9 @@ check "missing worktree .out" "verify exit=97" "$(cat "$T/out24/rv-probe.out" 2>
 # good stream and then exits 2 keeps this independent of file permissions.
 mkdir -p "$T/badtar"
 printf '#!/bin/bash\n"%s" "$@"; exit 2\n' "$REAL_TAR" > "$T/badtar/tar"; chmod +x "$T/badtar/tar"
-REPO="$R2" OUTDIR="$T/out11" run 0 "$T/ship11" PATH="$T/badtar:$PATH"; check "local tar failure exits 99" 99 $?
+REPO="$R2" OUTDIR="$T/out11" RMLOG="$T/rm11" run 0 "$T/ship11" PATH="$T/badtar:$PATH"; check "local tar failure exits 99" 99 $?
+# Pass-10: and the box copy is still cleaned up (red against 1ddd75f).
+check "local tar failure cleans the box" cleanup "$(cat "$T/rm11" 2>/dev/null)"
 
 # A FIFO log is opened once: a reader that stops at the first EOF still gets
 # the whole run, and the script finishes instead of blocking on a second open.
