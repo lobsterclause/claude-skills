@@ -8,6 +8,8 @@
 #   graphql-<n>.json      answer to `gh api graphql ... -F number=<n>`
 #   issue-list.txt        answer to `gh issue list`
 #   issue-view-<n>.json   answer to `gh issue view <n>`
+#   issue-view-<n>.next.json  the answer from the second view of <n> onward
+#                         (someone edited it after the first read)
 #   closed-<n>            written by `gh issue close <n>`; from then on
 #                         `gh issue view <n>` reports the state CLOSED
 #   fail-create           `gh issue create` exits 1
@@ -38,6 +40,11 @@ case "${1:-} ${2:-}" in
   "issue view")
     if [ -e "$dir/closed-$3" ] && [ -f "$dir/issue-view-$3.json" ]; then
       sed 's/"state" *: *"[A-Z]*"/"state":"CLOSED"/' "$dir/issue-view-$3.json"
+    elif [ -f "$dir/issue-view-$3.next.json" ] && [ -e "$dir/viewed-$3" ]; then
+      cat "$dir/issue-view-$3.next.json"
+    elif [ -f "$dir/issue-view-$3.next.json" ]; then
+      : > "$dir/viewed-$3"
+      answer "issue-view-$3.json"
     else
       answer "issue-view-$3.json"
     fi ;;

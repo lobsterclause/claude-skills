@@ -11,7 +11,9 @@ use crate::common::*;
 const CLOSURE_BOX: &str = "- [ ] close #101 ·";
 const TICKED_CLOSURE: &str = "- [x] close #101 ·";
 const MARKER: &str = "<!-- issue-drain:closure run=run -->";
-const ARGS: [&str; 4] = ["close-verified", "--ref", "develop", "--no-fetch"];
+/// A live run takes no --ref and no --no-fetch: it fetches origin's base.
+const ARGS: [&str; 1] = ["close-verified"];
+const DRY_ARGS: [&str; 4] = ["close-verified", "--ref", "develop", "--no-fetch"];
 
 fn tracker_md() -> String {
     fs::read_to_string(fixtures().join("run/tracker.md")).expect("the golden tracker")
@@ -30,9 +32,19 @@ fn tracker(env: &Env, body: &str, state: &str) {
     );
 }
 
+/// The issue as gh shows it. Every comment is the viewer's own.
 fn issue(env: &Env, number: u64, state: &str, labels: &[&str], comments: &[&str]) {
+    let comments: Vec<(&str, bool)> = comments.iter().map(|c| (*c, true)).collect();
+    issue_with(env, number, state, labels, &comments);
+}
+
+/// The same, with each comment marked as the viewer's own or someone else's.
+fn issue_with(env: &Env, number: u64, state: &str, labels: &[&str], comments: &[(&str, bool)]) {
     let labels: Vec<Value> = labels.iter().map(|l| json!({"name": l})).collect();
-    let comments: Vec<Value> = comments.iter().map(|c| json!({"body": c})).collect();
+    let comments: Vec<Value> = comments
+        .iter()
+        .map(|(body, own)| json!({"body": body, "viewerDidAuthor": own}))
+        .collect();
     env.stub_file(
         &format!("issue-view-{number}.json"),
         &json!({"state": state, "labels": labels, "comments": comments}).to_string(),
@@ -40,16 +52,24 @@ fn issue(env: &Env, number: u64, state: &str, labels: &[&str], comments: &[&str]
 }
 
 /// A published run whose tracker has #101 ticked, and #101 open and unlabelled.
+/// The checkout is a clone of the fixture repo with tidepool as its origin.
 fn ready() -> Env {
-    let env = Env::new();
+    let mut env = Env::new();
+    let checkout = origin_clone(env.dir.path(), fixture_repo());
+    env.set("ISSUE_DRAIN_REPO_DIR", &checkout.display().to_string());
+    publish(&env);
+    env
+}
+
+/// The run folder and the stub answers `ready` sets up, without a checkout.
+fn publish(env: &Env) {
     env.seed(&["queue.json", "verdicts.checked.json", "issues"]);
     env.write(
         "tracker.json",
         r#"{"number": 900, "url": "https://github.com/example/tidepool/issues/900", "run": "run", "published_at": "2026-11-21T03:53:00Z"}"#,
     );
-    tracker(&env, &ticked(), "OPEN");
-    issue(&env, 101, "OPEN", &["bug", "p2"], &["a first comment"]);
-    env
+    tracker(env, &ticked(), "OPEN");
+    issue(env, 101, "OPEN", &["bug", "p2"], &["a first comment"]);
 }
 
 /// The calls that change something on GitHub.
@@ -126,7 +146,7 @@ fn a_ticked_closure_is_commented_then_closed() {
 #[test]
 fn naming_the_ticked_number_closes_just_that_one() {
     let env = ready();
-    let out = env.run(&["close-verified", "101", "--ref", "develop", "--no-fetch"]);
+    let out = env.run(&["close-verified", "101"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(writes(&env).len(), 2);
 }
@@ -169,7 +189,7 @@ fn a_closed_tracker_refuses_every_closure() {
 #[test]
 fn a_number_that_is_not_ticked_refuses_every_closure() {
     let env = ready();
-    let out = env.run(&["close-verified", "101", "102", "--ref", "develop", "--no-fetch"]);
+    let out = env.run(&["close-verified", "101", "102"]);
     refused_all(&env, &out, "#102 is not a ticked closure on the tracker");
 }
 
@@ -177,10 +197,109 @@ fn a_number_that_is_not_ticked_refuses_every_closure() {
 fn a_body_file_is_for_dry_runs_only() {
     let env = ready();
     let body = env.write("body.md", &ticked()).display().to_string();
-    let out = env.run(&["close-verified", "--ref", "develop", "--no-fetch", "--body-file", &body]);
+    let out = env.run(&["close-verified", "--body-file", &body]);
     assert_eq!(out.code, 2);
     assert!(out.stderr.contains("--body-file is for dry runs"), "{}", out.stderr);
     assert_eq!(env.gh_calls(), Vec::<String>::new());
+}
+
+#[test]
+fn a_named_ref_and_a_skipped_fetch_are_for_dry_runs_only() {
+    // Either would let a closure be checked on code that is not the base as
+    // it is now: a stale local branch, or any ref at all.
+    for args in [
+        &DRY_ARGS[..],
+        &["close-verified", "--ref", "develop"],
+        &["close-verified", "--no-fetch"],
+    ] {
+        let env = ready();
+        let out = env.run(args);
+        assert_eq!(out.code, 2, "{args:?}");
+        assert!(
+            out.stderr
+                .contains("--ref and --no-fetch are for dry runs; a live closure is checked on origin/develop"),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(env.gh_calls(), Vec::<String>::new());
+    }
+}
+
+#[test]
+fn a_checkout_of_another_repo_refuses_every_closure() {
+    let env = ready();
+    let checkout = env.dir.path().join("checkout");
+    git(
+        &checkout,
+        &["config", "remote.origin.url", "https://github.com/example/other.git"],
+    );
+    refused_all(&env, &env.run(&ARGS), "has origin example/other, not example/tidepool");
+
+    let no_origin = ready();
+    git(&no_origin.dir.path().join("checkout"), &["remote", "remove", "origin"]);
+    refused_all(
+        &no_origin,
+        &no_origin.run(&ARGS),
+        "has origin unset or not on github.com, not example/tidepool",
+    );
+}
+
+#[test]
+fn a_queue_rendered_for_another_repo_is_a_usage_error() {
+    let mut env = ready();
+    env.set("ISSUE_DRAIN_REPO", "example/other");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 2);
+    assert!(
+        out.stderr
+            .contains("this run's queue is for example/tidepool, and ISSUE_DRAIN_REPO is example/other"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(env.gh_calls(), Vec::<String>::new());
+
+    // Control: GitHub does not tell owner and repo names apart by case.
+    let mut same = ready();
+    same.set("ISSUE_DRAIN_REPO", "Example/Tidepool");
+    let out = same.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(same.events_named("closure").len(), 1);
+}
+
+#[test]
+fn a_stop_added_after_the_run_began_refuses_every_closure() {
+    // The tracker is read once for the whole run and again before each
+    // closure. The second read is the one that sees the STOP.
+    let env = ready();
+    env.stub_file(
+        "issue-view-900.next.json",
+        &json!({"body": format!("{}\nSTOP\n", ticked()), "state": "OPEN"}).to_string(),
+    );
+    refused_all(&env, &env.run(&ARGS), "the tracker now says STOP; stopped before #101");
+}
+
+#[test]
+fn a_tracker_closed_after_the_run_began_refuses_every_closure() {
+    let env = ready();
+    env.stub_file(
+        "issue-view-900.next.json",
+        &json!({"body": ticked(), "state": "CLOSED"}).to_string(),
+    );
+    refused_all(
+        &env,
+        &env.run(&ARGS),
+        "the tracker issue is now closed; stopped before #101",
+    );
+}
+
+#[test]
+fn a_box_unticked_after_the_run_began_refuses_that_closure() {
+    let env = ready();
+    env.stub_file(
+        "issue-view-900.next.json",
+        &json!({"body": tracker_md(), "state": "OPEN"}).to_string(),
+    );
+    refused_one(&env, &env.run(&ARGS), "its box is no longer ticked on the tracker");
 }
 
 #[test]
@@ -219,6 +338,19 @@ fn an_issue_closed_already_is_skipped() {
 }
 
 #[test]
+fn an_issue_closed_already_is_skipped_even_when_the_code_has_moved() {
+    // Without the local record the evidence check fails (the test below).
+    // A closed issue is skipped before that check, not refused by it.
+    let env = ready();
+    issue(&env, 101, "CLOSED", &[], &[]);
+    fs::remove_file(env.workdir.join("issues/101.json")).expect("drop the record");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("skipped #101: already closed"), "{}", out.stdout);
+    assert!(env.events_named("closure_refused").is_empty());
+}
+
+#[test]
 fn a_hold_or_claim_label_added_since_triage_refuses() {
     for (label, shown) in [("Blocked", "blocked"), ("agent-in-progress", "agent-in-progress")] {
         let env = ready();
@@ -245,6 +377,22 @@ fn a_comment_already_posted_is_not_posted_twice() {
 }
 
 #[test]
+fn a_marker_someone_else_wrote_does_not_stand_in_for_the_comment() {
+    // Anyone who can comment can paste the marker. Only the drain's own
+    // comment, with the marker as its whole first line, counts as posted.
+    let theirs = format!("{MARKER}\nnothing to see");
+    let quoted = format!("{MARKER} and more\nClosing as already fixed");
+    let env = ready();
+    issue_with(&env, 101, "OPEN", &[], &[(&theirs, false), (&quoted, true)]);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let w = writes(&env);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].starts_with("issue comment 101 "), "{w:?}");
+    assert!(w[1].starts_with("issue close 101 "), "{w:?}");
+}
+
+#[test]
 fn a_close_that_did_not_take_is_a_failure_not_a_closure() {
     let mut env = ready();
     env.set("GH_STUB_CLOSE_NOOP", "1");
@@ -261,11 +409,14 @@ fn a_close_that_did_not_take_is_a_failure_not_a_closure() {
 
 #[test]
 fn code_that_changed_since_triage_refuses() {
-    let mut env = ready();
+    // The change lands upstream; the run's own fetch is what brings it in.
+    let mut env = Env::new();
     let repo = private_repo(env.dir.path());
-    env.set("ISSUE_DRAIN_REPO_DIR", &repo.display().to_string());
+    let checkout = origin_clone(env.dir.path(), &repo);
+    env.set("ISSUE_DRAIN_REPO_DIR", &checkout.display().to_string());
+    publish(&env);
     // Control: the private copy closes as the shared one does.
-    assert_eq!(env.run(&["close-verified", "--ref", "develop", "--no-fetch"]).code, 0);
+    assert_eq!(env.run(&ARGS).code, 0);
     fs::remove_file(env.stub.join("closed-101")).expect("reopen");
     fs::remove_file(env.dir.path().join("gh.log")).expect("clear the call log");
     fs::remove_file(env.workdir.join("events.jsonl")).expect("clear the events");
@@ -284,7 +435,11 @@ fn code_that_changed_since_triage_refuses() {
             "refactor: drop the session module",
         ],
     );
-    refused_one(&env, &env.run(&ARGS), "on develop it no longer checks out as fixed");
+    refused_one(
+        &env,
+        &env.run(&ARGS),
+        "on origin/develop it no longer checks out as fixed",
+    );
 }
 
 #[test]
@@ -318,11 +473,16 @@ fn a_gh_failure_reading_the_issue_exits_1() {
 }
 
 #[test]
-fn the_base_is_fetched_unless_told_not_to() {
-    // The fixture repo has no remote, so the fetch fails; nothing is closed
-    // against a base that could not be refreshed.
-    let env = ready();
-    let out = env.run(&["close-verified", "--ref", "develop"]);
+fn a_base_that_cannot_be_fetched_closes_nothing() {
+    // The remote is gone, so the fetch fails; nothing is closed against a
+    // base that could not be refreshed.
+    let mut env = Env::new();
+    let upstream = private_repo(env.dir.path());
+    let checkout = origin_clone(env.dir.path(), &upstream);
+    env.set("ISSUE_DRAIN_REPO_DIR", &checkout.display().to_string());
+    publish(&env);
+    fs::remove_dir_all(&upstream).expect("drop the remote");
+    let out = env.run(&ARGS);
     assert_eq!(out.code, 1);
     assert!(out.stderr.contains("could not fetch develop"), "{}", out.stderr);
     assert_eq!(writes(&env), Vec::<String>::new());
@@ -331,7 +491,7 @@ fn the_base_is_fetched_unless_told_not_to() {
 #[test]
 fn missing_input_and_bad_arguments_are_usage_errors() {
     let env = ready();
-    assert_eq!(env.run(&["close-verified", "abc", "--no-fetch"]).code, 2);
+    assert_eq!(env.run(&["close-verified", "abc"]).code, 2);
     assert_eq!(env.run(&["close-verified", "--bogus"]).code, 2);
 
     let unpublished = ready();

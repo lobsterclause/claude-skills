@@ -38,10 +38,11 @@ use crate::tracker::io::{Published, fetch_tracker, parse_body};
 pub struct Args {
     /// Issues to close (default: every closure ticked on the tracker).
     numbers: Vec<String>,
-    /// The ref to check the code on (default: origin/<base branch>).
+    /// The ref to check the code on. Dry runs only: a live closure is checked
+    /// on origin/<base branch>, fetched at that moment.
     #[arg(long = "ref")]
     reference: Option<String>,
-    /// Do not fetch the base branch first.
+    /// Do not fetch the base branch first. Dry runs only.
     #[arg(long)]
     no_fetch: bool,
     /// Read the tracker body from a file. Dry runs only: a live closure reads
@@ -61,7 +62,11 @@ struct Run<'a> {
     ctx: &'a Ctx,
     repo: String,
     repo_dir: PathBuf,
+    /// The commit the code is checked on, resolved once so every closure in
+    /// the run is held against the same tree.
     reference: String,
+    /// That commit's name, for messages.
+    shown: String,
     run: String,
     marker: String,
     tracker: Option<u64>,
@@ -139,40 +144,8 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
     let ctx = r.ctx;
     let refused = |why: String| Ok(Err(Stop::Refused(why)));
 
-    // The code, read again on the base as it is now.
-    let Some(verdict) = r.verdicts.iter().find(|v| v["number"] == number) else {
-        return refused("this run has no checked verdict for it".into());
-    };
-    let fresh = match check_verdict(
-        &ctx.profile,
-        &r.repo_dir,
-        &r.reference,
-        verdict,
-        created_at(ctx, number),
-        &r.known,
-    ) {
-        Ok(fresh) => fresh,
-        Err(e) => return refused(format!("the evidence check did not run ({})", e.msg)),
-    };
-    let fix = match &fresh.fix_commit {
-        Some(fix) if fresh.status == "already_fixed" && fresh.closable => fix,
-        _ => {
-            return refused(format!(
-                "on {} it no longer checks out as fixed ({})",
-                r.reference,
-                fresh.downgrade_reason.as_deref().unwrap_or(&fresh.status)
-            ));
-        }
-    };
-    if fix.sha != offered.fix_commit.sha {
-        return refused(format!(
-            "the tracker showed {} as the fix, and the quoted line now comes from {}; triage it again",
-            sha7(&offered.fix_commit.sha),
-            sha7(&fix.sha)
-        ));
-    }
-
-    // The issue, as it is now.
+    // The issue, as it is now. Read first: an issue someone already closed is
+    // skipped, whatever the code says today.
     let n = number.to_string();
     let unreadable = || Fail::failed(format!("could not read #{number}"));
     let raw = gh::read(&[
@@ -193,6 +166,40 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
     if state != "OPEN" {
         return refused(format!("its state is '{state}'"));
     }
+
+    // The code, read again on the base as it is now.
+    let Some(verdict) = r.verdicts.iter().find(|v| v["number"] == number) else {
+        return refused("this run has no checked verdict for it".into());
+    };
+    let fresh = match check_verdict(
+        &ctx.profile,
+        &r.repo_dir,
+        &r.reference,
+        verdict,
+        created_at(ctx, number),
+        &r.known,
+    ) {
+        Ok(fresh) => fresh,
+        Err(e) => return refused(format!("the evidence check did not run ({})", e.msg)),
+    };
+    let fix = match &fresh.fix_commit {
+        Some(fix) if fresh.status == "already_fixed" && fresh.closable => fix,
+        _ => {
+            return refused(format!(
+                "on {} it no longer checks out as fixed ({})",
+                r.shown,
+                fresh.downgrade_reason.as_deref().unwrap_or(&fresh.status)
+            ));
+        }
+    };
+    if fix.sha != offered.fix_commit.sha {
+        return refused(format!(
+            "the tracker showed {} as the fix, and the quoted line now comes from {}; triage it again",
+            sha7(&offered.fix_commit.sha),
+            sha7(&fix.sha)
+        ));
+    }
+
     let labels: Vec<String> = live["labels"]
         .as_array()
         .map(|l| {
@@ -213,9 +220,13 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
 
     let file = ctx.path(&format!("closures/{number}.md"));
     write_atomic(&file, comment(r, &fresh, fix, &offered.note).as_bytes())?;
+    // Only the drain's own comment counts as posted: anyone can write the
+    // marker, and a stranger's copy must not stand in for the reason.
     let posted = live["comments"].as_array().is_some_and(|c| {
-        c.iter()
-            .any(|c| c["body"].as_str().is_some_and(|b| b.starts_with(&r.marker)))
+        c.iter().any(|c| {
+            c["viewerDidAuthor"] == true
+                && c["body"].as_str().and_then(|b| b.lines().next()).map(str::trim_end) == Some(r.marker.as_str())
+        })
     });
     if !posted {
         gh::write(
@@ -261,10 +272,19 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         numbers.push(parse_number(text).ok_or_else(|| Fail::usage(format!("not an issue number: '{text}'")))?);
     }
     let body_file = args.body_file.as_ref().filter(|f| !f.as_os_str().is_empty());
-    if body_file.is_some() && !ctx.dry_run {
-        return Err(Fail::usage(
-            "--body-file is for dry runs; a live closure reads the published tracker",
-        ));
+    let named_ref = args.reference.as_ref().filter(|r| !r.is_empty());
+    if !ctx.dry_run {
+        if body_file.is_some() {
+            return Err(Fail::usage(
+                "--body-file is for dry runs; a live closure reads the published tracker",
+            ));
+        }
+        if named_ref.is_some() || args.no_fetch {
+            return Err(Fail::usage(format!(
+                "--ref and --no-fetch are for dry runs; a live closure is checked on origin/{}, fetched now",
+                ctx.profile.base_branch
+            )));
+        }
     }
     let (queue_path, checked_path) = (ctx.path("queue.json"), ctx.path("verdicts.checked.json"));
     for path in [&queue_path, &checked_path] {
@@ -279,6 +299,12 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         read_json(&queue_path).ok_or_else(|| Fail::usage(format!("{} is not a queue", queue_path.display())))?;
     let verdicts: Vec<Value> = read_json(&checked_path)
         .ok_or_else(|| Fail::usage(format!("{} is not a list of checked verdicts", checked_path.display())))?;
+    if !queue.repo.eq_ignore_ascii_case(&repo) {
+        return Err(Fail::usage(format!(
+            "this run's queue is for {}, and ISSUE_DRAIN_REPO is {repo}",
+            queue.repo
+        )));
+    }
 
     // What the tracker offers and what is ticked on it.
     let parsed = match body_file {
@@ -316,22 +342,43 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     }
 
     let base = &ctx.profile.base_branch;
+    if !ctx.dry_run {
+        // The checkout must be of the repo whose issues are being closed, or
+        // the "fix" is being read in someone else's code.
+        match git::origin_repo(&repo_dir) {
+            Some(origin) if origin.eq_ignore_ascii_case(&repo) => {}
+            origin => {
+                return Err(refuse_all(
+                    ctx,
+                    format!(
+                        "the checkout at {} has origin {}, not {repo}",
+                        repo_dir.display(),
+                        origin.as_deref().unwrap_or("unset or not on github.com")
+                    ),
+                ));
+            }
+        }
+    }
     if !args.no_fetch && !git::ok(&repo_dir, &["fetch", "--quiet", "origin", base]) {
         return Err(Fail::failed(format!(
             "could not fetch {base} in {}; a closure is checked against the base as it is now",
             repo_dir.display()
         )));
     }
+    let shown = named_ref.cloned().unwrap_or_else(|| format!("origin/{base}"));
+    let Some(reference) = git::commit(&repo_dir, &shown) else {
+        return Err(Fail::failed(format!(
+            "{shown} names no commit in {}",
+            repo_dir.display()
+        )));
+    };
 
     let r = Run {
         ctx,
         repo,
         repo_dir,
-        reference: args
-            .reference
-            .clone()
-            .filter(|r| !r.is_empty())
-            .unwrap_or_else(|| format!("origin/{base}")),
+        reference,
+        shown,
         marker: format!("<!-- issue-drain:closure run={run} -->"),
         run,
         tracker: read_json::<Published>(&ctx.path("tracker.json")).map(|p| p.number),
@@ -344,6 +391,33 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         let Some(offered) = queue.closures.iter().find(|c| c.number == *number) else {
             continue;
         };
+        // The tracker, read again: a STOP or an unticked box since the last
+        // closure is honoured before the next one, not after the run.
+        if !ctx.dry_run {
+            let now = fetch_tracker(ctx, &queue)?;
+            let halt = if !now.unknown.is_empty() {
+                Some(format!(
+                    "the tracker now has a ticked line this run never offered ({})",
+                    now.unknown.join(", ")
+                ))
+            } else if now.stop {
+                Some("the tracker now says STOP".to_string())
+            } else if now.tracker_state.as_deref().unwrap_or("OPEN") != "OPEN" {
+                Some("the tracker issue is now closed".to_string())
+            } else {
+                None
+            };
+            if let Some(why) = halt {
+                return Err(refuse_all(ctx, format!("{why}; stopped before #{number}")));
+            }
+            if !now.approved_closures.contains(number) {
+                let why = "its box is no longer ticked on the tracker";
+                println!("refused #{number}: {why}");
+                ctx.event("closure_refused", json!({"number": number, "why": why}))?;
+                refused += 1;
+                continue;
+            }
+        }
         match close_one(&r, *number, offered)? {
             Ok(()) => {}
             Err(Stop::Skipped(why)) => {

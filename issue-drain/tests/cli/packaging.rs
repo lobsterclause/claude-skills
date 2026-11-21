@@ -49,6 +49,68 @@ fn the_launcher_is_an_executable_that_parses() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+fn executable(path: &Path, text: &str) {
+    fs::create_dir_all(path.parent().expect("a parent")).expect("the folder");
+    fs::write(path, text).expect("the script");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+#[test]
+fn the_launcher_builds_from_the_crate_not_from_the_callers_folder() {
+    // The caller's folder is the repo being drained. Cargo started there would
+    // read its .cargo/config.toml, so the launcher must start cargo in the
+    // crate. A stand-in cargo records where it was started and with what.
+    let dir = tempfile::tempdir().expect("a temporary folder");
+    let caller = dir.path().join("drained-repo");
+    fs::create_dir_all(caller.join(".cargo")).expect("the caller's folder");
+    fs::write(
+        caller.join(".cargo/config.toml"),
+        "[build]\nrustc-wrapper = \"/nonexistent/wrapper\"\n",
+    )
+    .expect("a hostile config");
+    let seen = dir.path().join("cargo-seen");
+    executable(
+        &dir.path().join("bin/cargo"),
+        &format!(
+            "#!/bin/sh\n{{ pwd -P; echo \"$*\"; echo \"target=${{CARGO_BUILD_TARGET:-unset}}\"; }} > '{}'\n",
+            seen.display()
+        ),
+    );
+    // CARGO_TARGET_DIR is relative, as a caller might set it: it is the
+    // caller's folder it is relative to.
+    executable(&caller.join("out/release/issue-drain"), "#!/bin/sh\necho \"ran $*\"\n");
+
+    let path = format!(
+        "{}:{}",
+        dir.path().join("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(manifest_dir().join("bin/issue-drain"))
+        .args(["intake", "--all"])
+        .current_dir(&caller)
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", "out")
+        .env("CARGO_BUILD_TARGET", "wasm32-unknown-unknown")
+        .output()
+        .expect("the launcher runs");
+    let out = Out::from(out);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stdout, "ran intake --all\n");
+
+    let seen = fs::read_to_string(&seen).expect("cargo was called");
+    let lines: Vec<&str> = seen.lines().collect();
+    let crate_dir = fs::canonicalize(manifest_dir()).expect("the crate folder");
+    let caller = fs::canonicalize(&caller).expect("the caller's folder");
+    assert_eq!(Path::new(lines[0]), crate_dir, "cargo started in the wrong folder");
+    assert!(lines[1].starts_with("build --release --locked "), "{seen}");
+    assert!(
+        lines[1].ends_with(&format!("--target-dir {}", caller.join("out").display()))
+            || lines[1].ends_with(&format!("--target-dir {}/out", caller.display())),
+        "{seen}"
+    );
+    assert_eq!(lines[2], "target=unset");
+}
+
 #[test]
 fn the_eval_setup_parses_and_names_no_bash_script() {
     let setup = manifest_dir().join("evals/setup.sh");

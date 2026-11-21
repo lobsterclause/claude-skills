@@ -68,7 +68,7 @@ fn a_dry_run_prints_the_call_and_makes_none() {
     let mut env = Env::new();
     env.set("ISSUE_DRAIN_DRY_RUN", "1");
     let body = body(&env);
-    let cases: [(&[&str], String); 5] = [
+    let cases: [(&[&str], String); 4] = [
         (
             &["gh-write", "comment", "7", "--body-file", &body],
             format!("issue comment 7 --repo {REPO} --body-file {body}"),
@@ -80,10 +80,6 @@ fn a_dry_run_prints_the_call_and_makes_none() {
         (
             &["gh-write", "add-label", "7", "agent-in-progress"],
             format!("issue edit 7 --repo {REPO} --add-label agent-in-progress"),
-        ),
-        (
-            &["gh-write", "close-issue", "7"],
-            format!("issue close 7 --repo {REPO} --reason completed"),
         ),
         (
             &[
@@ -236,22 +232,37 @@ fn a_unit_process_may_comment_and_nothing_else() {
     let out = env.run(&["gh-write", "comment", "7", "--body-file", &body]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(env.gh_calls().len(), 1);
+}
 
-    // The same close is allowed to the driver.
-    env.set("ISSUE_DRAIN_MODE", "driver");
-    let out = env.run(&["gh-write", "close-issue", "7"]);
-    assert_eq!(out.code, 0, "{}", out.stderr);
-    assert_eq!(
-        env.gh_calls()[1],
-        format!("issue close 7 --repo {REPO} --reason completed")
-    );
+#[test]
+fn no_mode_can_close_an_issue_through_gh_write() {
+    // Closing belongs to close-verified, which holds the conditions. A bare
+    // close verb would let any caller skip all of them.
+    for mode in ["session", "driver"] {
+        let mut env = Env::new();
+        env.set("ISSUE_DRAIN_MODE", mode);
+        let out = env.run(&["gh-write", "close-issue", "7"]);
+        assert_eq!(out.code, 3, "{mode}: {}", out.stderr);
+        assert!(
+            out.stderr.contains("only by `issue-drain close-verified`"),
+            "{}",
+            out.stderr
+        );
+        assert!(env.gh_calls().is_empty(), "{mode}: {:?}", env.gh_calls());
+        assert_eq!(env.events_named("gh_write_refused")[0]["verb"], "close-issue");
+
+        env.set("ISSUE_DRAIN_DRY_RUN", "1");
+        let out = env.run(&["gh-write", "close-issue", "7"]);
+        assert_eq!(out.code, 3, "{mode} dry run: {}", out.stderr);
+        assert!(!out.stdout.contains("WOULD"), "{}", out.stdout);
+    }
 }
 
 #[test]
 fn an_unknown_mode_stops_the_command() {
     let mut env = Env::new();
     env.set("ISSUE_DRAIN_MODE", "admin");
-    let out = env.run(&["gh-write", "close-issue", "7"]);
+    let out = env.run(&["gh-write", "add-label", "7", "agent-in-progress"]);
     assert_eq!(out.code, 2);
     assert!(env.gh_calls().is_empty());
 }
@@ -275,11 +286,11 @@ fn a_gh_failure_exits_1_and_is_logged() {
 fn the_run_folder_and_the_repo_must_be_named() {
     let mut env = Env::new();
     env.set("ISSUE_DRAIN_WORKDIR", "relative/run");
-    assert_eq!(env.run(&["gh-write", "close-issue", "7"]).code, 2);
+    assert_eq!(env.run(&["gh-write", "add-label", "7", "agent-in-progress"]).code, 2);
 
     let mut env = Env::new();
     env.set("ISSUE_DRAIN_REPO", "not a repo");
-    let out = env.run(&["gh-write", "close-issue", "7"]);
+    let out = env.run(&["gh-write", "add-label", "7", "agent-in-progress"]);
     assert_eq!(out.code, 2);
     assert!(out.stderr.contains("ISSUE_DRAIN_REPO"), "{}", out.stderr);
     assert!(env.gh_calls().is_empty());
@@ -289,7 +300,7 @@ fn the_run_folder_and_the_repo_must_be_named() {
 fn a_missing_profile_stops_the_command() {
     let mut env = Env::new();
     env.set("ISSUE_DRAIN_PROFILE", "/nonexistent/profile.toml");
-    let out = env.run(&["gh-write", "close-issue", "7"]);
+    let out = env.run(&["gh-write", "add-label", "7", "agent-in-progress"]);
     assert_eq!(out.code, 2);
     assert!(
         out.stderr.contains("no profile at /nonexistent/profile.toml"),

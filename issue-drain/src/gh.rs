@@ -276,22 +276,32 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
         ),
         Err(_) => (127, String::new()),
     };
-    ctx.event(
+    // The call has happened. A log that cannot be written must not turn a
+    // write GitHub accepted into a failure the caller would retry.
+    if let Err(e) = ctx.event(
         "gh_write",
         json!({"verb": verb, "what": what, "dry_run": false, "rc": rc}),
-    )?;
+    ) {
+        eprintln!(
+            "issue-drain: warning: {what} ran (gh exit {rc}) but was not logged: {}",
+            e.msg
+        );
+    }
     if rc != 0 {
         return Err(Fail::failed(format!("gh failed (exit {rc}): {what}")));
     }
     Ok(Written { called: true, stdout })
 }
 
-const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|close-issue>";
+const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label>";
 
 /// `issue-drain gh-write <verb> ...`. The verb and its options are read by
 /// hand, not by clap, so that a unit process asking for a forbidden verb is
 /// refused, and the refusal logged, before anything else about the call is
 /// looked at.
+///
+/// There is no verb that closes an issue. `Write::CloseIssue` is reached only
+/// from `close-verified`, which holds every condition a closure needs.
 pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     ctx.repo()?;
     let mode = ctx.mode()?;
@@ -350,7 +360,14 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             number: number()?,
             label: arg(1),
         },
-        "close-issue" => Write::CloseIssue { number: number()? },
+        "close-issue" => {
+            return Err(refuse(
+                ctx,
+                verb,
+                mode,
+                "issues are closed only by `issue-drain close-verified`".to_string(),
+            ));
+        }
         other => return Err(Fail::usage(format!("unknown verb '{other}'"))),
     };
     print!("{}", write(ctx, &w)?.stdout);

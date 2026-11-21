@@ -19,10 +19,20 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+# One target folder, named in full, for the build and for the exec. A relative
+# CARGO_TARGET_DIR means relative to where the caller stands.
+target="${CARGO_TARGET_DIR:-$crate/target}"
+case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
+
+# The build runs from the crate, not from the caller's folder. Cargo reads
+# .cargo/config.toml upward from where it is started, and the caller's folder
+# is the repo being drained: its config could name a build wrapper or a linker,
+# which would then run as part of this build. A build target set in the
+# environment would also put the binary somewhere the exec does not look.
 # Build output goes to stderr only: stdout belongs to the subcommand.
-if ! cargo build --release --locked --quiet --manifest-path "$crate/Cargo.toml" >&2; then
-  echo "issue-drain: the build failed; run cargo build --release --manifest-path $crate/Cargo.toml to see why" >&2
+if ! (cd "$crate" && env -u CARGO_BUILD_TARGET cargo build --release --locked --quiet --target-dir "$target") >&2; then
+  echo "issue-drain: the build failed; run cargo build --release in $crate to see why" >&2
   exit 1
 fi
 
-exec "${CARGO_TARGET_DIR:-$crate/target}/release/issue-drain" "$@"
+exec "$target/release/issue-drain" "$@"

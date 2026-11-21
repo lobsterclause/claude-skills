@@ -62,6 +62,30 @@ pub fn private_repo(dir: &Path) -> PathBuf {
     dest
 }
 
+/// A clone of `upstream` at `<dir>/checkout` whose origin is configured as
+/// the tidepool repo on github.com, with a rewrite that sends the fetch to
+/// `upstream` on disk. A live `close-verified` checks the origin and fetches
+/// the base, so it needs a checkout like the one a person would have.
+pub fn origin_clone(dir: &Path, upstream: &Path) -> PathBuf {
+    let dest = dir.join("checkout");
+    let url = format!("https://github.com/{REPO}.git");
+    git(
+        dir,
+        &[
+            "clone",
+            "-q",
+            &upstream.display().to_string(),
+            &dest.display().to_string(),
+        ],
+    );
+    git(&dest, &["config", "remote.origin.url", &url]);
+    git(
+        &dest,
+        &["config", &format!("url.{}.insteadOf", upstream.display()), &url],
+    );
+    dest
+}
+
 /// `git -C <repo> <args>`, trimmed stdout. Panics if git fails.
 pub fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
