@@ -322,6 +322,94 @@ fn the_live_path_reads_graphql_and_normalises_it() {
     assert_eq!(intake["skipped"].as_array().unwrap().len(), 4);
 }
 
+/// A GraphQL answer for an open issue with one label and nothing else.
+fn plain_answer(n: u64, labels: &[&str]) -> Value {
+    let labels: Vec<Value> = labels.iter().map(|l| json!({"name": l})).collect();
+    json!({"data": {"repository": {"issue": {
+        "number": n, "title": format!("Issue {n}"), "body": "body", "state": "OPEN",
+        "url": format!("https://github.com/{REPO}/issues/{n}"),
+        "createdAt": "2026-11-01T00:00:00Z", "updatedAt": "2026-11-02T00:00:00Z",
+        "authorAssociation": "MEMBER", "author": {"login": "maintainer"},
+        "labels": {"pageInfo": {"hasNextPage": false}, "nodes": labels},
+        "closedByPullRequestsReferences": {"pageInfo": {"hasNextPage": false}, "nodes": []},
+        "timelineItems": {"pageInfo": {"hasPreviousPage": false}, "nodes": []}
+    }}}})
+}
+
+#[test]
+fn a_pr_in_this_repo_counts_whatever_the_case_of_the_repo_name() {
+    let env = Env::new();
+    let mut linked = plain_answer(31, &["bug"]);
+    linked["data"]["repository"]["issue"]["closedByPullRequestsReferences"]["nodes"] = json!([
+        {"number": 50, "state": "OPEN", "repository": {"nameWithOwner": "Example/Tidepool"}}]);
+    env.stub_file("graphql-31.json", &linked.to_string());
+    env.stub_file("graphql-32.json", &plain_answer(32, &["bug"]).to_string());
+    let out = env.run(&["intake", "31", "32"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let intake = intake_of(&env);
+    assert_eq!(
+        skipped_reason(&intake, 31).as_deref(),
+        Some("open PR #50 (a job for pr-drain)")
+    );
+    assert!(is_eligible(&intake, 32));
+}
+
+#[test]
+fn an_answer_cut_short_at_a_page_limit_is_skipped_and_not_judged() {
+    // The part not read could hold a hold label, an open PR or the claim's date.
+    let env = Env::new();
+    let mut labels = plain_answer(31, &["bug"]);
+    labels["data"]["repository"]["issue"]["labels"]["pageInfo"]["hasNextPage"] = json!(true);
+    let mut both = plain_answer(32, &["bug"]);
+    both["data"]["repository"]["issue"]["closedByPullRequestsReferences"]["pageInfo"]["hasNextPage"] = json!(true);
+    both["data"]["repository"]["issue"]["timelineItems"]["pageInfo"]["hasPreviousPage"] = json!(true);
+    env.stub_file("graphql-31.json", &labels.to_string());
+    env.stub_file("graphql-32.json", &both.to_string());
+    env.stub_file("graphql-33.json", &plain_answer(33, &["bug"]).to_string());
+    let out = env.run(&["intake", "31", "32", "33"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let intake = intake_of(&env);
+    assert_eq!(
+        skipped_reason(&intake, 31).as_deref(),
+        Some("could not be read in full (more labels than one page holds); check it by hand")
+    );
+    assert_eq!(
+        skipped_reason(&intake, 32).as_deref(),
+        Some("could not be read in full (more linked PRs, timeline than one page holds); check it by hand")
+    );
+    assert_eq!(intake["skipped"][0]["title"], "Issue 31");
+    assert!(!env.workdir.join("issues/31.json").exists());
+    assert!(!env.workdir.join("issues/31.md").exists());
+    // Control: the whole answer is taken in.
+    assert!(is_eligible(&intake, 33));
+    assert!(env.workdir.join("issues/33.json").is_file());
+}
+
+#[test]
+fn the_list_asks_for_more_than_the_cap_and_reading_stops_when_it_is_full() {
+    // A held issue does not use up the cap, so a list of exactly `cap` issues
+    // could come back with fewer eligible ones than the run may take.
+    let mut env = Env::new();
+    profile_with(&mut env, "intake_cap = 40", "intake_cap = 1");
+    env.stub_file("issue-list.txt", "31\n32\n33\n");
+    env.stub_file("graphql-31.json", &plain_answer(31, &["blocked"]).to_string());
+    env.stub_file("graphql-32.json", &plain_answer(32, &["bug"]).to_string());
+    env.stub_file("graphql-33.json", &plain_answer(33, &["bug"]).to_string());
+    let out = env.run(&["intake", "--label", "bug"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let calls = env.gh_calls();
+    assert!(calls[0].contains("--limit 3 --label bug"), "{calls:?}");
+    assert_eq!(graphql_numbers(&calls), ["31", "32"], "{calls:?}");
+    let intake = intake_of(&env);
+    assert_eq!(skipped_reason(&intake, 31).as_deref(), Some("label:blocked"));
+    assert!(is_eligible(&intake, 32));
+    assert_eq!(
+        skipped_reason(&intake, 33).as_deref(),
+        Some("not read: the cap of 1 issues per run was already full; take it in the next run")
+    );
+    assert!(!env.workdir.join("issues/33.json").exists());
+}
+
 #[test]
 fn a_gh_failure_listing_the_issues_is_exit_1_and_the_control_passes() {
     let env = Env::new();

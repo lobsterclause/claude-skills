@@ -43,11 +43,14 @@ pub struct Args {
 const QUERY: &str =
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){
   number title body state url createdAt updatedAt authorAssociation author{login}
-  labels(first:50){nodes{name}}
-  closedByPullRequestsReferences(first:20,includeClosedPrs:false){nodes{number state repository{nameWithOwner}}}
-  timelineItems(last:100,itemTypes:[CROSS_REFERENCED_EVENT,LABELED_EVENT]){nodes{__typename
+  labels(first:50){pageInfo{hasNextPage} nodes{name}}
+  closedByPullRequestsReferences(first:20,includeClosedPrs:false){pageInfo{hasNextPage} nodes{number state repository{nameWithOwner}}}
+  timelineItems(last:100,itemTypes:[CROSS_REFERENCED_EVENT,LABELED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename
     ... on CrossReferencedEvent{source{__typename ... on PullRequest{number state repository{nameWithOwner}}}}
     ... on LabeledEvent{createdAt label{name}}}}}}}";
+
+/// How many times the cap `--label` and `--search` list when no --limit is given.
+const LIST_FACTOR: usize = 3;
 
 /// One issue's verdict while the run is being worked out.
 struct Row {
@@ -72,16 +75,53 @@ fn nodes<'a>(v: &'a Value, path: &[&str]) -> &'a [Value] {
         .map_or(&[], Vec::as_slice)
 }
 
+/// What one fetch gave.
+enum Fetched {
+    Whole(Issue),
+    /// The answer was cut short at a page limit. The lists it names may lack
+    /// a hold label, an open PR or the claim's date, so the issue is not judged.
+    Partial {
+        title: String,
+        cut: Vec<&'static str>,
+    },
+}
+
+/// The lists of the answer that have more entries than the one page read.
+fn cut_short(i: &Value) -> Vec<&'static str> {
+    let more = |path: &[&str]| path.iter().try_fold(i, |v, key| v.get(key)).and_then(Value::as_bool) == Some(true);
+    let mut cut = Vec::new();
+    if more(&["labels", "pageInfo", "hasNextPage"]) {
+        cut.push("labels");
+    }
+    if more(&["closedByPullRequestsReferences", "pageInfo", "hasNextPage"]) {
+        cut.push("linked PRs");
+    }
+    if more(&["timelineItems", "pageInfo", "hasPreviousPage"]) {
+        cut.push("timeline");
+    }
+    cut
+}
+
 /// The GraphQL answer as the issue intake saves it. `None` when the answer is
 /// not an issue (a PR number, a missing issue).
-fn normalise(raw: &str, repo: &str, claim: &str) -> Option<Issue> {
+fn normalise(raw: &str, repo: &str, claim: &str) -> Option<Fetched> {
     let raw: Value = serde_json::from_str(raw).ok()?;
     let i = raw.get("data")?.get("repository")?.get("issue")?;
     if !i.is_object() {
         return None;
     }
-    let in_this_repo =
-        |pr: &Value| text_at(pr, &["state"]) == "OPEN" && text_at(pr, &["repository", "nameWithOwner"]) == repo;
+    let cut = cut_short(i);
+    if !cut.is_empty() {
+        i.get("number")?.as_u64()?;
+        return Some(Fetched::Partial {
+            title: text_at(i, &["title"]).to_string(),
+            cut,
+        });
+    }
+    // GitHub does not tell owner and repo names apart by case.
+    let in_this_repo = |pr: &Value| {
+        text_at(pr, &["state"]) == "OPEN" && text_at(pr, &["repository", "nameWithOwner"]).eq_ignore_ascii_case(repo)
+    };
     let mut open_prs = BTreeSet::new();
     for pr in nodes(i, &["closedByPullRequestsReferences", "nodes"]) {
         if in_this_repo(pr) {
@@ -103,7 +143,7 @@ fn normalise(raw: &str, repo: &str, claim: &str) -> Option<Issue> {
         .filter(|e| text_at(e, &["__typename"]) == "LabeledEvent" && same_label(text_at(e, &["label", "name"]), claim))
         .map(|e| text_at(e, &["createdAt"]).to_string())
         .max();
-    Some(Issue {
+    Some(Fetched::Whole(Issue {
         number: i.get("number")?.as_u64()?,
         title: text_at(i, &["title"]).to_string(),
         body: text_at(i, &["body"]).to_string(),
@@ -122,7 +162,7 @@ fn normalise(raw: &str, repo: &str, claim: &str) -> Option<Issue> {
             .collect(),
         open_prs: open_prs.into_iter().collect(),
         claim_labeled_at,
-    })
+    }))
 }
 
 /// One line: control characters (newlines included) become spaces, so text
@@ -167,7 +207,9 @@ fn list_numbers(args: &Args, repo: &str, cap: usize) -> Res<Vec<u64>> {
         Some(l) => parse_number(l)
             .ok_or_else(|| Fail::usage(format!("--limit must be a positive number (got '{l}')")))?
             .to_string(),
-        None => cap.to_string(),
+        // Held and claimed issues do not count against the cap, so the list
+        // asks for more than the cap; the run stops reading once it is full.
+        None => cap.saturating_mul(LIST_FACTOR).to_string(),
     };
     let mut argv = vec![
         "issue",
@@ -194,7 +236,7 @@ fn list_numbers(args: &Args, repo: &str, cap: usize) -> Res<Vec<u64>> {
     Ok(out.lines().filter_map(|l| parse_number(l.trim())).collect())
 }
 
-fn fetch(repo: &str, claim: &str, n: u64) -> Option<Issue> {
+fn fetch(repo: &str, claim: &str, n: u64) -> Option<Fetched> {
     let (owner, name) = repo.split_once('/')?;
     let query = format!("query={QUERY}");
     let raw = gh::read(&[
@@ -210,7 +252,10 @@ fn fetch(repo: &str, claim: &str, n: u64) -> Option<Issue> {
         &format!("number={n}"),
     ])
     .ok()?;
-    normalise(&raw, repo, claim).filter(|i| i.number == n)
+    normalise(&raw, repo, claim).filter(|f| match f {
+        Fetched::Whole(i) => i.number == n,
+        Fetched::Partial { .. } => true,
+    })
 }
 
 /// The profile's classifier, run in the repo checkout with the issue's text in
@@ -349,20 +394,48 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         if !seen.insert(n) {
             continue;
         }
-        let issue = match &from_file {
-            Some(issues) => issues.iter().find(|i| i.number == n).cloned(),
+        let unread = |title: String, reason: String| Row {
+            number: n,
+            title,
+            eligible: None,
+            skip: Some(reason),
+            stale_claim: None,
+        };
+        // With the cap full, nothing more is asked of gh. A file is already read.
+        if from_file.is_none() && eligible_count >= p.intake_cap {
+            rows.push(unread(
+                String::new(),
+                format!(
+                    "not read: the cap of {} issues per run was already full; take it in the next run",
+                    p.intake_cap
+                ),
+            ));
+            continue;
+        }
+        let fetched = match &from_file {
+            Some(issues) => issues.iter().find(|i| i.number == n).cloned().map(Fetched::Whole),
             None => fetch(&repo, &p.claim_label, n),
         };
-        let Some(issue) = issue else {
-            // A failed fetch is skipped even if an earlier run left a file for that number.
-            rows.push(Row {
-                number: n,
-                title: String::new(),
-                eligible: None,
-                skip: Some("could not be read as an issue (a PR number, or a gh error)".into()),
-                stale_claim: None,
-            });
-            continue;
+        let issue = match fetched {
+            Some(Fetched::Whole(issue)) => issue,
+            Some(Fetched::Partial { title, cut }) => {
+                rows.push(unread(
+                    title,
+                    format!(
+                        "could not be read in full (more {} than one page holds); check it by hand",
+                        cut.join(", ")
+                    ),
+                ));
+                continue;
+            }
+            None => {
+                // A failed fetch is skipped even if an earlier run left a file for that number.
+                rows.push(unread(
+                    String::new(),
+                    "could not be read as an issue (a PR number, or a gh error)".into(),
+                ));
+                continue;
+            }
         };
         write_json(&ctx.path(&format!("issues/{n}.json")), &issue)?;
         write_atomic(&ctx.path(&format!("issues/{n}.md")), markdown(&issue).as_bytes())?;
