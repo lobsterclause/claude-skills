@@ -41,6 +41,21 @@ fn the_good_verdicts_check_out_to_the_golden_file() {
     assert!(out.stdout.contains("#112: already_fixed -> unclear"), "{}", out.stdout);
 }
 
+#[test]
+fn a_folder_inside_the_checkout_checks_out_the_same() {
+    // Quoted paths are relative to the root of the repo, wherever in it
+    // ISSUE_DRAIN_REPO_DIR points.
+    let mut env = Env::new();
+    env.set(
+        "ISSUE_DRAIN_REPO_DIR",
+        &fixture_repo().join("src").display().to_string(),
+    );
+    env.seed(&["intake.json", "issues"]);
+    let out = env.run(&["evidence-check", &good_file(), "--ref", "develop"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(json(&checked_path(&env)), golden("verdicts.checked.json"));
+}
+
 // ---- one verdict at a time ----
 
 fn good(number: u64) -> Value {

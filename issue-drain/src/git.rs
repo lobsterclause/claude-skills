@@ -53,12 +53,23 @@ pub fn at_shallow_cut(dir: &Path, sha: &str) -> bool {
 }
 
 /// `owner/repo` of the checkout's origin on GitHub, or `None` when origin is
-/// unset or is not a github.com URL. This is the URL as configured, which is
-/// what says whose code the checkout holds; where a fetch really goes (an
+/// unset, is not a github.com URL, or has URLs that name more than one repo
+/// (git fetches from the first of them). This is the URL as configured, which
+/// is what says whose code the checkout holds; where a fetch really goes (an
 /// `insteadOf` rewrite, a mirror) is the machine's own business.
 pub fn origin_repo(dir: &Path) -> Option<String> {
-    let url = out(dir, &["config", "--get", "remote.origin.url"])?;
-    github_repo(url.trim())
+    let urls = out(dir, &["config", "--get-all", "remote.origin.url"])?;
+    let mut repos = urls.lines().map(|url| github_repo(url.trim()));
+    let first = repos.next()??;
+    repos
+        .all(|repo| repo.is_some_and(|repo| repo.eq_ignore_ascii_case(&first)))
+        .then_some(first)
+}
+
+/// Whether `file` is the same at both commits. A failed comparison is a
+/// difference. The path is taken as written, not as a pathspec pattern.
+pub fn same_file(dir: &Path, a: &str, b: &str, file: &str) -> bool {
+    ok(dir, &["--literal-pathspecs", "diff", "--quiet", a, b, "--", file])
 }
 
 /// `owner/repo` from an https, ssh or scp-style github.com URL.

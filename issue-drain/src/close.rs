@@ -138,6 +138,19 @@ fn comment(r: &Run, fresh: &Checked, fix: &FixCommit, note: &str) -> String {
     lines.join("\n") + "\n"
 }
 
+/// Whether the issue's title and body are the ones intake saved. The verdict
+/// and the approval were both given for that text.
+fn as_triaged(ctx: &Ctx, number: u64, live: &Value) -> bool {
+    let Some(saved) = read_json::<Value>(&ctx.path(&format!("issues/{number}.json"))) else {
+        return false;
+    };
+    let text = |issue: &Value, key: &str| {
+        let value = issue[key].as_str().unwrap_or_default();
+        value.replace("\r\n", "\n").trim_end().to_string()
+    };
+    ["title", "body"].iter().all(|key| text(&saved, key) == text(live, key))
+}
+
 fn created_at(ctx: &Ctx, number: u64) -> Option<i64> {
     let issue: Value = read_json(&ctx.path(&format!("issues/{number}.json")))?;
     parse_rfc3339(issue.get("createdAt")?.as_str()?)
@@ -153,7 +166,7 @@ fn view(r: &Run, number: u64) -> Res<Value> {
         "--repo",
         &r.repo,
         "--json",
-        "state,labels,comments",
+        "state,labels,comments,title,body",
     ])
     .map_err(|_| unreadable())?;
     serde_json::from_str(&raw).map_err(|_| unreadable())
@@ -228,6 +241,26 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
             sha7(&fix.sha)
         ));
     }
+    // The quote and its blame can survive a change that undoes the fix (an
+    // early return above it). The files were read as they were at render.
+    let Some(rendered) = git::commit(&r.repo_dir, &r.queue.base_sha) else {
+        return refused(format!(
+            "the commit the tracker was rendered at ({}) is not in the checkout",
+            sha7(&r.queue.base_sha)
+        ));
+    };
+    let mut files: Vec<&str> = offered.evidence.iter().map(|q| q.file.as_str()).collect();
+    files.sort_unstable();
+    files.dedup();
+    if let Some(file) = files
+        .iter()
+        .find(|file| !git::same_file(&r.repo_dir, &rendered, &r.reference, file))
+    {
+        return refused(format!(
+            "{file} changed on {} after the tracker was rendered; triage it again",
+            r.shown
+        ));
+    }
 
     // The tracker and the issue, read again: the evidence check takes a
     // while, and a STOP, an unticked box, a label or a close that landed
@@ -256,6 +289,9 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
     let live = view(r, number)?;
     if let Some(stop) = standing(ctx, &live) {
         return Ok(Err(stop));
+    }
+    if !as_triaged(ctx, number, &live) {
+        return refused("its title or body was edited after intake; triage it again".into());
     }
 
     let file = ctx.path(&format!("closures/{number}.md"));
@@ -393,7 +429,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                     format!(
                         "the checkout at {} has origin {}, not {repo}",
                         repo_dir.display(),
-                        origin.as_deref().unwrap_or("unset or not on github.com")
+                        origin
+                            .as_deref()
+                            .unwrap_or("unset, not on github.com, or set to more than one repo")
                     ),
                 ));
             }

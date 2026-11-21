@@ -250,7 +250,7 @@ fn lock(ctx: &Ctx) -> Res<Lock> {
 /// the tracker label and this run's marker line. A publish that died between
 /// `gh issue create` and tracker.json leaves one, and a second create would
 /// leave two trackers for one queue.
-fn existing(ctx: &Ctx, run: &str) -> Res<Option<(u64, String)>> {
+fn existing(ctx: &Ctx, run: &str) -> Res<Option<(u64, String, String)>> {
     let repo = ctx.repo()?;
     let unreadable = || {
         Fail::failed(format!(
@@ -280,7 +280,11 @@ fn existing(ctx: &Ctx, run: &str) -> Res<Option<(u64, String)>> {
         if captures(&lines, &MARKER).first().copied() != Some(run) {
             return None;
         }
-        Some((issue["number"].as_u64()?, issue["url"].as_str()?.to_string()))
+        Some((
+            issue["number"].as_u64()?,
+            issue["url"].as_str()?.to_string(),
+            issue["body"].as_str()?.to_string(),
+        ))
     }))
 }
 
@@ -328,7 +332,19 @@ pub fn publish(ctx: &Ctx, _args: &PublishArgs) -> Res<()> {
 
     // A dry run reads nothing from GitHub, as everywhere else.
     if !ctx.dry_run {
-        if let Some((number, url)) = existing(ctx, &run)? {
+        if let Some((number, url, theirs)) = existing(ctx, &run)? {
+            // The run can be rendered again between a publish that died and
+            // this one. A tracker showing the earlier render is not adopted:
+            // a tick on it approves an offer this queue may not make.
+            let ours =
+                fs::read_to_string(&body).map_err(|e| Fail::failed(format!("cannot read {}: {e}", body.display())))?;
+            let text = |s: &str| s.replace("\r\n", "\n").trim_end().to_string();
+            if text(&ours) != text(&theirs) {
+                return Err(Fail::refused(format!(
+                    "this run already created tracker #{number} ({url}), and its body does not match the queue \
+                     rendered now; close #{number} and publish again, or render the decisions it was made from"
+                )));
+            }
             return record(ctx, "tracker_adopted", number, &url, run);
         }
     }

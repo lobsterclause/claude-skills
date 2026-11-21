@@ -472,6 +472,25 @@ fn a_tracker_this_run_already_created_is_adopted_and_not_created_again() {
 }
 
 #[test]
+fn a_tracker_this_run_created_from_another_render_is_not_adopted() {
+    // The publish died, the decisions changed and the run was rendered again.
+    // The issue on GitHub shows the earlier offer; ticks on it are not
+    // approvals of this queue.
+    let env = publish_env();
+    listed(
+        &env,
+        4100,
+        &format!("{}\n- an offer the new render dropped\n", tracker_md()),
+    );
+    let out = env.run(&["tracker", "publish"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("#4100"), "{}", out.stderr);
+    assert!(out.stderr.contains("does not match"), "{}", out.stderr);
+    assert_eq!(env.gh_calls(), [tracker_list_call()]);
+    assert!(!env.workdir.join("tracker.json").exists());
+}
+
+#[test]
 fn another_runs_tracker_is_not_adopted() {
     let env = publish_env();
     listed(&env, 4100, &tracker_md().replace("run=run", "run=other"));

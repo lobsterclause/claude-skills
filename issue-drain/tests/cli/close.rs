@@ -39,7 +39,22 @@ fn issue(env: &Env, number: u64, state: &str, labels: &[&str], comments: &[&str]
 }
 
 /// The same, with each comment marked as the viewer's own or someone else's.
+/// The title and body are the ones intake saved.
 fn issue_with(env: &Env, number: u64, state: &str, labels: &[&str], comments: &[(&str, bool)]) {
+    let saved = json(&fixtures().join(format!("run/issues/{number}.json")));
+    issue_text(env, number, state, labels, comments, &saved["title"], &saved["body"]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn issue_text(
+    env: &Env,
+    number: u64,
+    state: &str,
+    labels: &[&str],
+    comments: &[(&str, bool)],
+    title: &Value,
+    body: &Value,
+) {
     let labels: Vec<Value> = labels.iter().map(|l| json!({"name": l})).collect();
     let comments: Vec<Value> = comments
         .iter()
@@ -47,7 +62,7 @@ fn issue_with(env: &Env, number: u64, state: &str, labels: &[&str], comments: &[
         .collect();
     env.stub_file(
         &format!("issue-view-{number}.json"),
-        &json!({"state": state, "labels": labels, "comments": comments}).to_string(),
+        &json!({"state": state, "labels": labels, "comments": comments, "title": title, "body": body}).to_string(),
     );
 }
 
@@ -240,7 +255,7 @@ fn a_checkout_of_another_repo_refuses_every_closure() {
     refused_all(
         &no_origin,
         &no_origin.run(&ARGS),
-        "has origin unset or not on github.com, not example/tidepool",
+        "has origin unset, not on github.com, or set to more than one repo, not example/tidepool",
     );
 }
 
@@ -455,6 +470,88 @@ fn code_that_changed_since_triage_refuses() {
         &env,
         &env.run(&ARGS),
         "on origin/develop it no longer checks out as fixed",
+    );
+}
+
+#[test]
+fn a_report_edited_since_intake_refuses() {
+    // The closure was approved for the report as intake saved it. A body the
+    // reporter has since changed is a report nobody triaged.
+    let env = ready();
+    let saved = json(&fixtures().join("run/issues/101.json"));
+    let edited = json!(format!(
+        "{}\n\nEdit: it still happens after a token refresh.",
+        saved["body"].as_str().expect("a body")
+    ));
+    issue_text(&env, 101, "OPEN", &["bug"], &[], &saved["title"], &edited);
+    refused_one(&env, &env.run(&ARGS), "its title or body was edited after intake");
+
+    // The same text with GitHub's line endings is the same report.
+    let env = ready();
+    let crlf = json!(saved["body"].as_str().expect("a body").replace('\n', "\r\n"));
+    issue_text(&env, 101, "OPEN", &["bug"], &[], &saved["title"], &crlf);
+    assert_eq!(env.run(&ARGS).code, 0);
+}
+
+#[test]
+fn a_later_change_to_the_quoted_file_refuses() {
+    // The quoted line and its blame are untouched, but the file around it is
+    // not the one that was read at triage: an early return above the fix
+    // would look the same to the evidence check.
+    let mut env = Env::new();
+    let repo = private_repo(env.dir.path());
+    let checkout = origin_clone(env.dir.path(), &repo);
+    env.set("ISSUE_DRAIN_REPO_DIR", &checkout.display().to_string());
+    publish(&env);
+
+    // Control: a commit to another file leaves the closure alone.
+    fs::write(repo.join("NOTES.md"), "a note\n").expect("the note");
+    git(&repo, &["add", "NOTES.md"]);
+    commit_all(&repo, "docs: a note");
+    assert_eq!(env.run(&ARGS).code, 0);
+    fs::remove_file(env.stub.join("closed-101")).expect("reopen");
+    fs::remove_file(env.dir.path().join("gh.log")).expect("clear the call log");
+    fs::remove_file(env.workdir.join("events.jsonl")).expect("clear the events");
+
+    let file = repo.join("src/auth/session.ts");
+    let text = fs::read_to_string(&file).expect("the module");
+    fs::write(&file, format!("{text}\nexport const LATER = true;\n")).expect("the edit");
+    commit_all(&repo, "feat: something later in the same file");
+    refused_one(
+        &env,
+        &env.run(&ARGS),
+        "src/auth/session.ts changed on origin/develop after the tracker was rendered",
+    );
+}
+
+#[test]
+fn an_origin_with_a_second_url_refuses_every_closure() {
+    // git fetches from the first URL and `git config --get` reads the last.
+    // An origin with two is not known to be the repo being drained.
+    let env = ready();
+    let checkout = env.dir.path().join("checkout");
+    let fork = "https://github.com/example/fork.git";
+    let target = format!("https://github.com/{REPO}.git");
+    let rewrite = format!("url.{}.insteadOf", fixture_repo().display());
+    git(&checkout, &["config", "--add", &rewrite, fork]);
+    git(&checkout, &["config", "--replace-all", "remote.origin.url", fork]);
+    git(&checkout, &["config", "--add", "remote.origin.url", &target]);
+    refused_all(&env, &env.run(&ARGS), "not example/tidepool");
+}
+
+fn commit_all(repo: &std::path::Path, subject: &str) {
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "-am",
+            subject,
+        ],
     );
 }
 

@@ -65,6 +65,22 @@ fn repo_from_env() -> Res<String> {
     }
 }
 
+/// `<dir>/<owner>__<repo>.toml`, matched without regard to case: GitHub does
+/// not tell `Owner/Repo` from `owner/repo`, and most filesystems do.
+fn default_profile(dir: &Path, repo: &str) -> PathBuf {
+    let name = format!("{}.toml", repo.replace('/', "__"));
+    let on_disk = fs::read_dir(dir).ok().and_then(|entries| {
+        entries
+            .flatten()
+            .map(|entry| entry.file_name())
+            .find(|file| file.to_string_lossy().eq_ignore_ascii_case(&name))
+    });
+    match on_disk {
+        Some(file) => dir.join(file),
+        None => dir.join(name),
+    }
+}
+
 impl Ctx {
     pub fn load() -> Res<Ctx> {
         let workdir = env_str("ISSUE_DRAIN_WORKDIR");
@@ -81,9 +97,7 @@ impl Ctx {
         };
         let profile_path = match env_str("ISSUE_DRAIN_PROFILE") {
             path if !path.is_empty() => PathBuf::from(path),
-            _ => skill_dir
-                .join("profiles")
-                .join(format!("{}.toml", repo_from_env()?.replace('/', "__"))),
+            _ => default_profile(&skill_dir.join("profiles"), &repo_from_env()?),
         };
         Ok(Ctx {
             workdir: PathBuf::from(workdir),
@@ -114,7 +128,12 @@ impl Ctx {
                 dir.display()
             )));
         }
-        Ok(dir)
+        // Quoted paths are relative to the root, so every git call runs there
+        // even when the setting names a folder inside the checkout.
+        let root = git::out(&dir, &["rev-parse", "--show-toplevel"])
+            .map(|root| PathBuf::from(root.trim_end_matches('\n')))
+            .filter(|root| root.is_absolute());
+        Ok(root.unwrap_or(dir))
     }
 
     pub fn mode(&self) -> Res<Mode> {
@@ -219,6 +238,16 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_profile_is_found_whatever_the_case_of_the_repo() {
+        let dir = tempfile::tempdir().expect("a temporary folder");
+        fs::write(dir.path().join("Not-Every-Mom__Tidepool.toml"), "").expect("the profile");
+        let found = default_profile(dir.path(), "not-every-mom/tidepool");
+        assert_eq!(found.file_name().unwrap(), "Not-Every-Mom__Tidepool.toml");
+        let missing = default_profile(dir.path(), "example/other");
+        assert_eq!(missing.file_name().unwrap(), "example__other.toml");
+    }
 
     #[test]
     fn timestamps_round_trip_in_utc() {
