@@ -140,6 +140,48 @@ fn created_at(ctx: &Ctx, number: u64) -> Option<i64> {
     parse_rfc3339(issue.get("createdAt")?.as_str()?)
 }
 
+/// The issue as GitHub shows it now.
+fn view(r: &Run, number: u64) -> Res<Value> {
+    let unreadable = || Fail::failed(format!("could not read #{number}"));
+    let raw = gh::read(&[
+        "issue",
+        "view",
+        &number.to_string(),
+        "--repo",
+        &r.repo,
+        "--json",
+        "state,labels,comments",
+    ])
+    .map_err(|_| unreadable())?;
+    serde_json::from_str(&raw).map_err(|_| unreadable())
+}
+
+/// Why the issue cannot be closed as it stands, if anything says so.
+fn standing(ctx: &Ctx, live: &Value) -> Option<Stop> {
+    let state = live["state"].as_str().unwrap_or_default();
+    if state == "CLOSED" {
+        return Some(Stop::Skipped("already closed"));
+    }
+    if state != "OPEN" {
+        return Some(Stop::Refused(format!("its state is '{state}'")));
+    }
+    let labels: Vec<String> = live["labels"]
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .filter_map(|l| l["name"].as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let held = ctx.profile.hold_label_on(&labels).or_else(|| {
+        ctx.profile
+            .has_claim(&labels)
+            .then_some(ctx.profile.claim_label.as_str())
+    });
+    held.map(|label| Stop::Refused(format!("it now carries the label '{label}'")))
+}
+
 fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
     let ctx = r.ctx;
     let refused = |why: String| Ok(Err(Stop::Refused(why)));
@@ -147,24 +189,8 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
     // The issue, as it is now. Read first: an issue someone already closed is
     // skipped, whatever the code says today.
     let n = number.to_string();
-    let unreadable = || Fail::failed(format!("could not read #{number}"));
-    let raw = gh::read(&[
-        "issue",
-        "view",
-        &n,
-        "--repo",
-        &r.repo,
-        "--json",
-        "state,labels,comments",
-    ])
-    .map_err(|_| unreadable())?;
-    let live: Value = serde_json::from_str(&raw).map_err(|_| unreadable())?;
-    let state = live["state"].as_str().unwrap_or_default();
-    if state == "CLOSED" {
-        return Ok(Err(Stop::Skipped("already closed")));
-    }
-    if state != "OPEN" {
-        return refused(format!("its state is '{state}'"));
+    if let Some(stop) = standing(ctx, &view(r, number)?) {
+        return Ok(Err(stop));
     }
 
     // The code, read again on the base as it is now.
@@ -200,22 +226,11 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
         ));
     }
 
-    let labels: Vec<String> = live["labels"]
-        .as_array()
-        .map(|l| {
-            l.iter()
-                .filter_map(|l| l["name"].as_str())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let held = ctx.profile.hold_label_on(&labels).or_else(|| {
-        ctx.profile
-            .has_claim(&labels)
-            .then_some(ctx.profile.claim_label.as_str())
-    });
-    if let Some(label) = held {
-        return refused(format!("it now carries the label '{label}'"));
+    // The issue, read again: the evidence check takes a while, and a label
+    // or a close that landed during it is honoured before anything is written.
+    let live = view(r, number)?;
+    if let Some(stop) = standing(ctx, &live) {
+        return Ok(Err(stop));
     }
 
     let file = ctx.path(&format!("closures/{number}.md"));
@@ -359,7 +374,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             }
         }
     }
-    if !args.no_fetch && !git::ok(&repo_dir, &["fetch", "--quiet", "origin", base]) {
+    // The refspec is spelled out: a checkout that does not track the base
+    // would otherwise move only FETCH_HEAD and leave origin/<base> as it was.
+    let refspec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
+    if !args.no_fetch && !git::ok(&repo_dir, &["fetch", "--quiet", "origin", &refspec]) {
         return Err(Fail::failed(format!(
             "could not fetch {base} in {}; a closure is checked against the base as it is now",
             repo_dir.display()

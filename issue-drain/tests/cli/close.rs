@@ -421,9 +421,19 @@ fn code_that_changed_since_triage_refuses() {
     fs::remove_file(env.dir.path().join("gh.log")).expect("clear the call log");
     fs::remove_file(env.workdir.join("events.jsonl")).expect("clear the events");
 
+    drop_the_session_module(&repo);
+    refused_one(
+        &env,
+        &env.run(&ARGS),
+        "on origin/develop it no longer checks out as fixed",
+    );
+}
+
+/// A commit upstream that removes the line #101's closure quotes.
+fn drop_the_session_module(repo: &std::path::Path) {
     fs::write(repo.join("src/auth/session.ts"), "export {};\n").expect("the edit");
     git(
-        &repo,
+        repo,
         &[
             "-c",
             "user.name=t",
@@ -435,11 +445,57 @@ fn code_that_changed_since_triage_refuses() {
             "refactor: drop the session module",
         ],
     );
+}
+
+#[test]
+fn a_checkout_that_does_not_track_the_base_still_checks_the_base_as_it_is_now() {
+    // With a fetch refspec that leaves the base out, `git fetch origin
+    // develop` moves FETCH_HEAD and not origin/develop. The closure must be
+    // checked on what was fetched, not on the ref the clone left behind.
+    let mut env = Env::new();
+    let repo = private_repo(env.dir.path());
+    let checkout = origin_clone(env.dir.path(), &repo);
+    git(
+        &checkout,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/release:refs/remotes/origin/release",
+        ],
+    );
+    env.set("ISSUE_DRAIN_REPO_DIR", &checkout.display().to_string());
+    publish(&env);
+    drop_the_session_module(&repo);
     refused_one(
         &env,
         &env.run(&ARGS),
         "on origin/develop it no longer checks out as fixed",
     );
+}
+
+#[test]
+fn a_label_added_while_the_code_was_being_checked_refuses() {
+    // The issue is read once before the evidence check and again right
+    // before the comment. The second read is the one that sees the label.
+    let env = ready();
+    env.stub_file(
+        "issue-view-101.next.json",
+        &json!({"state": "OPEN", "labels": [{"name": "blocked"}], "comments": []}).to_string(),
+    );
+    refused_one(&env, &env.run(&ARGS), "it now carries the label 'blocked'");
+}
+
+#[test]
+fn an_issue_closed_while_the_code_was_being_checked_is_skipped() {
+    let env = ready();
+    env.stub_file(
+        "issue-view-101.next.json",
+        &json!({"state": "CLOSED", "labels": [], "comments": []}).to_string(),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("skipped #101: already closed"), "{}", out.stdout);
+    assert_eq!(writes(&env), Vec::<String>::new());
 }
 
 #[test]
