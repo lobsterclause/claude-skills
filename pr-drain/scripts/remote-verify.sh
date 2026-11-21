@@ -3,14 +3,26 @@
 #
 # Run `pnpm verify` for a COMMITTED worktree inside a Docker container on a
 # homelab box, so a loaded laptop cannot manufacture "Timeout waiting for
-# worker" reds. Ships `git ls-files` (tracked + untracked-not-ignored) as a tar,
-# so uncommitted edits are included but the reported head is the worktree's HEAD:
-# commit first, or the result describes a SHA you are not pushing.
+# worker" reds. Ships the TRACKED files (`git ls-files --cached`) as a tar, read
+# from the working copy, so uncommitted edits to tracked files are included but
+# the reported head is the worktree's HEAD: commit first, or the result
+# describes a SHA you are not pushing. Untracked files are NOT shipped: the box
+# runs `git add -A`, so a stray local file (a test report, a scratch script)
+# would become a tracked file there and fail checks CI never sees (#204: a
+# functions-core/.vitest/ report failed `format (tracked)` twice). The log
+# prints a WARN naming every untracked path left out. RV_INCLUDE_UNTRACKED=1
+# restores the old behaviour (ship untracked-not-ignored files too).
+#
+# Exit status is the remote verify's exit code (same N as the .out file).
+# Before #204 the script always exited 0, so a background caller saw success
+# on a failed verify.
 #
 # Outputs (override the dir with RV_OUT_DIR):
 #   $RV_OUT_DIR/rverify-<name>.log   full log (ANSI colour included)
 #   $RV_OUT_DIR/rv-<name>.out        "verify exit=N" -- written LAST; poll for it
 #   RV_CMD overrides the command (default `pnpm verify`) to run one test file.
+#   RV_SSH overrides the ssh command for the chosen host (test seam; see
+#   pr-drain/tests/remote-verify.test.sh).
 #
 # Prove a result by the log: it must contain `host=... head=<sha>` for the SHA
 # you are about to push and `verify passed`. Exit 125 = docker failed to start
@@ -44,13 +56,21 @@ case "$HOSTK" in
   thunderbird) SSH="ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 thunderbird"; BASE=/home/admin/rverify; LIM="--cpus=14 --memory=12g";;
   *) echo "unknown host '$HOSTK'" >&2; exit 2;;
 esac
+SSH="${RV_SSH:-$SSH}"
 D=$BASE/$N; LOG=$OUTD/rverify-$N.log; OUT=$OUTD/rv-$N.out; rm -f "$OUT"
 if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | $SSH "docker build -q -t kma-verify:22 -"; exit $?; fi
 {
   cd "$WT" || { echo "verify exit=97" > "$OUT"; exit 97; }
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
   $SSH "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || { echo "verify exit=98" > "$OUT"; exit 98; }
-  /usr/bin/git ls-files -z --cached --others --exclude-standard | COPYFILE_DISABLE=1 tar --null -T - -czf - 2>/dev/null | $SSH "tar -xzf - -C $D/w" || { echo "verify exit=99" > "$OUT"; exit 99; }
+  LSF="--cached"
+  if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then LSF="--cached --others --exclude-standard"
+  else
+    UNTR=$(/usr/bin/git ls-files --others --exclude-standard)
+    [ -n "$UNTR" ] && { echo "WARN: not shipping $(printf '%s\n' "$UNTR" | wc -l | tr -d ' ') untracked file(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"; printf '%s\n' "$UNTR" | sed 's/^/  /'; }
+  fi
+  # shellcheck disable=SC2086 # LSF is a deliberate flag list
+  /usr/bin/git ls-files -z $LSF | COPYFILE_DISABLE=1 tar --null -T - -czf - 2>/dev/null | $SSH "tar -xzf - -C $D/w" || { echo "verify exit=99" > "$OUT"; exit 99; }
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""
@@ -65,3 +85,4 @@ if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | $SSH
   $SSH "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N"
   echo "verify exit=$rc" > "$OUT"
 } > "$LOG" 2>&1
+exit "$rc"
