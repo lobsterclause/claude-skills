@@ -189,6 +189,10 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   ) || { echo "shipping the tree failed (git ls-files, tar or ssh)"; fail_clean 99; }
   ( set -o pipefail; list_subs . "" | "${SSH[@]}" "cat > $D/gitlinks" ) \
     || { echo "shipping the submodule list failed"; fail_clean 99; }
+  # The working copy is on the box now. Record what it was at this moment,
+  # computed like the header: a stamp must be for the tree that was shipped,
+  # not the one the header saw before the stream ran.
+  echo "shipped head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""

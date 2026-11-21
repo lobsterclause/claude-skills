@@ -25,6 +25,8 @@
 # Pass-10: a file replacing a submodule, box cleanup on a local failure
 # (red against 1ddd75f).
 # Pass-11: submodule list for the box (red against 14e5587).
+# Pass-13: the `shipped head= dirty=` line written after the stream (for
+# issue-drain's stamp-remote-pass); no such line before it existed.
 # Pass-12: the box's own git setup, run locally on the shipped tree: an
 # empty submodule and force-tracked ignored files (red against d04df8c).
 #
@@ -57,7 +59,9 @@ cat > "$FSSH" <<'FAKE'
 #!/bin/bash
 cmd="$*"
 case "$cmd" in
-  *"tar -xzf -"*) mkdir -p "$SHIP" && "$REAL_TAR" -xzf - -C "$SHIP" ;;
+  *"tar -xzf -"*) mkdir -p "$SHIP" && "$REAL_TAR" -xzf - -C "$SHIP"; rc=$?
+    # EDIT_FILE: an edit made while the working copy streams.
+    [ -n "${EDIT_FILE:-}" ] && echo edit >> "$EDIT_FILE"; exit $rc ;;
   *"git init -q"*) [ -n "${CMDLOG:-}" ] && printf '%s' "$cmd" > "$CMDLOG"; exit "$FAKE_RC" ;;
   *"mkdir -p $"*|*"mkdir -p /"*) [ -n "${FAKE_SETUP_FAIL:-}" ] && exit 1; exit 0 ;;
   *"rm -rf /b/"*) [ -n "${RMLOG:-}" ] && echo cleanup >> "$RMLOG"; exit 0 ;;
@@ -257,5 +261,26 @@ else wait "$pid"; check "FIFO log run finishes" 0 $?; fi
 for _ in $(seq 1 50); do kill -0 "$rpid" 2>/dev/null || break; sleep 0.1; done
 kill "$rpid" 2>/dev/null; wait "$rpid" 2>/dev/null
 grep -q "remote rc=0" "$T/fifo.txt"; check "FIFO reader saw the whole log" 0 $?
+
+# Pass-13: after the stream the script records what was shipped, computed like
+# the header, so a stamp cannot be written for a tree that changed meanwhile.
+R13="$T/repo13"; mkdir -p "$R13"
+git -C "$R13" init -q
+echo tracked > "$R13/a.txt"
+git -C "$R13" add a.txt
+git -C "$R13" -c user.email=t@t -c user.name=t commit -q -m init
+H13=$(git -C "$R13" rev-parse HEAD)
+REPO="$R13" OUTDIR="$T/out13" run 0 "$T/ship13b"; check "clean run exits 0" 0 $?
+check "log has the header first" "host=firebird head=$H13 dirty=0" "$(sed -n 1p "$T/out13/rverify-probe.log")"
+check "log has one shipped line" 1 "$(grep -c '^shipped head=' "$T/out13/rverify-probe.log")"
+check "shipped line says head and dirty=0" "shipped head=$H13 dirty=0" "$(grep '^shipped head=' "$T/out13/rverify-probe.log")"
+# An edit made while the stream runs shows in the shipped line, not the header.
+REPO="$R13" OUTDIR="$T/out14" run 0 "$T/ship14b" EDIT_FILE="$R13/a.txt"; check "edit during stream: run still exits 0" 0 $?
+check "edit during stream: header dirty=0" "host=firebird head=$H13 dirty=0" "$(sed -n 1p "$T/out14/rverify-probe.log")"
+check "edit during stream: shipped line dirty=1" "shipped head=$H13 dirty=1" "$(grep '^shipped head=' "$T/out14/rverify-probe.log")"
+git -C "$R13" checkout -q a.txt
+# A failed ship writes no shipped line.
+REPO="$R2" OUTDIR="$T/out15" run 0 "$T/ship15" PATH="$T/badtar:$PATH" >/dev/null
+check "failed ship has no shipped line" 0 "$(grep -c '^shipped head=' "$T/out15/rverify-probe.log")"
 
 exit $fail

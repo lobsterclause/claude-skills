@@ -101,6 +101,7 @@ fn a_diff_inside_scope_is_ok_and_names_the_head() {
     assert_eq!(d["head"], git(&c.repo, &["rev-parse", "HEAD"]));
     assert_eq!(d["base"], git(&c.repo, &["rev-parse", "develop"]));
     assert_eq!(d["failures"], json!([]));
+    assert_eq!(d["risk_paths_touched"], json!([]));
     assert_eq!(d["flags"], json!({"new_dependency": [], "shortcuts": []}));
     assert_eq!(
         (d["scope_checked"].clone(), d["acceptance_checked"].clone()),
@@ -150,6 +151,30 @@ fn the_merge_base_the_diff_started_from_is_recorded() {
     assert_eq!(part.code, 0, "{}", part.stderr);
     assert_eq!(c.deliver()["merge_base"], first);
     assert_ne!(c.deliver()["merge_base"], fork);
+}
+
+#[test]
+fn a_risk_path_in_the_diff_is_recorded_and_the_check_still_passes() {
+    // The fixture profile's risk_path_re matches `crisis` and `billing`. The
+    // unit was planned without risk paths; a test file counts too.
+    let c = case_with(json!({"files": ["src/timer/", "src/billing/"]}));
+    commit(
+        &c.repo,
+        &[
+            ("src/timer/countdown.ts", "x\n"),
+            ("src/billing/charge.ts", "x\n"),
+            ("tests/crisis.test.ts", "t\n"),
+        ],
+        "fix",
+    );
+    let out = c.check(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let d = c.deliver();
+    assert_eq!(d["ok"], true);
+    assert_eq!(
+        d["risk_paths_touched"],
+        json!(["src/billing/charge.ts", "tests/crisis.test.ts"])
+    );
 }
 
 #[test]

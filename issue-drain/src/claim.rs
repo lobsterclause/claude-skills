@@ -12,10 +12,15 @@
 //! comments is read whole):
 //!   - the claim label is on the issue now;
 //!   - the newest claim marker (any tracker, any unit) is ours;
-//!   - that marker was created at or after the latest `labeled` event of the
-//!     claim label, so the label it describes is the one on the issue; a label
-//!     with no `labeled` event is not ours;
-//!   - no `unlabeled` event of the claim label is at or after the marker.
+//!   - that marker comes after the latest `labeled` event of the claim label,
+//!     so the label it describes is the one on the issue; a label with no
+//!     `labeled` event is not ours;
+//!   - no `unlabeled` event of the claim label comes after the marker.
+//!
+//! "After" is the pair (creation time, position in the timeline): GitHub's
+//! times are whole seconds, and a release and a retake inside one second share
+//! one, so the order of events with equal times is the timeline's, which is
+//! chronological.
 //!
 //! So an old marker of ours does not make a later run's claim, or a label a
 //! stranger added after our release or after our label call failed, ours;
@@ -92,10 +97,10 @@ fn is_any_marker(body: &str) -> bool {
 struct Timeline {
     /// Each claim marker comment: when, its place in the timeline, its body.
     markers: Vec<(i64, usize, String)>,
-    /// The latest time the claim label was added; `None` when it never was.
-    labeled: Option<i64>,
-    /// When the claim label was taken off, each time.
-    unlabeled: Vec<i64>,
+    /// The latest (time, place) the claim label was added; `None` when it never was.
+    labeled: Option<(i64, usize)>,
+    /// When the claim label was taken off, each time, with its place.
+    unlabeled: Vec<(i64, usize)>,
 }
 
 /// The issue's whole timeline, every page. A time that cannot be read counts as
@@ -139,7 +144,7 @@ fn read_timeline(repo: &str, number: u64, label: &str) -> Res<Timeline> {
                     if !same_label(named, label) {
                         continue;
                     }
-                    let at = at.unwrap_or(i64::MAX);
+                    let at = (at.unwrap_or(i64::MAX), index);
                     if kind == "labeled" {
                         found.labeled = found.labeled.max(Some(at));
                     } else {
@@ -155,15 +160,15 @@ fn read_timeline(repo: &str, number: u64, label: &str) -> Res<Timeline> {
 
 /// Whether the claim on the issue is ours: see the module header. The newest
 /// marker is the latest by creation time, a tie going to the later in the
-/// timeline. Equal times count against the claim wherever it is a question of
-/// order, except that a marker may share the second of the label it follows.
+/// timeline; every order question is decided by (time, place) the same way.
 fn is_ours(timeline: &Timeline, marker: &str) -> bool {
-    let Some((at, _, body)) = timeline.markers.iter().max_by_key(|(at, i, _)| (*at, *i)) else {
+    let Some((at, place, body)) = timeline.markers.iter().max_by_key(|(at, i, _)| (*at, *i)) else {
         return false;
     };
+    let ours = (*at, *place);
     is_marker(body, marker)
-        && timeline.labeled.is_some_and(|labeled| *at >= labeled)
-        && timeline.unlabeled.iter().all(|off| off < at)
+        && timeline.labeled.is_some_and(|labeled| ours > labeled)
+        && timeline.unlabeled.iter().all(|off| *off < ours)
 }
 
 /// What GitHub shows on the issue now.
@@ -383,6 +388,25 @@ pub fn run(ctx: &Ctx, command: &Command) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const M: &str = "<!-- issue-drain:claim tracker=1 unit=1 -->";
+
+    #[test]
+    fn events_in_one_second_are_ordered_by_their_place_in_the_timeline() {
+        let line = |markers: &[(i64, usize)], labeled, unlabeled: &[(i64, usize)]| Timeline {
+            markers: markers.iter().map(|(t, i)| (*t, *i, M.to_string())).collect(),
+            labeled,
+            unlabeled: unlabeled.to_vec(),
+        };
+        // labeled 1, marker 2, unlabeled 3, labeled 4, marker 5: one second.
+        assert!(is_ours(&line(&[(7, 2), (7, 5)], Some((7, 4)), &[(7, 3)]), M));
+        // The label came after the marker: not ours.
+        assert!(!is_ours(&line(&[(7, 2)], Some((7, 4)), &[(7, 3)]), M));
+        // An unlabel after the marker: not ours.
+        assert!(!is_ours(&line(&[(7, 2)], Some((7, 1)), &[(7, 3)]), M));
+        // No label event at all: not ours.
+        assert!(!is_ours(&line(&[(7, 2)], None, &[]), M));
+    }
 
     #[test]
     fn any_trackers_marker_is_a_marker_but_only_on_the_first_line() {

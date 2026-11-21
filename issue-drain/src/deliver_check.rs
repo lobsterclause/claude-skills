@@ -17,6 +17,12 @@
 //! When `units/<n>/unit.json` exists the check must run in the worktree it
 //! names, or it refuses (exit 2): git reads whatever folder it is started in.
 //!
+//! Every changed path, test paths included, is also matched against the
+//! profile's `risk_path_re`. The matches are recorded as `risk_paths_touched`.
+//! The check itself still passes on them (the work may be right), but
+//! `merge-gate` refuses a unit whose list is not empty, and one without the
+//! field, so a unit planned without risk paths cannot merge unattended.
+//!
 //! `deliver.json` records `merge_base`, the commit the diff started from.
 //! `merge-gate` refuses a report whose `merge_base` is not the PR's merge base
 //! with the live base branch, so run it without `--base` before a merge.
@@ -97,6 +103,8 @@ pub struct Verdict {
     pub failures: Vec<Failure>,
     /// Paths in scope only as test files of the unit's files.
     pub test_paths: Vec<String>,
+    /// Changed paths that match the profile's risk path rule. Not a failure.
+    pub risk_paths: Vec<String>,
     pub new_dependency: Vec<String>,
     pub shortcuts: Vec<AddedLine>,
 }
@@ -138,7 +146,12 @@ pub fn is_test_path(path: &str, scope: &[String]) -> bool {
 }
 
 /// Every rule, none stopping at the first. No I/O.
-pub fn judge(input: &Input, is_protected: &dyn Fn(&str) -> bool, is_frozen: &dyn Fn(&str) -> bool) -> Verdict {
+pub fn judge(
+    input: &Input,
+    is_protected: &dyn Fn(&str) -> bool,
+    is_frozen: &dyn Fn(&str) -> bool,
+    is_risk: &dyn Fn(&str) -> bool,
+) -> Verdict {
     let mut v = Verdict::default();
     let paths: Vec<&str> = input.changes.iter().map(|c| c.path.as_str()).collect();
     let listed = |hit: Vec<&str>| hit.join(", ");
@@ -168,6 +181,12 @@ pub fn judge(input: &Input, is_protected: &dyn Fn(&str) -> bool, is_frozen: &dyn
             ));
         }
     }
+    v.risk_paths = paths
+        .iter()
+        .copied()
+        .filter(|p| is_risk(p))
+        .map(str::to_string)
+        .collect();
     let protected: Vec<&str> = paths.iter().copied().filter(|p| is_protected(p)).collect();
     if !protected.is_empty() {
         v.failures.push(failure(
@@ -388,7 +407,12 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         scope,
         acceptance,
     };
-    let verdict = judge(&input, &|p| ctx.profile.is_protected(p), &|p| ctx.profile.is_frozen(p));
+    let verdict = judge(
+        &input,
+        &|p| ctx.profile.is_protected(p),
+        &|p| ctx.profile.is_frozen(p),
+        &|p| ctx.profile.is_risk(p),
+    );
     let ok = verdict.failures.is_empty();
     let failures: Vec<Value> = verdict
         .failures
@@ -411,6 +435,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         "deletions": deleted,
         "scope_checked": input.scope.is_some(),
         "test_paths": verdict.test_paths,
+        "risk_paths_touched": verdict.risk_paths,
         "acceptance_checked": input.acceptance.is_some(),
         "failures": failures,
         "flags": {"new_dependency": verdict.new_dependency, "shortcuts": shortcuts},
@@ -463,7 +488,9 @@ mod tests {
     }
 
     fn judge_plain(i: &Input) -> Verdict {
-        judge(i, &|p| p.starts_with(".github/"), &|p| p.starts_with("vendor/"))
+        judge(i, &|p| p.starts_with(".github/"), &|p| p.starts_with("vendor/"), &|p| {
+            p.contains("billing")
+        })
     }
 
     #[test]
@@ -564,6 +591,24 @@ mod tests {
         let v = judge_plain(&i);
         assert_eq!(codes(&v), ["out_of_scope", "frozen_path"]);
         assert_eq!(v.test_paths, ["vendor/x.test.js"]);
+    }
+
+    #[test]
+    fn risk_paths_are_listed_test_files_too_and_do_not_fail() {
+        let mut i = input(vec![
+            change("src/timer/a.ts", 1, 0),
+            change("src/timer/billing.ts", 1, 0),
+            change("src/timer/billing.test.ts", 1, 0),
+        ]);
+        i.scope = Some(vec!["src/timer/".into()]);
+        let v = judge_plain(&i);
+        assert!(v.failures.is_empty(), "{:?}", v.failures);
+        assert_eq!(v.risk_paths, ["src/timer/billing.ts", "src/timer/billing.test.ts"]);
+        assert!(
+            judge_plain(&input(vec![change("src/timer/a.ts", 1, 0)]))
+                .risk_paths
+                .is_empty()
+        );
     }
 
     #[test]

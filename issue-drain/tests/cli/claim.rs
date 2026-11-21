@@ -549,9 +549,9 @@ fn only_an_unlabel_of_the_claim_label_after_the_marker_ends_the_claim() {
             n,
             &[
                 ("commented", &theirs(), T1),
-                ("commented", &ours(), T2),
                 ("unlabeled", LABEL, T1),
                 ("labeled", LABEL, T2),
+                ("commented", &ours(), T2),
                 ("unlabeled", "bug", T3),
                 ("labeled", "bug", T3),
             ],
@@ -700,4 +700,50 @@ fn a_run_with_no_tracker_or_unit_is_a_usage_error() {
 
     let env = setup();
     assert_eq!(env.run(&["claim", "take", "--unit", "9"]).code, 2);
+}
+
+/// A release and a retake inside one second: every event carries the same
+/// timestamp, so the order is the timeline's order.
+#[test]
+fn a_release_and_a_retake_in_one_second_is_ours_and_a_stranger_in_that_second_is_not() {
+    let env = setup();
+    for n in [103, 106] {
+        labels(&env, n, &["bug", LABEL]);
+        timeline(
+            &env,
+            n,
+            &[
+                ("labeled", LABEL, T1),
+                ("commented", &ours(), T1),
+                ("unlabeled", LABEL, T2),
+                ("labeled", LABEL, T2),
+                ("commented", &ours(), T2),
+            ],
+        );
+    }
+    let out = run(&env, "check");
+    assert!(!out.stdout.contains("\"ours\":false"), "{}", out.stdout);
+    let out = run(&env, "release");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(removals(&env).len(), 2, "{:?}", writes(&env));
+
+    // Control: a stranger's label that follows our marker within the second.
+    let env = setup();
+    for n in [103, 106] {
+        labels(&env, n, &["bug", LABEL]);
+        timeline(
+            &env,
+            n,
+            &[
+                ("labeled", LABEL, T1),
+                ("commented", &ours(), T2),
+                ("unlabeled", LABEL, T2),
+                ("labeled", LABEL, T2),
+            ],
+        );
+    }
+    let out = run(&env, "check");
+    assert!(!out.stdout.contains("\"ours\":true"), "{}", out.stdout);
+    let out = run(&env, "take");
+    assert_eq!(out.code, 3, "{}", out.stderr);
 }

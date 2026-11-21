@@ -8,11 +8,21 @@
 //! leaves the same files at the run folder's root; they are read from there
 //! only when there is no `raw/`.
 //!
-//! A reviewer has output only when its stdout is substantive (200 non-blank
-//! bytes) AND its meta file shows it succeeded (`exit_code` 0, not timed out,
-//! `failure_kind` null). A reviewer that printed a page and then died on its
-//! quota has none, and one with no meta file is not proven. `failure_kind` is
-//! recorded as the meta has it.
+//! A reviewer has output only when its meta file shows it succeeded
+//! (`exit_code` 0, not timed out, `failure_kind` null) AND its stdout is not
+//! blank. A short verdict such as `{"findings":[]}` is output: cross-review
+//! itself accepts it (`output_no_verdict` in `run_reviewers.sh`). Only the
+//! codex baseline also needs 200 non-blank bytes, its "present and not trivial"
+//! rule. A reviewer that printed a page and then died on its quota has none,
+//! and one with no meta file is not proven. `failure_kind` is recorded as the
+//! meta has it.
+//!
+//! When the run folder has a `context.json` (cross-review's `worktree.sh start`
+//! writes it, with the `head_sha` it reviewed), its `head_sha` must equal
+//! `--head`: a folder left over from an earlier round cannot be stamped with a
+//! newer head. One that cannot be read, or has no `head_sha`, is refused too.
+//! A folder with no `context.json` (the rewritten-history procedure) is taken
+//! on the caller's `--head`.
 //!
 //! Exit: 0 written; 3 no reviewer folder or no reviewer in it; 2 bad
 //! arguments; 1 the filesystem failed.
@@ -40,8 +50,8 @@ pub struct Args {
     head: String,
 }
 
-/// Output shorter than this many non-whitespace bytes is not a review.
-const MIN_OUTPUT_BYTES: usize = 200;
+/// Codex's output shorter than this many non-whitespace bytes is not a review.
+const CODEX_MIN_BYTES: usize = 200;
 
 /// The reviewer a file in `raw/` belongs to, or `None` for a file that is not
 /// one reviewer's own output.
@@ -56,8 +66,27 @@ fn reviewer_of(file: &str) -> Option<&str> {
     (!name.is_empty() && !matches!(name, "run" | "context.files")).then_some(name)
 }
 
-fn has_output(stdout: &[u8]) -> bool {
-    stdout.iter().filter(|b| !b.is_ascii_whitespace()).count() >= MIN_OUTPUT_BYTES
+/// Whether `stdout` is output for the reviewer `name`: not blank, and for the
+/// codex baseline at least `CODEX_MIN_BYTES` non-blank bytes.
+fn has_output(name: &str, stdout: &[u8]) -> bool {
+    let floor = if name == "codex" { CODEX_MIN_BYTES } else { 1 };
+    stdout.iter().filter(|b| !b.is_ascii_whitespace()).count() >= floor
+}
+
+/// The run folder's own record of the reviewed commit. `Ok(None)` when there is
+/// no `context.json`; `Err` when it is there and unreadable or names no head.
+fn context_head(run_dir: &Path) -> Result<Option<String>, String> {
+    let path = run_dir.join("context.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+    match value.get("head_sha").and_then(serde_json::Value::as_str) {
+        Some(head) if is_sha(head) => Ok(Some(head.to_string())),
+        _ => Err(format!("{} has no usable head_sha", path.display())),
+    }
 }
 
 /// The string `failure_kind` of a meta file, if it has one.
@@ -94,7 +123,17 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             args.head
         )));
     }
-    // shortcut: nothing in a reviewer's meta or in the run folder names the commit that was reviewed (run.meta.json is written only for a skipped run, and the repeat-pass guard keeps its record elsewhere), so a reused run folder with stale reviewer files cannot be told from a fresh one; `--head` is taken on the caller's word. Add a head check here if cross-review ever stamps one.
+    match context_head(&args.run_dir) {
+        Ok(Some(reviewed)) if !reviewed.eq_ignore_ascii_case(&args.head) => {
+            return Err(Fail::refused(format!(
+                "the run folder's context.json says the reviewers read head {reviewed}, not {}; \
+                 run the review at this head, or pass the head it recorded",
+                args.head
+            )));
+        }
+        Ok(_) => {}
+        Err(what) => return Err(Fail::refused(what)),
+    }
     let raw = reviewer_dir(&args.run_dir);
     let entries = fs::read_dir(&raw).map_err(|e| Fail::refused(format!("cannot read {}: {e}", raw.display())))?;
     let names: BTreeSet<String> = entries
@@ -109,9 +148,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         .map(|name| {
             let meta = fs::read_to_string(raw.join(format!("{name}.meta.json"))).ok();
             Reviewer {
-                // Substantive output AND a meta file that says the run succeeded.
+                // Non-blank output AND a meta file that says the run succeeded.
                 has_output: meta.as_deref().is_some_and(succeeded)
-                    && fs::read(raw.join(format!("{name}.stdout"))).is_ok_and(|bytes| has_output(&bytes)),
+                    && fs::read(raw.join(format!("{name}.stdout"))).is_ok_and(|bytes| has_output(&name, &bytes)),
                 failure_kind: meta.as_deref().and_then(failure_kind),
                 name,
             }
@@ -186,12 +225,26 @@ mod tests {
     }
 
     #[test]
-    fn output_counts_only_non_whitespace_bytes() {
-        assert!(has_output("x".repeat(MIN_OUTPUT_BYTES).as_bytes()));
-        assert!(!has_output("x".repeat(MIN_OUTPUT_BYTES - 1).as_bytes()));
-        let padded = format!("{}{}", "x ".repeat(MIN_OUTPUT_BYTES - 1), " \n\t".repeat(500));
-        assert!(!has_output(padded.as_bytes()));
-        assert!(!has_output(b""));
+    fn codex_needs_the_floor_in_non_whitespace_bytes_and_the_rest_need_any() {
+        assert!(has_output("codex", "x".repeat(CODEX_MIN_BYTES).as_bytes()));
+        assert!(!has_output("codex", "x".repeat(CODEX_MIN_BYTES - 1).as_bytes()));
+        let padded = format!("{}{}", "x ".repeat(CODEX_MIN_BYTES - 1), " \n\t".repeat(500));
+        assert!(!has_output("codex", padded.as_bytes()));
+        assert!(!has_output("codex", b""));
+        assert!(has_output("kimi", br#"{"findings":[]}"#));
+        assert!(!has_output("kimi", b" \n\t"));
+        assert!(!has_output("kimi", b""));
+    }
+
+    #[test]
+    fn a_context_head_is_read_only_from_a_usable_file() {
+        let dir = tempfile::tempdir().expect("a folder");
+        assert_eq!(context_head(dir.path()), Ok(None));
+        let head = "a".repeat(40);
+        fs::write(dir.path().join("context.json"), format!(r#"{{"head_sha":"{head}"}}"#)).expect("file");
+        assert_eq!(context_head(dir.path()), Ok(Some(head)));
+        fs::write(dir.path().join("context.json"), "{}").expect("file");
+        assert!(context_head(dir.path()).is_err());
     }
 
     #[test]

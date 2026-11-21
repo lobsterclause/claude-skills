@@ -180,11 +180,14 @@ function pushDeny(args: string[], branch: string): string | undefined {
   const msg = `${P} git push may only push the unit branch (${branch}) to origin, without force`
   if (args.some(a => a.startsWith('-') && a !== '-u' && a !== '--set-upstream')) return msg
   const words = args.filter(a => !a.startsWith('-'))
-  // shortcut: bare `git push` goes where the upstream says; the driver sets that to the unit branch.
-  if (words.length === 0) return
-  if (words.length > 2 || words[0] !== 'origin') return msg
+  // The remote and the destination branch must both be named: a bare `git push`, `git push origin` or
+  // `git push origin HEAD` leaves the destination to git config.
   const spec = words[1]
-  if (spec === undefined || spec === 'HEAD' || spec === branch) return
+  if (words.length === 0 || (words[0] === 'origin' && (spec === undefined || spec === 'HEAD'))) {
+    return `${P} git push must name the remote and the unit branch; run: git push -u origin ${branch}`
+  }
+  if (words.length > 2 || words[0] !== 'origin') return msg
+  if (spec === branch) return
   const [src, dst, ...more] = spec.split(':')
   return more.length === 0 && dst === branch && (src === branch || src === 'HEAD') ? undefined : msg
 }

@@ -146,24 +146,80 @@ fn retries_and_failed_primaries_are_not_listed() {
 }
 
 #[test]
-fn output_below_the_floor_counts_whitespace_for_nothing() {
+fn the_codex_baseline_needs_the_floor_and_whitespace_counts_for_nothing() {
     let env = Env::new();
     let thin = format!("{}{}", "x".repeat(199), " \n".repeat(400));
+    let dir = run_dir(&env, &[("codex.stdout", &thin), ("codex.meta.json", OK)]);
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
+    assert_eq!(proof_file(&env)["reviewers"][0]["has_output"], false);
     let edge = "x".repeat(200);
+    let dir = run_dir(&env, &[("codex.stdout", &edge), ("codex.meta.json", OK)]);
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
+    assert_eq!(proof_file(&env)["reviewers"][0]["has_output"], true);
+}
+
+/// cross-review accepts a short verdict from the other reviewers, such as an
+/// empty findings array (`run_reviewers.sh`, `output_no_verdict`).
+#[test]
+fn another_reviewer_with_a_short_verdict_has_output_and_a_blank_one_has_none() {
+    let env = Env::new();
     let dir = run_dir(
         &env,
         &[
-            ("thin.stdout", &thin),
-            ("thin.meta.json", OK),
-            ("edge.stdout", &edge),
-            ("edge.meta.json", OK),
+            ("kimi.stdout", "{\"findings\":[]}"),
+            ("kimi.meta.json", OK),
+            ("glm.stdout", " \n\t "),
+            ("glm.meta.json", OK),
+            ("mimo.stdout", "LGTM"),
+            ("mimo.meta.json", r#"{"exit_code": 1, "failure_kind": null}"#),
         ],
     );
     assert_eq!(prove(&env, &dir, HEAD).code, 0);
-    let proof = proof_file(&env);
-    assert_eq!(proof["reviewers"][0]["name"], "edge");
-    assert_eq!(proof["reviewers"][0]["has_output"], true);
-    assert_eq!(proof["reviewers"][1]["has_output"], false);
+    let by_name = |n: &str| {
+        proof_file(&env)["reviewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == n)
+            .unwrap()["has_output"]
+            .clone()
+    };
+    assert_eq!(by_name("kimi"), true);
+    assert_eq!(by_name("glm"), false);
+    assert_eq!(by_name("mimo"), false, "a failed run is no output however short");
+}
+
+#[test]
+fn a_run_folder_whose_context_names_another_head_is_refused() {
+    let env = Env::new();
+    let dir = run_dir(&env, &[("codex.stdout", &review()), ("codex.meta.json", OK)]);
+    let other = "b".repeat(40);
+    fs::write(dir.join("context.json"), json!({"head_sha": other}).to_string()).expect("context.json");
+    let out = prove(&env, &dir, HEAD);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(
+        out.stderr.contains(&other) && out.stderr.contains("head"),
+        "{}",
+        out.stderr
+    );
+    assert!(!env.workdir.join("units/3/review-proof.json").exists());
+    // The same folder with the matching head is the control.
+    fs::write(dir.join("context.json"), json!({"head_sha": HEAD}).to_string()).expect("context.json");
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
+    assert_eq!(proof_file(&env)["head"], HEAD);
+}
+
+#[test]
+fn an_unreadable_context_or_one_without_a_head_is_refused_and_a_missing_one_is_not() {
+    let env = Env::new();
+    let dir = run_dir(&env, &[("codex.stdout", &review()), ("codex.meta.json", OK)]);
+    for bad in ["not json", "{}", r#"{"head_sha": 3}"#, r#"{"head_sha": ""}"#, ""] {
+        fs::write(dir.join("context.json"), bad).expect("context.json");
+        let out = prove(&env, &dir, HEAD);
+        assert_eq!(out.code, 3, "{bad}: {}", out.stderr);
+    }
+    fs::remove_file(dir.join("context.json")).expect("remove");
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
 }
 
 #[test]

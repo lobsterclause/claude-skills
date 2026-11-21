@@ -10,6 +10,12 @@
 //!   - the log's first line is `host=<h> head=<sha> dirty=<n>` (what
 //!     `pr-drain/scripts/remote-verify.sh` writes first), with `<sha>` equal to
 //!     `--head` and `dirty=0`;
+//!   - the log has exactly one line, anywhere in it and anchored at the start of
+//!     the line, `shipped head=<sha> dirty=<n>` (written after the working copy
+//!     was streamed to the box), with `<sha>` equal to `--head` and `dirty=0`;
+//!     a log without it is refused. The first line is read before the stream,
+//!     so an edit made while the stream ran and reverted before this command
+//!     would otherwise be verified remotely and stamped for the clean tree;
 //!   - the log records the command that ran, as a `cmd=<command>` line among its
 //!     first lines, and it is the profile's `full_verify_command`, word for word;
 //!   - every exit it shows is 0: `verify exit=N` and `remote rc=N` lines in the
@@ -21,6 +27,11 @@
 //!
 //! remote-verify.sh writes the `cmd=` line right after the header. A log from
 //! a copy of the script older than that has none, so nothing is stamped for it.
+//! The same goes for the `shipped` line.
+//!
+//! Still not excluded: an edit made and reverted entirely while the stream
+//! runs. Both the header and the `shipped` line then see a clean tree, and the
+//! box may have received the edited bytes.
 //!
 //! Exit: 0 stamped, or no stamp command in the profile (`stamped: false`);
 //! 3 a condition failed; 2 bad arguments, an unreadable log, or no
@@ -78,6 +89,32 @@ pub fn judge_log(log: &str, out_file: Option<&str>, head: &str, full_command: &s
             }
         }
         _ => failed.push("no head recorded: the log's first line is not `host=<h> head=<sha> dirty=<n>`".to_string()),
+    }
+
+    let shipped: Vec<&str> = log.lines().filter(|l| l.starts_with("shipped head=")).collect();
+    match shipped.as_slice() {
+        [] => failed.push(
+            "the log has no `shipped head=<sha> dirty=<n>` line, so it does not show the tree that was streamed to the box (run a current remote-verify.sh)"
+                .to_string(),
+        ),
+        [line] => {
+            let mut words = line.split_whitespace();
+            let field = |word: Option<&str>, key: &str| word.and_then(|w| w.strip_prefix(key)).map(str::to_string);
+            match (words.next(), field(words.next(), "head="), field(words.next(), "dirty="), words.next()) {
+                (Some("shipped"), Some(logged), Some(dirty), None) => {
+                    if !logged.eq_ignore_ascii_case(head) {
+                        failed.push(format!("the tree was shipped at head {logged}, not {head}"));
+                    }
+                    if dirty != "0" {
+                        failed.push(format!(
+                            "the working copy was dirty when it was shipped (dirty={dirty}): it changed after the verify started"
+                        ));
+                    }
+                }
+                _ => failed.push(format!("the log's `shipped` line is malformed: '{line}'")),
+            }
+        }
+        many => failed.push(format!("the log has {} `shipped head=` lines, not exactly one", many.len())),
     }
 
     if full_command.is_empty() {
@@ -220,19 +257,42 @@ mod tests {
     const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn good() -> String {
-        format!("host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nverify passed\nremote rc=0\n")
+        format!(
+            "host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nshipped head={HEAD} dirty=0\nverify passed\nremote rc=0\n"
+        )
     }
 
     #[test]
     fn a_good_log_has_no_failed_condition() {
         assert_eq!(judge_log(&good(), None, HEAD, "pnpm verify"), Vec::<String>::new());
-        let no_exit = "host=firebird head=0123456789abcdef0123456789abcdef01234567 dirty=0\ncmd=pnpm verify\n";
-        assert!(judge_log(no_exit, Some("verify exit=0\n"), HEAD, "pnpm verify").is_empty());
+        let no_exit = format!("host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nshipped head={HEAD} dirty=0\n");
+        assert!(judge_log(&no_exit, Some("verify exit=0\n"), HEAD, "pnpm verify").is_empty());
+    }
+
+    #[test]
+    fn the_shipped_line_is_required_exactly_once_for_the_head_and_clean() {
+        let line = format!("shipped head={HEAD} dirty=0\n");
+        let none = good().replace(&line, "");
+        let failed = judge_log(&none, None, HEAD, "pnpm verify");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains("shipped"));
+        let twice = good().replace(&line, &format!("{line}{line}"));
+        assert!(judge_log(&twice, None, HEAD, "pnpm verify")[0].contains("not exactly one"));
+        let dirty = good().replace(&line, &format!("shipped head={HEAD} dirty=1\n"));
+        assert!(judge_log(&dirty, None, HEAD, "pnpm verify")[0].contains("dirty"));
+        let other = good().replace(&line, &format!("shipped head={} dirty=0\n", "f".repeat(40)));
+        assert!(judge_log(&other, None, HEAD, "pnpm verify")[0].contains("not 0123"));
+        let junk = good().replace(&line, &format!("shipped head={HEAD} dirty=0 extra=1\n"));
+        assert!(judge_log(&junk, None, HEAD, "pnpm verify")[0].contains("malformed"));
+        // Anchored at the start of the line: an indented copy is no line.
+        let indented = good().replace(&line, &format!(" {line}"));
+        assert!(judge_log(&indented, None, HEAD, "pnpm verify")[0].contains("no `shipped"));
     }
 
     #[test]
     fn the_cmd_line_must_be_near_the_top() {
-        let late = format!("host=f head={HEAD} dirty=0\na\nb\nc\nd\ncmd=pnpm verify\nremote rc=0\n");
+        let late =
+            format!("host=f head={HEAD} dirty=0\nshipped head={HEAD} dirty=0\nb\nc\nd\ncmd=pnpm verify\nremote rc=0\n");
         let failed = judge_log(&late, None, HEAD, "pnpm verify");
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(failed[0].contains("cmd="));
@@ -246,7 +306,7 @@ mod tests {
             format!("host=f head={HEAD} dirty=0 extra=1"),
             String::new(),
         ] {
-            let log = format!("{header}\ncmd=pnpm verify\nremote rc=0\n");
+            let log = format!("{header}\ncmd=pnpm verify\nshipped head={HEAD} dirty=0\nremote rc=0\n");
             let failed = judge_log(&log, None, HEAD, "pnpm verify");
             assert!(
                 failed.iter().any(|f| f.contains("no head recorded")),

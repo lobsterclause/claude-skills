@@ -101,7 +101,7 @@ fn ready() -> Env {
     );
     env.write(
         "units/3/deliver.json",
-        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP}).to_string(),
+        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP, "risk_paths_touched": []}).to_string(),
     );
     env.write("units/3/guards-marker", "");
     env
@@ -466,7 +466,7 @@ fn a_delivery_audited_from_another_base_than_the_live_one_refuses() {
     let other = "2".repeat(40);
     env.write(
         "units/3/deliver.json",
-        &json!({"ok": true, "head": HEAD, "merge_base": other}).to_string(),
+        &json!({"ok": true, "head": HEAD, "merge_base": other, "risk_paths_touched": []}).to_string(),
     );
     let out = env.run(&ARGS);
     assert_eq!(out.code, 3, "{}", out.stderr);
@@ -479,10 +479,53 @@ fn a_delivery_audited_from_another_base_than_the_live_one_refuses() {
 #[test]
 fn a_delivery_report_with_no_merge_base_refuses() {
     let env = ready();
-    env.write("units/3/deliver.json", &json!({"ok": true, "head": HEAD}).to_string());
+    env.write(
+        "units/3/deliver.json",
+        &json!({"ok": true, "head": HEAD, "risk_paths_touched": []}).to_string(),
+    );
     let out = env.run(&ARGS);
     assert_eq!(out.code, 3, "{}", out.stderr);
     assert_eq!(codes(&result(&out)), ["deliver_check"]);
+}
+
+#[test]
+fn a_delivery_that_touched_a_risk_path_is_refused_and_a_person_merges_it() {
+    let env = ready();
+    env.write(
+        "units/3/deliver.json",
+        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP, "risk_paths_touched": ["src/billing/charge.ts"]})
+            .to_string(),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["risk_path"]);
+    let detail = r["refusals"][0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("src/billing/charge.ts") && detail.contains("person"),
+        "{detail}"
+    );
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_delivery_report_without_the_risk_field_is_refused() {
+    let env = ready();
+    env.write(
+        "units/3/deliver.json",
+        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP}).to_string(),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["deliver_check"]);
+    assert!(
+        r["refusals"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("deliver-check again")
+    );
+    assert!(merged_calls(&env).is_empty());
 }
 
 #[test]

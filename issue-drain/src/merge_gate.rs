@@ -24,7 +24,10 @@
 //!
 //! A unit whose queue entry names someone in `waits_for` is never merged here:
 //! a person merges it, and the gate does not try to verify that person's
-//! approval. The delivery check must have diffed from the same merge base the
+//! approval. The same goes for a unit whose delivered diff touches a risk path
+//! (`risk_path`): `deliver.json` lists them as `risk_paths_touched`, and a
+//! report without that field is refused (`deliver_check`), so a unit planned
+//! without risk paths cannot merge unattended. The delivery check must have diffed from the same merge base the
 //! PR has against the live base branch (GitHub's compare answer), so a
 //! `deliver-check --base` that audited only part of the PR is refused.
 //!
@@ -159,6 +162,10 @@ pub struct Deliver {
     /// before the field existed, which the gate does not accept.
     #[serde(default)]
     pub merge_base: String,
+    /// The changed paths that match the profile's risk path rule. `None` for a
+    /// report written before the field existed, which the gate does not accept.
+    #[serde(default)]
+    pub risk_paths_touched: Option<Vec<String>>,
 }
 
 /// Everything the decision depends on. `Err` is a field that could not be read.
@@ -452,6 +459,20 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                     "deliver_check",
                     format!("units/{unit}/deliver.json is for '{}', not the head", d.head),
                 ));
+            }
+            match &d.risk_paths_touched {
+                None => out.push(refusal(
+                    "deliver_check",
+                    format!("units/{unit}/deliver.json records no risk_paths_touched; run deliver-check again"),
+                )),
+                Some(paths) if !paths.is_empty() => out.push(refusal(
+                    "risk_path",
+                    format!(
+                        "the delivered diff touches risk paths ({}); a person merges this unit, this gate does not",
+                        paths.join(", ")
+                    ),
+                )),
+                Some(_) => {}
             }
             if d.merge_base.is_empty() {
                 out.push(refusal(
@@ -1185,6 +1206,7 @@ mod tests {
                 ok: true,
                 head: HEAD.into(),
                 merge_base: BASE_TIP.into(),
+                risk_paths_touched: Some(Vec::new()),
             }),
             guards_marker: true,
             threads: Ok(0),
@@ -1458,6 +1480,24 @@ mod tests {
         assert_eq!(codes(&f), ["deliver_check"]);
         let mut f = clear();
         f.deliver.as_mut().unwrap().head = "f".repeat(40);
+        assert_eq!(codes(&f), ["deliver_check"]);
+    }
+
+    #[test]
+    fn a_delivery_that_touched_a_risk_path_is_refused() {
+        let mut f = clear();
+        f.deliver.as_mut().unwrap().risk_paths_touched =
+            Some(vec!["src/billing/a.ts".into(), "src/crisis/b.ts".into()]);
+        let found = judge(&f);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].code, "risk_path");
+        assert!(
+            found[0].detail.contains("src/billing/a.ts, src/crisis/b.ts"),
+            "{}",
+            found[0].detail
+        );
+        let mut f = clear();
+        f.deliver.as_mut().unwrap().risk_paths_touched = None;
         assert_eq!(codes(&f), ["deliver_check"]);
     }
 

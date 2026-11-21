@@ -21,7 +21,7 @@ Bash (matched anywhere in the command, after `rtk`, `cd x &&`, `env A=b`, `;`, `
 
 - merges: `gh pr merge`, `gh api` to a `/merge` or `/merges` endpoint
 - closing, reopening, editing issues and PRs; `gh label`
-- `git push` to anything but the unit branch on `origin`; any force flag
+- `git push` to anything but the unit branch on `origin`, and a push that does not name both (`git push`, `git push origin`, `git push origin HEAD`); any force flag
 - bypass flags: `--admin`, `--auto` (with `gh`), `--no-verify`, `SKIP_PREPUSH`, `CROSS_REVIEW_MERGE_OVERRIDE`, `HUSKY=0`
 - raw GitHub writes: `gh api` writes or bodies, GraphQL mutations, `gh pr|issue create|comment`, `gh release`, `gh workflow run`, `gh run rerun|cancel|delete`, `gh secret`, `gh variable`, `gh auth` but `status`
 - `git worktree`, `git checkout|switch` to another branch, `git branch -d|-D|-m`, `git remote add|set-url|remove`, `git config --global|--system`, bare `git stash`, `stash pop|drop|clear`
