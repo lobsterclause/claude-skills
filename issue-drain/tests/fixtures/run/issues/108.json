@@ -1,0 +1,18 @@
+{
+  "number": 108,
+  "title": "Crisis phrase matcher misses curly apostrophes",
+  "body": "Phones type a curly apostrophe. `i can’t go on` (curly) does not match the phrase list in `src/crisis/keywords.ts`, which only has the straight form, so the message is not flagged.",
+  "state": "OPEN",
+  "url": "https://example.invalid/tidepool/issues/108",
+  "createdAt": "2026-10-01T09:35:00Z",
+  "updatedAt": "2026-10-01T09:35:00Z",
+  "author": "maintainer",
+  "authorAssociation": "MEMBER",
+  "labels": [
+    "bug",
+    "safety",
+    "p0"
+  ],
+  "open_prs": [],
+  "claim_labeled_at": null
+}

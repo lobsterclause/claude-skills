@@ -1,0 +1,94 @@
+#!/bin/sh
+# A stand-in for gh in the CLI tests. The harness puts this folder first on
+# PATH. Every call is appended to $GH_STUB_LOG, one line of arguments each, so
+# a test can assert what was called, and that nothing was.
+#
+# Files in $GH_STUB_DIR steer it:
+#   fail                  every call exits 1
+#   graphql-<n>.json      answer to `gh api graphql ... -F number=<n>`; without
+#                         the file the answer is GitHub's NOT_FOUND body and
+#                         exit 1, as gh gives for a number that is no issue
+#   graphql-<n>.err.json  printed for that call, which then exits 1 (a request
+#                         that failed; the file may be empty)
+#   issue-list.txt        answer to `gh issue list`
+#   tracker-list.json     answer to `gh issue list ... --json number,url,body`
+#                         (publish looking for a tracker it already made);
+#                         without the file the answer is []
+#   fail-list             `gh issue list` exits 1
+#   issue-view-<n>.json   answer to `gh issue view <n>`
+#   issue-view-<n>.next.json  the answer from the second view of <n> onward
+#                         (someone edited it after the first read)
+#   once-issue-view-<n>   a shell script run on the first `gh issue view <n>`,
+#                         before the answer (something changed elsewhere
+#                         while the caller was at work)
+#   closed-<n>            written by `gh issue close <n>`; from then on
+#                         `gh issue view <n>` reports the state CLOSED
+#   fail-create           `gh issue create` exits 1
+#   fail-comment          `gh issue comment` exits 1
+#   labels.txt            answer to `gh label list`, one name per line
+# GH_STUB_NEW_ISSUE       the number `gh issue create` reports (default 900)
+# GH_STUB_CLOSE_NOOP=1    `gh issue close` exits 0 but closes nothing
+#
+# A call it does not know exits 9, so a test cannot pass on a call nobody
+# thought about. A call made with GH_HOST other than github.com exits 8: the
+# repo is named owner/repo, and only a pinned host says which GitHub that is.
+dir="${GH_STUB_DIR:?the gh stub needs GH_STUB_DIR}"
+if [ -n "${GH_STUB_LOG:-}" ]; then printf '%s\n' "$*" >> "$GH_STUB_LOG"; fi
+if [ "${GH_HOST:-}" != "github.com" ]; then echo "gh stub: GH_HOST is '${GH_HOST:-}'" >&2; exit 8; fi
+if [ -e "$dir/fail" ]; then echo "gh stub: told to fail" >&2; exit 1; fi
+
+answer() { # answer <file>: print it, or fail the way gh does for a missing thing
+  if [ -f "$dir/$1" ]; then cat "$dir/$1"; else echo "gh stub: no $1" >&2; exit 1; fi
+}
+
+case "${1:-} ${2:-}" in
+  "api graphql")
+    n=""
+    for arg in "$@"; do
+      case "$arg" in number=*) n="${arg#number=}" ;; esac
+    done
+    if [ -f "$dir/graphql-$n.err.json" ]; then
+      cat "$dir/graphql-$n.err.json"; exit 1
+    elif [ -f "$dir/graphql-$n.json" ]; then
+      cat "$dir/graphql-$n.json"
+    else
+      printf '%s\n' '{"data":{"repository":{"issue":null}},"errors":[{"type":"NOT_FOUND","path":["repository","issue"],"message":"Could not resolve to an Issue."}]}'
+      exit 1
+    fi ;;
+  "issue list")
+    if [ -e "$dir/fail-list" ]; then echo "gh stub: list failed" >&2; exit 1; fi
+    case "$*" in
+      *"--json number,url,body"*)
+        if [ -f "$dir/tracker-list.json" ]; then cat "$dir/tracker-list.json"; else echo "[]"; fi ;;
+      *)
+        if [ -f "$dir/issue-list.txt" ]; then cat "$dir/issue-list.txt"; fi ;;
+    esac ;;
+  "issue view")
+    if [ -f "$dir/once-issue-view-$3" ]; then
+      mv "$dir/once-issue-view-$3" "$dir/ran-issue-view-$3"
+      sh "$dir/ran-issue-view-$3" >/dev/null 2>&1 || { echo "gh stub: the once script failed" >&2; exit 7; }
+    fi
+    if [ -e "$dir/closed-$3" ] && [ -f "$dir/issue-view-$3.json" ]; then
+      sed 's/"state" *: *"[A-Z]*"/"state":"CLOSED"/' "$dir/issue-view-$3.json"
+    elif [ -f "$dir/issue-view-$3.next.json" ] && [ -e "$dir/viewed-$3" ]; then
+      cat "$dir/issue-view-$3.next.json"
+    elif [ -f "$dir/issue-view-$3.next.json" ]; then
+      : > "$dir/viewed-$3"
+      answer "issue-view-$3.json"
+    else
+      answer "issue-view-$3.json"
+    fi ;;
+  "issue create")
+    if [ -e "$dir/fail-create" ]; then echo "gh stub: create failed" >&2; exit 1; fi
+    echo "https://github.com/example/tidepool/issues/${GH_STUB_NEW_ISSUE:-900}" ;;
+  "issue close")
+    if [ "${GH_STUB_CLOSE_NOOP:-}" != "1" ]; then : > "$dir/closed-$3"; fi ;;
+  "issue comment")
+    if [ -e "$dir/fail-comment" ]; then echo "gh stub: comment failed" >&2; exit 1; fi ;;
+  "issue edit" | "label create") ;;
+  "label list")
+    if [ -f "$dir/labels.txt" ]; then cat "$dir/labels.txt"; fi ;;
+  *)
+    echo "gh stub: unexpected call: $*" >&2
+    exit 9 ;;
+esac
