@@ -1,5 +1,4 @@
-//! `issue-drain tracker render`. Ported from scripts/tracker.sh (render) and
-//! scripts/tracker-render.jq, which is the specification.
+//! `issue-drain tracker render`.
 //!
 //! The session's decisions.json, held against the checked verdicts, becomes
 //! queue.json (what the drain reads) and tracker.md (what a person edits). A

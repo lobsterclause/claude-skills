@@ -1,4 +1,4 @@
-//! `issue-drain evidence-check`. Ported from scripts/evidence-check.sh, which is the specification.
+//! `issue-drain evidence-check`.
 //!
 //! A reader is a cheap model reading an issue someone else wrote. Its verdict
 //! is a claim, and this is where the claim meets the repo:

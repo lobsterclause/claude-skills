@@ -1,4 +1,4 @@
-//! `issue-drain intake`. Ported from scripts/intake.sh, which is the specification.
+//! `issue-drain intake`.
 //!
 //! Fetches a set of issues to local files and decides which are eligible. It
 //! reads GitHub and never writes to it. Left out, each with its reason in

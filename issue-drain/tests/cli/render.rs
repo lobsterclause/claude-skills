@@ -1,5 +1,5 @@
-//! `issue-drain tracker render`. The two golden tests compare with the bash
-//! implementation's output; each refusal has a control beside it that passes.
+//! `issue-drain tracker render`. The two golden tests compare with the
+//! reference run under tests/fixtures; each refusal has a control beside it that passes.
 
 use std::fs;
 

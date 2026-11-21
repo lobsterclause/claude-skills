@@ -1,4 +1,4 @@
-//! `issue-drain overlap`. Ported from scripts/overlap.sh, which is the specification.
+//! `issue-drain overlap`.
 //!
 //! Proposes which issues overlap, from the checked verdicts. Two issues that
 //! are both still to be worked (status live or duplicate_of) are related as

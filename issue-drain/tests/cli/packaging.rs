@@ -1,6 +1,5 @@
 //! Packaging: the kma profile, the launcher, the eval setup and the CI workflow.
 
-use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -14,28 +13,6 @@ fn load(path: &Path) -> Profile {
     Profile::load(path, manifest_dir()).unwrap_or_else(|e| panic!("{} does not load: {e:?}", path.display()))
 }
 
-/// The `KEY="value"` lines of a shell-form profile.
-fn env_profile(path: &Path) -> HashMap<String, String> {
-    let text = fs::read_to_string(path).expect("the .env profile");
-    text.lines()
-        .filter(|l| !l.trim_start().starts_with('#') && l.contains('='))
-        .map(|l| {
-            let (k, v) = l.split_once('=').expect("a pair");
-            let v = v.trim();
-            let v = v
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-                .unwrap_or(v);
-            (k.trim().to_string(), v.to_string())
-        })
-        .collect()
-}
-
-fn words(s: &str) -> Vec<String> {
-    s.split_whitespace().map(str::to_string).collect()
-}
-
 fn toml_files(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = fs::read_dir(dir)
         .expect("the folder")
@@ -44,30 +21,6 @@ fn toml_files(dir: &Path) -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
-}
-
-#[test]
-fn the_kma_profile_matches_its_env_form() {
-    let dir = manifest_dir().join("profiles");
-    let env = env_profile(&dir.join("Not-Every-Mom__kindred-mama-ai.env"));
-    let p = load(&dir.join("Not-Every-Mom__kindred-mama-ai.toml"));
-    assert_eq!(p.base_branch, env["BASE_BRANCH"]);
-    assert_eq!(p.hold_labels, words(&env["HOLD_LABELS"]));
-    assert_eq!(p.claim_label, env["CLAIM_LABEL"]);
-    assert_eq!(p.blocked_label, env["BLOCKED_LABEL"]);
-    assert_eq!(p.tracker_label, env["TRACKER_LABEL"]);
-    assert_eq!(p.priority_labels, words(&env["PRIORITY_LABELS"]));
-    assert_eq!(p.protected_path_re, env["PROTECTED_PATH_RE"]);
-    assert_eq!(p.risk_path_re, env["RISK_PATH_RE"]);
-    assert_eq!(p.trusted_associations, words(&env["TRUSTED_ASSOCIATIONS"]));
-    assert_eq!(p.intake_cap.to_string(), env["INTAKE_CAP"]);
-    assert_eq!(p.stale_claim_days.to_string(), env["STALE_CLAIM_DAYS"]);
-    assert_eq!(p.issue_classifier, env["ISSUE_CLASSIFIER"]);
-    assert_eq!(p.cluster_max_issues.to_string(), env["CLUSTER_MAX_ISSUES"]);
-    assert_eq!(p.cluster_max_lines.to_string(), env["CLUSTER_MAX_LINES"]);
-    assert_eq!(p.evidence_line_slack.to_string(), env["EVIDENCE_LINE_SLACK"]);
-    assert_eq!(p.evidence_min_quote.to_string(), env["EVIDENCE_MIN_QUOTE"]);
-    assert_eq!(p.unit_permissions, env["UNIT_PERMISSIONS"]);
 }
 
 #[test]

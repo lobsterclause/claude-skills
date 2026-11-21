@@ -1,5 +1,4 @@
-//! `issue-drain tracker publish` and `tracker parse`. Ported from the publish
-//! and parse halves of scripts/tracker.sh, which is the specification.
+//! `issue-drain tracker publish` and `tracker parse`.
 //!
 //! The tracker body is a person's: they tick, delete, reorder and type in it.
 //! So parse reads by line prefix and by nothing else, and what the queue never

@@ -64,7 +64,7 @@ pub struct Eligible {
     #[serde(rename = "createdAt")]
     pub created_at: String,
     /// Position of the issue's first priority label in the profile's list;
-    /// the list's length when it has none.
+    /// 99 when it has none.
     pub priority: usize,
     pub trusted_author: bool,
     pub open_prs: Vec<u64>,

@@ -14,15 +14,14 @@ use std::sync::OnceLock;
 use serde_json::Value;
 
 pub const REPO: &str = "example/tidepool";
-/// 2026-11-21T03:53:00Z, the `generated_at` of tests/fixtures/run/intake.json.
+/// 2026-11-21T03:53:00Z. Every test runs with the clock pinned here.
 pub const NOW: &str = "1795233180";
 
 pub fn manifest_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// tests/fixtures: the reference run under `run/`, written by the bash
-/// implementation this crate replaced.
+/// tests/fixtures: the reference run under `run/`, which the golden tests compare against.
 pub fn fixtures() -> PathBuf {
     manifest_dir().join("tests/fixtures")
 }
