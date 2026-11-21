@@ -34,15 +34,6 @@ const BODY_LIMIT: usize = 65000;
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let run = ctx.run_id()?;
     let repo = ctx.repo()?;
-    let published = ctx.path("tracker.json");
-    if published.exists() {
-        let url = read_json::<Value>(&published)
-            .and_then(|v| v.get("url").and_then(Value::as_str).map(str::to_string))
-            .unwrap_or_default();
-        return Err(Fail::refused(format!(
-            "this run is already published as {url}; start a new run to triage again"
-        )));
-    }
     let intake_path = ctx.path("intake.json");
     let checked_path = ctx.path("verdicts.checked.json");
     for path in [&intake_path, &checked_path] {
@@ -52,6 +43,19 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                 path.display()
             )));
         }
+    }
+    // Held from the look for tracker.json to the last write: a publish that
+    // has seen no tracker.json must find the queue and body it then sends
+    // unchanged.
+    let _lock = super::io::lock(ctx)?;
+    let published = ctx.path("tracker.json");
+    if published.exists() {
+        let url = read_json::<Value>(&published)
+            .and_then(|v| v.get("url").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        return Err(Fail::refused(format!(
+            "this run is already published as {url}; start a new run to triage again"
+        )));
     }
     let decisions_path = args.decisions.clone().unwrap_or_else(|| ctx.path("decisions.json"));
     let decisions = fs::read_to_string(&decisions_path)
@@ -171,6 +175,7 @@ struct Draft {
 struct ClosureOut {
     number: u64,
     title: String,
+    body: String,
     fix_commit: Option<FixCommit>,
     pr: Option<u64>,
     note: String,
@@ -464,28 +469,37 @@ fn render(input: &Input) -> Res<Rendered> {
     let (risky, plain): (Vec<&Draft>, Vec<&Draft>) = sorted.into_iter().partition(|u| u.risk);
     let all: Vec<&Draft> = adjacent_order(plain).into_iter().chain(risky).collect();
 
-    let closures: Vec<ClosureOut> = conf
-        .iter()
-        .filter_map(|(number, note)| {
-            let n = number.as_u64()?;
-            let v = ck.get(&n)?;
-            if v.status != "already_fixed" || !v.closable {
-                return None;
-            }
-            let pr = v.fix_commit.as_ref().and_then(|f| {
-                PR_IN_SUBJECT
-                    .captures(&f.subject)
-                    .and_then(|c| c[1].parse::<u64>().ok())
-            });
-            Some(ClosureOut {
-                number: n,
-                title: el.get(&n).map(|e| e.title.clone()).unwrap_or_default(),
-                fix_commit: v.fix_commit.clone(),
-                pr,
-                note: note.clone(),
-            })
-        })
-        .collect();
+    let mut closures: Vec<ClosureOut> = Vec::new();
+    for (number, note) in &conf {
+        let Some(n) = number.as_u64() else { continue };
+        let Some(v) = ck.get(&n) else { continue };
+        if v.status != "already_fixed" || !v.closable {
+            continue;
+        }
+        let pr = v.fix_commit.as_ref().and_then(|f| {
+            PR_IN_SUBJECT
+                .captures(&f.subject)
+                .and_then(|c| c[1].parse::<u64>().ok())
+        });
+        // The report as intake saved it goes into the queue: close-verified
+        // holds the live issue against this copy, which nothing writes again.
+        let saved_path = input.ctx.path(&format!("issues/{n}.json"));
+        let saved: Value = read_json(&saved_path).ok_or_else(|| {
+            Fail::usage(format!(
+                "missing {}; a closure needs the report intake saved",
+                saved_path.display()
+            ))
+        })?;
+        let text = |key: &str| saved[key].as_str().unwrap_or_default().to_string();
+        closures.push(ClosureOut {
+            number: n,
+            title: text("title"),
+            body: text("body"),
+            fix_commit: v.fix_commit.clone(),
+            pr,
+            note: note.clone(),
+        });
+    }
 
     let md = body(input, &all, &closures, &el);
     let length = md.chars().count();
@@ -560,7 +574,31 @@ fn unit_errors(
             None => push(format!("#{n} was not taken in by this run")),
             Some(v) if v.status == "live" => {}
             Some(v) if v.status == "duplicate_of" => match v.duplicate_of {
-                Some(original) if u.issues.contains(&original) => {}
+                Some(original) if u.issues.contains(&original) => {
+                    // Follow the duplicates to the issue that gets fixed. Two
+                    // that name each other lead nowhere.
+                    let mut seen = vec![*n];
+                    let mut at = original;
+                    let dead_end = loop {
+                        if seen.contains(&at) || !u.issues.contains(&at) {
+                            break true;
+                        }
+                        seen.push(at);
+                        match ck.get(&at) {
+                            Some(next) if next.status == "duplicate_of" => match next.duplicate_of {
+                                Some(further) => at = further,
+                                None => break true,
+                            },
+                            // Live, or refused under its own number.
+                            _ => break false,
+                        }
+                    };
+                    if dead_end {
+                        push(format!(
+                            "#{n} duplicates #{original}, and following the duplicates from there never reaches a live issue in this unit"
+                        ));
+                    }
+                }
                 other => push(format!(
                     "#{n} duplicates #{}, which is not in this unit",
                     other.map_or("null".to_string(), |o| o.to_string())
@@ -667,6 +705,7 @@ fn closure_json(c: &ClosureOut, verdict: Option<&Checked>) -> Value {
     json!({
         "number": c.number,
         "title": c.title,
+        "body": c.body,
         "fix_commit": c.fix_commit,
         "pr": c.pr,
         "evidence": evidence,

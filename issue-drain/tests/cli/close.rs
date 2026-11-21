@@ -484,7 +484,11 @@ fn a_report_edited_since_intake_refuses() {
         saved["body"].as_str().expect("a body")
     ));
     issue_text(&env, 101, "OPEN", &["bug"], &[], &saved["title"], &edited);
-    refused_one(&env, &env.run(&ARGS), "its title or body was edited after intake");
+    refused_one(
+        &env,
+        &env.run(&ARGS),
+        "its title or body was edited after the tracker was rendered",
+    );
 
     // The same text with GitHub's line endings is the same report.
     let env = ready();
@@ -690,4 +694,53 @@ fn missing_input_and_bad_arguments_are_usage_errors() {
         out.stderr
     );
     assert_eq!(env.gh_calls(), Vec::<String>::new());
+}
+
+#[test]
+fn a_report_taken_in_again_after_approval_does_not_stand_in_for_the_one_approved() {
+    // The tick was given for the report the tracker was rendered from. An
+    // intake file written again later holds some other text, and agreeing
+    // with it proves nothing.
+    let env = ready();
+    let mut saved = json(&env.workdir.join("issues/101.json"));
+    let edited = json!(format!(
+        "{}\n\nEdit: it still happens after a token refresh.",
+        saved["body"].as_str().expect("a body")
+    ));
+    saved["body"] = edited.clone();
+    env.write("issues/101.json", &saved.to_string());
+    issue_text(&env, 101, "OPEN", &["bug"], &[], &saved["title"], &edited);
+    refused_one(
+        &env,
+        &env.run(&ARGS),
+        "its title or body was edited after the tracker was rendered",
+    );
+}
+
+#[test]
+fn a_base_that_moves_while_an_issue_is_checked_stops_the_run() {
+    // The base was fetched when the run began. A commit that lands while the
+    // first issue is being checked is code nobody held the closure against.
+    let mut env = Env::new();
+    let repo = private_repo(env.dir.path());
+    let checkout = origin_clone(env.dir.path(), &repo);
+    env.set("ISSUE_DRAIN_REPO_DIR", &checkout.display().to_string());
+    publish(&env);
+    fs::write(repo.join("NOTES.md"), "a note\n").expect("the note");
+    git(&repo, &["add", "NOTES.md"]);
+    env.stub_file(
+        "once-issue-view-101",
+        &format!(
+            "git -C '{}' -c user.name=t -c user.email=t@example.invalid commit -q -m 'docs: a note'\n",
+            repo.display()
+        ),
+    );
+    let out = env.run(&ARGS);
+    refused_all(&env, &out, "origin/develop moved while #101 was being checked");
+    assert!(out.stderr.contains("stopped before #101"), "{}", out.stderr);
+
+    // Control: run again with the base at rest, and it closes.
+    fs::remove_file(env.workdir.join("events.jsonl")).expect("clear the events");
+    assert_eq!(env.run(&ARGS).code, 0);
+    assert_eq!(env.events_named("closure").len(), 1);
 }

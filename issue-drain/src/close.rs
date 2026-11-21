@@ -10,7 +10,10 @@
 //!   - the evidence check, run again on the base branch as it is now, still
 //!     calls it already_fixed and closable, and names the same fixing commit
 //!     the tracker showed;
-//!   - the issue is open and carries no hold label and no claim label.
+//!   - the issue is open and carries no hold label and no claim label, and
+//!     its title and body are the ones the queue recorded at render;
+//!   - the base branch, fetched again after the check, is still the commit
+//!     the check ran on.
 //!
 //! The comment goes first and the close second, so no issue is closed without
 //! its reason. A closure killed between the two is finished by running this
@@ -70,6 +73,8 @@ struct Run<'a> {
     reference: String,
     /// That commit's name, for messages.
     shown: String,
+    /// What fetches the base branch into origin/<base>.
+    refspec: String,
     run: String,
     marker: String,
     tracker: Option<u64>,
@@ -138,17 +143,13 @@ fn comment(r: &Run, fresh: &Checked, fix: &FixCommit, note: &str) -> String {
     lines.join("\n") + "\n"
 }
 
-/// Whether the issue's title and body are the ones intake saved. The verdict
-/// and the approval were both given for that text.
-fn as_triaged(ctx: &Ctx, number: u64, live: &Value) -> bool {
-    let Some(saved) = read_json::<Value>(&ctx.path(&format!("issues/{number}.json"))) else {
-        return false;
-    };
-    let text = |issue: &Value, key: &str| {
-        let value = issue[key].as_str().unwrap_or_default();
-        value.replace("\r\n", "\n").trim_end().to_string()
-    };
-    ["title", "body"].iter().all(|key| text(&saved, key) == text(live, key))
+/// Whether the issue's title and body are the ones the queue recorded when
+/// the tracker was rendered. The verdict and the approval were both given for
+/// that text. The run's issues/<n>.json is not asked: it can be written again.
+fn as_triaged(offered: &Closure, live: &Value) -> bool {
+    let text = |value: &str| value.replace("\r\n", "\n").trim_end().to_string();
+    let now = |key: &str| text(live[key].as_str().unwrap_or_default());
+    text(&offered.title) == now("title") && text(&offered.body) == now("body")
 }
 
 fn created_at(ctx: &Ctx, number: u64) -> Option<i64> {
@@ -262,10 +263,22 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
         ));
     }
 
-    // The tracker and the issue, read again: the evidence check takes a
-    // while, and a STOP, an unticked box, a label or a close that landed
-    // during it is honoured before anything is written.
+    // The base, the tracker and the issue, read again: the evidence check
+    // takes a while, and a commit, a STOP, an unticked box, a label or a
+    // close that landed during it is honoured before anything is written.
     if !ctx.dry_run {
+        let base = &ctx.profile.base_branch;
+        if !git::ok(&r.repo_dir, &["fetch", "--quiet", "origin", &r.refspec]) {
+            return Err(Fail::failed(format!(
+                "could not fetch {base} again in {} before closing #{number}",
+                r.repo_dir.display()
+            )));
+        }
+        if git::base_commit(&r.repo_dir, base).as_deref() != Some(r.reference.as_str()) {
+            return Ok(Err(Stop::Halt(format!(
+                "origin/{base} moved while #{number} was being checked; run close-verified again"
+            ))));
+        }
         let now = fetch_tracker(ctx, r.queue)?;
         let halt = if !now.unknown.is_empty() {
             Some(format!(
@@ -290,8 +303,8 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
     if let Some(stop) = standing(ctx, &live) {
         return Ok(Err(stop));
     }
-    if !as_triaged(ctx, number, &live) {
-        return refused("its title or body was edited after intake; triage it again".into());
+    if !as_triaged(offered, &live) {
+        return refused("its title or body was edited after the tracker was rendered; triage it again".into());
     }
 
     let file = ctx.path(&format!("closures/{number}.md"));
@@ -466,6 +479,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         repo_dir,
         reference,
         shown,
+        refspec,
         marker: format!("<!-- issue-drain:closure run={run} -->"),
         run,
         tracker: read_json::<Published>(&ctx.path("tracker.json")).map(|p| p.number),

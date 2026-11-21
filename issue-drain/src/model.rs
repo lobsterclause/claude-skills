@@ -260,7 +260,10 @@ pub struct Unit {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Closure {
     pub number: u64,
+    /// The issue's title and body as intake saved them when the tracker was
+    /// rendered. The verdict and the tick are about this text.
     pub title: String,
+    pub body: String,
     pub fix_commit: FixCommit,
     /// The PR number in the fixing commit's subject, when it names one.
     pub pr: Option<u64>,

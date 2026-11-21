@@ -18,6 +18,9 @@
 #   issue-view-<n>.json   answer to `gh issue view <n>`
 #   issue-view-<n>.next.json  the answer from the second view of <n> onward
 #                         (someone edited it after the first read)
+#   once-issue-view-<n>   a shell script run on the first `gh issue view <n>`,
+#                         before the answer (something changed elsewhere
+#                         while the caller was at work)
 #   closed-<n>            written by `gh issue close <n>`; from then on
 #                         `gh issue view <n>` reports the state CLOSED
 #   fail-create           `gh issue create` exits 1
@@ -61,6 +64,10 @@ case "${1:-} ${2:-}" in
         if [ -f "$dir/issue-list.txt" ]; then cat "$dir/issue-list.txt"; fi ;;
     esac ;;
   "issue view")
+    if [ -f "$dir/once-issue-view-$3" ]; then
+      mv "$dir/once-issue-view-$3" "$dir/ran-issue-view-$3"
+      sh "$dir/ran-issue-view-$3" >/dev/null 2>&1 || { echo "gh stub: the once script failed" >&2; exit 7; }
+    fi
     if [ -e "$dir/closed-$3" ] && [ -f "$dir/issue-view-$3.json" ]; then
       sed 's/"state" *: *"[A-Z]*"/"state":"CLOSED"/' "$dir/issue-view-$3.json"
     elif [ -f "$dir/issue-view-$3.next.json" ] && [ -e "$dir/viewed-$3" ]; then

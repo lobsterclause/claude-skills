@@ -400,6 +400,15 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         numbers.push(parse_number(n).ok_or_else(|| Fail::usage(format!("not an issue number: '{n}'")))?);
     }
 
+    // The verdicts, the tracker and any tick on it are about the reports
+    // this run already saved. Taking issues in again would swap them out.
+    if ctx.path("verdicts.checked.json").exists() {
+        return Err(Fail::refused(format!(
+            "this run's verdicts are already checked ({} exists); start a new run to take issues in again",
+            ctx.path("verdicts.checked.json").display()
+        )));
+    }
+
     // Where the issues come from: one file, or gh.
     let from_file = args.from_file.as_deref().map(read_from_file).transpose()?;
     if from_file.is_none() && (!args.labels.is_empty() || args.search.is_some()) {
@@ -408,7 +417,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     if let Some(issues) = &from_file {
         numbers.extend(issues.iter().map(|i| i.number));
     }
-    if numbers.is_empty() {
+    // A label or search that matches nothing is an answer: the intake written
+    // below is empty, and an earlier one does not stay in its place.
+    let asked = !args.numbers.is_empty() || from_file.is_some() || !args.labels.is_empty() || args.search.is_some();
+    if !asked {
         return Err(Fail::usage(
             "no issues to take in: give numbers, --label, --search or --from-file",
         ));

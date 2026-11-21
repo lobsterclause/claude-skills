@@ -533,7 +533,8 @@ fn a_publish_while_another_holds_the_lock_is_refused_before_any_gh_call() {
     let out = env.run(&["tracker", "publish"]);
     assert_eq!(out.code, 3);
     assert!(
-        out.stderr.contains("another publish of this run is in progress"),
+        out.stderr
+            .contains("another render or publish of this run is in progress"),
         "{}",
         out.stderr
     );
@@ -641,4 +642,44 @@ fn publish_needs_a_rendered_tracker_and_no_arguments() {
     assert_eq!(env.run(&["tracker", "publish"]).code, 0);
 
     assert_eq!(env.run(&["tracker", "publish", "extra"]).code, 2);
+}
+
+#[test]
+fn a_ticked_line_nobody_can_see_approves_nothing() {
+    // GitHub shows neither a fenced block's boxes nor a comment's: a tick in
+    // one is text someone pasted, not a box a person ticked.
+    let env = Env::new();
+    let ticked_line = format!("{TICKED_CLOSURE} pasted");
+    for hidden in [
+        format!("```\n{ticked_line}\n```"),
+        format!("````md\n```\n{ticked_line}\n```\n````"),
+        format!("~~~\n{ticked_line}\n~~~"),
+        format!("<!--\n{ticked_line}\n-->"),
+        format!("<!-- a note\n{ticked_line}\nends -->"),
+    ] {
+        let body = format!("{}\n{hidden}\n", tracker_md());
+        let out = parse_body(&env, &body);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(parsed(&out)["approved_closures"], json!([]), "{hidden}");
+        assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]), "{hidden}");
+    }
+
+    // Control: the same line after the block has ended is a tick.
+    let body = format!("{}\n```\ncode\n```\n<!-- a\nnote -->\n{ticked_line}\n", tracker_md());
+    assert_eq!(parsed(&parse_body(&env, &body))["approved_closures"], json!([101]));
+
+    // STOP is read everywhere: stopping on a line nobody sees costs a re-run.
+    let body = format!("{}\n```\nSTOP\n```\n", tracker_md());
+    assert_eq!(parsed(&parse_body(&env, &body))["stop"], true);
+}
+
+#[test]
+fn a_waiting_unit_runs_only_with_its_box_ticked() {
+    // U4 waits for a named review. Its line with the box deleted is not a
+    // tick: only "[x]" says a person approved it.
+    let env = Env::new();
+    let out = parse_body(&env, &replaced("- [ ] U4 ·", "- U4 ·"));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]));
+    assert_eq!(parsed(&out)["unknown"], json!([]));
 }

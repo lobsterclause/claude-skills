@@ -522,3 +522,30 @@ fn a_bad_repo_or_a_relative_workdir_is_a_usage_error() {
     env.set("ISSUE_DRAIN_WORKDIR", &good);
     assert_eq!(env.run(&["intake", "--from-file", &issues_file()]).code, 0);
 }
+
+#[test]
+fn intake_is_refused_once_the_verdicts_are_checked() {
+    // The verdicts, the tracker and any approval are all about the reports
+    // as this run saved them; taking issues in again would swap them out.
+    let env = Env::new();
+    assert_eq!(run_with(&env, &[issue(1, &[])]).code, 0);
+    env.write("verdicts.checked.json", "[]");
+    let before = fs::read_to_string(env.workdir.join("issues/1.json")).expect("the saved issue");
+    let mut edited = issue(1, &[]);
+    edited["body"] = json!("another body");
+    let out = run_with(&env, &[edited]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("start a new run"), "{}", out.stderr);
+    let after = fs::read_to_string(env.workdir.join("issues/1.json")).expect("the saved issue");
+    assert_eq!(before, after);
+}
+
+#[test]
+fn a_selector_that_matches_nothing_leaves_an_empty_intake_and_not_the_last_one() {
+    let env = Env::new();
+    assert_eq!(run_with(&env, &[issue(1, &[])]).code, 0);
+    assert!(is_eligible(&intake_of(&env), 1));
+    let out = env.run(&["intake", "--label", "no-such-label"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(intake_of(&env)["eligible"], json!([]));
+}

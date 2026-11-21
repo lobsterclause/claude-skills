@@ -110,15 +110,57 @@ fn split_numbers(found: &[&str], offered: &[u64]) -> (Vec<u64>, Vec<String>) {
     (approved, unknown)
 }
 
+/// The lines GitHub shows as lines: not those inside a fenced code block
+/// (``` or ~~~) and not those inside an HTML comment that spans lines. A box
+/// in either is text, and nobody can tick it.
+fn shown<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_comment = false;
+    for line in lines {
+        if in_comment {
+            in_comment = !line.contains("-->");
+            continue;
+        }
+        let text = line.trim_start();
+        let run_of = |mark: char| text.chars().take_while(|c| *c == mark).count();
+        if let Some((mark, opened)) = fence {
+            let run = run_of(mark);
+            if run >= opened && text[run..].trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        fence = ['`', '~']
+            .into_iter()
+            .map(|mark| (mark, run_of(mark)))
+            .find(|(_, run)| *run >= 3);
+        if fence.is_some() {
+            continue;
+        }
+        // A comment that opens here and closes on a later line. What stands
+        // before it on this line is still shown.
+        in_comment = line.rfind("<!--").is_some_and(|at| !line[at..].contains("-->"));
+        if !(in_comment && text.starts_with("<!--")) {
+            out.push(*line);
+        }
+    }
+    out
+}
+
 /// Read what a person left on the tracker. No I/O.
 ///
 /// Lines are read by prefix and nothing else:
-///   `- U3 · ...`            a queue unit, in the order written
+///   `- U3 · ...`            a queue unit, in the order written; a unit that
+///                           waits for a review needs its box and is not
+///                           read from a line like this
 ///   `- [x] U5 · ...`        a ticked unit; these run before the queue
 ///   `- [x] close #101 ...`  an approved closure
 ///   `- [x] release #9 ...`  a stale claim to release
 ///   `STOP`                  alone on a line
-/// `[X]` counts as `[x]` and CRLF line endings are fine. The marker line
+/// `[X]` counts as `[x]` and CRLF line endings are fine. A line inside a
+/// fenced code block or an HTML comment is not read, except STOP, which
+/// counts wherever it stands. The marker line
 /// `<!-- issue-drain:tracker v1 run=<id> -->` must name `queue.run`, or the
 /// body is some other tracker and this fails with a usage error (exit 2).
 /// `tracker_state` is left null; a live read sets it.
@@ -142,11 +184,14 @@ fn parse_body_for(body: &str, queue: &Queue, run: &str) -> Res<Parsed> {
         )));
     }
 
+    let raw = lines;
+    let lines = shown(&raw);
+    // A waiting unit runs on a ticked box only. Its line with the box
+    // deleted says nothing, like its line with the box left empty.
+    let waits = |id: &str| queue.units.iter().any(|u| u.id == id && u.waits);
+    let plain = captures(&lines, &PLAIN_UNIT).into_iter().filter(|id| !waits(id));
     let mut order: Vec<&str> = Vec::new();
-    for id in captures(&lines, &TICKED_UNIT)
-        .into_iter()
-        .chain(captures(&lines, &PLAIN_UNIT))
-    {
+    for id in captures(&lines, &TICKED_UNIT).into_iter().chain(plain) {
         if !order.contains(&id) {
             order.push(id);
         }
@@ -166,7 +211,7 @@ fn parse_body_for(body: &str, queue: &Queue, run: &str) -> Res<Parsed> {
 
     Ok(Parsed {
         run: queue.run.clone(),
-        stop: lines.iter().any(|line| STOP.is_match(line)),
+        stop: raw.iter().any(|line| STOP.is_match(line)),
         units,
         approved_closures,
         release_claims,
@@ -224,9 +269,10 @@ fn load_queue(ctx: &Ctx) -> Res<Queue> {
     Ok(queue)
 }
 
-/// Held while a publish runs, so two cannot both create a tracker. The file
-/// is removed when the publish returns.
-struct Lock(PathBuf);
+/// Held while a render or a publish runs, so two publishes cannot both create
+/// a tracker and a render cannot change the queue under a publish. The file
+/// is removed when the holder returns.
+pub(crate) struct Lock(PathBuf);
 
 impl Drop for Lock {
     fn drop(&mut self) {
@@ -234,12 +280,12 @@ impl Drop for Lock {
     }
 }
 
-fn lock(ctx: &Ctx) -> Res<Lock> {
+pub(crate) fn lock(ctx: &Ctx) -> Res<Lock> {
     let path = ctx.path("publish.lock");
     match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(_) => Ok(Lock(path)),
         Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(Fail::refused(format!(
-            "another publish of this run is in progress ({} exists); if none is, remove that file",
+            "another render or publish of this run is in progress ({} exists); if none is, remove that file",
             path.display()
         ))),
         Err(e) => Err(Fail::failed(format!("cannot create {}: {e}", path.display()))),

@@ -10,7 +10,7 @@ use crate::common::*;
 /// A run folder holding what render reads, with the good decisions.
 fn rendered_env() -> Env {
     let env = Env::new();
-    env.seed(&["intake.json", "verdicts.checked.json", "overlap.json"]);
+    env.seed(&["intake.json", "verdicts.checked.json", "overlap.json", "issues"]);
     fs::copy(
         eval_fixtures().join("decisions.good.json"),
         env.workdir.join("decisions.json"),
@@ -102,7 +102,7 @@ fn the_event_reports_what_was_rendered() {
 #[test]
 fn the_decisions_file_can_be_named() {
     let env = Env::new();
-    env.seed(&["intake.json", "verdicts.checked.json"]);
+    env.seed(&["intake.json", "verdicts.checked.json", "issues"]);
     let other = env.dir.path().join("elsewhere.json");
     fs::copy(eval_fixtures().join("decisions.good.json"), &other).unwrap();
     let out = env.run(&["tracker", "render", "--decisions", &other.display().to_string()]);
@@ -547,4 +547,57 @@ fn hostile_text_cannot_add_a_line_a_tick_or_a_mention() {
         !body.contains("](http://e)") || body.contains("\\[z](http://e)"),
         "{body}"
     );
+}
+
+#[test]
+fn a_closure_needs_the_report_intake_saved() {
+    // The queue records the title and body a closure was offered for.
+    let env = rendered_env();
+    fs::remove_file(env.workdir.join("issues/101.json")).expect("remove the report");
+    let out = render(&env);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(out.stderr.contains("issues/101.json"), "{}", out.stderr);
+    assert!(!env.workdir.join("queue.json").exists());
+}
+
+#[test]
+fn a_render_while_a_publish_holds_the_lock_is_refused() {
+    // A publish that has checked for tracker.json must not have the queue
+    // change under it before it creates the issue.
+    let env = rendered_env();
+    let lock = env.write("publish.lock", "");
+    let out = render(&env);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("another render or publish of this run is in progress"),
+        "{}",
+        out.stderr
+    );
+    assert!(!env.workdir.join("queue.json").exists());
+    assert!(lock.exists(), "a lock someone else holds is left alone");
+
+    // Control: with the lock gone the render runs, and leaves no lock behind.
+    fs::remove_file(&lock).expect("remove the lock");
+    assert_eq!(render(&env).code, 0);
+    assert!(!lock.exists());
+}
+
+#[test]
+fn duplicates_of_each_other_are_refused_even_beside_a_live_issue() {
+    // #106 duplicates #103. If #103 is called a duplicate of #106, neither
+    // leads to something to fix, whatever else is in the unit.
+    let env = rendered_env();
+    let mut checked = json(&env.workdir.join("verdicts.checked.json"));
+    for v in checked.as_array_mut().unwrap() {
+        if v["number"] == 103 {
+            v["status"] = json!("duplicate_of");
+            v["duplicate_of"] = json!(106);
+        }
+    }
+    env.write("verdicts.checked.json", &checked.to_string());
+    let mut d = decisions();
+    d["units"][0]["issues"] = json!([103, 106, 104]);
+    d["units"][1]["issues"] = json!([105]);
+    expect_refused(&env, &d, "never reaches a live issue in this unit");
 }
