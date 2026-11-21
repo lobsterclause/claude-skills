@@ -46,6 +46,10 @@ A run has a folder that holds all of its state. There is no default: every comma
 
    The refspec is written out because a checkout that does not track the base (a single-branch clone of something else) would fetch it and still leave `origin/<base>` where it was.
 
+   The checkout needs its full history. In a shallow clone `git blame` credits old lines to the commit the history was cut at, so the evidence check fails every quote blamed on that commit. Run `git fetch --unshallow` first.
+
+Every `gh` call the binary makes is pinned to github.com, whatever `GH_HOST` says. A repo on another GitHub host is not supported.
+
    Remove it with `git worktree remove` when triage is published.
 5. Write the environment to `<run folder>/env.sh` once, and source it in every call, since a shell call does not remember the last one's variables:
 
@@ -95,7 +99,7 @@ Lead with the tracker link. Then, briefly: how many issues were taken in and how
 An issue is closed only when all of this is true at the moment of closing:
 
 - the run offered it as a closure and its box is ticked on the published tracker
-- the tracker is open, has no `STOP` line, and has no ticked line the run never offered
+- the tracker is open, has no `STOP` line, and has no ticked line the run never offered, read when the run starts and again for each issue after its evidence check
 - the evidence check, run again on the base branch as it is now, still says `already_fixed` and closable, and names the same fixing commit the tracker showed
 - the issue is open and carries no hold label and no claim label, read before the evidence check and again right before the comment
 

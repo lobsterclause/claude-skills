@@ -42,8 +42,9 @@ Name the run folder: a bare `verdicts/*.json` is read from wherever the shell ha
 
 Writes `verdicts.checked.json` and prints what it downgraded and why. This step is not optional and its output replaces the readers' verdicts everywhere after it. It:
 
-- finds every quoted line on `origin/<base>` and corrects the line number, or downgrades the verdict to `unclear`
+- finds every quoted line on `origin/<base>` (the remote branch, even if a tag or a local branch has that name) and corrects the line number, or downgrades the verdict to `unclear`
 - dates each `already_fixed` quote with `git blame`: a line older than the issue is not its fix, so the verdict becomes `unclear`
+- fails a quote that blame credits to the commit a shallow clone was cut at, since that commit may not be the one that wrote the line
 - sets `closable` on an `already_fixed` verdict only when the bug is not behavioural
 - turns a fix on a protected path into `needs_human`, and marks `risk` on a risk path
 - gives an eligible issue with no verdict an `unclear` one, and drops a verdict for an issue this run did not take in
