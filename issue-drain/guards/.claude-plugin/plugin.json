@@ -1,0 +1,5 @@
+{
+  "name": "drain-guards",
+  "version": "0.1.0",
+  "description": "Keeps one issue-drain unit inside its worktree and away from merges, closures and raw GitHub writes."
+}
