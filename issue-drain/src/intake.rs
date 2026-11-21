@@ -77,7 +77,7 @@ fn nodes<'a>(v: &'a Value, path: &[&str]) -> &'a [Value] {
 
 /// What one fetch gave.
 enum Fetched {
-    Whole(Issue),
+    Whole(Box<Issue>),
     /// The answer was cut short at a page limit. The lists it names may lack
     /// a hold label, an open PR or the claim's date, so the issue is not judged.
     Partial {
@@ -143,7 +143,7 @@ fn normalise(raw: &str, repo: &str, claim: &str) -> Option<Fetched> {
         .filter(|e| text_at(e, &["__typename"]) == "LabeledEvent" && same_label(text_at(e, &["label", "name"]), claim))
         .map(|e| text_at(e, &["createdAt"]).to_string())
         .max();
-    Some(Fetched::Whole(Issue {
+    Some(Fetched::Whole(Box::new(Issue {
         number: i.get("number")?.as_u64()?,
         title: text_at(i, &["title"]).to_string(),
         body: text_at(i, &["body"]).to_string(),
@@ -162,7 +162,7 @@ fn normalise(raw: &str, repo: &str, claim: &str) -> Option<Fetched> {
             .collect(),
         open_prs: open_prs.into_iter().collect(),
         claim_labeled_at,
-    }))
+    })))
 }
 
 /// One line: control characters (newlines included) become spaces, so text
@@ -413,11 +413,15 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             continue;
         }
         let fetched = match &from_file {
-            Some(issues) => issues.iter().find(|i| i.number == n).cloned().map(Fetched::Whole),
+            Some(issues) => issues
+                .iter()
+                .find(|i| i.number == n)
+                .cloned()
+                .map(|i| Fetched::Whole(Box::new(i))),
             None => fetch(&repo, &p.claim_label, n),
         };
         let issue = match fetched {
-            Some(Fetched::Whole(issue)) => issue,
+            Some(Fetched::Whole(issue)) => *issue,
             Some(Fetched::Partial { title, cut }) => {
                 rows.push(unread(
                     title,

@@ -57,6 +57,34 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         ))
     })?;
 
+    // A number listed twice would be scored against whichever row comes first.
+    let twice = |numbers: Vec<u64>| -> Vec<u64> {
+        let mut seen = std::collections::BTreeSet::new();
+        let dup: std::collections::BTreeSet<u64> = numbers.into_iter().filter(|n| !seen.insert(*n)).collect();
+        dup.into_iter().collect()
+    };
+    let repeated = twice(wants.iter().map(|w| w.number).collect());
+    if !repeated.is_empty() {
+        return Err(Fail::usage(format!(
+            "{} lists an issue more than once: {repeated:?}",
+            args.expected.display()
+        )));
+    }
+    let repeated = twice(got.iter().map(|g| g.number).collect());
+    if !repeated.is_empty() {
+        return Err(Fail::usage(format!(
+            "{} has more than one verdict for an issue: {repeated:?}",
+            input.display()
+        )));
+    }
+    // A verdict for an issue the fixture does not list is not scored, so it
+    // is reported: a clean score must mean every verdict was looked at.
+    let unlisted: Vec<u64> = got
+        .iter()
+        .map(|g| g.number)
+        .filter(|n| !wants.iter().any(|w| w.number == *n))
+        .collect();
+
     let mut mismatches = Vec::new();
     let mut wrong = 0;
     for want in &wants {
@@ -117,6 +145,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             "recall": ratio(true_positive, expected_fixed),
         },
         "false_closable": false_closable,
+        "unlisted": unlisted,
         "mismatches": mismatches,
     });
     println!(
@@ -127,12 +156,13 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         "eval_score",
         json!({"issues": wants.len(), "correct": wants.len() - wrong, "false_closable": false_closable}),
     )?;
-    if wrong == 0 && false_closable.is_empty() {
+    if wrong == 0 && false_closable.is_empty() && unlisted.is_empty() {
         return Ok(());
     }
     Err(Fail::failed(format!(
-        "{wrong} of {} issues scored wrong; {} offered for closing that should not be",
+        "{wrong} of {} issues scored wrong; {} offered for closing that should not be; {} not in the fixture",
         wants.len(),
-        false_closable.len()
+        false_closable.len(),
+        unlisted.len()
     )))
 }

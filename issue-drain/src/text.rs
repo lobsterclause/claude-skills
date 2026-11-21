@@ -28,13 +28,18 @@ pub fn truncate(s: &str, max: usize) -> String {
 pub fn clean(s: &str, max: usize) -> String {
     let s = INVISIBLE.replace_all(s, " ");
     let s = SPACES.replace_all(&s, " ");
-    let s = s
-        .trim_matches(' ')
+    truncate(&defuse(s.trim_matches(' ')), max)
+}
+
+/// No HTML, no code span, no link and no mention. The backslash is escaped
+/// first: text that brings its own would otherwise turn the escape before "["
+/// into an escaped backslash and a live bracket.
+fn defuse(s: &str) -> String {
+    s.replace('\\', "\\\\")
         .replace('<', "&lt;")
         .replace('`', "'")
         .replace('[', "\\[")
-        .replace('@', AT);
-    truncate(&s, max)
+        .replace('@', AT)
 }
 
 /// One line shown as code: backticks inside become apostrophes, so the span
@@ -44,10 +49,11 @@ pub fn code(s: &str, max: usize) -> String {
     format!("`{}`", truncate(&s, max))
 }
 
-/// Text kept at full length (a quoted line in a closing comment): control and
-/// invisible characters out, no HTML, no mention.
+/// Text kept at full length (a commit subject or a note in a closing comment):
+/// control and invisible characters out, no HTML, no code span, no link, no
+/// mention.
 pub fn safe(s: &str) -> String {
-    INVISIBLE.replace_all(s, " ").replace('<', "&lt;").replace('@', AT)
+    defuse(&INVISIBLE.replace_all(s, " "))
 }
 
 /// A code span that holds `s` exactly: fenced by one more backtick than the
@@ -118,6 +124,21 @@ mod tests {
         assert_eq!(
             clean("  a\tb\n<!-- x --> `c` [d](e) @f  ", 80),
             "a b &lt;!-- x --> 'c' \\[d](e) @\u{200B}f"
+        );
+    }
+
+    #[test]
+    fn a_backslash_in_the_text_cannot_undo_the_escape() {
+        // "\[x](u)" once came out as "\\[x](u)": an escaped backslash, then a link.
+        assert_eq!(clean("\\[x](u)", 80), "\\\\\\[x](u)");
+        assert_eq!(safe("\\[x](u)"), "\\\\\\[x](u)");
+    }
+
+    #[test]
+    fn safe_text_opens_no_link_span_or_mention() {
+        assert_eq!(
+            safe("fix [a](http://x) `b` <i> @c\u{7}d"),
+            "fix \\[a](http://x) 'b' &lt;i> @\u{200B}c d"
         );
     }
 

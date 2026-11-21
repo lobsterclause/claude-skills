@@ -35,6 +35,7 @@ fn the_reference_run_scores_clean() {
     assert_eq!(s["correct"], 12);
     assert_eq!(s["mismatches"], serde_json::json!([]));
     assert_eq!(s["false_closable"], serde_json::json!([]));
+    assert_eq!(s["unlisted"], serde_json::json!([]));
     assert_eq!(s["already_fixed"]["expected"], 2);
     assert_eq!(s["already_fixed"]["returned"], 2);
     assert_eq!(s["already_fixed"]["precision"], 1.0);
@@ -63,6 +64,52 @@ fn a_live_issue_called_fixed_is_a_miss_and_a_false_closure() {
     assert_eq!(miss["number"], 103);
     assert_eq!(miss["field"], "status");
     assert_eq!(miss["got"], "already_fixed");
+}
+
+#[test]
+fn a_number_listed_twice_is_a_usage_error_on_either_side() {
+    let env = Env::new();
+    let mut verdicts = golden("verdicts.checked.json");
+    let again = verdicts[0].clone();
+    verdicts.as_array_mut().expect("an array").push(again);
+    let twice = env.write("twice.json", &verdicts.to_string()).display().to_string();
+    let out = env.run(&["eval-score", "--expected", &expected(), "--in", &twice]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(
+        out.stderr.contains("more than one verdict for an issue"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stdout.is_empty());
+
+    let mut wants = json(&eval_fixtures().join("expected.json"));
+    let again = wants[0].clone();
+    wants.as_array_mut().expect("an array").push(again);
+    let wants = env.write("expected.json", &wants.to_string()).display().to_string();
+    env.seed(&["verdicts.checked.json"]);
+    let out = env.run(&["eval-score", "--expected", &wants]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(out.stderr.contains("lists an issue more than once"), "{}", out.stderr);
+
+    // Control: the same files without the repeat score clean.
+    assert_eq!(env.run(&["eval-score", "--expected", &expected()]).code, 0);
+}
+
+#[test]
+fn a_verdict_for_an_issue_the_fixture_does_not_list_is_reported() {
+    let env = Env::new();
+    let mut verdicts = golden("verdicts.checked.json");
+    let mut extra = verdicts[0].clone();
+    extra["number"] = 999.into();
+    extra["closable"] = false.into();
+    verdicts.as_array_mut().expect("an array").push(extra);
+    let more = env.write("more.json", &verdicts.to_string()).display().to_string();
+    let out = env.run(&["eval-score", "--expected", &expected(), "--in", &more]);
+    assert_eq!(out.code, 1);
+    let s = score(&out);
+    assert_eq!(s["unlisted"], serde_json::json!([999]));
+    assert_eq!(s["correct"], 12);
+    assert!(out.stderr.contains("1 not in the fixture"), "{}", out.stderr);
 }
 
 #[test]

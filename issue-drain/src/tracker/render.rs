@@ -592,10 +592,10 @@ fn unit_errors(
         ));
     }
     // queue.json is typed (model::Unit), so each field has its type here.
-    if !u.est_minutes.as_u64().is_some_and(|m| m > 0) {
+    if u.est_minutes.as_u64().is_none_or(|m| m == 0) {
         push("est_minutes must be a whole number above 0".into());
     }
-    if !u.kind.as_str().is_some_and(|k| !k.is_empty()) {
+    if u.kind.as_str().is_none_or(str::is_empty) {
         push("kind must be a word such as bugfix".into());
     }
     if !(u.waits_for.is_null() || u.waits_for.is_string()) {
