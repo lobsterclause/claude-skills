@@ -662,7 +662,6 @@ fn markup_that_can_hide_a_box_stops_every_approval() {
         format!("> ```\n{tick}"),
         format!("1. ~~~\n{tick}"),
         format!("<!--\n{tick}\n-->"),
-        format!("{tick}\ntext <!-- a note -->"),
         format!("<pre>\n{tick}\n</pre>"),
         format!("<div>\n{tick}\n</div>"),
         format!("  - <table>\n{tick}"),
@@ -720,6 +719,16 @@ fn the_rendered_details_block_is_read_only_as_render_wrote_it() {
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert_eq!(parsed(&out)["approved_closures"], json!([]));
 
+    // A line of non-breaking spaces is not blank to GitHub, so the HTML
+    // goes on past it.
+    let out = parse_body(&env, &replaced(&format!("{opener}\n"), &format!("{opener}\u{a0}\n")));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(parsed(&out)["units"], json!([]));
+    // Control: spaces and tabs are blank.
+    let out = parse_body(&env, &replaced(&format!("{opener}\n"), &format!("{opener} \t\n")));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]));
+
     // Any other HTML line is refused, the details lines changed included.
     let out = parse_body(&env, &replaced("<details><summary>", "<details open><summary>"));
     assert_eq!(out.code, 1, "{}", out.stderr);
@@ -734,4 +743,45 @@ fn a_waiting_unit_runs_only_with_its_box_ticked() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]));
     assert_eq!(parsed(&out)["unknown"], json!([]));
+}
+
+#[test]
+fn a_comment_marker_inside_a_line_hides_nothing() {
+    // A test command can hold "<!--", and render writes it in a code span.
+    // Only a line that starts with HTML starts an HTML block, and a line
+    // that starts with "- " starts a list item whatever stands above it.
+    let env = Env::new();
+    let body = replaced("`pnpm vitest run src/timer`", "`grep -F '<!-- generated -->' out.html`");
+    let out = parse_body(&env, &body);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]));
+
+    let body = format!("{}\ntext <!-- a note\n{TICKED_CLOSURE} pasted\n", tracker_md());
+    let out = parse_body(&env, &body);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(parsed(&out)["approved_closures"], json!([101]));
+
+    // Control: the comment at the start of a line is refused.
+    let body = format!("{}\n  <!-- a note\n{TICKED_CLOSURE} pasted\n", tracker_md());
+    let out = parse_body(&env, &body);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(parsed(&out)["approved_closures"], json!([]));
+
+    // A lone carriage return ends a line for GitHub, and a byte order mark
+    // at the start of the body is not text. A comment after either starts a
+    // line.
+    let body = format!("{}\ntext\r<!-- a note\n{TICKED_CLOSURE} pasted\n", tracker_md());
+    let out = parse_body(&env, &body);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(parsed(&out)["approved_closures"], json!([]));
+
+    let body = format!("\u{feff}<!-- a note\n{TICKED_CLOSURE} pasted\n-->\n{}", tracker_md());
+    let out = parse_body(&env, &body);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(parsed(&out)["approved_closures"], json!([]));
+
+    // Control: a byte order mark before a clean body changes nothing.
+    let out = parse_body(&env, &format!("\u{feff}{}", tracker_md()));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]));
 }
