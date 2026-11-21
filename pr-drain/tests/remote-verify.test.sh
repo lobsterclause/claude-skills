@@ -54,7 +54,7 @@ chmod +x "$FSSH"
 run() { # rc ship-dir [env...]
   local rc=$1 ship=$2; shift 2
   # Pin the knobs a caller's shell may have exported; cases override after.
-  env RV_INCLUDE_UNTRACKED=0 RV_BUILD_IMAGE=0 RV_SSH="$FSSH" RV_OUT_DIR="${OUTDIR:-$T/out}" SHIP="$ship" FAKE_RC="$rc" "$@" \
+  env RV_INCLUDE_UNTRACKED=0 RV_BUILD_IMAGE=0 RV_GH_TOKEN=0 RV_SSH="$FSSH" RV_OUT_DIR="${OUTDIR:-$T/out}" SHIP="$ship" FAKE_RC="$rc" "$@" \
     bash "$S/remote-verify.sh" "$R" probe firebird
 }
 
@@ -88,6 +88,11 @@ OUTDIR="$T/out7" run 0 "$T/ship7" 2>/dev/null; check "unopenable log exits 93" 9
 check "unopenable log still writes .out" "verify exit=93" "$(cat "$T/out7/rv-probe.out")"
 
 # A relative RV_SSH resolves from the caller's directory, not the worktree.
-( cd "$T/sp ace" && env GIT_CONFIG_GLOBAL=/dev/null RV_INCLUDE_UNTRACKED=0 RV_BUILD_IMAGE=0 RV_SSH=./fake-ssh RV_OUT_DIR="$T/out8" SHIP="$T/ship8" FAKE_RC=0 bash "$S/remote-verify.sh" "$R" probe firebird ); check "relative RV_SSH resolves from caller dir" 0 $?
+( cd "$T/sp ace" && env GIT_CONFIG_GLOBAL=/dev/null RV_INCLUDE_UNTRACKED=0 RV_BUILD_IMAGE=0 RV_GH_TOKEN=0 RV_SSH=./fake-ssh RV_OUT_DIR="$T/out8" SHIP="$T/ship8" FAKE_RC=0 bash "$S/remote-verify.sh" "$R" probe firebird ); check "relative RV_SSH resolves from caller dir" 0 $?
+
+# Image-build mode leaves an earlier verify's log alone.
+echo keep > "$T/out8/rverify-probe.log"
+env RV_GH_TOKEN=0 RV_BUILD_IMAGE=1 RV_SSH="$FSSH" RV_OUT_DIR="$T/out8" bash "$S/remote-verify.sh" "$R" probe firebird >/dev/null
+check "image build keeps the verify log" keep "$(cat "$T/out8/rverify-probe.log")"
 
 exit $fail

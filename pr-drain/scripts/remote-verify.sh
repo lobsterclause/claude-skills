@@ -64,6 +64,8 @@ if [ -n "${RV_SSH:-}" ]; then
   case "$RV_SSH" in /*) ;; */*) RV_SSH="$PWD/$RV_SSH";; esac
   SSH=("$RV_SSH")
 fi
+# Image-build mode touches neither the log nor .out, so it runs first.
+if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | "${SSH[@]}" "docker build -q -t kma-verify:22 -"; exit $?; fi
 D=$BASE/$N; LOG=$OUTD/rverify-$N.log; OUT=$OUTD/rv-$N.out; rm -f "$OUT"
 # Every exit after this point writes the result a caller polls for. If that
 # write fails, exit 94: never report a result nobody can read.
@@ -71,7 +73,6 @@ finish() { echo "verify exit=$1" > "$OUT" || { echo "cannot write $OUT"; exit 94
 # The block's output goes to $LOG; if that can't be opened, the block never
 # runs, so fail here instead of exiting with whatever status came before.
 : > "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
-if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | "${SSH[@]}" "docker build -q -t kma-verify:22 -"; exit $?; fi
 {
   cd "$WT" || finish 97
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
