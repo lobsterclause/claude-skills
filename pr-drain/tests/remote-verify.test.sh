@@ -15,6 +15,7 @@
 # with unwritable .out, unopenable log, relative RV_SSH): 4 fail against the
 # pass-1 fix commit. Pass-4 cases (stale .out after an image build, tar
 # recursion, masked tar failure, FIFO log): checked red against c6d811c.
+# Pass-5: submodule contents (red against b2c919e's --no-recursion).
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -25,6 +26,7 @@ trap 'rm -rf "$T"' EXIT
 # would make the fixture's stray file ignored instead of untracked).
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 XDG_CONFIG_HOME="$T/xdg"
 fail=0
+REAL_TAR=$(command -v tar); export REAL_TAR
 exists() { if [ -f "$1" ]; then echo 0; else echo 1; fi; }
 check() { # name expected actual
   if [ "$2" = "$3" ]; then echo "ok   $1 ($3)"; else echo "FAIL $1 expected $2 got $3"; fail=1; fi
@@ -44,7 +46,7 @@ cat > "$FSSH" <<'FAKE'
 #!/bin/bash
 cmd="$*"
 case "$cmd" in
-  *"tar -xzf -"*) mkdir -p "$SHIP" && tar -xzf - -C "$SHIP" ;;
+  *"tar -xzf -"*) mkdir -p "$SHIP" && "$REAL_TAR" -xzf - -C "$SHIP" ;;
   *"git init -q"*) exit "$FAKE_RC" ;;
   *"mkdir -p $"*|*"mkdir -p /"*) [ -n "${FAKE_SETUP_FAIL:-}" ] && exit 1; exit 0 ;;
   *) exit 0 ;;
@@ -109,19 +111,33 @@ REPO="$R2" run 0 "$T/ship10"; check "locally deleted tracked file doesn't fail t
 check "untracked file under a dir that replaced a tracked file not shipped" 1 "$(exists "$T/ship10/d/secret.txt")"
 check "other tracked files still shipped" 0 "$(exists "$T/ship10/a.txt")"
 
-# A local tar failure (unreadable tracked file) is 99, not masked by ssh's 0.
-chmod 000 "$R2/u.txt"
-REPO="$R2" OUTDIR="$T/out11" run 0 "$T/ship11"; check "local tar failure exits 99" 99 $?
-chmod 644 "$R2/u.txt"
+# A submodule checkout is still shipped whole.
+S3="$T/sub"; mkdir -p "$S3"; git -C "$S3" init -q; echo s > "$S3/s.txt"
+git -C "$S3" add s.txt; git -C "$S3" -c user.email=t@t -c user.name=t commit -q -m s
+git -C "$R2" -c protocol.file.allow=always submodule -q add "$S3" vendor 2>/dev/null
+git -C "$R2" -c user.email=t@t -c user.name=t commit -q -m sub
+REPO="$R2" run 0 "$T/ship13" >/dev/null
+check "submodule contents shipped" 0 "$(exists "$T/ship13/vendor/s.txt")"
+
+# A local tar failure is 99, not masked by ssh's 0. A tar stub that writes a
+# good stream and then exits 2 keeps this independent of file permissions.
+mkdir -p "$T/badtar"
+printf '#!/bin/bash\n"%s" "$@"; exit 2\n' "$REAL_TAR" > "$T/badtar/tar"; chmod +x "$T/badtar/tar"
+REPO="$R2" OUTDIR="$T/out11" run 0 "$T/ship11" PATH="$T/badtar:$PATH"; check "local tar failure exits 99" 99 $?
 
 # A FIFO log is opened once: a reader that stops at the first EOF still gets
 # the whole run, and the script finishes instead of blocking on a second open.
 mkdir -p "$T/out12"; mkfifo "$T/out12/rverify-probe.log"
-cat "$T/out12/rverify-probe.log" > "$T/fifo.txt" &
-OUTDIR="$T/out12" run 0 "$T/ship12" & pid=$!
+cat "$T/out12/rverify-probe.log" > "$T/fifo.txt" & rpid=$!
+# env execs bash, so $pid is the verifier itself.
+env RV_INCLUDE_UNTRACKED=0 RV_BUILD_IMAGE=0 RV_GH_TOKEN=0 RV_SSH="$FSSH" RV_OUT_DIR="$T/out12" SHIP="$T/ship12" FAKE_RC=0 \
+  bash "$S/remote-verify.sh" "$R" probe firebird & pid=$!
 for _ in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-if kill -0 "$pid" 2>/dev/null; then kill "$pid"; pkill -P $$ cat 2>/dev/null; check "FIFO log run finishes" finished hung
+if kill -0 "$pid" 2>/dev/null; then kill "$pid" "$rpid" 2>/dev/null; wait "$pid" "$rpid" 2>/dev/null; check "FIFO log run finishes" finished hung
 else wait "$pid"; check "FIFO log run finishes" 0 $?; fi
+# Reap the reader before reading what it wrote (bounded: kill if it lingers).
+for _ in $(seq 1 50); do kill -0 "$rpid" 2>/dev/null || break; sleep 0.1; done
+kill "$rpid" 2>/dev/null; wait "$rpid" 2>/dev/null
 grep -q "remote rc=0" "$T/fifo.txt"; check "FIFO reader saw the whole log" 0 $?
 
 exit $fail

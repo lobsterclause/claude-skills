@@ -84,16 +84,18 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
     UNTR=$(/usr/bin/git ls-files --others --exclude-standard)
     [ -n "$UNTR" ] && { echo "WARN: not shipping $(printf '%s\n' "$UNTR" | wc -l | tr -d ' ') untracked file(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"; printf '%s\n' "$UNTR" | sed 's/^/  /'; }
   fi
-  # Ship exactly git's list as it stands in the working copy: tracked files
-  # deleted locally are skipped (the box sees what you see), and
-  # --no-recursion keeps a directory that replaced a tracked file from
-  # dragging its untracked contents along. pipefail: a local git or tar
-  # failure is not masked by ssh's status.
+  # Ship git's list as it stands in the working copy. Tracked files deleted
+  # locally are skipped (the box sees what you see). A directory is shipped
+  # only if it is a submodule checkout (tar recurses into it); a directory
+  # that replaced a tracked file is skipped, so its untracked contents stay
+  # home. pipefail: a local git or tar failure is not masked by ssh's status.
   # shellcheck disable=SC2086 # LSF is a deliberate flag list
   ( set -o pipefail
     /usr/bin/git ls-files -z $LSF \
-      | while IFS= read -r -d '' f; do if [ -e "$f" ] || [ -L "$f" ]; then printf '%s\0' "$f"; fi; done \
-      | COPYFILE_DISABLE=1 tar --null --no-recursion -T - -czf - \
+      | while IFS= read -r -d '' f; do
+          if [ -L "$f" ] || [ -f "$f" ] || { [ -d "$f" ] && [ -e "$f/.git" ]; }; then printf '%s\0' "$f"; fi
+        done \
+      | COPYFILE_DISABLE=1 tar --null -T - -czf - \
       | "${SSH[@]}" "tar -xzf - -C $D/w"
   ) || { echo "shipping the tree failed (git ls-files, tar or ssh)"; finish 99; }
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
