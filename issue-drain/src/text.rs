@@ -80,6 +80,19 @@ pub fn norm_quote(s: &str) -> String {
         .join(" ")
 }
 
+/// Whether `s` names a file inside the repo: not empty, not absolute, not an
+/// option, and no empty, "." or ".." part. `Err` says why not. Every path a
+/// reader or a session names goes through this before git or a queue sees it.
+pub fn repo_path(s: &str) -> Result<(), &'static str> {
+    if s.is_empty() || s.starts_with(['/', '-']) || s.split('/').any(|part| matches!(part, "" | "." | "..")) {
+        return Err("is not a repo-relative path");
+    }
+    if s.chars().any(char::is_control) {
+        return Err("has a control character in its path");
+    }
+    Ok(())
+}
+
 pub fn sha7(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
@@ -147,6 +160,18 @@ mod tests {
         ] {
             assert_eq!(parse_number(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_repo_path_stays_inside_the_repo() {
+        for good in ["a", "src/a.ts", ".github/workflows/ci.yml", "a..b/c", "src/-x"] {
+            assert_eq!(repo_path(good), Ok(()), "{good}");
+        }
+        for bad in ["", "/a", "-a", "..", "a/../b", "./a", "a/./b", "a//b", "a/", "a/.."] {
+            assert_eq!(repo_path(bad), Err("is not a repo-relative path"), "{bad}");
+        }
+        assert_eq!(repo_path("a\u{7}b"), Err("has a control character in its path"));
+        assert_eq!(repo_path("a\nb"), Err("has a control character in its path"));
     }
 
     #[test]

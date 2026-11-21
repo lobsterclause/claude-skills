@@ -192,6 +192,57 @@ fn a_path_that_is_not_repo_relative_or_has_a_control_character_fails() {
 }
 
 #[test]
+fn a_line_number_at_the_edge_of_the_range_fails_and_does_not_overflow() {
+    let r = check_one(&with_quote(103, COUNTDOWN, json!(i64::MAX), QUOTE));
+    assert_eq!(
+        r["evidence"][0]["reason"],
+        "quote is not within 3 lines of that line on develop"
+    );
+    assert_eq!(
+        check_one(&with_quote(103, COUNTDOWN, json!(5), QUOTE))["status"],
+        "live"
+    );
+}
+
+#[test]
+fn a_likely_file_that_is_no_repo_path_makes_the_verdict_unclear() {
+    for (number, status) in [(103, "live"), (101, "already_fixed"), (106, "duplicate_of")] {
+        assert_eq!(check_one(&good(number))["status"], status, "control #{number}");
+        for bad in ["../outside.ts", "/etc/passwd", "-rf", "src/./a.ts", ""] {
+            let r = check_one(&with(good(number), "likely_files", json!([COUNTDOWN, bad])));
+            assert_eq!(r["status"], "unclear", "#{number} {bad:?}");
+            assert_eq!(r["downgrade_reason"], "a likely file is not a repo-relative path");
+            assert_eq!(r["likely_files"], json!([COUNTDOWN]), "the bad path is not kept");
+            assert!(!r["files"].as_array().expect("files").iter().any(|f| f == bad));
+        }
+    }
+    let r = check_one(&with(good(103), "likely_files", json!(["src/a\u{7}.ts"])));
+    assert_eq!(
+        r["downgrade_reason"],
+        "a likely file has a control character in its path"
+    );
+}
+
+#[test]
+fn an_already_fixed_issue_on_a_protected_path_is_still_already_fixed() {
+    // Nothing is written for it, so there is nothing for a person to change.
+    let r = check_one(&with(
+        good(101),
+        "likely_files",
+        json!(["src/auth/session.ts", ".github/workflows/ci.yml"]),
+    ));
+    assert_eq!(r["status"], "already_fixed", "{r}");
+    assert!(r["downgrade_reason"].is_null());
+    // Control: the same path sends a live issue to a person.
+    let live = check_one(&with(
+        good(103),
+        "likely_files",
+        json!([COUNTDOWN, ".github/workflows/ci.yml"]),
+    ));
+    assert_eq!(live["status"], "needs_human");
+}
+
+#[test]
 fn a_failed_reuse_quote_is_dropped_and_counted() {
     let control = check_one(&good(103));
     assert_eq!(control["reuse"].as_array().expect("reuse").len(), 1);

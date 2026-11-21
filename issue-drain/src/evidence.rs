@@ -28,7 +28,7 @@ use crate::error::{Fail, Res};
 use crate::git;
 use crate::model::{Checked, FixCommit, Line, Quote};
 use crate::profile::Profile;
-use crate::text::{norm_quote, parse_number};
+use crate::text::{norm_quote, parse_number, repo_path};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -96,13 +96,15 @@ fn given_line(line: &str) -> Line {
 /// once its own spacing is normalised. Lines count from 1; the first of two
 /// equally near lines wins.
 fn find_line(text: &str, want: i64, slack: i64, nq: &str) -> u64 {
-    let mut best: Option<(i64, i64)> = None;
+    // A reader may name any line number, so nothing here may overflow.
+    let (low, high) = (want.saturating_sub(slack), want.saturating_add(slack));
+    let mut best: Option<(i64, u64)> = None;
     for (i, raw) in text.split('\n').enumerate() {
-        let n = i as i64 + 1;
-        if n < want - slack || n > want + slack || !norm_quote(raw).contains(nq) {
+        let n = i64::try_from(i).map_or(i64::MAX, |i| i.saturating_add(1));
+        if n < low || n > high || !norm_quote(raw).contains(nq) {
             continue;
         }
-        let d = (n - want).abs();
+        let d = n.abs_diff(want);
         if best.is_none_or(|(_, best_d)| d < best_d) {
             best = Some((n, d));
         }
@@ -142,12 +144,7 @@ fn quote_outcome(basis: &Basis, file: &str, line: &str, quote: &str) -> Result<(
     let slack = basis.profile.evidence_line_slack;
     let min = basis.profile.evidence_min_quote;
     let nq = norm_quote(quote);
-    if file.is_empty() || file.starts_with('/') || file.starts_with('-') || file.contains("..") {
-        return Err("is not a repo-relative path".into());
-    }
-    if file.chars().any(char::is_control) {
-        return Err("has a control character in its path".into());
-    }
+    repo_path(file)?;
     let want = parse_number(line)
         .and_then(|n| i64::try_from(n).ok())
         .ok_or("has no line number")?;
@@ -227,7 +224,12 @@ fn check_with(basis: &Basis, verdict: &Value, created: Option<i64>, known: &[u64
     let orig = tostr(verdict.get("status"));
     let evidence = check_items(basis, verdict, "evidence");
     let reuse_all = check_items(basis, verdict, "reuse");
-    let likely_files = strings(verdict.get("likely_files"));
+    // A likely file that is no repo path is not kept: it would reach the
+    // queue's file list and from there a unit's scope.
+    let (likely_files, bad_files): (Vec<String>, Vec<String>) = strings(verdict.get("likely_files"))
+        .into_iter()
+        .partition(|f| repo_path(f).is_ok());
+    let bad_file = bad_files.first().and_then(|f| repo_path(f).err());
     let files: BTreeSet<&String> = likely_files
         .iter()
         .chain(evidence.iter().map(|q| &q.file))
@@ -265,6 +267,8 @@ fn check_with(basis: &Basis, verdict: &Value, created: Option<i64>, known: &[u64
             line_text(&q.line),
             q.reason.as_deref().unwrap_or_default()
         ))
+    } else if let Some(why) = bad_file {
+        unclear(format!("a likely file {why}"))
     } else if orig == "already_fixed" && created.is_none() {
         unclear("no local record of the issue, so the fix cannot be dated".into())
     } else if orig == "already_fixed" && fix.is_none() {
@@ -272,6 +276,8 @@ fn check_with(basis: &Basis, verdict: &Value, created: Option<i64>, known: &[u64
     } else if let (true, Some(Err(why))) = (orig == "already_fixed", &fixing) {
         unclear(format!("the fixing commit the reader named {why}"))
     } else if orig == "already_fixed" {
+        // Before the protected-path rule on purpose: nothing is written for an
+        // issue that is already fixed, so there is no change for a person to make.
         (orig.clone(), None)
     } else if orig == "duplicate_of" && !duplicate_ok {
         unclear("duplicate_of does not name another issue in this run".into())

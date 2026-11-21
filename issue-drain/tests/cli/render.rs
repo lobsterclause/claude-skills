@@ -290,7 +290,7 @@ fn a_protected_path_is_refused() {
 
 #[test]
 fn a_unit_with_a_bad_field_is_refused() {
-    let cases: [(&str, Value, &str); 7] = [
+    let cases: [(&str, Value, &str); 13] = [
         (
             "model",
             json!("gpt"),
@@ -301,8 +301,14 @@ fn a_unit_with_a_bad_field_is_refused() {
             json!("extreme"),
             "effort must be one of low medium high (got extreme)",
         ),
-        ("est_minutes", json!(0), "est_minutes must be a number above 0"),
-        ("est_minutes", json!("30"), "est_minutes must be a number above 0"),
+        ("est_minutes", json!(0), "est_minutes must be a whole number above 0"),
+        ("est_minutes", json!("30"), "est_minutes must be a whole number above 0"),
+        ("est_minutes", json!(30.5), "est_minutes must be a whole number above 0"),
+        ("est_minutes", json!(-5), "est_minutes must be a whole number above 0"),
+        ("kind", json!(3), "kind must be a word such as bugfix"),
+        ("kind", json!(""), "kind must be a word such as bugfix"),
+        ("test_command", json!(7), "test_command must be one non-empty line"),
+        ("waits_for", json!(5), "waits_for must be text or left out"),
         ("size", json!("XXL"), "size must be S, M, L or XL"),
         ("test_command", json!("a\nb"), "test_command must be one non-empty line"),
         ("title", json!(""), "no title"),
@@ -312,6 +318,62 @@ fn a_unit_with_a_bad_field_is_refused() {
         d["units"][2][key] = value;
         expect_refused(&rendered_env(), &d, needle);
     }
+}
+
+#[test]
+fn the_queue_reads_back_as_the_type_the_other_commands_use() {
+    let env = rendered_env();
+    assert_eq!(render(&env).code, 0);
+    let queue: issue_drain::model::Queue =
+        serde_json::from_value(json(&env.workdir.join("queue.json"))).expect("queue.json is a Queue");
+    assert_eq!(queue.units.len(), 4);
+    assert_eq!(queue.units[0].est_minutes, 30);
+}
+
+#[test]
+fn a_risk_path_named_in_the_units_own_files_counts() {
+    // U3 (#111) is not a risk-path issue by its verdict; the session names a crisis file for it.
+    let mut d = decisions();
+    d["units"][2]["files"] = json!(["src/search/box.ts", "src/crisis/keywords.ts"]);
+    expect_refused(&rendered_env(), &d, "name who reviews its PR in waits_for");
+    d["units"][2]["waits_for"] = json!("clinical review");
+    let env = rendered_env();
+    set_decisions(&env, &d);
+    assert_eq!(render(&env).code, 0);
+    let queue = json(&env.workdir.join("queue.json"));
+    let unit = queue["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["issues"] == json!([111]))
+        .expect("the unit for #111");
+    assert_eq!(unit["risk"], true);
+    assert_eq!(unit["waits"], true);
+    assert_eq!(unit["risk_paths"], json!(["src/crisis/keywords.ts"]));
+}
+
+#[test]
+fn a_file_that_is_no_repo_path_is_refused() {
+    for bad in ["../outside.ts", "/etc/passwd", "-rf", "src/../a.ts"] {
+        let mut d = decisions();
+        d["units"][2]["files"] = json!(["src/search/box.ts", bad]);
+        expect_refused(&rendered_env(), &d, "names a file that is not a repo-relative path");
+    }
+}
+
+#[test]
+fn a_unit_of_duplicates_alone_is_refused() {
+    // #106 duplicates #103. If #103 is called a duplicate of #106, the unit has nothing to fix.
+    let env = rendered_env();
+    let mut checked = json(&env.workdir.join("verdicts.checked.json"));
+    for v in checked.as_array_mut().unwrap() {
+        if v["number"] == 103 {
+            v["status"] = json!("duplicate_of");
+            v["duplicate_of"] = json!(106);
+        }
+    }
+    env.write("verdicts.checked.json", &checked.to_string());
+    expect_refused(&env, &decisions(), "has no live issue");
 }
 
 #[test]

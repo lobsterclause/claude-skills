@@ -16,8 +16,8 @@ use serde_json::{Map, Value, json};
 
 use crate::ctx::{Ctx, read_json, write_atomic, write_json};
 use crate::error::{Fail, Res};
-use crate::model::{Checked, Eligible, FixCommit, Intake, Line};
-use crate::text::{clean, code, count, sha7};
+use crate::model::{Checked, Eligible, FixCommit, Intake, Line, Queue};
+use crate::text::{clean, code, count, repo_path, sha7};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -329,10 +329,18 @@ fn render(input: &Input) -> Res<Rendered> {
                 .map(|q| format!("{}:{}", q.file, line_text(&q.line)))
                 .collect(),
         );
+        // The session may name the unit's files itself, so a risk path is
+        // looked for in the final list too and not only in the verdicts.
+        let risk_paths = sorted_unique(
+            vs.iter()
+                .flat_map(|v| v.risk_paths.iter().cloned())
+                .chain(files.iter().filter(|f| input.ctx.profile.is_risk(f)).cloned())
+                .collect(),
+        );
         let draft = Draft {
             live: live_vs.iter().map(|v| v.number).collect(),
-            risk: vs.iter().any(|v| v.risk),
-            risk_paths: sorted_unique(vs.iter().flat_map(|v| v.risk_paths.iter().cloned()).collect()),
+            risk: !risk_paths.is_empty() || vs.iter().any(|v| v.risk),
+            risk_paths,
             priority: nums
                 .iter()
                 .map(|n| el.get(n).map_or(99, |e| e.priority))
@@ -496,11 +504,13 @@ fn render(input: &Input) -> Res<Rendered> {
         serde_json::to_value(&input.intake.stale_claims).expect("plain data"),
     );
     queue.insert("title".into(), json!(title));
-    Ok(Rendered {
-        errors,
-        queue: Value::Object(queue),
-        md,
-    })
+    // close-verified and the tracker commands read queue.json as a Queue, so
+    // one that does not read back is never written.
+    let queue = Value::Object(queue);
+    if let Err(e) = serde_json::from_value::<Queue>(queue.clone()) {
+        return Err(Fail::failed(format!("the rendered queue does not read back: {e}")));
+    }
+    Ok(Rendered { errors, queue, md })
 }
 
 fn unit_errors(
@@ -522,6 +532,9 @@ fn unit_errors(
             u.issues.len(),
             input.cluster_max
         ));
+    }
+    if !u.issues.is_empty() && u.live.is_empty() {
+        push("has no live issue; a unit needs one issue to fix".into());
     }
     for bad in not_numbers {
         push(format!("#{bad} was not taken in by this run"));
@@ -553,7 +566,9 @@ fn unit_errors(
         ));
     }
     for file in &u.files {
-        if input.ctx.profile.is_protected(file) {
+        if let Err(why) = repo_path(file) {
+            push(format!("names a file that {why} ({})", clean(file, 80)));
+        } else if input.ctx.profile.is_protected(file) {
             push(format!("names a protected path ({file}); that work needs a person"));
         }
     }
@@ -576,13 +591,20 @@ fn unit_errors(
             got(&u.effort)
         ));
     }
-    if !u.est_minutes.as_f64().is_some_and(|m| m > 0.0) {
-        push("est_minutes must be a number above 0".into());
+    // queue.json is typed (model::Unit), so each field has its type here.
+    if !u.est_minutes.as_u64().is_some_and(|m| m > 0) {
+        push("est_minutes must be a whole number above 0".into());
+    }
+    if !u.kind.as_str().is_some_and(|k| !k.is_empty()) {
+        push("kind must be a word such as bugfix".into());
+    }
+    if !(u.waits_for.is_null() || u.waits_for.is_string()) {
+        push("waits_for must be text or left out".into());
     }
     if !u.size.as_str().is_some_and(|s| ["S", "M", "L", "XL"].contains(&s)) {
         push("size must be S, M, L or XL".into());
     }
-    let command = truthy(Some(&u.test_command)).map(ts).unwrap_or_default();
+    let command = u.test_command.as_str().unwrap_or_default();
     if command.is_empty() || command.contains(['\n', '\r']) {
         push("test_command must be one non-empty line".into());
     }
