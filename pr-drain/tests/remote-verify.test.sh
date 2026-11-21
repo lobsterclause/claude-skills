@@ -24,6 +24,7 @@
 # WARN count (red against d831fdb); 98/97 early-failure codes.
 # Pass-10: a file replacing a submodule, box cleanup on a local failure
 # (red against 1ddd75f).
+# Pass-11: submodule list for the box (red against 14e5587).
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -58,6 +59,7 @@ case "$cmd" in
   *"git init -q"*) exit "$FAKE_RC" ;;
   *"mkdir -p $"*|*"mkdir -p /"*) [ -n "${FAKE_SETUP_FAIL:-}" ] && exit 1; exit 0 ;;
   *"rm -rf /b/"*) [ -n "${RMLOG:-}" ] && echo cleanup >> "$RMLOG"; exit 0 ;;
+  *"cat > "*"/gitlinks") if [ -n "${GITLINKS:-}" ]; then cat > "$GITLINKS"; else cat >/dev/null; fi; exit 0 ;;
   *"docker build -q"*|*"tok.env"*) cat >/dev/null; exit 0 ;;
   # Anything else is a remote command the tests don't know: fail loudly.
   *) echo "fake-ssh: unexpected command: $cmd" >&2; exit 60 ;;
@@ -174,6 +176,16 @@ grep -q "submodule vendor is a symlink" "$T/out20/rverify-probe.log"; check "sym
 R5="$T/repo5"; cp -R "$R2" "$R5"; rm -rf "$R5/vendor"; mkdir "$R5/vendor"
 REPO="$R5" OUTDIR="$T/out21" run 0 "$T/ship21" >/dev/null; check "submodule without a checkout still exits 0" 0 $?
 grep -q "note: submodule vendor has no checkout" "$T/out21/rverify-probe.log"; check "submodule without a checkout named in the log" 0 $?
+
+# Pass-11: the box is told which checked-out submodules to keep as gitlinks,
+# innermost first (red against 14e5587).
+S4="$T/inner"; mkdir -p "$S4"; git -C "$S4" init -q; echo i > "$S4/i.txt"
+git -C "$S4" add i.txt; git -C "$S4" -c user.email=t@t -c user.name=t commit -q -m i
+R8="$T/repo8"; cp -R "$R2" "$R8"
+git -C "$R8/vendor" -c protocol.file.allow=always submodule -q add "$S4" deep 2>/dev/null
+git -C "$R8/vendor" -c user.email=t@t -c user.name=t commit -q -m deep
+REPO="$R8" OUTDIR="$T/out26" GITLINKS="$T/gl26" run 0 "$T/ship26" >/dev/null; check "nested submodules run exits 0" 0 $?
+check "gitlinks list, innermost first" "vendor/deep|vendor|" "$(tr '\0' '|' < "$T/gl26" 2>/dev/null)"
 
 # Pass-10: a file that replaced a submodule (unstaged) is shipped as itself
 # (red against 1ddd75f).

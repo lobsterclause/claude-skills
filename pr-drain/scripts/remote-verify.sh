@@ -130,6 +130,23 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
     rm -f "$idx"
     return "$rc"
   }
+  # list_subs <dir> <prefix>: NUL-separated paths of the checked-out
+  # submodules list_tree walks into, innermost first. The box makes each one
+  # its own repository before `git add -A`, so the snapshot keeps them as
+  # gitlinks (as CI sees them) instead of flattening their files.
+  list_subs() {
+    local dir=$1 pre=$2 ent mode path idx rc=0
+    idx=$(mktemp) || return 1
+    /usr/bin/git -C "$dir" ls-files -z -s > "$idx" || { rm -f "$idx"; return 1; }
+    while IFS= read -r -d '' ent; do
+      mode=${ent%% *}; path=${ent#*$'\t'}
+      [ "$mode" = 160000 ] && [ ! -L "$dir/$path" ] && [ -d "$dir/$path" ] && [ -e "$dir/$path/.git" ] || continue
+      list_subs "$dir/$path" "$pre$path/" || { rc=1; break; }
+      printf '%s%s\0' "$pre" "$path"
+    done < "$idx"
+    rm -f "$idx"
+    return "$rc"
+  }
   INCL=0
   if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then INCL=1
   else
@@ -164,6 +181,8 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
       | COPYFILE_DISABLE=1 tar --null --no-recursion -T - -czf - \
       | "${SSH[@]}" "tar -xzf - -C $D/w"
   ) || { echo "shipping the tree failed (git ls-files, tar or ssh)"; fail_clean 99; }
+  ( set -o pipefail; list_subs . "" | "${SSH[@]}" "cat > $D/gitlinks" ) \
+    || { echo "shipping the submodule list failed"; fail_clean 99; }
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""
@@ -172,7 +191,7 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
     ENVF="--env-file $D/tok.env"
   fi
   # RV_INSTALL overrides the install step (default: pnpm frozen install at the repo root).
-  "${SSH[@]}" "cd $D/w && docker run --rm $LIM $ENVF --user \$(id -u):\$(id -g) --name rv-$N -v $D:/m -w /m/w -e HOME=/tmp -e TMPDIR=/m/tmp -e CI=1 -e COREPACK_HOME=/tmp/.corepack $IMAGE bash -c 'set -e; git config --global --add safe.directory /m/w; git init -q; git -c user.email=v@v -c user.name=v add -A; git -c user.email=v@v -c user.name=v commit -q -m snap; mkdir -p /tmp/bin; corepack enable --install-directory /tmp/bin; export PATH=/tmp/bin:\$PATH; ${RV_INSTALL:-pnpm install --frozen-lockfile} 2>&1 | tail -3; ${RV_CMD:-pnpm verify} 2>&1'"
+  "${SSH[@]}" "cd $D/w && docker run --rm $LIM $ENVF --user \$(id -u):\$(id -g) --name rv-$N -v $D:/m -w /m/w -e HOME=/tmp -e TMPDIR=/m/tmp -e CI=1 -e COREPACK_HOME=/tmp/.corepack $IMAGE bash -c 'set -e; git config --global --add safe.directory \"*\"; while IFS= read -r -d \"\" p; do (cd \"\$p\" && git init -q && git -c user.email=v@v -c user.name=v add -A && git -c user.email=v@v -c user.name=v commit -q --allow-empty -m snap) || exit 1; done < /m/gitlinks; git init -q; git -c user.email=v@v -c user.name=v add -A; git -c user.email=v@v -c user.name=v commit -q -m snap; mkdir -p /tmp/bin; corepack enable --install-directory /tmp/bin; export PATH=/tmp/bin:\$PATH; ${RV_INSTALL:-pnpm install --frozen-lockfile} 2>&1 | tail -3; ${RV_CMD:-pnpm verify} 2>&1'"
   rc=$?
   echo "remote rc=$rc"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N"
