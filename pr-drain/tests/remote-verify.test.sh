@@ -25,6 +25,8 @@
 # Pass-10: a file replacing a submodule, box cleanup on a local failure
 # (red against 1ddd75f).
 # Pass-11: submodule list for the box (red against 14e5587).
+# Pass-12: the box's own git setup, run locally on the shipped tree: an
+# empty submodule and force-tracked ignored files (red against d04df8c).
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -56,7 +58,7 @@ cat > "$FSSH" <<'FAKE'
 cmd="$*"
 case "$cmd" in
   *"tar -xzf -"*) mkdir -p "$SHIP" && "$REAL_TAR" -xzf - -C "$SHIP" ;;
-  *"git init -q"*) exit "$FAKE_RC" ;;
+  *"git init -q"*) [ -n "${CMDLOG:-}" ] && printf '%s' "$cmd" > "$CMDLOG"; exit "$FAKE_RC" ;;
   *"mkdir -p $"*|*"mkdir -p /"*) [ -n "${FAKE_SETUP_FAIL:-}" ] && exit 1; exit 0 ;;
   *"rm -rf /b/"*) [ -n "${RMLOG:-}" ] && echo cleanup >> "$RMLOG"; exit 0 ;;
   *"cat > "*"/gitlinks") if [ -n "${GITLINKS:-}" ]; then cat > "$GITLINKS"; else cat >/dev/null; fi; exit 0 ;;
@@ -186,6 +188,29 @@ git -C "$R8/vendor" -c protocol.file.allow=always submodule -q add "$S4" deep 2>
 git -C "$R8/vendor" -c user.email=t@t -c user.name=t commit -q -m deep
 REPO="$R8" OUTDIR="$T/out26" GITLINKS="$T/gl26" run 0 "$T/ship26" >/dev/null; check "nested submodules run exits 0" 0 $?
 check "gitlinks list, innermost first" "vendor/deep|vendor|" "$(tr '\0' '|' < "$T/gl26" 2>/dev/null)"
+
+# Pass-12: run the box's git setup itself on the shipped tree. An empty
+# submodule ships no files, and a tracked file matching a .gitignore must
+# stay tracked, in a submodule and at the top (red against d04df8c).
+S5="$T/empty"; mkdir -p "$S5"; git -C "$S5" init -q
+git -C "$S5" -c user.email=t@t -c user.name=t commit -q --allow-empty -m e
+R9="$T/repo9"; cp -R "$R8" "$R9"
+git -C "$R9" -c protocol.file.allow=always submodule -q add "$S5" empty 2>/dev/null
+echo '*.log' > "$R9/vendor/.gitignore"; echo k > "$R9/vendor/keep.log"
+git -C "$R9/vendor" add .gitignore; git -C "$R9/vendor" add -f keep.log
+git -C "$R9/vendor" -c user.email=t@t -c user.name=t commit -q -m keep
+echo '*.tmp' > "$R9/.gitignore"; echo t > "$R9/top.tmp"
+git -C "$R9" add .gitignore vendor; git -C "$R9" add -f top.tmp
+git -C "$R9" -c user.email=t@t -c user.name=t commit -q -m top
+REPO="$R9" OUTDIR="$T/out27" GITLINKS="$T/gl27" CMDLOG="$T/cmd27" run 0 "$T/ship27" >/dev/null
+check "box setup run exits 0" 0 $?
+inner=$(sed -E "s/.*bash -c '//; s/ mkdir -p \/tmp\/bin.*//" "$T/cmd27" 2>/dev/null | sed "s|/m/gitlinks|$T/gl27|")
+(cd "$T/ship27" && GIT_CONFIG_GLOBAL="$T/boxgitconfig" bash -c "$inner") >/dev/null 2>&1
+check "box git setup succeeds with an empty submodule" 0 $?
+check "empty submodule is a gitlink on the box" 160000 "$(git -C "$T/ship27" ls-files -s empty 2>/dev/null | cut -c1-6)"
+check "nested submodule stays a gitlink" 160000 "$(git -C "$T/ship27/vendor" ls-files -s deep 2>/dev/null | cut -c1-6)"
+check "ignored file tracked in a submodule stays tracked" keep.log "$(git -C "$T/ship27/vendor" ls-files keep.log 2>/dev/null)"
+check "ignored file tracked at the top stays tracked" top.tmp "$(git -C "$T/ship27" ls-files top.tmp 2>/dev/null)"
 
 # Pass-10: a file that replaced a submodule (unstaged) is shipped as itself
 # (red against 1ddd75f).

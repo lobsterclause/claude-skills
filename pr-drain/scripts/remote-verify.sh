@@ -7,7 +7,7 @@
 # from the working copy, so uncommitted edits to tracked files are included but
 # the reported head is the worktree's HEAD: commit first, or the result
 # describes a SHA you are not pushing. Untracked files are NOT shipped: the box
-# runs `git add -A`, so a stray local file (a test report, a scratch script)
+# runs `git add -A -f`, so a stray local file (a test report, a scratch script)
 # would become a tracked file there and fail checks CI never sees (#204: a
 # functions-core/.vitest/ report failed `format (tracked)` twice). The log
 # prints a WARN naming every untracked path left out, inside submodules too.
@@ -132,8 +132,11 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   }
   # list_subs <dir> <prefix>: NUL-separated paths of the checked-out
   # submodules list_tree walks into, innermost first. The box makes each one
-  # its own repository before `git add -A`, so the snapshot keeps them as
-  # gitlinks (as CI sees them) instead of flattening their files.
+  # its own repository before `git add -A -f`, so the snapshot keeps them as
+  # gitlinks (as CI sees them) instead of flattening their files. The box
+# creates each directory first (an empty submodule ships no files), and
+# stages with -f: only shipped paths exist there, and a tracked file that
+# matches a .gitignore must stay tracked.
   list_subs() {
     local dir=$1 pre=$2 ent mode path idx rc=0
     idx=$(mktemp) || return 1
@@ -191,7 +194,7 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
     ENVF="--env-file $D/tok.env"
   fi
   # RV_INSTALL overrides the install step (default: pnpm frozen install at the repo root).
-  "${SSH[@]}" "cd $D/w && docker run --rm $LIM $ENVF --user \$(id -u):\$(id -g) --name rv-$N -v $D:/m -w /m/w -e HOME=/tmp -e TMPDIR=/m/tmp -e CI=1 -e COREPACK_HOME=/tmp/.corepack $IMAGE bash -c 'set -e; git config --global --add safe.directory \"*\"; while IFS= read -r -d \"\" p; do (cd \"\$p\" && git init -q && git -c user.email=v@v -c user.name=v add -A && git -c user.email=v@v -c user.name=v commit -q --allow-empty -m snap) || exit 1; done < /m/gitlinks; git init -q; git -c user.email=v@v -c user.name=v add -A; git -c user.email=v@v -c user.name=v commit -q -m snap; mkdir -p /tmp/bin; corepack enable --install-directory /tmp/bin; export PATH=/tmp/bin:\$PATH; ${RV_INSTALL:-pnpm install --frozen-lockfile} 2>&1 | tail -3; ${RV_CMD:-pnpm verify} 2>&1'"
+  "${SSH[@]}" "cd $D/w && docker run --rm $LIM $ENVF --user \$(id -u):\$(id -g) --name rv-$N -v $D:/m -w /m/w -e HOME=/tmp -e TMPDIR=/m/tmp -e CI=1 -e COREPACK_HOME=/tmp/.corepack $IMAGE bash -c 'set -e; git config --global --add safe.directory \"*\"; while IFS= read -r -d \"\" p; do (mkdir -p \"\$p\" && cd \"\$p\" && git init -q && git -c user.email=v@v -c user.name=v add -A -f && git -c user.email=v@v -c user.name=v commit -q --allow-empty -m snap) || exit 1; done < /m/gitlinks; git init -q; git -c user.email=v@v -c user.name=v add -A -f; git -c user.email=v@v -c user.name=v commit -q -m snap; mkdir -p /tmp/bin; corepack enable --install-directory /tmp/bin; export PATH=/tmp/bin:\$PATH; ${RV_INSTALL:-pnpm install --frozen-lockfile} 2>&1 | tail -3; ${RV_CMD:-pnpm verify} 2>&1'"
   rc=$?
   echo "remote rc=$rc"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N"
