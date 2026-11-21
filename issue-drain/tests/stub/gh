@@ -30,6 +30,8 @@
 #   protection.json       answer to `gh api repos/<o>/<r>/branches/<b>/protection`
 #   compare.json          answer to `gh api repos/<o>/<r>/compare/<b>...<sha>`
 #   fail-merge            `gh pr merge` exits 1
+#   fail-thread           the thread-reply and thread-resolve mutations exit 1
+# GH_STUB_NEW_PR          the number `gh pr create` reports (default 901)
 # GH_STUB_NEW_ISSUE       the number `gh issue create` reports (default 900)
 # GH_STUB_CLOSE_NOOP=1    `gh issue close` exits 0 but closes nothing
 #
@@ -47,6 +49,11 @@ answer() { # answer <file>: print it, or fail the way gh does for a missing thin
 
 case "${1:-} ${2:-}" in
   "api graphql")
+    case "$*" in
+      *addPullRequestReviewThreadReply* | *resolveReviewThread*)
+        if [ -e "$dir/fail-thread" ]; then echo "gh stub: thread call failed" >&2; exit 1; fi
+        echo '{"data":{}}'; exit 0 ;;
+    esac
     n=""
     for arg in "$@"; do
       case "$arg" in number=*) n="${arg#number=}" ;; esac
@@ -89,6 +96,8 @@ case "${1:-} ${2:-}" in
     if [ "${GH_STUB_CLOSE_NOOP:-}" != "1" ]; then : > "$dir/closed-$3"; fi ;;
   "issue comment")
     if [ -e "$dir/fail-comment" ]; then echo "gh stub: comment failed" >&2; exit 1; fi ;;
+  "pr create")
+    echo "https://github.com/example/tidepool/pull/${GH_STUB_NEW_PR:-901}" ;;
   "pr view")
     answer "pr-view-$3.json" ;;
   "pr merge")
