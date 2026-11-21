@@ -110,6 +110,18 @@ fn split_numbers(found: &[&str], offered: &[u64]) -> (Vec<u64>, Vec<String>) {
     (approved, unknown)
 }
 
+/// A line's run of `mark` and what follows it, when the line can be a code
+/// fence: at most three spaces come before the run. A line indented further,
+/// or with a tab, is text.
+fn fence_run(line: &str, mark: char) -> Option<(usize, &str)> {
+    let text = line.trim_start_matches(' ');
+    if line.len() - text.len() > 3 {
+        return None;
+    }
+    let run = text.chars().take_while(|c| *c == mark).count();
+    Some((run, &text[run..]))
+}
+
 /// The lines GitHub shows as lines: not those inside a fenced code block
 /// (``` or ~~~) and not those inside an HTML comment that spans lines. A box
 /// in either is text, and nobody can tick it.
@@ -122,22 +134,23 @@ fn shown<'a>(lines: &[&'a str]) -> Vec<&'a str> {
             in_comment = !line.contains("-->");
             continue;
         }
-        let text = line.trim_start();
-        let run_of = |mark: char| text.chars().take_while(|c| *c == mark).count();
         if let Some((mark, opened)) = fence {
-            let run = run_of(mark);
-            if run >= opened && text[run..].trim().is_empty() {
+            // A block closes on a run of its own mark, at least as long as
+            // the one that opened it, with nothing after it.
+            if fence_run(line, mark).is_some_and(|(run, rest)| run >= opened && rest.trim().is_empty()) {
                 fence = None;
             }
             continue;
         }
-        fence = ['`', '~']
-            .into_iter()
-            .map(|mark| (mark, run_of(mark)))
-            .find(|(_, run)| *run >= 3);
+        // A backtick fence has no backtick after its run.
+        fence = ['`', '~'].into_iter().find_map(|mark| {
+            let (run, rest) = fence_run(line, mark)?;
+            (run >= 3 && !(mark == '`' && rest.contains('`'))).then_some((mark, run))
+        });
         if fence.is_some() {
             continue;
         }
+        let text = line.trim_start();
         // A comment that opens here and closes on a later line. What stands
         // before it on this line is still shown.
         in_comment = line.rfind("<!--").is_some_and(|at| !line[at..].contains("-->"));

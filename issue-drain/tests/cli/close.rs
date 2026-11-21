@@ -744,3 +744,25 @@ fn a_base_that_moves_while_an_issue_is_checked_stops_the_run() {
     assert_eq!(env.run(&ARGS).code, 0);
     assert_eq!(env.events_named("closure").len(), 1);
 }
+
+#[test]
+fn a_verdict_checked_again_after_render_does_not_replace_the_evidence_shown() {
+    // The tick was given for the lines the tracker quoted. A verdict written
+    // again later can quote others, and those were never held against the
+    // commit the tracker was rendered at.
+    let env = ready();
+    let mut checked = json(&env.workdir.join("verdicts.checked.json"));
+    for v in checked.as_array_mut().unwrap() {
+        if v["number"] == 101 {
+            let mut more = v["evidence"][0].clone();
+            more["line"] = json!(15);
+            v["evidence"].as_array_mut().unwrap().push(more);
+        }
+    }
+    env.write("verdicts.checked.json", &checked.to_string());
+    refused_one(
+        &env,
+        &env.run(&ARGS),
+        "its checked evidence is not the evidence the tracker showed",
+    );
+}

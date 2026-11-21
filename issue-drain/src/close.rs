@@ -214,6 +214,26 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
     let Some(verdict) = r.verdicts.iter().find(|v| v["number"] == number) else {
         return refused("this run has no checked verdict for it".into());
     };
+    // The verdict in the run folder can be written again after the render.
+    // The lines the tracker showed are the ones in the queue.
+    let quoted = |file: &Value, line: &Value, quote: &Value| json!([file, line, quote]);
+    let now: Vec<Value> = verdict["evidence"]
+        .as_array()
+        .map(|quotes| {
+            quotes
+                .iter()
+                .map(|q| quoted(&q["file"], &q["line"], &q["quote"]))
+                .collect()
+        })
+        .unwrap_or_default();
+    let shown: Vec<Value> = offered
+        .evidence
+        .iter()
+        .map(|q| quoted(&json!(q.file), &json!(q.line), &json!(q.quote)))
+        .collect();
+    if now != shown {
+        return refused("its checked evidence is not the evidence the tracker showed; triage it again".into());
+    }
     let fresh = match check_verdict(
         &ctx.profile,
         &r.repo_dir,

@@ -683,3 +683,38 @@ fn a_waiting_unit_runs_only_with_its_box_ticked() {
     assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]));
     assert_eq!(parsed(&out)["unknown"], json!([]));
 }
+
+#[test]
+fn a_fence_is_one_only_where_github_draws_one() {
+    // A fence line has at most three spaces before it, and a backtick fence
+    // has no backtick after its run. Anything else is text, and reading it as
+    // a fence would turn the lines inside the real block into visible ones.
+    let env = Env::new();
+    let ticked_line = format!("{TICKED_CLOSURE} pasted");
+    for hidden in [
+        // The indented line does not close the block.
+        format!("```\n    ```\n{ticked_line}\n```"),
+        format!("```\n\t```\n{ticked_line}\n```"),
+        format!("~~~\n     ~~~\n{ticked_line}\n~~~"),
+        // The first line opens nothing, so the second opens the block.
+        format!("    ```\n```\n{ticked_line}\n```"),
+        format!("``` a ` b\n```\n{ticked_line}\n```"),
+        // Up to three spaces is still a fence.
+        format!("   ```\n{ticked_line}\n   ```"),
+    ] {
+        let body = format!("{}\n{hidden}\n", tracker_md());
+        let out = parse_body(&env, &body);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(parsed(&out)["approved_closures"], json!([]), "{hidden}");
+    }
+    for shown in [
+        format!("    ```\n{ticked_line}"),
+        format!("``` a ` b\n{ticked_line}"),
+        format!("```\ncode\n   ```\n{ticked_line}"),
+    ] {
+        let body = format!("{}\n{shown}\n", tracker_md());
+        let out = parse_body(&env, &body);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(parsed(&out)["approved_closures"], json!([101]), "{shown}");
+    }
+}
