@@ -82,6 +82,9 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
 {
   cd "$WT" || finish 97
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
+  # Which command this run is for. issue-drain's stamp-remote-pass reads it: a
+  # run of one test file must not count as the full verify.
+  echo "cmd=${RV_CMD:-pnpm verify}"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || finish 98
   # From here a local failure still removes what was set up on the box; the
   # cleanup's own status never replaces the failure code.

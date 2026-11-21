@@ -30,5 +30,13 @@ To add a repo, copy an existing profile, then check each label against `gh label
 | `allowed_models` | `haiku`, `sonnet`, `opus` | The models a unit line may name |
 | `allowed_efforts` | `low`, `medium`, `high` | The effort levels a unit line may name |
 | `unit_permissions` | "not set in the profile" | One line shown in the tracker header: what tools each kind of agent has |
+| `guard_protected_paths` | `.github/workflows`, `.husky`, `.claude` | Files and folders (path prefixes, not a pattern) the guards mod keeps a unit from editing. Written to `guards-unit.json` by `unit-prepare`. Keep it in step with `protected_path_re` |
+| `bootstrap_command` | none | Run in the new worktree by `unit-prepare`. `{worktree}` is its path; a relative program path is relative to the worktree. No shell runs it. It must be safe to run twice. A nonzero exit fails the step |
+| `bootstrap_requires` | none | Paths that must exist in the main checkout before the worktree is made (for example `node_modules`). A missing one refuses with exit 3. Relative, no `..` |
+| `bootstrap_timeout_secs` | 900 | The bootstrap is killed, with what it started, after this long |
+| `codegraph_init` | `false` | When true and a `codegraph` program is on PATH, `unit-prepare` runs `codegraph init -i` in the worktree. A failure or a missing program is recorded in `unit.json`, never an error |
+| `codegraph_timeout_secs` | 300 | The same limit for `codegraph init` |
+| `full_verify_command` | none | The command a homelab verify must have run for `stamp-remote-pass` to stamp (`pnpm verify`). Empty means nothing is ever stamped |
+| `stamp_command` | none | Run in the unit worktree to record the repo's verify stamp. `{tree}` is `HEAD^{tree}` and `{head}` is HEAD. Empty means `stamp-remote-pass` records `stamped: false` and does nothing else |
 
 Both path patterns are regular expressions matched against repo-relative paths, ignoring case. Labels are compared ignoring case, as GitHub does. The base branch and the three single labels are checked for shape, because they become `git` and `gh` arguments.

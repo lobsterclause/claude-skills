@@ -19,6 +19,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::error::{Fail, Res};
 use crate::git;
+use crate::model::{Queue, Unit};
 use crate::profile::Profile;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,6 +146,29 @@ impl Ctx {
                 "ISSUE_DRAIN_MODE must be session, driver or unit (got '{other}')"
             ))),
         }
+    }
+
+    /// Refuse when this is a unit process: `command` is the driver's job.
+    pub fn require_driver(&self, command: &str) -> Res<()> {
+        match self.mode()? {
+            Mode::Unit => Err(Fail::refused(format!(
+                "{command} is the driver's job; a unit process may not run it"
+            ))),
+            Mode::Session | Mode::Driver => Ok(()),
+        }
+    }
+
+    /// Unit `n` of this run's queue.json.
+    pub fn queue_unit(&self, n: u64) -> Res<Unit> {
+        let path = self.path("queue.json");
+        let queue: Queue = read_json(&path)
+            .ok_or_else(|| Fail::usage(format!("no queue in {}; run `tracker render` first", path.display())))?;
+        let id = format!("U{n}");
+        queue
+            .units
+            .into_iter()
+            .find(|u| u.id == id)
+            .ok_or_else(|| Fail::usage(format!("queue.json has no unit {id}")))
     }
 
     /// The run id is the run folder's name. It goes into the tracker's marker

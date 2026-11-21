@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use issue_drain::ctx::Ctx;
 use issue_drain::error::Res;
 use issue_drain::{
-    close, deliver_check, evalscore, evidence, gh, intake, merge_gate, overlap, review_proof, state, tracker,
+    claim, close, deliver_check, evalscore, evidence, gh, intake, merge_gate, overlap, review_proof, stamp, state,
+    tracker, unit_prepare,
 };
 
 /// Triage a set of GitHub issues and carry each one through to a merged PR.
@@ -49,6 +50,13 @@ enum Command {
     DeliverCheck(deliver_check::Args),
     /// Record which reviewers of a cross-review run produced output.
     ReviewProof(review_proof::Args),
+    /// Cut a unit's worktree from the fresh base and write the files its process starts from.
+    UnitPrepare(unit_prepare::Args),
+    /// Label a unit's issues as claimed, release them, or say whose claim they carry.
+    #[command(subcommand)]
+    Claim(claim::Command),
+    /// Record the local verify stamp after a homelab verify passed at an exact commit.
+    StampRemotePass(stamp::Args),
 }
 
 fn name(command: &Command) -> &'static str {
@@ -72,6 +80,11 @@ fn name(command: &Command) -> &'static str {
         Command::MergeGate(_) => "merge-gate",
         Command::DeliverCheck(_) => "deliver-check",
         Command::ReviewProof(_) => "review-proof",
+        Command::UnitPrepare(_) => "unit-prepare",
+        Command::Claim(claim::Command::Take(_)) => "claim take",
+        Command::Claim(claim::Command::Release(_)) => "claim release",
+        Command::Claim(claim::Command::Check(_)) => "claim check",
+        Command::StampRemotePass(_) => "stamp-remote-pass",
     }
 }
 
@@ -92,6 +105,9 @@ fn run(command: &Command) -> Res<()> {
         Command::MergeGate(args) => merge_gate::run(&ctx, args),
         Command::DeliverCheck(args) => deliver_check::run(&ctx, args),
         Command::ReviewProof(args) => review_proof::run(&ctx, args),
+        Command::UnitPrepare(args) => unit_prepare::run(&ctx, args),
+        Command::Claim(command) => claim::run(&ctx, command),
+        Command::StampRemotePass(args) => stamp::run(&ctx, args),
     }
 }
 

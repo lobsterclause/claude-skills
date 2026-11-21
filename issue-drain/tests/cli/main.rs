@@ -4,6 +4,7 @@
 
 mod common;
 
+mod claim;
 mod close;
 mod deliver_check;
 mod evalscore;
@@ -16,5 +17,7 @@ mod overlap;
 mod packaging;
 mod render;
 mod review_proof;
+mod stamp;
 mod state;
 mod tracker_io;
+mod unit_prepare;

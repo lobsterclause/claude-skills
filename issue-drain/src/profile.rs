@@ -37,6 +37,14 @@ pub struct Profile {
     pub allowed_models: Vec<String>,
     pub allowed_efforts: Vec<String>,
     pub unit_permissions: String,
+    pub guard_protected_paths: Vec<String>,
+    pub bootstrap_command: String,
+    pub bootstrap_requires: Vec<String>,
+    pub bootstrap_timeout_secs: u64,
+    pub codegraph_init: bool,
+    pub codegraph_timeout_secs: u64,
+    pub full_verify_command: String,
+    pub stamp_command: String,
     #[serde(skip)]
     protected: Option<Regex>,
     #[serde(skip)]
@@ -72,6 +80,14 @@ impl Default for Profile {
             allowed_models: words("haiku sonnet opus"),
             allowed_efforts: words("low medium high"),
             unit_permissions: "not set in the profile".into(),
+            guard_protected_paths: words(".github/workflows .husky .claude"),
+            bootstrap_command: String::new(),
+            bootstrap_requires: Vec::new(),
+            bootstrap_timeout_secs: 900,
+            codegraph_init: false,
+            codegraph_timeout_secs: 300,
+            full_verify_command: String::new(),
+            stamp_command: String::new(),
             protected: None,
             risk: None,
             file: PathBuf::new(),
@@ -162,6 +178,20 @@ impl Profile {
             return Err(Fail::usage(
                 "profile keys intake_cap and cluster_max_issues must be above 0",
             ));
+        }
+        if self.bootstrap_timeout_secs == 0 || self.codegraph_timeout_secs == 0 {
+            return Err(Fail::usage(
+                "profile keys bootstrap_timeout_secs and codegraph_timeout_secs must be above 0",
+            ));
+        }
+        // A required path is joined onto the main checkout: it stays inside it.
+        for path in &self.bootstrap_requires {
+            let inside = !path.is_empty() && !path.starts_with('/') && !path.split('/').any(|part| part == "..");
+            if !inside {
+                return Err(Fail::usage(format!(
+                    "profile key bootstrap_requires must hold paths inside the checkout (got '{path}')"
+                )));
+            }
         }
         Ok(())
     }
@@ -259,6 +289,28 @@ mod tests {
     #[test]
     fn a_base_branch_that_looks_like_an_option_is_rejected() {
         assert_eq!(load("base_branch = \"--upload-pack=x\"\n").unwrap_err().code, 2);
+    }
+
+    #[test]
+    fn the_unit_keys_default_to_off() {
+        let p = load("").unwrap();
+        assert_eq!(p.guard_protected_paths, [".github/workflows", ".husky", ".claude"]);
+        assert!(p.bootstrap_command.is_empty() && p.bootstrap_requires.is_empty());
+        assert!(!p.codegraph_init);
+        assert_eq!((p.bootstrap_timeout_secs, p.codegraph_timeout_secs), (900, 300));
+        assert!(p.full_verify_command.is_empty() && p.stamp_command.is_empty());
+    }
+
+    #[test]
+    fn a_required_path_outside_the_checkout_or_a_zero_timeout_is_rejected() {
+        for bad in ["/etc", "../x", "a/../b", ""] {
+            let err = load(&format!("bootstrap_requires = [\"{bad}\"]\n")).unwrap_err();
+            assert_eq!(err.code, 2, "{bad}");
+            assert!(err.msg.contains("bootstrap_requires"), "{}", err.msg);
+        }
+        assert!(load("bootstrap_requires = [\"node_modules\", \"a/b\"]\n").is_ok());
+        assert_eq!(load("bootstrap_timeout_secs = 0\n").unwrap_err().code, 2);
+        assert_eq!(load("codegraph_timeout_secs = 0\n").unwrap_err().code, 2);
     }
 
     #[test]

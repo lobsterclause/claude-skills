@@ -15,7 +15,7 @@ description: >
 
 Takes a set of issues and produces a queue a person approves. Each unit on the queue is one issue, or a few issues that one change fixes, sized and routed to the cheapest model that can do it. Issues the code already fixes are offered for closing with proof.
 
-This version does triage and verified closures. Carrying each unit to a merged PR (the unit runner, the merge gate and the driver) is the next build; until it lands the queue is a plan, and nothing here opens a PR or merges.
+This version does triage and verified closures. Carrying each unit to a merged PR (the unit runner, the merge gate and the driver) is the next build; until it lands the queue is a plan, and nothing here opens a PR or merges. The driver's per-unit commands exist and are run by hand until then: `unit-prepare --unit <n>` (cut the worktree, write `units/<n>/unit.json` and `guards-unit.json`), `claim take|release|check --unit <n>`, and `stamp-remote-pass --unit <n> --log <file> --head <sha>` (record the local verify stamp after a passing homelab verify). `unit-prepare` and `claim` refuse to run inside a unit process; `stamp-remote-pass` does not.
 
 The work is split between you and one program. You judge: which closures hold up, which issues are one change, what each unit should cost. The program, `bin/issue-drain`, does everything that can be checked mechanically and is the only thing that writes to GitHub.
 
