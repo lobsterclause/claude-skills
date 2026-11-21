@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/lobsterclause/splitstream-skill/schemas/manifest.schema.json",
+  "title": "Splitstream manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "round_id", "base", "max_concurrency", "publish", "shards"],
+  "properties": {
+    "version": {"const": 1},
+    "round_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"},
+    "base": {"type": "string", "minLength": 1},
+    "base_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "repo_identity": {"type": ["string", "null"]},
+    "git_common_dir": {"type": "string", "minLength": 1},
+    "prepared_at": {"type": "string"},
+    "max_concurrency": {"type": "integer", "minimum": 1, "maximum": 16},
+    "publish": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "issue_mutations"],
+      "properties": {
+        "mode": {"enum": ["draft-pr", "branches-only", "none"]},
+        "issue_mutations": {"enum": ["ask", "authorized", "none"]}
+      }
+    },
+    "waves": {
+      "type": "array",
+      "items": {"type": "array", "items": {"type": "string"}}
+    },
+    "shards": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/shard"}
+    }
+  },
+  "$defs": {
+    "shard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "task", "branch", "model", "risk", "scope", "proof"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"},
+        "title": {"type": "string", "minLength": 1},
+        "task": {"type": "string", "minLength": 1},
+        "branch": {"type": "string", "minLength": 1},
+        "model": {"enum": ["haiku", "sonnet", "opus"]},
+        "risk": {"enum": ["low", "normal", "high"]},
+        "scope": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "proof": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "expectation"],
+          "properties": {
+            "mode": {"enum": ["regression-test", "existing-suite", "static-check", "visual-evidence", "manual-contract"]},
+            "command": {"type": "string", "minLength": 1},
+            "expectation": {"type": "string", "minLength": 1}
+          }
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "value"],
+          "properties": {
+            "type": {"type": "string", "minLength": 1},
+            "value": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    }
+  }
+}
