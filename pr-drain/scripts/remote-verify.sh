@@ -10,8 +10,8 @@
 # runs `git add -A`, so a stray local file (a test report, a scratch script)
 # would become a tracked file there and fail checks CI never sees (#204: a
 # functions-core/.vitest/ report failed `format (tracked)` twice). The log
-# prints a WARN naming every untracked path left out. RV_INCLUDE_UNTRACKED=1
-# restores the old behaviour (ship untracked-not-ignored files too).
+# prints a WARN naming every untracked path left out, inside submodules too.
+# RV_INCLUDE_UNTRACKED=1 ships untracked-not-ignored files as well.
 #
 # Exit status is the remote verify's exit code (same N as the .out file), 93
 # if the log could not be opened, or 94 if the .out file could not be written.
@@ -64,6 +64,9 @@ if [ -n "${RV_SSH:-}" ]; then
   case "$RV_SSH" in /*) ;; */*) RV_SSH="$PWD/$RV_SSH";; esac
   SSH=("$RV_SSH")
 fi
+# A relative RV_OUT_DIR is resolved now, before the `cd "$WT"` below, so
+# the .out and the log land in the same place on every exit path.
+case "$OUTD" in /*) ;; *) OUTD="$PWD/$OUTD";; esac
 D=$BASE/$N; LOG=$OUTD/rverify-$N.log; OUT=$OUTD/rv-$N.out; rm -f "$OUT"
 # Image-build mode keeps the last verify's log but not its .out (removed
 # above), so a poller can't read an old result as this run's.
@@ -78,10 +81,19 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   cd "$WT" || finish 97
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || finish 98
+  # Untracked-not-ignored paths, NUL-separated, in the superproject and in
+  # every initialized submodule (prefixed with its path); git can't list
+  # --others across submodules itself. Any git failure fails the function.
+  untracked() {
+    /usr/bin/git ls-files -z --others --exclude-standard || return 1
+    # shellcheck disable=SC2016  # perl expands $ENV{displaypath}, not this shell
+    /usr/bin/git submodule foreach --quiet --recursive \
+      'perl -e '"'"'open(my $g, "-|", qw(git ls-files -z --others --exclude-standard)) or die; local $/ = "\0"; print "$ENV{displaypath}/$_" while <$g>; close($g) or exit 1'"'"'' || return 1
+  }
   INCL=0
   if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then INCL=1
   else
-    UNTR=$(/usr/bin/git ls-files --others --exclude-standard)
+    UNTR=$(set -o pipefail; untracked | tr '\0' '\n') || { echo "listing untracked files failed"; finish 99; }
     [ -n "$UNTR" ] && { echo "WARN: not shipping $(printf '%s\n' "$UNTR" | wc -l | tr -d ' ') untracked file(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"; printf '%s\n' "$UNTR" | sed 's/^/  /'; }
   fi
   # Ship git's file list as it stands in the working copy, and nothing else.
@@ -89,12 +101,12 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   # submodules, so tar never recurses (--no-recursion): a submodule's
   # untracked files stay home, and so does a directory that replaced a
   # tracked file. Tracked files deleted locally are skipped (the box sees
-  # what you see). RV_INCLUDE_UNTRACKED=1 adds the superproject's untracked
-  # files (git can't list --others across submodules). pipefail: a local
+  # what you see). RV_INCLUDE_UNTRACKED=1 adds the untracked files, submodules'
+  # included. A failed listing exits the producer non-zero. pipefail: a local
   # git or tar failure is not masked by ssh's status.
   ( set -o pipefail
-    { /usr/bin/git ls-files -z --cached --recurse-submodules
-      if [ "$INCL" = 1 ]; then /usr/bin/git ls-files -z --others --exclude-standard; fi
+    { /usr/bin/git ls-files -z --cached --recurse-submodules || exit 1
+      if [ "$INCL" = 1 ]; then untracked || exit 1; fi
     } \
       | while IFS= read -r -d '' f; do
           if [ -L "$f" ] || [ -f "$f" ]; then printf '%s\0' "$f"; fi

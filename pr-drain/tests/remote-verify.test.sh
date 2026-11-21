@@ -17,6 +17,8 @@
 # recursion, masked tar failure, FIFO log): checked red against c6d811c.
 # Pass-5: submodule contents (red against b2c919e's --no-recursion).
 # Pass-6: a submodule's untracked file (red against 4b38fbc).
+# Pass-7: submodule WARN/opt-in, git listing failure, relative RV_OUT_DIR
+# (red against 5807820).
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -121,6 +123,24 @@ echo stray > "$R2/vendor/stray.txt"
 REPO="$R2" run 0 "$T/ship13" >/dev/null
 check "submodule contents shipped" 0 "$(exists "$T/ship13/vendor/s.txt")"
 check "untracked file inside a submodule not shipped" 1 "$(exists "$T/ship13/vendor/stray.txt")"
+# Pass-7: a submodule's untracked file is named in the WARN, and the opt-in
+# ships it (both red against 5807820).
+grep -qx "  vendor/stray.txt" "$T/out/rverify-probe.log"; check "WARN names an untracked file inside a submodule" 0 $?
+REPO="$R2" run 0 "$T/ship14" RV_INCLUDE_UNTRACKED=1 >/dev/null
+check "RV_INCLUDE_UNTRACKED=1 ships a submodule's untracked file" 0 "$(exists "$T/ship14/vendor/stray.txt")"
+
+# Pass-7: a git listing failure is 99, in both modes (a corrupt submodule
+# index makes the recursive listing fail; red against 5807820).
+R3="$T/repo3"; cp -R "$R2" "$R3"; echo garbage > "$R3/.git/modules/vendor/index"
+REPO="$R3" OUTDIR="$T/out15" run 0 "$T/ship15" >/dev/null; check "git listing failure exits 99" 99 $?
+REPO="$R3" OUTDIR="$T/out16" run 0 "$T/ship16" RV_INCLUDE_UNTRACKED=1 >/dev/null; check "git listing failure exits 99 with the opt-in" 99 $?
+
+# Pass-7: a relative RV_OUT_DIR puts the .out and the log beside each other
+# under the caller's cwd, not inside the worktree.
+mkdir -p "$T/cwd/rel"
+(cd "$T/cwd" && OUTDIR=rel run 0 "$T/ship17" >/dev/null); check "relative RV_OUT_DIR run exits 0" 0 $?
+check "relative RV_OUT_DIR .out under the caller's cwd" "verify exit=0" "$(cat "$T/cwd/rel/rv-probe.out" 2>/dev/null)"
+check "relative RV_OUT_DIR log under the caller's cwd" 0 "$(exists "$T/cwd/rel/rverify-probe.log")"
 
 # A local tar failure is 99, not masked by ssh's 0. A tar stub that writes a
 # good stream and then exits 2 keeps this independent of file permissions.
