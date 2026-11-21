@@ -52,14 +52,17 @@ pub struct Args {
     body_file: Option<PathBuf>,
 }
 
-/// What stops one closure. The others still run.
+/// What stops one closure. After `Refused` and `Skipped` the others still
+/// run; `Halt` stops the run.
 enum Stop {
     Refused(String),
     Skipped(&'static str),
+    Halt(String),
 }
 
 struct Run<'a> {
     ctx: &'a Ctx,
+    queue: &'a Queue,
     repo: String,
     repo_dir: PathBuf,
     /// The commit the code is checked on, resolved once so every closure in
@@ -226,8 +229,30 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
         ));
     }
 
-    // The issue, read again: the evidence check takes a while, and a label
-    // or a close that landed during it is honoured before anything is written.
+    // The tracker and the issue, read again: the evidence check takes a
+    // while, and a STOP, an unticked box, a label or a close that landed
+    // during it is honoured before anything is written.
+    if !ctx.dry_run {
+        let now = fetch_tracker(ctx, r.queue)?;
+        let halt = if !now.unknown.is_empty() {
+            Some(format!(
+                "the tracker now has a ticked line this run never offered ({})",
+                now.unknown.join(", ")
+            ))
+        } else if now.stop {
+            Some("the tracker now says STOP".to_string())
+        } else if now.tracker_state.as_deref().unwrap_or("OPEN") != "OPEN" {
+            Some("the tracker issue is now closed".to_string())
+        } else {
+            None
+        };
+        if let Some(why) = halt {
+            return Ok(Err(Stop::Halt(why)));
+        }
+        if !now.approved_closures.contains(&number) {
+            return refused("its box is no longer ticked on the tracker".into());
+        }
+    }
     let live = view(r, number)?;
     if let Some(stop) = standing(ctx, &live) {
         return Ok(Err(stop));
@@ -384,7 +409,12 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         )));
     }
     let shown = named_ref.cloned().unwrap_or_else(|| format!("origin/{base}"));
-    let Some(reference) = git::commit(&repo_dir, &shown) else {
+    // Without --ref it is the remote branch just fetched, by its full name.
+    let resolved = match named_ref {
+        Some(named) => git::commit(&repo_dir, named),
+        None => git::base_commit(&repo_dir, base),
+    };
+    let Some(reference) = resolved else {
         return Err(Fail::failed(format!(
             "{shown} names no commit in {}",
             repo_dir.display()
@@ -393,6 +423,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
 
     let r = Run {
         ctx,
+        queue: &queue,
         repo,
         repo_dir,
         reference,
@@ -409,35 +440,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         let Some(offered) = queue.closures.iter().find(|c| c.number == *number) else {
             continue;
         };
-        // The tracker, read again: a STOP or an unticked box since the last
-        // closure is honoured before the next one, not after the run.
-        if !ctx.dry_run {
-            let now = fetch_tracker(ctx, &queue)?;
-            let halt = if !now.unknown.is_empty() {
-                Some(format!(
-                    "the tracker now has a ticked line this run never offered ({})",
-                    now.unknown.join(", ")
-                ))
-            } else if now.stop {
-                Some("the tracker now says STOP".to_string())
-            } else if now.tracker_state.as_deref().unwrap_or("OPEN") != "OPEN" {
-                Some("the tracker issue is now closed".to_string())
-            } else {
-                None
-            };
-            if let Some(why) = halt {
-                return Err(refuse_all(ctx, format!("{why}; stopped before #{number}")));
-            }
-            if !now.approved_closures.contains(number) {
-                let why = "its box is no longer ticked on the tracker";
-                println!("refused #{number}: {why}");
-                ctx.event("closure_refused", json!({"number": number, "why": why}))?;
-                refused += 1;
-                continue;
-            }
-        }
         match close_one(&r, *number, offered)? {
             Ok(()) => {}
+            Err(Stop::Halt(why)) => {
+                return Err(refuse_all(ctx, format!("{why}; stopped before #{number}")));
+            }
             Err(Stop::Skipped(why)) => {
                 println!("skipped #{number}: {why}");
                 ctx.event("closure_skipped", json!({"number": number, "why": why}))?;

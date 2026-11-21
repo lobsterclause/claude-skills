@@ -565,6 +565,50 @@ fn the_default_ref_is_origin_and_the_base_branch() {
 }
 
 #[test]
+fn the_default_ref_is_the_remote_branch_and_not_a_tag_of_that_name() {
+    let mut env = Env::new();
+    let checkout = origin_clone(env.dir.path(), fixture_repo());
+    let root = git(&checkout, &["rev-list", "--max-parents=0", "HEAD"]);
+    git(&checkout, &["tag", "origin/develop", &root]);
+    env.set("ISSUE_DRAIN_REPO_DIR", &checkout.display().to_string());
+    env.seed(&["intake.json", "issues"]);
+    let input = env.write("in.json", &json!([good(101)]).to_string());
+    let out = env.run(&["evidence-check", &input.display().to_string()]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let checked = row(&json(&checked_path(&env)), 101);
+    assert_eq!(checked["status"], "already_fixed", "{checked}");
+    assert_eq!(checked["checked_ref"], "origin/develop");
+}
+
+#[test]
+fn a_line_blamed_on_the_edge_of_a_shallow_clone_proves_nothing() {
+    // In a shallow clone every line older than the cut is blamed on the
+    // commit at the cut, so that commit is not known to be the one that
+    // wrote the line.
+    let mut env = Env::new();
+    let shallow = env.dir.path().join("shallow");
+    git(
+        env.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", fixture_repo().display()),
+            &shallow.display().to_string(),
+        ],
+    );
+    env.set("ISSUE_DRAIN_REPO_DIR", &shallow.display().to_string());
+    let (out, rows) = check_all(&env, &json!([good(101)]));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let checked = row(&rows, 101);
+    assert_eq!(checked["status"], "unclear", "{checked}");
+    assert_eq!(checked["evidence"][0]["ok"], false, "{checked}");
+    let reason = checked["evidence"][0]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("shallow"), "{reason}");
+}
+
+#[test]
 fn an_unknown_option_is_a_usage_error() {
     let env = Env::new();
     env.seed(&["intake.json", "issues"]);

@@ -267,9 +267,38 @@ fn a_queue_rendered_for_another_repo_is_a_usage_error() {
 }
 
 #[test]
+fn the_tracker_is_read_again_after_the_code_is_checked() {
+    // The evidence check sits between the first read of the issue and the
+    // second. The tracker's second read belongs after it, beside the issue's:
+    // a STOP typed while the code was being checked must stop the write.
+    let env = ready();
+    assert_eq!(env.run(&ARGS).code, 0);
+    let views: Vec<String> = env
+        .gh_calls()
+        .iter()
+        .filter_map(|c| c.strip_prefix("issue view "))
+        .filter_map(|c| c.split(' ').next().map(str::to_string))
+        .collect();
+    assert_eq!(views[..4], ["900", "101", "900", "101"], "{views:?}");
+}
+
+#[test]
+fn a_tag_named_like_the_base_does_not_stand_in_for_it() {
+    // git reads `origin/develop` as the tag of that name before the remote
+    // branch. The closure is checked on the branch that was just fetched.
+    let env = ready();
+    let checkout = env.dir.path().join("checkout");
+    let root = git(&checkout, &["rev-list", "--max-parents=0", "HEAD"]);
+    git(&checkout, &["tag", "origin/develop", &root]);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert_eq!(env.events_named("closure").len(), 1);
+}
+
+#[test]
 fn a_stop_added_after_the_run_began_refuses_every_closure() {
-    // The tracker is read once for the whole run and again before each
-    // closure. The second read is the one that sees the STOP.
+    // The tracker is read once for the whole run and again for each closure,
+    // after its evidence check. The second read is the one that sees the STOP.
     let env = ready();
     env.stub_file(
         "issue-view-900.next.json",

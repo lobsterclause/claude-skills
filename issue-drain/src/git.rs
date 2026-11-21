@@ -33,6 +33,25 @@ pub fn commit(dir: &Path, reference: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The commit origin's branch `base` was at when it was last fetched. The ref
+/// is named in full: `origin/<base>` alone is read as a tag or a local branch
+/// of that name before the remote branch.
+pub fn base_commit(dir: &Path, base: &str) -> Option<String> {
+    commit(dir, &format!("refs/remotes/origin/{base}"))
+}
+
+/// Whether the checkout is shallow and `sha` is a commit its history was cut
+/// at. Such a commit's parents are missing, so blame credits it with every
+/// line older than the cut.
+pub fn at_shallow_cut(dir: &Path, sha: &str) -> bool {
+    let Some(path) = out(dir, &["rev-parse", "--git-path", "shallow"]) else {
+        return false;
+    };
+    // git prints the path relative to the folder it ran in.
+    let path = dir.join(path.trim());
+    std::fs::read_to_string(path).is_ok_and(|cuts| cuts.lines().any(|cut| cut.trim() == sha))
+}
+
 /// `owner/repo` of the checkout's origin on GitHub, or `None` when origin is
 /// unset or is not a github.com URL. This is the URL as configured, which is
 /// what says whose code the checkout holds; where a fetch really goes (an

@@ -167,6 +167,12 @@ fn quote_outcome(basis: &Basis, file: &str, line: &str, quote: &str) -> Result<(
         ));
     }
     let blamed = blame(basis, file, found).ok_or("git blame gave no commit for that line")?;
+    if git::at_shallow_cut(basis.dir, &blamed.sha) {
+        return Err(
+            "the checkout is shallow and its history stops at the commit blamed for that line; fetch the full history (git fetch --unshallow)"
+                .into(),
+        );
+    }
     Ok((found, blamed))
 }
 
@@ -356,8 +362,12 @@ pub fn check_verdict(
 }
 
 fn basis<'a>(profile: &'a Profile, dir: &'a Path, reference: &'a str) -> Res<Basis<'a>> {
-    let sha = git::commit(dir, reference)
-        .ok_or_else(|| Fail::usage(format!("cannot resolve {reference} in {}", dir.display())))?;
+    basis_at(profile, dir, reference, git::commit(dir, reference))
+}
+
+/// A basis whose commit the caller resolved. `reference` is its name in messages.
+fn basis_at<'a>(profile: &'a Profile, dir: &'a Path, reference: &'a str, sha: Option<String>) -> Res<Basis<'a>> {
+    let sha = sha.ok_or_else(|| Fail::usage(format!("cannot resolve {reference} in {}", dir.display())))?;
     Ok(Basis {
         profile,
         dir,
@@ -426,10 +436,8 @@ fn created_at(ctx: &Ctx, number: u64) -> Option<i64> {
 
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let dir = ctx.repo_dir()?;
-    let reference = args
-        .reference
-        .clone()
-        .unwrap_or_else(|| format!("origin/{}", ctx.profile.base_branch));
+    let base = &ctx.profile.base_branch;
+    let reference = args.reference.clone().unwrap_or_else(|| format!("origin/{base}"));
     let out = args.out.clone().unwrap_or_else(|| ctx.path("verdicts.checked.json"));
     if args.inputs.is_empty() {
         return Err(Fail::usage(
@@ -442,7 +450,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     for input in inputs {
         all.extend(read_verdicts(input)?);
     }
-    let basis = basis(&ctx.profile, &dir, &reference)?;
+    let basis = match &args.reference {
+        Some(named) => basis(&ctx.profile, &dir, named)?,
+        // The default is the remote branch, not whatever else is called origin/<base>.
+        None => basis_at(&ctx.profile, &dir, &reference, git::base_commit(&dir, base))?,
+    };
 
     let mut rows: Vec<Checked> = Vec::new();
     let mut dropped = 0;
