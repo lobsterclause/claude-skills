@@ -24,6 +24,8 @@ Split the eligible numbers (`jq '[.eligible[].number]' intake.json`) into batche
 
 Two at a time keeps this under the user's pre-flight threshold for parallel agents and keeps a 40-issue intake to about four rounds.
 
+A reader sees only its own batch, so it can call two issues duplicates only when they share one. Duplicates split across batches come back as two `live` verdicts with the same file and symbol, and `overlap` in step 5 proposes them as a pair. Sorting the numbers so that issues with the same label or area sit together helps, but do not rely on it.
+
 Readers read the base checkout, so it must be at the base branch's tip (SKILL.md, "Setting up a run"). A reader that read a stale tree quotes lines the check will not find.
 
 ## 3. Check the evidence

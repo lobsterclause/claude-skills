@@ -70,7 +70,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                 if !want.status.contains(&g.status) {
                     miss("status", json!(want.status), json!(g.status));
                 }
-                if want.duplicate_of.is_some() && g.duplicate_of != want.duplicate_of {
+                if g.status == "duplicate_of" && want.duplicate_of.is_some() && g.duplicate_of != want.duplicate_of {
                     miss("duplicate_of", json!(want.duplicate_of), json!(g.duplicate_of));
                 }
                 if want.closable.is_some_and(|c| c != g.closable) {

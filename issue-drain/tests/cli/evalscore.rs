@@ -103,6 +103,16 @@ fn an_acceptable_second_answer_scores() {
     assert_eq!(out.code, 0, "{}", out.stderr);
 }
 
+/// Readers see one batch each, so a duplicate split across batches comes back
+/// as two live verdicts; the pairing is then the overlap step's job.
+#[test]
+fn a_duplicate_read_as_live_scores_and_its_target_is_not_held() {
+    let env = Env::new();
+    let changed = with_change(&env, 106, &[("status", "live".into()), ("duplicate_of", Value::Null)]);
+    let out = env.run(&["eval-score", "--expected", &expected(), "--in", &changed]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+}
+
 #[test]
 fn an_issue_with_no_verdict_is_a_miss() {
     let env = Env::new();

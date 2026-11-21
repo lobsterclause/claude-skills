@@ -38,15 +38,15 @@ Return these fields, all of them, for every issue in the batch:
 | `pattern` | when the same mechanical change is needed at several sites, a short name for it; else `""` |
 | `size` | `S` (under about 50 changed lines), `M` (up to about 200) or `L` |
 | `behavioural` | `true` when only running the app can show whether the bug is there (layout, focus, timing, anything on screen); `false` when reading the code settles it |
-| `task` | for a `live` issue, one or two sentences an implementer can act on without the issue body; else `""` |
-| `acceptance` | for a `live` issue, one check that fails now and passes when fixed, written as a call and its result where you can; else `""` |
+| `task` | for a `live` or `duplicate_of` issue, one or two sentences an implementer can act on without the issue body; else `""` |
+| `acceptance` | for a `live` or `duplicate_of` issue, one check that fails now and passes when fixed, written as a call and its result where you can; else `""` |
 | `reason` | one or two sentences: why this status |
 
 Choosing the status:
 
 - `live`: the code still has the problem. Quote the line that shows it.
 - `already_fixed`: the code on this branch already does what the issue asks. Quote the line that does it. The script dates that line with `git blame`; you do not name a commit. If the line is older than the issue, it is not the fix, and the script will downgrade you.
-- `duplicate_of`: another issue in your batch describes the same defect, so one fix closes both. The lower number is the original; give the duplicate its own `acceptance` anyway, with its own example.
+- `duplicate_of`: another issue in your batch describes the same defect, so one fix closes both. The lower number is the original; give the duplicate its own `task` and `acceptance` anyway, with its own example. The script throws away a duplicate verdict that has neither.
 - `needs_human`: the issue asks a product or design question, needs a decision nobody has made, or its fix lives in CI, hooks or security rules.
 - `unclear`: you cannot tell. No steps, no code you can find, or two readings that both fit. This is a real answer and the right one when you are unsure. A wrong `already_fixed` can close a live bug; an `unclear` costs one line on a list.
 
@@ -62,19 +62,19 @@ End with the JSON array and nothing after it: no summary, no code fence. For exa
 
 [
   {
-    "number": 103,
+    "number": 412,
     "status": "live",
     "duplicate_of": null,
-    "evidence": [{ "file": "src/timer/countdown.ts", "line": 5, "quote": "return minutes + \":\" + seconds;" }],
-    "likely_files": ["src/timer/countdown.ts"],
-    "symbols": ["countdownLabel"],
-    "reuse": [{ "file": "src/lib/format.ts", "line": 2, "quote": "export function formatDuration(ms: number): string {" }],
+    "evidence": [{ "file": "src/cart/total.ts", "line": 14, "quote": "return subtotal + shipping;" }],
+    "likely_files": ["src/cart/total.ts"],
+    "symbols": ["cartTotal"],
+    "reuse": [{ "file": "src/lib/tax.ts", "line": 3, "quote": "export function withTax(amount: number, region: string): number {" }],
     "change_kind": "bugfix",
     "pattern": "",
     "size": "S",
     "behavioural": false,
-    "task": "Make countdownLabel zero-pad the seconds by returning formatDuration(remainingMs).",
-    "acceptance": "countdownLabel(65000) returns \"1:05\".",
-    "reason": "The label is built by string concatenation with no padding."
+    "task": "Make cartTotal apply tax by returning withTax(subtotal, region) + shipping.",
+    "acceptance": "cartTotal({ subtotal: 100, shipping: 5, region: \"CA\" }) returns 112.25.",
+    "reason": "The total adds shipping to the subtotal and never calls the tax helper."
   }
 ]

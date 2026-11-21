@@ -19,7 +19,7 @@ Return one JSON array with a verdict for each of the <count> issues, as your ins
 
 That is the whole brief. The reader's own instructions carry the schema and the rules, so a longer brief only gives it more to misread. Do not paste issue bodies into the brief: the reader opens the files, which carry the header that marks the body as material.
 
-When the `issue-triage-reader` agent type is not installed, use `Explore` with the same brief, prefix it with the contents of `agents/issue-triage-reader.md` (below the frontmatter), and tell the user: Explore can run shell commands, so the read-only guarantee is weaker for that run.
+When the `issue-triage-reader` agent type is not installed, use `Explore` with the same brief, prefix it with the contents of `agents/issue-triage-reader.md` (below the frontmatter), and add one line: "Where the instructions say Grep and Glob and you lack those tools, search with read-only shell commands (grep, find, ls) inside the checkout. Run nothing else and write nothing." Explore may have no Grep or Glob of its own, and a reader that is forbidden the shell as well cannot search and returns `unclear` for everything. Tell the user that the read-only guarantee is weaker for that run.
 
 Save each reader's array, unchanged, to `<run folder>/verdicts/<batch>.json`. If a reader wrapped it in prose or a code fence, save only the array. If it returned no array, do not write one for it: the evidence check gives every issue without a verdict an `unclear`, which is the honest result.
 
