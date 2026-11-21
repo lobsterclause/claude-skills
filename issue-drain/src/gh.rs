@@ -55,6 +55,11 @@ pub enum Write<'a> {
         number: u64,
         head: &'a str,
     },
+    /// Turn auto-merge off on a PR. Reached only from `merge-gate`, when the
+    /// merge call armed it instead of merging.
+    DisableAutoMerge {
+        number: u64,
+    },
     /// Open a PR. The body comes from a file.
     PrCreate {
         head: &'a str,
@@ -194,6 +199,7 @@ impl Write<'_> {
             Write::RemoveLabel { .. } => "remove-label",
             Write::CloseIssue { .. } => "close-issue",
             Write::MergePr { .. } => "merge-pr",
+            Write::DisableAutoMerge { .. } => "disable-auto-merge",
             Write::PrCreate { .. } => "pr-create",
             Write::ThreadReply { .. } => "thread-reply",
             Write::ThreadResolve { .. } => "thread-resolve",
@@ -405,6 +411,12 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
             }
             (format!("merge #{number} at {head}"), merge_argv(&repo, *number, head))
         }
+        Write::DisableAutoMerge { number } => (
+            format!("turn auto-merge off on #{number}"),
+            ["pr", "merge", &number.to_string(), "--repo", &repo, "--disable-auto"]
+                .map(str::to_string)
+                .to_vec(),
+        ),
         Write::PrCreate {
             head,
             base,

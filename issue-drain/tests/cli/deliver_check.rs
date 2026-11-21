@@ -115,6 +115,62 @@ fn a_diff_inside_scope_is_ok_and_names_the_head() {
 }
 
 #[test]
+fn the_users_diff_config_cannot_make_the_diff_incomplete() {
+    // diff.relative limits a diff to the folder git runs in, and
+    // diff.ignoreSubmodules=all hides a submodule change: either one would
+    // leave a change out of the scope check.
+    let c = case();
+    // `sub/package.json` is outside the scope, but seen from `sub` it reads as
+    // `package.json`, which is inside it.
+    commit(&c.repo, &[("sub/package.json", "{}\n")], "a package outside the scope");
+    git(&c.repo, &["config", "diff.relative", "true"]);
+    let inside = c.repo.join("sub");
+    let out = c
+        .env
+        .run_in(Some(&inside), &["deliver-check", "--unit", "3", "--base", "develop"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(
+        c.failure_codes().contains(&"out_of_scope".to_string()),
+        "{:?}",
+        c.failure_codes()
+    );
+    git(&c.repo, &["config", "--unset", "diff.relative"]);
+
+    git(&c.repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    git(&c.repo, &["config", "diff.ignoreSubmodules", "all"]);
+    let sha = git(&c.repo, &["rev-parse", "HEAD"]);
+    git(
+        &c.repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{sha},vendor/sub"),
+        ],
+    );
+    git(
+        &c.repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "bump",
+        ],
+    );
+    let out = c.check(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(
+        c.failure_codes().contains(&"out_of_scope".to_string()),
+        "{:?}",
+        c.failure_codes()
+    );
+}
+
+#[test]
 fn the_base_defaults_to_the_profile_branch_on_origin() {
     let c = case();
     commit(&c.repo, &[("src/timer/countdown.ts", "x\n")], "fix");

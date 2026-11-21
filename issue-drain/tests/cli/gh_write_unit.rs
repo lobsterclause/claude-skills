@@ -259,3 +259,50 @@ fn without_the_variable_the_same_verb_is_not_refused_as_the_drivers() {
     let out = env.run(&["gh-write", "close-issue", "7"]);
     assert!(!out.stderr.contains("driver's job"), "{}", out.stderr);
 }
+
+/// Every verb below is the driver's. A unit process must be refused before it
+/// posts, labels or logs anything: `close-verified` used to comment before the
+/// close was refused, `tracker publish` to make a label before the issue, and
+/// `merge-gate` to log an event and answer for a merged PR.
+const DRIVERS_VERBS: [&[&str]; 8] = [
+    &["close-verified", "7"],
+    &["tracker", "publish"],
+    &["merge-gate", "--unit", "3", "--pr", "12"],
+    &["state", "init"],
+    &["state", "event", "3", "working"],
+    &["state", "stop", "--reason", "x"],
+    &["state", "resume"],
+    &["state", "show"],
+];
+
+fn assert_refused_as_the_drivers(env: &Env, why: &str) {
+    for args in DRIVERS_VERBS {
+        let out = env.run(args);
+        assert_eq!(out.code, 3, "{why}: {args:?}: {}", out.stderr);
+        assert!(out.stderr.contains("driver's job"), "{why}: {args:?}: {}", out.stderr);
+    }
+    for args in [&["state", "rebuild"][..], &["state", "next"][..]] {
+        let out = env.run(args);
+        assert_eq!(out.code, 3, "{why}: {args:?}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{why}: {:?}", env.gh_calls());
+    assert!(env.events().is_empty(), "{why}: {:?}", env.events());
+}
+
+#[test]
+fn a_unit_process_is_refused_the_drivers_commands_before_they_do_anything() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_MODE", "unit");
+    assert_refused_as_the_drivers(&env, "ISSUE_DRAIN_MODE=unit");
+}
+
+#[test]
+fn a_unit_file_with_no_mode_is_a_unit_process() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_UNIT_FILE", "/state/unit-3.json");
+    assert_refused_as_the_drivers(&env, "only ISSUE_DRAIN_UNIT_FILE");
+    // The same variable does not override a mode that was named.
+    env.set("ISSUE_DRAIN_MODE", "driver");
+    let out = env.run(&["state", "show"]);
+    assert!(!out.stderr.contains("driver's job"), "{}", out.stderr);
+}

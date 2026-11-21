@@ -153,6 +153,25 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
     rm -f "$idx"
     return "$rc"
   }
+  # count_unshipped <dir>: how many tracked gitlinks (submodules) never had
+  # their contents shipped: a directory without a checkout, or nothing there.
+  # A clean `git status` says nothing about these (an empty directory is
+  # clean), so the shipped line counts them. Checked-out submodules are walked
+  # into, as list_tree does; a file that replaced a gitlink ships as itself.
+  count_unshipped() {
+    local dir=$1 ent mode path n=0 sub
+    while IFS= read -r -d '' ent; do
+      mode=${ent%% *}; path=${ent#*$'\t'}
+      [ "$mode" = 160000 ] || continue
+      if [ -L "$dir/$path" ] || [ -f "$dir/$path" ]; then continue
+      elif [ -d "$dir/$path" ] && [ -e "$dir/$path/.git" ]; then
+        sub=$(count_unshipped "$dir/$path") || return 1
+        n=$((n + sub))
+      else n=$((n + 1))
+      fi
+    done < <(/usr/bin/git -C "$dir" ls-files -z -s)
+    echo "$n"
+  }
   INCL=0
   if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then INCL=1
   else
@@ -192,7 +211,8 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   # The working copy is on the box now. Record what it was at this moment,
   # computed like the header: a stamp must be for the tree that was shipped,
   # not the one the header saw before the stream ran.
-  echo "shipped head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
+  UNSHIPPED=$(count_unshipped .) || { echo "counting unshipped submodules failed"; fail_clean 99; }
+  echo "shipped head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ') unshipped=$UNSHIPPED"
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""

@@ -35,8 +35,13 @@
 //! `WOULD: ...` and writes nothing. These are the driver's commands: a unit
 //! process is refused.
 //!
+//! When a later issue fails during `take`, the claims taken earlier in the call
+//! are released only while they are still ours (the check `release` makes); one
+//! that is not is left alone and named. The issue whose own marker failed to
+//! post gets its label taken off without that check: it never had a marker.
+//!
 //! Exit: 0 done; 3 an issue is claimed by someone else (everything taken in
-//! this call is released first) or a unit process asked; 2 no queue, unit or
+//! this call is released first, where still ours) or a unit process asked; 2 no queue, unit or
 //! tracker; 1 a read or a write on GitHub failed (the issue, or its timeline).
 //! A read that fails is never taken to mean "not claimed", or "still ours".
 
@@ -231,11 +236,28 @@ impl Run<'_> {
     }
 
     /// Release what this call took, then hand back the error that stopped it.
-    fn roll_back(&self, taken: &[u64], cause: Fail) -> Fail {
+    /// `verify` is for claims taken earlier in the call, which others may have
+    /// changed since: each is released only while it is still ours, as `release`
+    /// does. The issue whose own marker failed is not one of them: no marker
+    /// was posted, so its label is taken off without asking.
+    fn roll_back(&self, taken: &[u64], cause: Fail, verify: bool) -> Fail {
+        let mut left: Vec<String> = Vec::new();
         let stuck: Vec<String> = taken
             .iter()
             .rev()
-            .filter_map(|n| self.remove_label(*n).err().map(|e| format!("#{n}: {}", e.msg)))
+            .filter_map(|&n| {
+                if verify {
+                    match self.seen(n) {
+                        Ok(seen) if seen.labelled && seen.ours => {}
+                        Ok(_) => {
+                            left.push(format!("#{n}"));
+                            return None;
+                        }
+                        Err(e) => return Some(format!("#{n}: {}", e.msg)),
+                    }
+                }
+                self.remove_label(n).err().map(|e| format!("#{n}: {}", e.msg))
+            })
             .collect();
         if !stuck.is_empty() {
             return Fail::failed(format!(
@@ -244,14 +266,19 @@ impl Run<'_> {
                 stuck.join("; ")
             ));
         }
-        if taken.is_empty() {
-            return cause;
+        let released: Vec<String> = taken
+            .iter()
+            .map(|n| format!("#{n}"))
+            .filter(|n| !left.contains(n))
+            .collect();
+        let mut msg = cause.msg;
+        if !released.is_empty() {
+            msg = format!("{msg}; released {}", released.join(", "));
         }
-        let list: Vec<String> = taken.iter().map(|n| format!("#{n}")).collect();
-        Fail {
-            code: cause.code,
-            msg: format!("{}; released {}", cause.msg, list.join(", ")),
+        if !left.is_empty() {
+            msg = format!("{msg}; left {} alone: no longer this unit's claim", left.join(", "));
         }
+        Fail { code: cause.code, msg }
     }
 
     fn post_marker(&self, number: u64) -> Res<()> {
@@ -303,7 +330,7 @@ impl Run<'_> {
                     },
                 )?;
                 if let Err(e) = self.post_marker(number) {
-                    return Err(self.roll_back(&[number], e));
+                    return Err(self.roll_back(&[number], e, false));
                 }
                 Ok("taken")
             })();
@@ -314,7 +341,7 @@ impl Run<'_> {
                     }
                     report.push(json!({"issue": number, "action": action}));
                 }
-                Err(e) => return Err(self.roll_back(&taken, e)),
+                Err(e) => return Err(self.roll_back(&taken, e, true)),
             }
         }
         self.ctx.event(

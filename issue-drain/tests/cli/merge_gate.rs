@@ -25,6 +25,9 @@ fn pr_view(state: &str, labels: &[&str], body: &str) -> Value {
     let labels: Vec<Value> = labels.iter().map(|l| json!({"name": l})).collect();
     json!({
         "state": state, "headRefOid": HEAD, "baseRefName": "develop", "body": body,
+        "headRefName": "fix/tide", "headRepository": {"name": "tidepool"},
+        "headRepositoryOwner": {"login": "example"}, "mergeStateStatus": "CLEAN",
+        "reviewDecision": "", "autoMergeRequest": null,
         "labels": labels, "mergeCommit": null, "changedFiles": 2,
         "closingIssuesReferences": [closing(103, "example", "tidepool"), closing(106, "example", "tidepool")],
         "statusCheckRollup": [
@@ -49,7 +52,7 @@ fn preflight(env: &mut Env, output: &str, exit: i32) {
 fn clean_preflight(env: &mut Env) {
     preflight(
         env,
-        &json!({"status": "clear", "pr": "12", "head": HEAD, "verdict": "CLEAN"}).to_string(),
+        &json!({"status": "clear", "pr": "12", "head": HEAD, "reviewed": HEAD, "verdict": "CLEAN"}).to_string(),
         0,
     );
 }
@@ -101,15 +104,17 @@ fn ready() -> Env {
     );
     env.write(
         "units/3/deliver.json",
-        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP, "risk_paths_touched": []}).to_string(),
+        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP, "risk_paths_touched": [], "scope_checked": true})
+            .to_string(),
     );
     env.write("units/3/guards-marker", "");
+    env.write("units/3/unit.json", &json!({"branch": "fix/tide"}).to_string());
     env
 }
 
 /// What GitHub says about PR 12 after a merge that went through.
 fn merged_view() -> Value {
-    json!({"state": "MERGED", "mergeCommit": {"oid": "fedcba9876543210fedcba9876543210fedcba98"}})
+    json!({"state": "MERGED", "mergeCommit": {"oid": "fedcba9876543210fedcba9876543210fedcba98"}, "autoMergeRequest": null})
 }
 
 fn result(out: &Out) -> Value {
@@ -231,6 +236,254 @@ fn an_already_merged_pr_exits_0_without_a_merge_call() {
 }
 
 #[test]
+fn an_already_merged_pr_that_is_not_the_units_is_not_reported_for_it() {
+    for (key, value) in [
+        ("headRefName", json!("fix/other")),
+        ("headRepositoryOwner", json!({"login": "stranger"})),
+    ] {
+        let env = ready();
+        let mut view = pr_view("MERGED", &[], "");
+        view[key] = value;
+        put(&env, "pr-view-12.json", &view);
+        let out = env.run(&ARGS);
+        assert_eq!(out.code, 3, "{}", out.stderr);
+        let r = result(&out);
+        assert_eq!(
+            (r["merged"].clone(), codes(&r)),
+            (json!(false), vec!["pr_unit".to_string()]),
+            "{key}"
+        );
+        assert!(merged_calls(&env).is_empty());
+    }
+    // No unit.json: nothing says which branch is the unit's.
+    let env = ready();
+    fs::remove_file(env.workdir.join("units/3/unit.json")).expect("remove");
+    put(&env, "pr-view-12.json", &pr_view("MERGED", &[], ""));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["pr_unit"]);
+}
+
+#[test]
+fn a_pr_that_is_not_the_units_is_not_merged() {
+    for (key, value) in [
+        ("headRefName", json!("fix/other")),
+        ("headRepositoryOwner", json!({"login": "stranger"})),
+    ] {
+        let env = ready();
+        let mut view = pr_view("OPEN", &["bug"], "Fixes #5");
+        view[key] = value;
+        put(&env, "pr-view-12.json", &view);
+        let out = env.run(&ARGS);
+        assert_eq!(out.code, 3, "{}", out.stderr);
+        assert_eq!(codes(&result(&out)), ["pr_unit"], "{key}");
+        assert!(merged_calls(&env).is_empty());
+    }
+}
+
+#[test]
+fn a_pr_github_would_only_queue_for_later_is_refused_before_the_merge_call() {
+    for (key, value) in [
+        ("mergeStateStatus", "BLOCKED"),
+        ("mergeStateStatus", "UNKNOWN"),
+        ("reviewDecision", "REVIEW_REQUIRED"),
+        ("reviewDecision", "CHANGES_REQUESTED"),
+    ] {
+        let env = ready();
+        let mut view = pr_view("OPEN", &["bug"], "Fixes #5");
+        view[key] = json!(value);
+        put(&env, "pr-view-12.json", &view);
+        let out = env.run(&ARGS);
+        assert_eq!(out.code, 3, "{value}: {}", out.stderr);
+        assert_eq!(codes(&result(&out)), ["not_mergeable"], "{value}");
+        assert!(merged_calls(&env).is_empty(), "{value}");
+    }
+    // Control: UNSTABLE and an approval merge.
+    let env = ready();
+    let mut view = pr_view("OPEN", &["bug"], "Fixes #5");
+    view["mergeStateStatus"] = json!("UNSTABLE");
+    view["reviewDecision"] = json!("APPROVED");
+    put(&env, "pr-view-12.json", &view);
+    assert_eq!(env.run(&ARGS).code, 0);
+}
+
+fn armed_view() -> Value {
+    let mut view = pr_view("OPEN", &["bug"], "Fixes #5");
+    view["autoMergeRequest"] = json!({"enabledAt": "2026-11-21T02:00:00Z", "mergeMethod": "SQUASH"});
+    view
+}
+
+fn disable_calls(env: &Env) -> Vec<String> {
+    env.gh_calls()
+        .into_iter()
+        .filter(|c| c.contains("--disable-auto"))
+        .collect()
+}
+
+#[test]
+fn auto_merge_armed_by_the_merge_call_is_turned_off_and_refused() {
+    let env = ready();
+    put(&env, "pr-view-12.after-merge.json", &armed_view());
+    let mut after = pr_view("OPEN", &["bug"], "Fixes #5");
+    after["autoMergeRequest"] = Value::Null;
+    put(&env, "pr-view-12.after-disable.json", &after);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("turned off"), "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(
+        (r["merged"].clone(), r["auto_merge_disabled"].clone()),
+        (json!(false), json!(true))
+    );
+    assert!(r.get("queued").is_none());
+    assert_eq!(
+        disable_calls(&env),
+        ["pr merge 12 --repo example/tidepool --disable-auto"]
+    );
+}
+
+#[test]
+fn auto_merge_that_cannot_be_turned_off_is_reported_still_armed() {
+    let env = ready();
+    put(&env, "pr-view-12.after-merge.json", &armed_view());
+    env.stub_file("fail-disable-auto", "");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("STILL ARMED"), "{}", out.stderr);
+    assert_eq!(result(&out)["auto_merge_armed"], true);
+}
+
+#[test]
+fn an_open_pr_with_no_auto_merge_request_is_queued_and_nothing_is_turned_off() {
+    let env = ready();
+    put(
+        &env,
+        "pr-view-12.after-merge.json",
+        &pr_view("OPEN", &["bug"], "Fixes #5"),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 4, "{}", out.stderr);
+    assert!(disable_calls(&env).is_empty());
+    // An answer that does not say whether auto-merge is armed is not "not armed".
+    let mut unsure = pr_view("OPEN", &["bug"], "Fixes #5");
+    unsure.as_object_mut().unwrap().remove("autoMergeRequest");
+    put(&env, "pr-view-12.after-merge.json", &unsure);
+    fs::remove_file(env.stub.join("merged-12")).expect("the stub forgets the merge");
+    assert_eq!(env.run(&ARGS).code, 1);
+}
+
+#[test]
+fn a_unit_process_cannot_turn_auto_merge_off_either() {
+    // The write path refuses any verb a unit may not use, so the new one is too.
+    let mut env = ready();
+    env.set("ISSUE_DRAIN_MODE", "unit");
+    let out = env.run(&["gh-write", "disable-auto-merge", "12"]);
+    assert_ne!(out.code, 0);
+    assert!(disable_calls(&env).is_empty());
+}
+
+fn pinned_ruleset() -> Value {
+    json!([{"type": "required_status_checks", "parameters": {"required_status_checks": [
+        {"context": "build", "integration_id": 15368}]}}])
+}
+
+fn runs_of(app: u64, conclusion: &str) -> Value {
+    json!({"total_count": 1, "check_runs": [
+        {"name": "build", "status": "completed", "conclusion": conclusion, "started_at": "2026-11-21T01:00:00Z", "app": {"id": app}}]})
+}
+
+#[test]
+fn a_check_pinned_to_an_app_needs_a_run_from_that_app() {
+    let env = ready();
+    put(&env, "rules.json", &pinned_ruleset());
+    // The rollup's `build` passes, but nothing says which app made it.
+    put(&env, "check-runs.json", &runs_of(99, "success"));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["required_check"]);
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("app 15368"));
+    assert!(merged_calls(&env).is_empty());
+    assert!(
+        env.gh_calls()
+            .iter()
+            .any(|c| c.starts_with(&format!("api repos/example/tidepool/commits/{HEAD}/check-runs")))
+    );
+    // The right app, failing.
+    put(&env, "check-runs.json", &runs_of(15368, "failure"));
+    assert_eq!(codes(&result(&env.run(&ARGS))), ["required_check"]);
+    // The right app, passing.
+    put(&env, "check-runs.json", &runs_of(15368, "success"));
+    assert_eq!(env.run(&ARGS).code, 0);
+}
+
+#[test]
+fn an_unreadable_check_run_list_refuses_a_pinned_check_and_is_not_read_for_an_unpinned_one() {
+    let env = ready();
+    put(&env, "rules.json", &pinned_ruleset());
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["read_error"]);
+    let env = ready();
+    assert_eq!(env.run(&ARGS).code, 0);
+    assert!(
+        env.gh_calls().iter().all(|c| !c.contains("check-runs")),
+        "{:?}",
+        env.gh_calls()
+    );
+}
+
+#[test]
+fn a_review_stamped_before_the_head_needs_an_ancestor() {
+    let mut env = ready();
+    let stamped = &BASE_TIP[..9];
+    preflight(
+        &mut env,
+        &json!({"status": "clear", "head": HEAD, "reviewed": stamped, "verdict": "CLEAN"}).to_string(),
+        0,
+    );
+    put(
+        &env,
+        "compare-reviewed.json",
+        &json!({"status": "diverged", "behind_by": 1, "ahead_by": 1}),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["review"]);
+    assert!(merged_calls(&env).is_empty());
+    env.stub_file("compare-reviewed.json", "");
+    fs::remove_file(env.stub.join("compare-reviewed.json")).expect("remove");
+    assert_eq!(codes(&result(&env.run(&ARGS))), ["read_error"]);
+    put(
+        &env,
+        "compare-reviewed.json",
+        &json!({"status": "ahead", "behind_by": 0, "ahead_by": 1}),
+    );
+    assert_eq!(env.run(&ARGS).code, 0);
+    assert!(
+        env.gh_calls()
+            .iter()
+            .any(|c| c == &format!("api repos/example/tidepool/compare/{stamped}...{HEAD}"))
+    );
+}
+
+#[test]
+fn a_unit_with_no_file_scope_is_refused_by_the_gate() {
+    let env = ready();
+    env.write(
+        "units/3/deliver.json",
+        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP, "risk_paths_touched": [], "scope_checked": false})
+            .to_string(),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["deliver_check"]);
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("no file scope"));
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
 fn a_closed_unmerged_pr_is_refused() {
     let env = ready();
     put(&env, "pr-view-12.json", &pr_view("CLOSED", &["bug"], "Fixes #5"));
@@ -275,7 +528,7 @@ fn a_review_script_that_prints_not_clear_and_exits_0_is_a_refusal() {
     let mut env = ready();
     preflight(
         &mut env,
-        &json!({"status": "stale", "head": HEAD, "verdict": "CLEAN"}).to_string(),
+        &json!({"status": "stale", "head": HEAD, "reviewed": HEAD, "verdict": "CLEAN"}).to_string(),
         0,
     );
     let out = env.run(&ARGS);
@@ -295,7 +548,7 @@ fn a_review_script_that_exits_1_with_clear_json_still_counts_only_the_json() {
     fs::remove_file(env.stub.join("merged-12")).expect("the stub forgets the merge");
     preflight(
         &mut env,
-        &json!({"status": "clear", "head": HEAD, "verdict": "CLEAN"}).to_string(),
+        &json!({"status": "clear", "head": HEAD, "reviewed": HEAD, "verdict": "CLEAN"}).to_string(),
         1,
     );
     assert_eq!(env.run(&ARGS).code, 0, "its exit code is ignored");
@@ -466,7 +719,8 @@ fn a_delivery_audited_from_another_base_than_the_live_one_refuses() {
     let other = "2".repeat(40);
     env.write(
         "units/3/deliver.json",
-        &json!({"ok": true, "head": HEAD, "merge_base": other, "risk_paths_touched": []}).to_string(),
+        &json!({"ok": true, "head": HEAD, "merge_base": other, "risk_paths_touched": [], "scope_checked": true})
+            .to_string(),
     );
     let out = env.run(&ARGS);
     assert_eq!(out.code, 3, "{}", out.stderr);
@@ -481,7 +735,7 @@ fn a_delivery_report_with_no_merge_base_refuses() {
     let env = ready();
     env.write(
         "units/3/deliver.json",
-        &json!({"ok": true, "head": HEAD, "risk_paths_touched": []}).to_string(),
+        &json!({"ok": true, "head": HEAD, "risk_paths_touched": [], "scope_checked": true}).to_string(),
     );
     let out = env.run(&ARGS);
     assert_eq!(out.code, 3, "{}", out.stderr);
@@ -493,7 +747,7 @@ fn a_delivery_that_touched_a_risk_path_is_refused_and_a_person_merges_it() {
     let env = ready();
     env.write(
         "units/3/deliver.json",
-        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP, "risk_paths_touched": ["src/billing/charge.ts"]})
+        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP, "risk_paths_touched": ["src/billing/charge.ts"], "scope_checked": true})
             .to_string(),
     );
     let out = env.run(&ARGS);
@@ -513,7 +767,7 @@ fn a_delivery_report_without_the_risk_field_is_refused() {
     let env = ready();
     env.write(
         "units/3/deliver.json",
-        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP}).to_string(),
+        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP, "scope_checked": true}).to_string(),
     );
     let out = env.run(&ARGS);
     assert_eq!(out.code, 3, "{}", out.stderr);
@@ -607,10 +861,7 @@ fn a_closing_issue_with_no_repository_does_not_parse() {
 
 /// A ruleset's `required_status_checks` rule, as `rules/branches/<b>` lists it.
 fn ruleset_requiring(contexts: &[&str]) -> Value {
-    let checks: Vec<Value> = contexts
-        .iter()
-        .map(|c| json!({"context": c, "integration_id": 15368}))
-        .collect();
+    let checks: Vec<Value> = contexts.iter().map(|c| json!({"context": c})).collect();
     json!([
         {"type": "deletion", "ruleset_source_type": "Repository", "ruleset_source": REPO, "ruleset_id": 1},
         {"type": "required_status_checks", "ruleset_source_type": "Repository", "ruleset_source": REPO,

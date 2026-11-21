@@ -137,8 +137,12 @@ impl Ctx {
         Ok(root.unwrap_or(dir))
     }
 
+    /// The mode of this process. With no ISSUE_DRAIN_MODE, a set
+    /// ISSUE_DRAIN_UNIT_FILE (the driver gives one to each unit process) means
+    /// a unit: a unit that lost the mode variable must not become a session.
     pub fn mode(&self) -> Res<Mode> {
         match env_str("ISSUE_DRAIN_MODE").as_str() {
+            "" if !env_str("ISSUE_DRAIN_UNIT_FILE").is_empty() => Ok(Mode::Unit),
             "" | "session" => Ok(Mode::Session),
             "driver" => Ok(Mode::Driver),
             "unit" => Ok(Mode::Unit),

@@ -127,6 +127,8 @@ Every subcommand uses the first four, and prints one line saying why on anything
 | 3 | A rule refused the action | Report the reason. Change the input (for `tracker render`, fix `decisions.json`), never the rule |
 | 4 | `merge-gate` only: the merge call was accepted but the PR is not merged yet (a merge queue) | The output says `merged: false, queued: true`. Do not report it merged; ask the gate again later |
 
+`close-verified`, `tracker publish`, `merge-gate` and every `state` verb refuse with exit 3, before they write or log anything, in a unit process: `ISSUE_DRAIN_MODE=unit`, or `ISSUE_DRAIN_UNIT_FILE` set with no mode.
+
 `state init --parsed` takes the same go-ahead as step 1 above: it refuses (exit 3) a saved `tracker parse` that has `stop: true`, a `tracker_state` other than `OPEN` (null only in a dry run), a non-empty `unknown`, or a `run` that is not this run's (a parse without `run` is exit 2). `state event --head` takes a full 40 or 64 digit commit SHA.
 
 ## The run folder

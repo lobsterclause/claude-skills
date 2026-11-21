@@ -31,14 +31,45 @@
 //! PR has against the live base branch (GitHub's compare answer), so a
 //! `deliver-check --base` that audited only part of the PR is refused.
 //!
+//! The PR must be the unit's (`pr_unit`): its head branch is the `branch` in
+//! `units/<n>/unit.json` and its head repository is the profile's repo. This
+//! holds for the already-merged answer as well, which is read only after it.
+//! The PR must also be mergeable now (`not_mergeable`): `mergeStateStatus` is
+//! CLEAN, HAS_HOOKS or UNSTABLE (only non-required checks failing or pending,
+//! which this gate judges itself), and `reviewDecision` is neither
+//! CHANGES_REQUESTED nor REVIEW_REQUIRED. On a merge-queue branch `gh pr merge`
+//! can otherwise arm auto-merge for a PR that is not eligible yet, and GitHub
+//! would merge it later with none of these conditions read again.
+//!
+//! The review script's `head` is the live head; its `reviewed` is the commit
+//! the newest record was stamped at. They differ on purpose when the script
+//! clears a base-only sync (digest equality) or a union of records. Then the
+//! gate accepts only when `reviewed` is an ancestor of the head (GitHub's
+//! compare answer) and the review proof on disk is for the head or for
+//! `reviewed`; a record naming no `reviewed` is refused.
+//!
+//! A required check pinned to an app (classic `app_id`, ruleset
+//! `integration_id`; null and -1 mean any app) needs a run from that app. The
+//! rollup carries no app id, so a pinned check reads
+//! `commits/<head>/check-runs`; a failed read refuses (`read_error`).
+//!
+//! A unit with no file scope (`scope_checked` not true in `deliver.json`) is
+//! refused (`deliver_check`): a person merges it. The gate may not be run by a
+//! unit process (`ISSUE_DRAIN_MODE=unit`, or `ISSUE_DRAIN_UNIT_FILE` with no mode).
+//!
 //! `gh pr merge` exiting 0 does not mean merged: on a merge-queue branch it
-//! means queued. The PR is read again after the call, and `merged: true` is
-//! printed only when GitHub says MERGED.
+//! means queued, or auto-merge armed. The PR is read again after the call
+//! (state, merge commit, `autoMergeRequest`), and `merged: true` is printed
+//! only when GitHub says MERGED. An open PR with an auto-merge request has it
+//! turned off (`gh pr merge --disable-auto`, through the write path) and the
+//! gate exits 3; if that fails it exits 1 and says it is still armed. Only an
+//! open PR with no request is reported as queued.
 //!
 //! Exit: 0 merged (or already merged, or a dry run that would have); 3 a
-//! condition refused; 1 the merge call itself failed, or the read after it did
-//! (the PR may then have been merged); 4 the merge call was accepted but the PR
-//! is not merged yet (queued: `merged: false, queued: true`); 2 bad arguments.
+//! condition refused, or auto-merge was armed and turned off; 1 the merge call
+//! itself failed, or the read after it did (the PR may then have been merged),
+//! or auto-merge is still armed; 4 the merge call was accepted but the PR is
+//! not merged yet (queued: `merged: false, queued: true`); 2 bad arguments.
 
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
@@ -112,6 +143,13 @@ pub struct Closing {
 pub struct PrView {
     pub state: PrState,
     pub head: String,
+    /// The PR's head branch, and the repository (`owner/name`) it is in; empty
+    /// when GitHub no longer names the repository (a deleted fork).
+    pub head_ref: String,
+    pub head_repo: String,
+    /// GitHub's `mergeStateStatus` and `reviewDecision` (empty: no decision).
+    pub merge_state: String,
+    pub review_decision: String,
     pub base_ref: String,
     pub labels: Vec<String>,
     pub body: String,
@@ -135,7 +173,37 @@ pub struct UnitEntry {
 pub struct Preflight {
     pub status: String,
     pub verdict: String,
+    /// The live head the script read.
     pub head: String,
+    /// The commit the newest review record was stamped at; it differs from the
+    /// head when the script cleared a base-only sync or a union of records.
+    pub reviewed: String,
+}
+
+/// A required check: the context, and the app it is pinned to (classic
+/// protection `app_id`, ruleset `integration_id`) when it is pinned.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Required {
+    pub context: String,
+    pub app_id: Option<u64>,
+}
+
+impl From<&str> for Required {
+    fn from(context: &str) -> Self {
+        Required {
+            context: context.to_string(),
+            app_id: None,
+        }
+    }
+}
+
+/// What the PR after a merge call looks like.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AfterMerge {
+    pub state: PrState,
+    pub merge_commit: Option<String>,
+    /// An auto-merge request is armed on the PR.
+    pub auto_merge: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +234,10 @@ pub struct Deliver {
     /// report written before the field existed, which the gate does not accept.
     #[serde(default)]
     pub risk_paths_touched: Option<Vec<String>>,
+    /// Whether the diff was checked against a file scope. `false` for a unit
+    /// with `files: []`, which the gate does not accept; absent in an old report.
+    #[serde(default)]
+    pub scope_checked: Option<bool>,
 }
 
 /// Everything the decision depends on. `Err` is a field that could not be read.
@@ -178,8 +250,16 @@ pub struct Facts {
     /// The profile's hold labels.
     pub hold_labels: Vec<String>,
     pub view: Read<PrView>,
-    pub required: Read<Vec<String>>,
+    /// The branch `units/<n>/unit.json` says the unit works on.
+    pub unit_branch: Read<String>,
+    pub required: Read<Vec<Required>>,
+    /// The check runs at the head with the app that made each (`source` is
+    /// `app:<id>`); read only when a required check is pinned to an app.
+    pub app_runs: Read<Vec<Run>>,
     pub preflight: Read<Preflight>,
+    /// Whether `preflight.reviewed` is an ancestor of the head; `None` when it
+    /// is the head and nothing was asked.
+    pub reviewed_ancestry: Option<Read<bool>>,
     /// For `proof` and `deliver`, `Err` means the file is absent or not the
     /// shape asked for, which has a refusal code of its own.
     pub proof: Read<Proof>,
@@ -246,6 +326,42 @@ pub fn reviewers(f: &Facts) -> Vec<String> {
     }
 }
 
+/// Whether `short` (a full SHA or the abbreviation a review stamp carries, at
+/// least 7 characters) names the commit `full`.
+fn same_commit(short: &str, full: &str) -> bool {
+    short.len() >= 7 && full.len() >= short.len() && full[..short.len()].eq_ignore_ascii_case(short)
+}
+
+/// The PR must be the unit's: its head branch is the one `unit.json` names and
+/// it is in the profile's repository. Nothing else ties `--pr` to `--unit`, so
+/// the already-merged answer needs it as much as a merge does.
+fn binding(repo: &str, unit: u64, pr: u64, view: &PrView, branch: &Read<String>) -> Vec<Refusal> {
+    let mut out = Vec::new();
+    match branch {
+        Err(what) => out.push(refusal("pr_unit", what.clone())),
+        Ok(branch) if branch.is_empty() || *branch != view.head_ref => out.push(refusal(
+            "pr_unit",
+            format!(
+                "PR #{pr} is from branch '{}', not unit {unit}'s branch '{branch}'",
+                view.head_ref
+            ),
+        )),
+        Ok(_) => {}
+    }
+    if !view.head_repo.eq_ignore_ascii_case(repo) {
+        let from = if view.head_repo.is_empty() {
+            "an unknown repository"
+        } else {
+            &view.head_repo
+        };
+        out.push(refusal(
+            "pr_unit",
+            format!("PR #{pr} comes from {from}, not from {repo}"),
+        ));
+    }
+    out
+}
+
 /// Every condition that stops the merge. No I/O. An empty list is the only
 /// way to a merge.
 pub fn judge(f: &Facts) -> Vec<Refusal> {
@@ -275,24 +391,73 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                 format!("PR #{n} targets '{}', not '{}'", v.base_ref, f.base),
             ));
         }
+        out.extend(binding(&f.repo, f.unit, n, v, &f.unit_branch));
+        // On a merge-queue branch `gh pr merge` enables auto-merge when the PR
+        // is not eligible now, and GitHub then merges later with none of this
+        // gate's conditions read again. So the PR must be mergeable now.
+        // UNSTABLE is only non-required checks failing or pending, which this
+        // gate judges itself.
+        if v.state == PrState::Open {
+            if !matches!(v.merge_state.as_str(), "CLEAN" | "HAS_HOOKS" | "UNSTABLE") {
+                out.push(refusal(
+                    "not_mergeable",
+                    format!("GitHub says PR #{n} is '{}', not mergeable now", v.merge_state),
+                ));
+            }
+            if matches!(v.review_decision.as_str(), "CHANGES_REQUESTED" | "REVIEW_REQUIRED") {
+                out.push(refusal(
+                    "not_mergeable",
+                    format!("PR #{n} review decision is {}", v.review_decision),
+                ));
+            }
+        }
     }
 
     // 2 and 3. checks at the head
+    let pinned = f.required.as_ref().is_ok_and(|r| r.iter().any(|c| c.app_id.is_some()));
+    if pinned {
+        if let Err(what) = &f.app_runs {
+            out.push(refusal("read_error", format!("could not read {what}")));
+        }
+    }
     match (&f.required, view) {
         (Err(what), _) => out.push(refusal("read_error", format!("could not read {what}"))),
         (Ok(required), Some(v)) => {
             let latest = newest(&v.runs);
-            for context in required {
-                // Every source that carries the name must be ok.
-                let groups: Vec<&Vec<&Run>> = latest
-                    .iter()
-                    .filter(|((name, _), _)| *name == context.as_str())
-                    .map(|(_, group)| group)
-                    .collect();
+            let apps = f.app_runs.as_deref().unwrap_or_default();
+            let latest_apps = newest(apps);
+            for check in required {
+                let context = &check.context;
+                // Every source that carries the name must be ok. A check
+                // pinned to an app is satisfied only by that app's runs.
+                let (groups, from): (Vec<&Vec<&Run>>, String) = match check.app_id {
+                    None => (
+                        latest
+                            .iter()
+                            .filter(|((name, _), _)| *name == context.as_str())
+                            .map(|(_, group)| group)
+                            .collect(),
+                        String::new(),
+                    ),
+                    Some(id) => {
+                        let source = format!("app:{id}");
+                        (
+                            latest_apps
+                                .iter()
+                                .filter(|((name, src), _)| *name == context.as_str() && *src == source)
+                                .map(|(_, group)| group)
+                                .collect(),
+                            format!(" from app {id}"),
+                        )
+                    }
+                };
                 if groups.is_empty() {
+                    if check.app_id.is_some() && f.app_runs.is_err() {
+                        continue; // the read error is already named
+                    }
                     out.push(refusal(
                         "required_check",
-                        format!("required check '{context}' has no run at the head"),
+                        format!("required check '{context}' has no run{from} at the head"),
                     ));
                     continue;
                 }
@@ -303,12 +468,12 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                 {
                     out.push(refusal(
                         "required_check",
-                        format!("required check '{context}' is {} at the head", bad.word),
+                        format!("required check '{context}'{from} is {} at the head", bad.word),
                     ));
                 }
             }
             for ((name, _), group) in &latest {
-                if required.iter().any(|r| r == name) {
+                if required.iter().any(|r| r.context == *name) {
                     continue;
                 }
                 if let Some(bad) = group.iter().find(|r| r.outcome == Outcome::Fail) {
@@ -335,6 +500,42 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                     "review",
                     format!("the review record is for {}, not the head", p.head),
                 ));
+            } else if let Some(h) = head.filter(|h| !same_commit(&p.reviewed, h)) {
+                // The script clears a head that moved when the records cover it
+                // (a base-only sync is cleared by digest equality on purpose),
+                // so the commit the record was stamped at is not the head.
+                // That is accepted only when the stamped commit is an ancestor
+                // of the head and the review proof is for the head or for it.
+                if p.reviewed.is_empty() {
+                    out.push(refusal("review", "the review record names no reviewed commit"));
+                } else {
+                    match &f.reviewed_ancestry {
+                        Some(Ok(true)) => {}
+                        Some(Ok(false)) => out.push(refusal(
+                            "review",
+                            format!(
+                                "the review record is for {}, which is not an ancestor of the head",
+                                p.reviewed
+                            ),
+                        )),
+                        Some(Err(what)) => out.push(refusal("read_error", format!("could not read {what}"))),
+                        None => out.push(refusal(
+                            "read_error",
+                            "could not read whether the reviewed commit is an ancestor",
+                        )),
+                    }
+                    if let Ok(proof) = &f.proof {
+                        if proof.head != h && !same_commit(&p.reviewed, &proof.head) {
+                            out.push(refusal(
+                                "review_proof",
+                                format!(
+                                    "the review proof is for '{}', neither the head nor {}",
+                                    proof.head, p.reviewed
+                                ),
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
@@ -458,6 +659,14 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                 out.push(refusal(
                     "deliver_check",
                     format!("units/{unit}/deliver.json is for '{}', not the head", d.head),
+                ));
+            }
+            if d.scope_checked != Some(true) {
+                out.push(refusal(
+                    "deliver_check",
+                    format!(
+                        "unit {unit} has no file scope, so nothing checked what its diff touches; a person merges it"
+                    ),
                 ));
             }
             match &d.risk_paths_touched {
@@ -645,7 +854,8 @@ fn parse_closing(entry: &Value) -> Read<Closing> {
     }
 }
 
-/// `gh pr view --json state,headRefOid,baseRefName,labels,body,
+/// `gh pr view --json state,headRefOid,headRefName,headRepository,
+/// headRepositoryOwner,mergeStateStatus,reviewDecision,baseRefName,labels,body,
 /// closingIssuesReferences,changedFiles,statusCheckRollup,mergeCommit`.
 pub fn parse_view(raw: &str) -> Read<PrView> {
     let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
@@ -666,9 +876,28 @@ pub fn parse_view(raw: &str) -> Read<PrView> {
         .iter()
         .map(parse_run)
         .collect::<Read<Vec<Run>>>()?;
+    // `reviewDecision` is "" (or null) when nothing requires a review; the key
+    // itself must be there. A head repository GitHub no longer names (a deleted
+    // fork) is empty, which `binding` refuses.
+    let review_decision = match v.get("reviewDecision") {
+        Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        _ => return Err("no 'reviewDecision'".into()),
+    };
+    let head_repo = match (
+        v.pointer("/headRepositoryOwner/login").and_then(Value::as_str),
+        v.pointer("/headRepository/name").and_then(Value::as_str),
+    ) {
+        (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => format!("{owner}/{name}"),
+        _ => String::new(),
+    };
     Ok(PrView {
         state,
         head,
+        head_ref: text(&v, "headRefName")?,
+        head_repo,
+        merge_state: text(&v, "mergeStateStatus")?,
+        review_decision,
         base_ref: text(&v, "baseRefName")?,
         labels: names(&v, "labels")?,
         body: v.get("body").and_then(Value::as_str).unwrap_or_default().to_string(),
@@ -689,8 +918,21 @@ fn merge_commit_of(v: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `gh api repos/{o}/{r}/branches/{base}/protection`: the required contexts.
-pub fn parse_protection(raw: &str) -> Read<Vec<String>> {
+/// An app id as classic protection (`app_id`) and rulesets (`integration_id`)
+/// give it. Null, absent and -1 all mean any app.
+fn pinned_app(entry: &Value, key: &str) -> Read<Option<u64>> {
+    match entry.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_i64() {
+            Some(-1) => Ok(None),
+            Some(id) if id > 0 => Ok(Some(id as u64)),
+            _ => Err(format!("a required check has an '{key}' that is not an app id")),
+        },
+    }
+}
+
+/// `gh api repos/{o}/{r}/branches/{base}/protection`: the required checks.
+pub fn parse_protection(raw: &str) -> Read<Vec<Required>> {
     let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
     if !v.is_object() {
         return Err("the answer is not an object".into());
@@ -699,18 +941,26 @@ pub fn parse_protection(raw: &str) -> Read<Vec<String>> {
     let Some(checks) = v.get("required_status_checks").filter(|c| !c.is_null()) else {
         return Ok(required);
     };
-    let strings = |key: &str| -> Read<Vec<String>> {
+    let strings = |key: &str| -> Read<Vec<Required>> {
         match checks.get(key) {
             None | Some(Value::Null) => Ok(Vec::new()),
             Some(Value::Array(list)) => list
                 .iter()
                 .map(|c| {
-                    match key {
+                    let context = match key {
                         "contexts" => c.as_str(),
                         _ => c.get("context").and_then(Value::as_str),
                     }
-                    .map(str::to_string)
-                    .ok_or_else(|| format!("a '{key}' entry has no context"))
+                    .ok_or_else(|| format!("a '{key}' entry has no context"))?;
+                    let app_id = if key == "contexts" {
+                        None
+                    } else {
+                        pinned_app(c, "app_id")?
+                    };
+                    Ok(Required {
+                        context: context.to_string(),
+                        app_id,
+                    })
                 })
                 .collect(),
             Some(_) => Err(format!("'{key}' is not a list")),
@@ -737,7 +987,7 @@ fn is_not_protected(raw: &str) -> bool {
 /// `gh api repos/{o}/{r}/rules/branches/{base} --paginate`: the contexts of
 /// every `required_status_checks` rule that applies to the branch. `--paginate`
 /// prints one JSON array per page, one after the other.
-pub fn parse_rules(raw: &str) -> Read<Vec<String>> {
+pub fn parse_rules(raw: &str) -> Read<Vec<Required>> {
     let mut required = Vec::new();
     let mut pages = 0;
     for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
@@ -758,7 +1008,10 @@ pub fn parse_rules(raw: &str) -> Read<Vec<String>> {
                     .get("context")
                     .and_then(Value::as_str)
                     .ok_or("a rule's required check has no context")?;
-                required.push(context.to_string());
+                required.push(Required {
+                    context: context.to_string(),
+                    app_id: pinned_app(check, "integration_id")?,
+                });
             }
         }
     }
@@ -824,11 +1077,85 @@ fn parse_merge_base(raw: &str) -> Read<String> {
         .ok_or_else(|| "no merge_base_commit in the answer".to_string())
 }
 
-/// `gh pr view --json state,mergeCommit` after the merge call: whether the PR
-/// is merged, and the merge commit when GitHub names one.
-fn parse_after_merge(raw: &str) -> Read<(PrState, Option<String>)> {
+/// `gh pr view --json state,mergeCommit,autoMergeRequest` after the merge
+/// call: whether the PR is merged, the merge commit when GitHub names one, and
+/// whether an auto-merge request is armed. An open PR whose answer does not
+/// say is unreadable, never "not armed".
+fn parse_after_merge(raw: &str) -> Read<AfterMerge> {
     let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
-    Ok((pr_state(&v)?, merge_commit_of(&v)))
+    let state = pr_state(&v)?;
+    let auto_merge = match v.get("autoMergeRequest") {
+        Some(Value::Null) => false,
+        Some(_) => true,
+        None if state == PrState::Open => return Err("no 'autoMergeRequest' in the answer".into()),
+        None => false,
+    };
+    Ok(AfterMerge {
+        state,
+        merge_commit: merge_commit_of(&v),
+        auto_merge,
+    })
+}
+
+/// One page of `commits/<head>/check-runs`, or several one after another
+/// (`--paginate`): every run with the app that made it (`source` is
+/// `app:<id>`). A run without an app id cannot satisfy a pinned check, so it
+/// is kept under `app:0`.
+pub fn parse_check_runs(raw: &str) -> Read<Vec<Run>> {
+    let mut runs = Vec::new();
+    let mut pages = 0;
+    for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
+        let page = page.map_err(|_| "the answer is not JSON".to_string())?;
+        let list = page
+            .get("check_runs")
+            .and_then(Value::as_array)
+            .ok_or("a page has no check_runs")?;
+        pages += 1;
+        for entry in list {
+            let name = text(entry, "name")?;
+            let id = entry.pointer("/app/id").and_then(Value::as_u64).unwrap_or(0);
+            let status = entry.get("status").and_then(Value::as_str).unwrap_or_default();
+            let conclusion = entry.get("conclusion").and_then(Value::as_str).unwrap_or_default();
+            let started = entry.get("started_at").and_then(Value::as_str).unwrap_or_default();
+            let (outcome, word) = if !status.eq_ignore_ascii_case("completed") {
+                (Outcome::Pending, "pending".to_string())
+            } else {
+                (
+                    outcome_of_conclusion(&conclusion.to_uppercase()),
+                    conclusion.to_lowercase(),
+                )
+            };
+            let started = if !started.is_empty() {
+                started.to_string()
+            } else if outcome == Outcome::Pending {
+                "9999-12-31T23:59:59Z".to_string()
+            } else {
+                String::new()
+            };
+            runs.push(Run {
+                name,
+                source: format!("app:{id}"),
+                outcome,
+                word,
+                started,
+            });
+        }
+    }
+    if pages == 0 {
+        return Err("the answer is empty".into());
+    }
+    Ok(runs)
+}
+
+/// `status` of a compare answer: whether the first commit is an ancestor of
+/// (or the same as) the second.
+fn parse_ancestry(raw: &str) -> Read<bool> {
+    let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
+    match v.get("status").and_then(Value::as_str) {
+        Some("ahead" | "identical") => Ok(true),
+        Some("behind" | "diverged") => Ok(false),
+        _ => Err("no usable status in the answer".into()),
+    }
 }
 
 fn parse_preflight(raw: &str) -> Read<Preflight> {
@@ -837,10 +1164,15 @@ fn parse_preflight(raw: &str) -> Read<Preflight> {
         return Err("its output is not an object".into());
     }
     let word = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let reviewed = word("reviewed");
+    if !reviewed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("its 'reviewed' is not a commit".into());
+    }
     Ok(Preflight {
         status: word("status"),
         verdict: word("verdict"),
         head: word("head"),
+        reviewed,
     })
 }
 
@@ -903,22 +1235,30 @@ fn preflight(repo: &str, pr: u64) -> Read<Preflight> {
     parse_preflight(&String::from_utf8_lossy(&out.stdout)).map_err(|e| format!("{what}: {e}"))
 }
 
+/// What `units/<n>/unit.json` says the gate needs: the unit's branch.
+#[derive(Deserialize)]
+struct UnitBranch {
+    #[serde(default)]
+    branch: String,
+}
+
 fn unit_file<T: serde::de::DeserializeOwned>(ctx: &Ctx, unit: u64, name: &str) -> Read<T> {
     read_json(&ctx.path(&format!("units/{unit}/{name}")))
         .ok_or_else(|| format!("units/{unit}/{name} is missing or not the expected shape"))
 }
 
 /// Every read the decision needs. Nothing here decides anything.
-fn gather(ctx: &Ctx, repo: &str, unit: u64, pr: u64, view: Read<PrView>) -> Facts {
+fn gather(
+    ctx: &Ctx,
+    repo: &str,
+    unit: u64,
+    pr: u64,
+    view: Read<PrView>,
+    unit_entry: Read<UnitEntry>,
+    unit_branch: Read<String>,
+) -> Facts {
     let base = ctx.profile.base_branch.clone();
     let head = view.as_ref().ok().map(|v| v.head.clone());
-    let unit_entry = ctx
-        .queue_unit(unit)
-        .map(|u| UnitEntry {
-            waits_for: u.waits_for,
-            issues: u.issues,
-        })
-        .map_err(|e| format!("the queue entry of unit {unit} ({})", e.msg));
     // The unit's issues and the PR's own, so a hold label on either is seen. An
     // issue in another repository is refused by `judge`, not looked up here by
     // a number that means something else in this repo.
@@ -966,6 +1306,28 @@ fn gather(ctx: &Ctx, repo: &str, unit: u64, pr: u64, view: Read<PrView>) -> Fact
         })
         .collect();
 
+    // Only a check pinned to an app needs the runs with their app ids, which
+    // the rollup does not carry. A failed read refuses in `judge`.
+    let app_runs = match (&required, &head) {
+        (Ok(required), Some(head)) if required.iter().any(|c| c.app_id.is_some()) => read_gh(&[
+            "api",
+            &format!("repos/{repo}/commits/{head}/check-runs?per_page=100"),
+            "--paginate",
+        ])
+        .and_then(|raw| parse_check_runs(&raw))
+        .map_err(|e| format!("the check runs at the head ({e})")),
+        _ => Ok(Vec::new()),
+    };
+    let preflight = preflight(repo, pr);
+    let reviewed_ancestry = match (&preflight, &head) {
+        (Ok(p), Some(head)) if !p.reviewed.is_empty() && !same_commit(&p.reviewed, head) => Some(
+            read_gh(&["api", &format!("repos/{repo}/compare/{}...{head}", p.reviewed)])
+                .and_then(|raw| parse_ancestry(&raw))
+                .map_err(|e| format!("whether {} is an ancestor of the head ({e})", p.reviewed)),
+        ),
+        _ => None,
+    };
+
     Facts {
         unit,
         pr,
@@ -973,8 +1335,11 @@ fn gather(ctx: &Ctx, repo: &str, unit: u64, pr: u64, view: Read<PrView>) -> Fact
         base,
         hold_labels: ctx.profile.hold_labels.clone(),
         view,
+        unit_branch,
         required,
-        preflight: preflight(repo, pr),
+        app_runs,
+        preflight,
+        reviewed_ancestry,
         proof: unit_file(ctx, unit, "review-proof.json"),
         deliver: unit_file(ctx, unit, "deliver.json"),
         guards_marker: ctx.path(&format!("units/{unit}/guards-marker")).is_file(),
@@ -990,7 +1355,7 @@ fn gather(ctx: &Ctx, repo: &str, unit: u64, pr: u64, view: Read<PrView>) -> Fact
 /// ruleset that applies to it. A branch with no classic protection has no
 /// classic requirements, but only when the rules were read; any other failure
 /// of either read is an error, so a requirement is never assumed absent.
-fn required_checks(repo: &str, base: &str) -> Read<Vec<String>> {
+fn required_checks(repo: &str, base: &str) -> Read<Vec<Required>> {
     let classic = {
         let (rc, out) = gh::read_raw(&["api", &format!("repos/{repo}/branches/{base}/protection")]);
         match rc {
@@ -1020,13 +1385,14 @@ fn read_view(repo: &str, pr: u64) -> Read<PrView> {
         "--repo",
         repo,
         "--json",
-        "state,headRefOid,baseRefName,labels,body,closingIssuesReferences,changedFiles,statusCheckRollup,mergeCommit",
+        "state,headRefOid,headRefName,headRepository,headRepositoryOwner,mergeStateStatus,reviewDecision,baseRefName,labels,body,closingIssuesReferences,changedFiles,statusCheckRollup,mergeCommit",
     ])?;
     parse_view(&raw)
 }
 
-/// The PR's state and merge commit, read again after the merge call.
-fn read_after_merge(repo: &str, pr: u64) -> Read<(PrState, Option<String>)> {
+/// The PR's state, merge commit and auto-merge request, read again after the
+/// merge call.
+fn read_after_merge(repo: &str, pr: u64) -> Read<AfterMerge> {
     read_gh(&[
         "pr",
         "view",
@@ -1034,7 +1400,7 @@ fn read_after_merge(repo: &str, pr: u64) -> Read<(PrState, Option<String>)> {
         "--repo",
         repo,
         "--json",
-        "state,mergeCommit",
+        "state,mergeCommit,autoMergeRequest",
     ])
     .and_then(|raw| parse_after_merge(&raw))
 }
@@ -1051,13 +1417,44 @@ fn report(ctx: &Ctx, unit: u64, pr: u64, head: &str, merged: bool, refusals: &[R
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
+    // A unit does not merge, and must not get an answer (or a log line) for it.
+    ctx.require_driver("merge-gate")?;
     let repo = ctx.repo()?;
     let (unit, pr) = (args.unit, args.pr);
     let view = read_view(&repo, pr);
+    let unit_entry = ctx
+        .queue_unit(unit)
+        .map(|u| UnitEntry {
+            waits_for: u.waits_for,
+            issues: u.issues,
+        })
+        .map_err(|e| format!("the queue entry of unit {unit} ({})", e.msg));
+    let unit_branch = unit_file::<UnitBranch>(ctx, unit, "unit.json").map(|u| u.branch);
 
-    // A restarted driver asks again for a PR it already merged.
+    // A restarted driver asks again for a PR it already merged. Not for any
+    // merged PR: this one must be the unit's, or `--pr` could name any number.
     if let Ok(v) = &view {
         if v.state == PrState::Merged {
+            let mut refusals = binding(&repo, unit, pr, v, &unit_branch);
+            if let Err(what) = &unit_entry {
+                refusals.push(refusal("read_error", format!("could not read {what}")));
+            }
+            if !refusals.is_empty() {
+                report(ctx, unit, pr, &v.head, false, &refusals);
+                let list: Vec<Value> = refusals
+                    .iter()
+                    .map(|r| json!({"code": r.code, "detail": r.detail}))
+                    .collect();
+                println!(
+                    "{}",
+                    json!({"pr": pr, "unit": unit, "head": v.head, "merged": false, "refusals": list, "reviewers": []})
+                );
+                let codes: Vec<&str> = refusals.iter().map(|r| r.code).collect();
+                return Err(Fail::refused(format!(
+                    "PR #{pr} was not reported: {}",
+                    codes.join(", ")
+                )));
+            }
             report(ctx, unit, pr, &v.head, true, &[]);
             let out = json!({"pr": pr, "unit": unit, "head": v.head, "merged": true, "already": true, "merge_commit": v.merge_commit, "refusals": [], "reviewers": []});
             println!("{out}");
@@ -1065,7 +1462,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         }
     }
 
-    let facts = gather(ctx, &repo, unit, pr, view);
+    let facts = gather(ctx, &repo, unit, pr, view, unit_entry, unit_branch);
     let refusals = judge(&facts);
     let head = facts.view.as_ref().map(|v| v.head.clone()).unwrap_or_default();
     let output = |merged: bool| {
@@ -1109,16 +1506,52 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             // Exit 0 from `gh pr merge` also means "queued" on a merge-queue
             // branch, so ask GitHub what became of the PR.
             match read_after_merge(&repo, pr) {
-                Ok((PrState::Merged, oid)) => {
+                Ok(AfterMerge {
+                    state: PrState::Merged,
+                    merge_commit,
+                    ..
+                }) => {
                     report(ctx, unit, pr, &head, true, &[]);
-                    println!("{}", output_with(true, json!({"merge_commit": oid})));
+                    println!("{}", output_with(true, json!({"merge_commit": merge_commit})));
                     Ok(())
                 }
-                Ok((state, _)) => {
+                Ok(AfterMerge {
+                    state: PrState::Open,
+                    auto_merge: true,
+                    ..
+                }) => {
+                    // GitHub armed auto-merge instead of merging: it would merge
+                    // later with none of this gate's conditions read again.
+                    report(ctx, unit, pr, &head, false, &[]);
+                    match gh::write(ctx, &Write::DisableAutoMerge { number: pr }) {
+                        Ok(_) => {
+                            println!("{}", output_with(false, json!({"auto_merge_disabled": true})));
+                            Err(Fail::refused(format!(
+                                "PR #{pr}: the merge call armed auto-merge instead of merging; auto-merge has been turned off"
+                            )))
+                        }
+                        Err(_) => {
+                            println!("{}", output_with(false, json!({"auto_merge_armed": true})));
+                            Err(Fail::failed(format!(
+                                "PR #{pr}: the merge call armed auto-merge and turning it off failed; it is STILL ARMED: run `gh pr merge {pr} --disable-auto`"
+                            )))
+                        }
+                    }
+                }
+                Ok(AfterMerge {
+                    state: PrState::Open, ..
+                }) => {
                     report(ctx, unit, pr, &head, false, &[]);
                     println!("{}", output_with(false, json!({"queued": true})));
                     Err(Fail::queued(format!(
-                        "PR #{pr}: the merge call was accepted but the PR is {state:?}, not merged (queued?); ask again later"
+                        "PR #{pr}: the merge call was accepted but the PR is Open, not merged (queued?); ask again later"
+                    )))
+                }
+                Ok(AfterMerge { state, .. }) => {
+                    report(ctx, unit, pr, &head, false, &[]);
+                    println!("{}", output_with(false, json!({"state_unknown": true})));
+                    Err(Fail::failed(format!(
+                        "PR #{pr}: the merge call exited 0 but the PR is {state:?}, neither merged nor open"
                     )))
                 }
                 Err(what) => {
@@ -1181,6 +1614,10 @@ mod tests {
             view: Ok(PrView {
                 state: PrState::Open,
                 head: HEAD.into(),
+                head_ref: "fix/tide".into(),
+                head_repo: "example/tidepool".into(),
+                merge_state: "CLEAN".into(),
+                review_decision: String::new(),
                 base_ref: "develop".into(),
                 labels: vec!["bug".into()],
                 body: "Fixes #5".into(),
@@ -1192,11 +1629,15 @@ mod tests {
                 runs: vec![pass("build"), pass("lint")],
                 merge_commit: None,
             }),
+            unit_branch: Ok("fix/tide".into()),
             required: Ok(vec!["build".into()]),
+            app_runs: Ok(Vec::new()),
+            reviewed_ancestry: None,
             preflight: Ok(Preflight {
                 status: "clear".into(),
                 verdict: "CLEAN".into(),
                 head: HEAD.into(),
+                reviewed: HEAD.into(),
             }),
             proof: Ok(Proof {
                 head: HEAD.into(),
@@ -1207,6 +1648,7 @@ mod tests {
                 head: HEAD.into(),
                 merge_base: BASE_TIP.into(),
                 risk_paths_touched: Some(Vec::new()),
+                scope_checked: Some(true),
             }),
             guards_marker: true,
             threads: Ok(0),
@@ -1218,6 +1660,10 @@ mod tests {
                 issues: vec![5],
             }),
         }
+    }
+
+    fn contexts(required: &[Required]) -> Vec<&str> {
+        required.iter().map(|r| r.context.as_str()).collect()
     }
 
     fn entry(f: &mut Facts) -> &mut UnitEntry {
@@ -1344,12 +1790,14 @@ mod tests {
             status: "stale".into(),
             verdict: "CLEAN".into(),
             head: HEAD.into(),
+            reviewed: HEAD.into(),
         });
         assert_eq!(codes(&f), ["review"]);
         f.preflight = Ok(Preflight {
             status: "clear".into(),
             verdict: "FIXES_APPLIED".into(),
             head: HEAD.into(),
+            reviewed: HEAD.into(),
         });
         assert_eq!(codes(&f), ["review"]);
     }
@@ -1361,6 +1809,7 @@ mod tests {
             status: "clear".into(),
             verdict: String::new(),
             head: HEAD.into(),
+            reviewed: HEAD.into(),
         });
         let found = judge(&f);
         assert_eq!(found.len(), 1);
@@ -1573,7 +2022,7 @@ mod tests {
     #[test]
     fn a_view_parses_checks_of_both_kinds_and_keeps_unstarted_runs_newest() {
         let raw = json!({
-            "state": "OPEN", "headRefOid": HEAD, "baseRefName": "develop", "body": "x",
+            "state": "OPEN", "headRefOid": HEAD, "headRefName": "fix/tide", "headRepository": {"name": "tidepool"}, "headRepositoryOwner": {"login": "example"}, "mergeStateStatus": "CLEAN", "reviewDecision": "", "baseRefName": "develop", "body": "x",
             "labels": [{"name": "bug"}], "closingIssuesReferences": [{"number": 5, "repository": {"name": "tidepool", "owner": {"login": "example"}}}], "changedFiles": 1,
             "statusCheckRollup": [
                 {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-11-20T01:00:00Z"},
@@ -1605,7 +2054,7 @@ mod tests {
     #[test]
     fn a_view_missing_a_field_or_with_a_bad_head_does_not_parse() {
         let good = json!({
-            "state": "OPEN", "headRefOid": HEAD, "baseRefName": "develop", "body": "",
+            "state": "OPEN", "headRefOid": HEAD, "headRefName": "fix/tide", "headRepository": {"name": "tidepool"}, "headRepositoryOwner": {"login": "example"}, "mergeStateStatus": "CLEAN", "reviewDecision": "", "baseRefName": "develop", "body": "",
             "labels": [], "closingIssuesReferences": [], "changedFiles": 1, "statusCheckRollup": []
         });
         assert!(parse_view(&good.to_string()).is_ok());
@@ -1631,7 +2080,7 @@ mod tests {
     #[test]
     fn protection_reads_both_shapes_and_nothing_else_is_assumed() {
         let raw = r#"{"required_status_checks":{"contexts":["a","b"],"checks":[{"context":"b"},{"context":"c","app_id":1}]}}"#;
-        assert_eq!(parse_protection(raw).unwrap(), ["a", "b", "c"]);
+        assert_eq!(contexts(&parse_protection(raw).unwrap()), ["a", "b", "c"]);
         assert!(parse_protection("{}").unwrap().is_empty());
         assert!(parse_protection("[]").is_err());
         assert!(parse_protection(r#"{"required_status_checks":{"contexts":"a"}}"#).is_err());
@@ -1685,7 +2134,7 @@ mod tests {
     #[test]
     fn a_check_run_and_a_commit_status_of_one_name_are_two_checks() {
         let raw = json!({
-            "state": "OPEN", "headRefOid": HEAD, "baseRefName": "develop", "body": "",
+            "state": "OPEN", "headRefOid": HEAD, "headRefName": "fix/tide", "headRepository": {"name": "tidepool"}, "headRepositoryOwner": {"login": "example"}, "mergeStateStatus": "CLEAN", "reviewDecision": "", "baseRefName": "develop", "body": "",
             "labels": [], "closingIssuesReferences": [], "changedFiles": 1,
             "statusCheckRollup": [
                 {"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-11-21T03:00:00Z"},
@@ -1748,7 +2197,10 @@ mod tests {
         ]);
         let page2 = json!([{"type": "required_status_checks", "parameters": {
             "required_status_checks": [{"context": "c"}, {"context": "a"}]}}]);
-        assert_eq!(parse_rules(&format!("{page1}\n{page2}")).unwrap(), ["a", "b", "c"]);
+        assert_eq!(
+            contexts(&parse_rules(&format!("{page1}\n{page2}")).unwrap()),
+            ["a", "b", "c"]
+        );
         assert!(parse_rules("[]").unwrap().is_empty());
         assert!(parse_rules("[{\"type\":\"deletion\"}]").unwrap().is_empty());
         for bad in [
@@ -1776,7 +2228,9 @@ mod tests {
     #[test]
     fn a_view_carries_the_merge_commit_when_github_names_one() {
         let mut raw = json!({
-            "state": "MERGED", "headRefOid": HEAD, "baseRefName": "develop", "body": "",
+            "state": "MERGED", "headRefOid": HEAD, "headRefName": "fix/tide", "headRepository": {"name": "tidepool"},
+            "headRepositoryOwner": {"login": "example"}, "mergeStateStatus": "UNKNOWN", "reviewDecision": null,
+            "baseRefName": "develop", "body": "",
             "labels": [], "closingIssuesReferences": [], "changedFiles": 1, "statusCheckRollup": [],
             "mergeCommit": {"oid": BASE_TIP}
         });
@@ -1809,5 +2263,176 @@ mod tests {
         for flag in ["\"--admin\"", "\"--auto\"", "CROSS_REVIEW_MERGE_OVERRIDE"] {
             assert!(!include_str!("gh.rs").contains(flag), "{flag} in gh.rs");
         }
+    }
+
+    #[test]
+    fn a_pr_github_would_only_queue_is_not_mergeable_now() {
+        let mut f = clear();
+        for ok in ["CLEAN", "HAS_HOOKS", "UNSTABLE"] {
+            view(&mut f).merge_state = ok.into();
+            assert!(codes(&f).is_empty(), "{ok}");
+        }
+        for bad in ["BLOCKED", "BEHIND", "DIRTY", "DRAFT", "UNKNOWN", ""] {
+            view(&mut f).merge_state = bad.into();
+            assert_eq!(codes(&f), ["not_mergeable"], "{bad}");
+        }
+        view(&mut f).merge_state = "CLEAN".into();
+        for bad in ["CHANGES_REQUESTED", "REVIEW_REQUIRED"] {
+            view(&mut f).review_decision = bad.into();
+            assert_eq!(codes(&f), ["not_mergeable"], "{bad}");
+        }
+        for ok in ["APPROVED", ""] {
+            view(&mut f).review_decision = ok.into();
+            assert!(codes(&f).is_empty(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn the_pr_must_be_the_units_branch_in_the_profiles_repo() {
+        let mut f = clear();
+        view(&mut f).head_ref = "fix/other".into();
+        assert_eq!(codes(&f), ["pr_unit"]);
+        view(&mut f).head_ref = "fix/tide".into();
+        view(&mut f).head_repo = "stranger/tidepool".into();
+        assert_eq!(codes(&f), ["pr_unit"]);
+        view(&mut f).head_repo = String::new();
+        assert_eq!(codes(&f), ["pr_unit"]);
+        view(&mut f).head_repo = "Example/Tidepool".into();
+        assert!(codes(&f).is_empty(), "case does not matter");
+        f.unit_branch = Err("units/3/unit.json is missing".into());
+        assert_eq!(codes(&f), ["pr_unit"]);
+        f.unit_branch = Ok(String::new());
+        assert_eq!(codes(&f), ["pr_unit"]);
+    }
+
+    #[test]
+    fn a_unit_with_no_file_scope_is_left_to_a_person() {
+        let mut f = clear();
+        f.deliver.as_mut().unwrap().scope_checked = Some(false);
+        let found = judge(&f);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].code, "deliver_check");
+        assert!(found[0].detail.contains("no file scope"), "{}", found[0].detail);
+        f.deliver.as_mut().unwrap().scope_checked = None;
+        assert_eq!(codes(&f), ["deliver_check"]);
+    }
+
+    #[test]
+    fn a_review_stamped_at_another_commit_needs_an_ancestor_and_a_proof_for_the_head_or_it() {
+        let reviewed = &BASE_TIP[..9];
+        let mut f = clear();
+        f.preflight.as_mut().unwrap().reviewed = reviewed.into();
+        f.reviewed_ancestry = Some(Ok(true));
+        assert!(codes(&f).is_empty(), "an ancestor, proof for the head");
+        f.reviewed_ancestry = Some(Ok(false));
+        assert_eq!(codes(&f), ["review"]);
+        f.reviewed_ancestry = Some(Err("whether it is an ancestor (gh exit 1)".into()));
+        assert_eq!(codes(&f), ["read_error"]);
+        f.reviewed_ancestry = None;
+        assert_eq!(codes(&f), ["read_error"]);
+        f.reviewed_ancestry = Some(Ok(true));
+        f.proof.as_mut().unwrap().head = "e".repeat(40);
+        let found = codes(&f);
+        assert!(found.contains(&"review_proof"), "{found:?}");
+        // The proof for the reviewed commit itself is not the head's, and the
+        // head check still refuses it; only the new rule is relaxed by it.
+        f.proof.as_mut().unwrap().head = BASE_TIP.into();
+        let found = judge(&f);
+        assert!(
+            found.iter().all(|r| !r.detail.contains("neither the head nor")),
+            "{found:?}"
+        );
+        f.proof.as_mut().unwrap().head = HEAD.into();
+        f.preflight.as_mut().unwrap().reviewed = String::new();
+        assert_eq!(codes(&f), ["review"]);
+        // The head itself, whole or abbreviated, needs no ancestry read.
+        f.preflight.as_mut().unwrap().reviewed = HEAD[..9].into();
+        f.reviewed_ancestry = None;
+        assert!(codes(&f).is_empty());
+    }
+
+    #[test]
+    fn a_check_pinned_to_an_app_needs_that_apps_run() {
+        let from = |id: u64, outcome: Outcome, word: &str| {
+            from_source("build", &format!("app:{id}"), outcome, word, "2026-11-21T01:00:00Z")
+        };
+        let mut f = clear();
+        f.required = Ok(vec![Required {
+            context: "build".into(),
+            app_id: Some(15368),
+        }]);
+        // The rollup has a passing `build`, but not from the pinned app.
+        f.app_runs = Ok(vec![from(99, Outcome::Pass, "success")]);
+        let found = judge(&f);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].detail.contains("from app 15368"), "{}", found[0].detail);
+        f.app_runs = Ok(vec![
+            from(99, Outcome::Pass, "success"),
+            from(15368, Outcome::Fail, "failure"),
+        ]);
+        assert_eq!(codes(&f), ["required_check"]);
+        f.app_runs = Ok(vec![from(15368, Outcome::Pass, "success")]);
+        assert!(codes(&f).is_empty());
+        f.app_runs = Err("the check runs at the head (gh exit 1)".into());
+        assert_eq!(codes(&f), ["read_error"]);
+        // Unpinned: the unreadable runs do not matter.
+        f.required = Ok(vec!["build".into()]);
+        assert!(codes(&f).is_empty());
+    }
+
+    #[test]
+    fn an_app_id_is_kept_unless_it_is_null_or_minus_one() {
+        let raw = r#"{"required_status_checks":{"contexts":["a"],"checks":[{"context":"b","app_id":15368},{"context":"c","app_id":-1},{"context":"d","app_id":null},{"context":"e"}]}}"#;
+        let got: Vec<(String, Option<u64>)> = parse_protection(raw)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.context, r.app_id))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a".to_string(), None),
+                ("b".to_string(), Some(15368)),
+                ("c".to_string(), None),
+                ("d".to_string(), None),
+                ("e".to_string(), None)
+            ]
+        );
+        let rules = r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"b","integration_id":15368},{"context":"c","integration_id":0}]}}]"#;
+        assert!(parse_rules(rules).is_err(), "0 is not an app id");
+        let rules = r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"b","integration_id":15368},{"context":"c"}]}}]"#;
+        let got = parse_rules(rules).unwrap();
+        assert_eq!((got[0].app_id, got[1].app_id), (Some(15368), None));
+        assert!(parse_protection(r#"{"required_status_checks":{"checks":[{"context":"b","app_id":"x"}]}}"#).is_err());
+    }
+
+    #[test]
+    fn check_runs_keep_the_app_that_made_each() {
+        let page1 = json!({"total_count": 2, "check_runs": [
+            {"name": "build", "status": "completed", "conclusion": "success", "started_at": "2026-11-21T01:00:00Z", "app": {"id": 15368}}]});
+        let page2 = json!({"total_count": 2, "check_runs": [
+            {"name": "build", "status": "in_progress", "conclusion": null, "started_at": null, "app": {"id": 7}}]});
+        let runs = parse_check_runs(&format!("{page1}\n{page2}")).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].source.as_str(), runs[0].outcome), ("app:15368", Outcome::Pass));
+        assert_eq!((runs[1].source.as_str(), runs[1].outcome), ("app:7", Outcome::Pending));
+        assert!(parse_check_runs("").is_err());
+        assert!(parse_check_runs("{}").is_err());
+    }
+
+    #[test]
+    fn after_a_merge_call_the_pr_may_be_merged_queued_or_armed() {
+        let read = |v: Value| parse_after_merge(&v.to_string());
+        let merged = read(json!({"state": "MERGED", "mergeCommit": {"oid": BASE_TIP}})).unwrap();
+        assert_eq!((merged.state, merged.auto_merge), (PrState::Merged, false));
+        let queued = read(json!({"state": "OPEN", "mergeCommit": null, "autoMergeRequest": null})).unwrap();
+        assert_eq!((queued.state, queued.auto_merge), (PrState::Open, false));
+        let armed =
+            read(json!({"state": "OPEN", "mergeCommit": null, "autoMergeRequest": {"enabledAt": "x"}})).unwrap();
+        assert!(armed.auto_merge);
+        assert!(
+            read(json!({"state": "OPEN", "mergeCommit": null})).is_err(),
+            "unknown is not 'not armed'"
+        );
     }
 }

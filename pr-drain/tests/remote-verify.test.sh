@@ -183,6 +183,21 @@ R5="$T/repo5"; cp -R "$R2" "$R5"; rm -rf "$R5/vendor"; mkdir "$R5/vendor"
 REPO="$R5" OUTDIR="$T/out21" run 0 "$T/ship21" >/dev/null; check "submodule without a checkout still exits 0" 0 $?
 grep -q "note: submodule vendor has no checkout" "$T/out21/rverify-probe.log"; check "submodule without a checkout named in the log" 0 $?
 
+# Pass-14: an uninitialised submodule leaves git status clean but its contents
+# never ship; the shipped line counts it (unshipped=), for stamp-remote-pass.
+R7="$T/repo7"; mkdir -p "$R7"; git -C "$R7" init -q; echo t > "$R7/a.txt"
+git -C "$R7" add a.txt
+git -C "$R7" update-index --add --cacheinfo 160000,"$(git -C "$S3" rev-parse HEAD)",vendor
+git -C "$R7" -c user.email=t@t -c user.name=t commit -q -m gitlink
+H7=$(git -C "$R7" rev-parse HEAD)
+mkdir "$R7/vendor"
+REPO="$R7" OUTDIR="$T/out27" run 0 "$T/ship27" >/dev/null
+check "uninitialised submodule: git status is clean" "host=firebird head=$H7 dirty=0" "$(sed -n 1p "$T/out27/rverify-probe.log")"
+check "uninitialised submodule counted" "shipped head=$H7 dirty=0 unshipped=1" "$(grep '^shipped head=' "$T/out27/rverify-probe.log")"
+rmdir "$R7/vendor"
+REPO="$R7" OUTDIR="$T/out28" run 0 "$T/ship28" >/dev/null
+check "missing submodule directory counted" 1 "$(grep -c '^shipped head=.* unshipped=1$' "$T/out28/rverify-probe.log")"
+
 # Pass-11: the box is told which checked-out submodules to keep as gitlinks,
 # innermost first (red against 14e5587).
 S4="$T/inner"; mkdir -p "$S4"; git -C "$S4" init -q; echo i > "$S4/i.txt"
@@ -273,11 +288,11 @@ H13=$(git -C "$R13" rev-parse HEAD)
 REPO="$R13" OUTDIR="$T/out13" run 0 "$T/ship13b"; check "clean run exits 0" 0 $?
 check "log has the header first" "host=firebird head=$H13 dirty=0" "$(sed -n 1p "$T/out13/rverify-probe.log")"
 check "log has one shipped line" 1 "$(grep -c '^shipped head=' "$T/out13/rverify-probe.log")"
-check "shipped line says head and dirty=0" "shipped head=$H13 dirty=0" "$(grep '^shipped head=' "$T/out13/rverify-probe.log")"
+check "shipped line says head, dirty=0 and unshipped=0" "shipped head=$H13 dirty=0 unshipped=0" "$(grep '^shipped head=' "$T/out13/rverify-probe.log")"
 # An edit made while the stream runs shows in the shipped line, not the header.
 REPO="$R13" OUTDIR="$T/out14" run 0 "$T/ship14b" EDIT_FILE="$R13/a.txt"; check "edit during stream: run still exits 0" 0 $?
 check "edit during stream: header dirty=0" "host=firebird head=$H13 dirty=0" "$(sed -n 1p "$T/out14/rverify-probe.log")"
-check "edit during stream: shipped line dirty=1" "shipped head=$H13 dirty=1" "$(grep '^shipped head=' "$T/out14/rverify-probe.log")"
+check "edit during stream: shipped line dirty=1" "shipped head=$H13 dirty=1 unshipped=0" "$(grep '^shipped head=' "$T/out14/rverify-probe.log")"
 git -C "$R13" checkout -q a.txt
 # A failed ship writes no shipped line.
 REPO="$R2" OUTDIR="$T/out15" run 0 "$T/ship15" PATH="$T/badtar:$PATH" >/dev/null

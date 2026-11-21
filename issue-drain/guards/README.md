@@ -23,8 +23,8 @@ Bash (matched anywhere in the command, after `rtk`, `cd x &&`, `env A=b`, `;`, `
 - closing, reopening, editing issues and PRs; `gh label`
 - `git push` to anything but the unit branch on `origin`, and a push that does not name both (`git push`, `git push origin`, `git push origin HEAD`); any force flag
 - bypass flags: `--admin`, `--auto` (with `gh`), `--no-verify`, `SKIP_PREPUSH`, `CROSS_REVIEW_MERGE_OVERRIDE`, `HUSKY=0`
-- raw GitHub writes: `gh api` writes or bodies, GraphQL mutations, `gh pr|issue create|comment`, `gh release`, `gh workflow run`, `gh run rerun|cancel|delete`, `gh secret`, `gh variable`, `gh auth` but `status`
-- `git worktree`, `git checkout|switch` to another branch, `git branch -d|-D|-m`, `git remote add|set-url|remove`, `git config --global|--system`, bare `git stash`, `stash pop|drop|clear`
+- raw GitHub writes: `gh api` writes or bodies, GraphQL mutations and GraphQL query text read from a file (`--input`, `@file`), `gh pr|issue create|comment`, `gh release`, `gh workflow run`, `gh run rerun|cancel|delete`, `gh secret`, `gh variable`, `gh auth` but `status`
+- `git worktree`, `git checkout|switch` to another branch, `git branch -d|-D|-m`, `git remote add|set-url|remove`, `git config --global|--system`, bare `git stash`, `stash pop|drop|clear`, `git --git-dir|--work-tree` (run git inside the unit worktree)
 
 Allowed on purpose: read-only `gh`, `issue-drain gh-write ...`, cross-review's `post_comment.sh`, `git checkout -- <path>`, `git reset --hard origin/...`.
 

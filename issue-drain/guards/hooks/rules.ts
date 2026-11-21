@@ -123,18 +123,40 @@ function ghApiDeny(args: string[], command: string): string | undefined {
   }
   if (args.some(a => /\/merges?(\/|\?|$)/.test(a)))
     return `${P} gh api merge endpoints: merges are the driver's job; write result.json and exit`
-  // A GraphQL read is a POST with fields, so only the word decides. A unit reads review threads this way.
-  // shortcut: any "mutation" in the command denies, even inside a string; parse the query if that bites.
-  if (args.includes('graphql'))
+  // A GraphQL read is a POST with fields, so only the endpoint and the query text decide. A unit reads review threads this way.
+  if (isGraphql(args)) {
+    // Query text read from a file never shows its "mutation" word, so deny every way of reading one.
+    if (args.some(a => /^--input(=|$)/.test(a) || a.startsWith('@') || a.includes('=@')))
+      return `${P} GraphQL query text from a file cannot be checked; pass the query inline`
+    if (method !== undefined && method !== 'POST') return `${P} gh api writes are not allowed; ${WRITE_VIA}`
+    // shortcut: any "mutation" in the command denies, even inside a string; parse the query if that bites.
     return /mutation/i.test(command) ? `${P} GraphQL mutations are not allowed; ${WRITE_VIA}` : undefined
+  }
   if (method !== undefined && method !== 'GET') return `${P} gh api writes are not allowed; ${WRITE_VIA}`
   if (hasBody && method !== 'GET') return `${P} gh api with a body is a POST; use -X GET or ${WRITE_VIA}`
 }
 
+// gh api flags whose value is the next word.
+const GH_API_VALUE_FLAGS = /^(-X|--method|-H|--header|-f|-F|--field|--raw-field|--input|-q|--jq|-t|--template|--hostname|--cache|-p|--preview)$/
+
+/** The endpoint is the first word that is neither a flag nor a flag's value. */
+function isGraphql(args: string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!
+    if (GH_API_VALUE_FLAGS.test(a)) i++
+    else if (!a.startsWith('-')) return a === 'graphql' || a === '/graphql'
+  }
+  return false
+}
+
 function gitDeny(args: string[], branch: string): string | undefined {
-  // Skip git's global options: -C <dir>, -c <k=v>, other leading flags.
+  // --git-dir and --work-tree point git at another repository.
+  if (args.some(a => /^--(git-dir|work-tree)(=|$)/.test(a)))
+    return `${P} --git-dir/--work-tree point git at another repository; run git inside the unit worktree`
+  // Skip git's global options: the two-word ones take a separate value, other leading flags do not.
   let i = 0
-  while (args[i]?.startsWith('-')) i += args[i] === '-C' || args[i] === '-c' ? 2 : 1
+  while (args[i]?.startsWith('-'))
+    i += /^(-C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)$/.test(args[i]!) ? 2 : 1
   const verb = args[i]
   const rest = args.slice(i + 1)
   const flags = rest.filter(a => a.startsWith('-'))

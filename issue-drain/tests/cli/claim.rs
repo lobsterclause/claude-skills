@@ -102,6 +102,20 @@ fn comment_body(env: &Env, n: u64) -> String {
     std::fs::read_to_string(env.workdir.join(format!("units/3/claim-{n}.md"))).expect("the marker comment's body file")
 }
 
+/// Make the stub behave as GitHub would once 103 has been taken: on the first
+/// read of `before` (the next issue), 103 gets the claim label and a marker of
+/// `by`'s making. Without it 103 stays as `clean` left it, which is not a claim
+/// of ours, and a rollback that checks ownership would rightly leave it alone.
+fn once_103_is_taken_by(env: &Env, before: u64, by: &str) {
+    let dir = env.stub.display();
+    let labels = json!({"labels": [{"name": "bug"}, {"name": LABEL}]}).to_string();
+    let timeline = timeline_page(&[("labeled", LABEL, T1), ("commented", by, T2)]).to_string();
+    let script = format!(
+        "cat > '{dir}/issue-view-103.json' <<'EOF'\n{labels}\nEOF\ncat > '{dir}/timeline-103.json' <<'EOF'\n{timeline}\nEOF\n"
+    );
+    env.stub_file(&format!("once-issue-view-{before}"), &script);
+}
+
 fn position(calls: &[String], starts: &str) -> usize {
     calls
         .iter()
@@ -197,6 +211,7 @@ fn a_label_with_someone_elses_marker_or_none_is_a_foreign_claim() {
         view(&env, 103, &["bug"], &[]);
         let refs: Vec<&str> = comments.iter().map(String::as_str).collect();
         view(&env, 106, &["bug", LABEL], &refs);
+        once_103_is_taken_by(&env, 106, &ours());
         let out = run(&env, "take");
         assert_eq!(out.code, 3, "{comments:?}: {}", out.stderr);
         assert!(out.stderr.contains("claimed by someone else"), "{}", out.stderr);
@@ -217,6 +232,34 @@ fn a_label_with_someone_elses_marker_or_none_is_a_foreign_claim() {
             "nothing written on 106: {calls:?}"
         );
     }
+}
+
+/// 103 was taken, then 106 turned out to be someone else's. Before the
+/// rollback a stranger took 103's claim over (the label stayed, the marker is
+/// theirs): taking the label off would be taking theirs.
+#[test]
+fn a_rollback_leaves_an_earlier_claim_alone_when_it_is_no_longer_ours() {
+    for by in [theirs(), "I am on it".to_string()] {
+        let env = setup();
+        view(&env, 103, &["bug"], &[]);
+        view(&env, 106, &["bug", LABEL], &[]);
+        once_103_is_taken_by(&env, 106, &by);
+        let out = run(&env, "take");
+        assert_eq!(out.code, 3, "{}", out.stderr);
+        assert!(out.stderr.contains("left #103 alone"), "{}", out.stderr);
+        assert!(removals(&env).is_empty(), "{:?}", writes(&env));
+    }
+    // Control: while 103 is still ours it is released.
+    let env = setup();
+    view(&env, 103, &["bug"], &[]);
+    view(&env, 106, &["bug", LABEL], &[]);
+    once_103_is_taken_by(&env, 106, &ours());
+    let out = run(&env, "take");
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(
+        removals(&env),
+        [format!("issue edit 103 --repo {REPO} --remove-label {LABEL}")]
+    );
 }
 
 #[test]
@@ -401,6 +444,7 @@ fn a_read_error_is_exit_1_and_never_read_as_not_claimed() {
     for verb in ["take", "release", "check"] {
         let env = setup();
         view(&env, 103, &["bug"], &[]);
+        once_103_is_taken_by(&env, 106, &ours());
         // No answer for 106: gh exits 1 for it.
         let out = run(&env, verb);
         assert_eq!(out.code, 1, "{verb}: {}", out.stderr);

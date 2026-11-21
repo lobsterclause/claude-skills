@@ -23,6 +23,14 @@
 //! `merge-gate` refuses a unit whose list is not empty, and one without the
 //! field, so a unit planned without risk paths cannot merge unattended.
 //!
+//! Every diff is asked for in full: `--no-relative` and `--ignore-submodules=none`
+//! override a user's `diff.relative` and `diff.ignoreSubmodules`, either of
+//! which would leave a change out of the scope check.
+//!
+//! A unit with no file scope (`files: []`) has nothing to check the diff
+//! against: the check still passes, `deliver.json` says `scope_checked: false`,
+//! and `merge-gate` refuses it, so a person merges that unit.
+//!
 //! `deliver.json` records `merge_base`, the commit the diff started from.
 //! `merge-gate` refuses a report whose `merge_base` is not the PR's merge base
 //! with the live base branch, so run it without `--base` before a merge.
@@ -381,7 +389,17 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let range = format!("{base}...{head}");
     let numstat = git_out(
         dir,
-        &["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", &range, "--"],
+        &[
+            "diff",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-relative",
+            "--ignore-submodules=none",
+            &range,
+            "--",
+        ],
     )?;
     let patch = git_out(
         dir,
@@ -392,6 +410,8 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             "-U0",
             "--no-renames",
             "--no-ext-diff",
+            "--no-relative",
+            "--ignore-submodules=none",
             "--no-color",
             "--src-prefix=a/",
             "--dst-prefix=b/",

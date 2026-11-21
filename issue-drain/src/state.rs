@@ -437,6 +437,10 @@ pub struct ShowArgs {
 }
 
 pub fn run(ctx: &Ctx, command: &Command) -> Res<()> {
+    // references/unit.md tells a unit to run none of the state verbs: the
+    // driver records unit events itself, and a unit that wrote one could move
+    // its own unit along. So none is open to a unit.
+    ctx.require_driver("state")?;
     match command {
         Command::Init(args) => init(ctx, args),
         Command::Event(args) => event(ctx, args),

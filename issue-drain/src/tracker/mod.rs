@@ -20,7 +20,11 @@ pub enum Command {
 pub fn run(ctx: &Ctx, command: &Command) -> Res<()> {
     match command {
         Command::Render(args) => render::run(ctx, args),
-        Command::Publish(args) => io::publish(ctx, args),
+        Command::Publish(args) => {
+            // Before the label or the issue is made.
+            ctx.require_driver("tracker publish")?;
+            io::publish(ctx, args)
+        }
         Command::Parse(args) => io::parse(ctx, args),
     }
 }

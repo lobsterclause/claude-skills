@@ -18,7 +18,7 @@ struct Case {
     stamped: PathBuf,
 }
 
-const GOOD_LOG: &str = "host=firebird head={head} dirty=0\ncmd=pnpm verify\nshipped head={head} dirty=0\nsome verify output\nverify passed\nremote rc=0\nverify exit=0\n";
+const GOOD_LOG: &str = "host=firebird head={head} dirty=0\ncmd=pnpm verify\nshipped head={head} dirty=0 unshipped=0\nsome verify output\nverify passed\nremote rc=0\nverify exit=0\n";
 
 fn case_with(extra: &str) -> Case {
     let mut env = Env::new();
@@ -107,7 +107,9 @@ fn a_full_verify_that_passed_at_the_head_is_stamped() {
 #[test]
 fn the_exit_line_may_be_in_the_out_file_beside_the_log() {
     let c = case();
-    let log = c.log("host=firebird head={head} dirty=0\ncmd=pnpm verify\nshipped head={head} dirty=0\nverify output\n");
+    let log = c.log(
+        "host=firebird head={head} dirty=0\ncmd=pnpm verify\nshipped head={head} dirty=0 unshipped=0\nverify output\n",
+    );
     let out = c.stamp(&log, &c.head.clone());
     c.refused(&out, "verify exit");
     fs::write(c.env.dir.path().join("rv-x.out"), "verify exit=0\n").expect("the out file");
@@ -127,7 +129,7 @@ fn a_dirty_remote_tree_is_refused() {
 fn a_log_without_the_shipped_line_is_refused() {
     let c = case();
     let out = c.stamp(
-        &c.log(&GOOD_LOG.replacen("shipped head={head} dirty=0\n", "", 1)),
+        &c.log(&GOOD_LOG.replacen("shipped head={head} dirty=0 unshipped=0\n", "", 1)),
         &c.head.clone(),
     );
     c.refused(&out, "shipped");
@@ -144,18 +146,34 @@ fn a_shipped_line_for_another_head_or_a_dirty_copy_is_refused() {
     );
     c.refused(&out, "shipped at head");
     let out = c.stamp(
-        &c.log(&GOOD_LOG.replacen("shipped head={head} dirty=0", "shipped head={head} dirty=1", 1)),
+        &c.log(&GOOD_LOG.replacen(
+            "shipped head={head} dirty=0 unshipped=0",
+            "shipped head={head} dirty=1 unshipped=0",
+            1,
+        )),
         &c.head.clone(),
     );
     c.refused(&out, "dirty when it was shipped");
 }
 
 #[test]
+fn a_shipped_line_with_unshipped_submodules_or_without_the_field_is_refused() {
+    let c = case();
+    let out = c.stamp(
+        &c.log(&GOOD_LOG.replacen("unshipped=0", "unshipped=1", 1)),
+        &c.head.clone(),
+    );
+    c.refused(&out, "never reached the box");
+    let out = c.stamp(&c.log(&GOOD_LOG.replacen(" unshipped=0", "", 1)), &c.head.clone());
+    c.refused(&out, "malformed");
+}
+
+#[test]
 fn two_shipped_lines_or_an_indented_one_do_not_count() {
     let c = case();
     let twice = GOOD_LOG.replacen(
-        "shipped head={head} dirty=0\n",
-        "shipped head={head} dirty=0\nshipped head={head} dirty=0\n",
+        "shipped head={head} dirty=0 unshipped=0\n",
+        "shipped head={head} dirty=0 unshipped=0\nshipped head={head} dirty=0 unshipped=0\n",
         1,
     );
     let out = c.stamp(&c.log(&twice), &c.head.clone());
@@ -168,7 +186,8 @@ fn two_shipped_lines_or_an_indented_one_do_not_count() {
 #[test]
 fn the_shipped_line_may_come_after_other_output() {
     let c = case();
-    let moved = GOOD_LOG.replacen("shipped head={head} dirty=0\n", "", 1) + "shipped head={head} dirty=0\n";
+    let moved = GOOD_LOG.replacen("shipped head={head} dirty=0 unshipped=0\n", "", 1)
+        + "shipped head={head} dirty=0 unshipped=0\n";
     let out = c.stamp(&c.log(&moved), &c.head.clone());
     assert_eq!(out.code, 0, "{}", out.stderr);
 }

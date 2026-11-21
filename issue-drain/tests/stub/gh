@@ -38,6 +38,16 @@
 #                         without the file, []
 #   fail-rules            that call exits 1
 #   compare.json          answer to `gh api repos/<o>/<r>/compare/<b>...<sha>`
+#   compare-reviewed.json answer to a compare whose first side is not the base
+#                         branch (is the reviewed commit an ancestor of the head)
+#   check-runs.json       answer to `gh api repos/<o>/<r>/commits/<sha>/check-runs`
+#                         (one object, or several one after another); a missing
+#                         file fails the call
+#   merged-<n> and pr-view-<n>.after-merge.json: see above; `gh pr merge <n>
+#                         --disable-auto` writes disable-auto-<n>, and from then
+#                         on the view is pr-view-<n>.after-disable.json when it
+#                         exists
+#   fail-disable-auto     `gh pr merge --disable-auto` exits 1
 #   timeline-<n>.json     answer to `gh api repos/<o>/<r>/issues/<n>/timeline`
 #                         (what `--paginate` prints: one JSON array, or
 #                         several one after another); without the file, []
@@ -113,8 +123,14 @@ case "${1:-} ${2:-}" in
   "pr create")
     echo "https://github.com/example/tidepool/pull/${GH_STUB_NEW_PR:-901}" ;;
   "pr view")
-    if [ -e "$dir/merged-$3" ]; then answer "pr-view-$3.after-merge.json"; else answer "pr-view-$3.json"; fi ;;
+    if [ -e "$dir/disable-auto-$3" ] && [ -f "$dir/pr-view-$3.after-disable.json" ]; then answer "pr-view-$3.after-disable.json"
+    elif [ -e "$dir/merged-$3" ]; then answer "pr-view-$3.after-merge.json"; else answer "pr-view-$3.json"; fi ;;
   "pr merge")
+    case "$*" in
+      *--disable-auto*)
+        if [ -e "$dir/fail-disable-auto" ]; then echo "gh stub: disable-auto failed" >&2; exit 1; fi
+        : > "$dir/disable-auto-$3"; exit 0 ;;
+    esac
     if [ -e "$dir/fail-merge" ]; then echo "gh stub: merge failed" >&2; exit 1; fi
     : > "$dir/merged-$3" ;;
   "api repos/"*)
@@ -128,7 +144,9 @@ case "${1:-} ${2:-}" in
       */rules/branches/*)
         if [ -e "$dir/fail-rules" ]; then echo "gh stub: rules failed" >&2; exit 1; fi
         if [ -f "$dir/rules.json" ]; then cat "$dir/rules.json"; else echo "[]"; fi ;;
-      */compare/*) answer compare.json ;;
+      */compare/develop...*) answer compare.json ;;
+      */compare/*) answer compare-reviewed.json ;;
+      */commits/*/check-runs*) answer check-runs.json ;;
       */issues/*/timeline*)
         if [ -e "$dir/fail-timeline" ]; then echo "gh stub: timeline failed" >&2; exit 1; fi
         t="${2#*/issues/}"

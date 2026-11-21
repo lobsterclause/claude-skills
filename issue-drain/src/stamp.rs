@@ -11,8 +11,12 @@
 //!     `pr-drain/scripts/remote-verify.sh` writes first), with `<sha>` equal to
 //!     `--head` and `dirty=0`;
 //!   - the log has exactly one line, anywhere in it and anchored at the start of
-//!     the line, `shipped head=<sha> dirty=<n>` (written after the working copy
-//!     was streamed to the box), with `<sha>` equal to `--head` and `dirty=0`;
+//!     the line, `shipped head=<sha> dirty=<n> unshipped=<n>` (written after
+//!     the working copy was streamed to the box), with `<sha>` equal to
+//!     `--head`, `dirty=0` and `unshipped=0` (`unshipped` counts tracked
+//!     submodules whose contents were not shipped, such as one never
+//!     initialised: `git status` is clean for it, yet the box never saw its
+//!     files; a line without the field is refused too);
 //!     a log without it is refused. The first line is read before the stream,
 //!     so an edit made while the stream ran and reverted before this command
 //!     would otherwise be verified remotely and stamped for the clean tree;
@@ -94,14 +98,25 @@ pub fn judge_log(log: &str, out_file: Option<&str>, head: &str, full_command: &s
     let shipped: Vec<&str> = log.lines().filter(|l| l.starts_with("shipped head=")).collect();
     match shipped.as_slice() {
         [] => failed.push(
-            "the log has no `shipped head=<sha> dirty=<n>` line, so it does not show the tree that was streamed to the box (run a current remote-verify.sh)"
+            "the log has no `shipped head=<sha> dirty=<n> unshipped=<n>` line, so it does not show the tree that was streamed to the box (run a current remote-verify.sh)"
                 .to_string(),
         ),
         [line] => {
             let mut words = line.split_whitespace();
             let field = |word: Option<&str>, key: &str| word.and_then(|w| w.strip_prefix(key)).map(str::to_string);
-            match (words.next(), field(words.next(), "head="), field(words.next(), "dirty="), words.next()) {
-                (Some("shipped"), Some(logged), Some(dirty), None) => {
+            match (
+                words.next(),
+                field(words.next(), "head="),
+                field(words.next(), "dirty="),
+                field(words.next(), "unshipped="),
+                words.next(),
+            ) {
+                (Some("shipped"), Some(logged), Some(dirty), Some(unshipped), None) => {
+                    if unshipped != "0" {
+                        failed.push(format!(
+                            "{unshipped} submodule(s) never reached the box (unshipped={unshipped}): their contents were not part of the verified tree"
+                        ));
+                    }
                     if !logged.eq_ignore_ascii_case(head) {
                         failed.push(format!("the tree was shipped at head {logged}, not {head}"));
                     }
@@ -258,31 +273,32 @@ mod tests {
 
     fn good() -> String {
         format!(
-            "host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nshipped head={HEAD} dirty=0\nverify passed\nremote rc=0\n"
+            "host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nshipped head={HEAD} dirty=0 unshipped=0\nverify passed\nremote rc=0\n"
         )
     }
 
     #[test]
     fn a_good_log_has_no_failed_condition() {
         assert_eq!(judge_log(&good(), None, HEAD, "pnpm verify"), Vec::<String>::new());
-        let no_exit = format!("host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nshipped head={HEAD} dirty=0\n");
+        let no_exit =
+            format!("host=firebird head={HEAD} dirty=0\ncmd=pnpm verify\nshipped head={HEAD} dirty=0 unshipped=0\n");
         assert!(judge_log(&no_exit, Some("verify exit=0\n"), HEAD, "pnpm verify").is_empty());
     }
 
     #[test]
     fn the_shipped_line_is_required_exactly_once_for_the_head_and_clean() {
-        let line = format!("shipped head={HEAD} dirty=0\n");
+        let line = format!("shipped head={HEAD} dirty=0 unshipped=0\n");
         let none = good().replace(&line, "");
         let failed = judge_log(&none, None, HEAD, "pnpm verify");
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(failed[0].contains("shipped"));
         let twice = good().replace(&line, &format!("{line}{line}"));
         assert!(judge_log(&twice, None, HEAD, "pnpm verify")[0].contains("not exactly one"));
-        let dirty = good().replace(&line, &format!("shipped head={HEAD} dirty=1\n"));
+        let dirty = good().replace(&line, &format!("shipped head={HEAD} dirty=1 unshipped=0\n"));
         assert!(judge_log(&dirty, None, HEAD, "pnpm verify")[0].contains("dirty"));
-        let other = good().replace(&line, &format!("shipped head={} dirty=0\n", "f".repeat(40)));
+        let other = good().replace(&line, &format!("shipped head={} dirty=0 unshipped=0\n", "f".repeat(40)));
         assert!(judge_log(&other, None, HEAD, "pnpm verify")[0].contains("not 0123"));
-        let junk = good().replace(&line, &format!("shipped head={HEAD} dirty=0 extra=1\n"));
+        let junk = good().replace(&line, &format!("shipped head={HEAD} dirty=0 unshipped=0 extra=1\n"));
         assert!(judge_log(&junk, None, HEAD, "pnpm verify")[0].contains("malformed"));
         // Anchored at the start of the line: an indented copy is no line.
         let indented = good().replace(&line, &format!(" {line}"));
@@ -290,9 +306,25 @@ mod tests {
     }
 
     #[test]
+    fn a_submodule_that_never_reached_the_box_or_a_missing_field_is_refused() {
+        let line = format!("shipped head={HEAD} dirty=0 unshipped=0\n");
+        let some = good().replace(&line, &format!("shipped head={HEAD} dirty=0 unshipped=2\n"));
+        let failed = judge_log(&some, None, HEAD, "pnpm verify");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains("never reached the box"), "{failed:?}");
+        let old_script = good().replace(&line, &format!("shipped head={HEAD} dirty=0\n"));
+        let failed = judge_log(&old_script, None, HEAD, "pnpm verify");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains("malformed"), "{failed:?}");
+        let junk = good().replace(&line, &format!("shipped head={HEAD} dirty=0 unshipped=x\n"));
+        assert!(judge_log(&junk, None, HEAD, "pnpm verify")[0].contains("never reached the box"));
+    }
+
+    #[test]
     fn the_cmd_line_must_be_near_the_top() {
-        let late =
-            format!("host=f head={HEAD} dirty=0\nshipped head={HEAD} dirty=0\nb\nc\nd\ncmd=pnpm verify\nremote rc=0\n");
+        let late = format!(
+            "host=f head={HEAD} dirty=0\nshipped head={HEAD} dirty=0 unshipped=0\nb\nc\nd\ncmd=pnpm verify\nremote rc=0\n"
+        );
         let failed = judge_log(&late, None, HEAD, "pnpm verify");
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(failed[0].contains("cmd="));
@@ -306,7 +338,7 @@ mod tests {
             format!("host=f head={HEAD} dirty=0 extra=1"),
             String::new(),
         ] {
-            let log = format!("{header}\ncmd=pnpm verify\nshipped head={HEAD} dirty=0\nremote rc=0\n");
+            let log = format!("{header}\ncmd=pnpm verify\nshipped head={HEAD} dirty=0 unshipped=0\nremote rc=0\n");
             let failed = judge_log(&log, None, HEAD, "pnpm verify");
             assert!(
                 failed.iter().any(|f| f.contains("no head recorded")),

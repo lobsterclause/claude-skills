@@ -130,6 +130,21 @@ const denied: [name: string, command: string][] = [
   ['stash pop', 'git stash pop'],
   ['stash drop', 'git stash drop'],
   ['stash clear', 'git stash clear'],
+  ['REST write with graphql in a field', 'gh api -X POST repos/o/r/issues/1/comments -f body="fix graphql query"'],
+  ['REST delete of a graphql label', 'gh api -X DELETE repos/o/r/issues/1/labels/graphql'],
+  ['graphql --input', 'gh api graphql --input m.json'],
+  ['graphql query from file', 'gh api graphql -F query=@m.graphql'],
+  ['graphql attached file field', 'gh api graphql -Fquery=@m.graphql'],
+  ['graphql --field= file', 'gh api graphql --field=query=@m.graphql'],
+  ['graphql with PUT', 'gh api -X PUT graphql -f query=x'],
+  ['/graphql mutation', "gh api /graphql -f query='mutation { x }'"],
+  ['--git-dir separate', 'git --git-dir /elsewhere/.git push -f origin main'],
+  ['--git-dir=', 'git --git-dir=/elsewhere/.git status'],
+  ['--work-tree separate', 'git --work-tree /elsewhere push origin main'],
+  ['--work-tree=', 'git --work-tree=/elsewhere status'],
+  ['--namespace value hides force push', 'git --namespace ns push -f origin main'],
+  ['--super-prefix value hides rebase', 'git --super-prefix p rebase origin/develop'],
+  ['--config-env value hides rebase', 'git --config-env k=V rebase origin/develop'],
 ]
 
 for (const [name, command] of denied) {
@@ -170,6 +185,8 @@ const allowed: [name: string, command: string][] = [
   ['graphql read', 'gh api graphql -f query=\'query($n:Int!){repository(owner:"o",name:"r"){pullRequest(number:$n){reviewThreads(first:100){nodes{id isResolved}}}}}\' -F n=1'],
   ['gh-write pr-create', 'issue-drain gh-write pr-create --head fix/issue-3 --base develop --title t --body-file /tmp/b.md'],
   ['gh-write thread-resolve', 'issue-drain gh-write thread-resolve --thread PRRT_abc'],
+  ['api GET with graphql in a path', 'gh api repos/o/r/contents/graphql'],
+  ['git --namespace then status', 'git --namespace ns status'],
   ['status and diff', 'git status && git diff > /tmp/x.diff'],
   ['commit', 'git commit -m "fix thing"'],
 ]

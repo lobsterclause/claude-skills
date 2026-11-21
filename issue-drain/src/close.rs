@@ -370,6 +370,8 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
+    // Before anything is posted: a closure is the driver's, not a unit's.
+    ctx.require_driver("close-verified")?;
     let repo = ctx.repo()?;
     let repo_dir = ctx.repo_dir()?;
     let run = ctx.run_id()?;

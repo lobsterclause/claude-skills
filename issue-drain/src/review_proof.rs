@@ -69,7 +69,11 @@ fn reviewer_of(file: &str) -> Option<&str> {
 /// Whether `stdout` is output for the reviewer `name`: not blank, and for the
 /// codex baseline at least `CODEX_MIN_BYTES` non-blank bytes.
 fn has_output(name: &str, stdout: &[u8]) -> bool {
-    let floor = if name == "codex" { CODEX_MIN_BYTES } else { 1 };
+    let floor = if name.eq_ignore_ascii_case("codex") {
+        CODEX_MIN_BYTES
+    } else {
+        1
+    };
     stdout.iter().filter(|b| !b.is_ascii_whitespace()).count() >= floor
 }
 
@@ -222,6 +226,16 @@ mod tests {
         assert_eq!(reviewer_of("codex.attempt2.stdout"), None);
         assert_eq!(reviewer_of("gemini.primary-failed.meta.json"), None);
         assert_eq!(reviewer_of("gemini.attempt1.meta.json"), None);
+    }
+
+    #[test]
+    fn codex_is_codex_whatever_the_case_of_its_file_name() {
+        // merge-gate matches the name with eq_ignore_ascii_case, so the floor does too.
+        for name in ["codex", "Codex", "CODEX"] {
+            assert!(!has_output(name, b"{\"findings\":[]}"), "{name}");
+            assert!(has_output(name, "x".repeat(CODEX_MIN_BYTES).as_bytes()), "{name}");
+        }
+        assert!(has_output("kimi", b"{\"findings\":[]}"));
     }
 
     #[test]
