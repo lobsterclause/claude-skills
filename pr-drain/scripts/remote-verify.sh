@@ -15,6 +15,8 @@
 #
 # Exit status is the remote verify's exit code (same N as the .out file), 93
 # if the log could not be opened, or 94 if the .out file could not be written.
+# (A verify that itself exits 93 or 94 reads the same; the log tells them
+# apart.)
 # Before #204 the script always exited 0, so a background caller saw success
 # on a failed verify.
 #
@@ -81,35 +83,62 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   cd "$WT" || finish 97
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || finish 98
-  # Untracked-not-ignored paths, NUL-separated, in the superproject and in
-  # every initialized submodule (prefixed with its path); git can't list
-  # --others across submodules itself. Any git failure fails the function.
-  untracked() {
-    /usr/bin/git ls-files -z --others --exclude-standard || return 1
-    # shellcheck disable=SC2016  # perl expands $ENV{displaypath}, not this shell
-    /usr/bin/git submodule foreach --quiet --recursive \
-      'perl -e '"'"'open(my $g, "-|", qw(git ls-files -z --others --exclude-standard)) or die; local $/ = "\0"; print "$ENV{displaypath}/$_" while <$g>; close($g) or exit 1'"'"'' || return 1
+  # list_tree <dir> <prefix> <cached|others>: NUL-separated paths under <dir>,
+  # each with <prefix> in front. It walks into every gitlink that has a
+  # checkout itself, whatever git's submodule.active says, because
+  # --recurse-submodules and `submodule foreach` both skip inactive ones.
+  # `others` lists untracked-not-ignored paths; a nested repository that
+  # isn't a submodule shows up as "dir/" and is passed through as such.
+  # Any git failure returns 1.
+  list_tree() {
+    local dir=$1 pre=$2 kind=$3 ent mode path idx rc=0
+    if [ "$kind" = others ]; then
+      /usr/bin/git -C "$dir" ls-files -z --others --exclude-standard \
+        | while IFS= read -r -d '' path; do printf '%s%s\0' "$pre" "$path"; done
+      [ "${PIPESTATUS[0]}" = 0 ] || return 1
+    fi
+    idx=$(mktemp) || return 1
+    /usr/bin/git -C "$dir" ls-files -z -s > "$idx" || { rm -f "$idx"; return 1; }
+    while IFS= read -r -d '' ent; do
+      mode=${ent%% *}; path=${ent#*$'\t'}
+      if [ "$mode" = 160000 ]; then
+        [ -e "$dir/$path/.git" ] || continue
+        list_tree "$dir/$path" "$pre$path/" "$kind" || { rc=1; break; }
+      elif [ "$kind" = cached ]; then
+        printf '%s%s\0' "$pre" "$path"
+      fi
+    done < "$idx"
+    rm -f "$idx"
+    return "$rc"
   }
   INCL=0
   if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then INCL=1
   else
-    UNTR=$(set -o pipefail; untracked | tr '\0' '\n') || { echo "listing untracked files failed"; finish 99; }
-    [ -n "$UNTR" ] && { echo "WARN: not shipping $(printf '%s\n' "$UNTR" | wc -l | tr -d ' ') untracked file(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"; printf '%s\n' "$UNTR" | sed 's/^/  /'; }
+    UNTR=$(mktemp) || finish 99
+    list_tree . "" others > "$UNTR" || { rm -f "$UNTR"; echo "listing untracked files failed"; finish 99; }
+    n=$(tr -cd '\0' < "$UNTR" | wc -c | tr -d ' ')
+    if [ "$n" != 0 ]; then
+      echo "WARN: not shipping $n untracked path(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"
+      while IFS= read -r -d '' f; do printf '  %q\n' "$f"; done < "$UNTR"
+    fi
+    rm -f "$UNTR"
   fi
   # Ship git's file list as it stands in the working copy, and nothing else.
-  # --recurse-submodules lists the tracked files inside initialized
-  # submodules, so tar never recurses (--no-recursion): a submodule's
-  # untracked files stay home, and so does a directory that replaced a
-  # tracked file. Tracked files deleted locally are skipped (the box sees
-  # what you see). RV_INCLUDE_UNTRACKED=1 adds the untracked files, submodules'
-  # included. A failed listing exits the producer non-zero. pipefail: a local
-  # git or tar failure is not masked by ssh's status.
+  # tar never recurses (--no-recursion), so a submodule's untracked files
+  # stay home, and so does a directory that replaced a tracked file.
+  # Tracked files deleted locally are skipped (the box sees what you see);
+  # any other path that isn't a file or symlink is named in the log.
+  # RV_INCLUDE_UNTRACKED=1 adds the untracked files, submodules' included;
+  # a nested repository that isn't a submodule is named, not shipped.
+  # pipefail: a local git or tar failure is not masked by ssh's status.
   ( set -o pipefail
-    { /usr/bin/git ls-files -z --cached --recurse-submodules || exit 1
-      if [ "$INCL" = 1 ]; then untracked || exit 1; fi
+    { list_tree . "" cached || exit 1
+      if [ "$INCL" = 1 ]; then list_tree . "" others || exit 1; fi
     } \
       | while IFS= read -r -d '' f; do
-          if [ -L "$f" ] || [ -f "$f" ]; then printf '%s\0' "$f"; fi
+          if [ -L "$f" ] || [ -f "$f" ]; then printf '%s\0' "$f"
+          elif [ -e "$f" ]; then printf 'note: not shipping %q (not a file or symlink)\n' "$f" >&2
+          fi
         done \
       | COPYFILE_DISABLE=1 tar --null --no-recursion -T - -czf - \
       | "${SSH[@]}" "tar -xzf - -C $D/w"

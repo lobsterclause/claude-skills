@@ -19,6 +19,7 @@
 # Pass-6: a submodule's untracked file (red against 4b38fbc).
 # Pass-7: submodule WARN/opt-in, git listing failure, relative RV_OUT_DIR
 # (red against 5807820).
+# Pass-8: inactive submodule, nested repository note (red against fdfd5b1).
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -52,7 +53,10 @@ case "$cmd" in
   *"tar -xzf -"*) mkdir -p "$SHIP" && "$REAL_TAR" -xzf - -C "$SHIP" ;;
   *"git init -q"*) exit "$FAKE_RC" ;;
   *"mkdir -p $"*|*"mkdir -p /"*) [ -n "${FAKE_SETUP_FAIL:-}" ] && exit 1; exit 0 ;;
-  *) exit 0 ;;
+  *"rm -rf /b/"*) exit 0 ;;
+  *"docker build -q"*|*"tok.env"*) cat >/dev/null; exit 0 ;;
+  # Anything else is a remote command the tests don't know: fail loudly.
+  *) echo "fake-ssh: unexpected command: $cmd" >&2; exit 60 ;;
 esac
 FAKE
 chmod +x "$FSSH"
@@ -68,7 +72,7 @@ run 1 "$T/ship1"; check "exit code = 1 on failed verify" 1 $?
 check ".out records the failure" "verify exit=1" "$(cat "$T/out/rv-probe.out")"
 check "untracked file not shipped" 1 "$(exists "$T/ship1/pkg/.vitest/json/output.json")"
 check "tracked file shipped" 0 "$(exists "$T/ship1/a.txt")"
-grep -q "WARN: not shipping 1 untracked file" "$T/out/rverify-probe.log"; check "log WARNs about the untracked file" 0 $?
+grep -q "WARN: not shipping 1 untracked path" "$T/out/rverify-probe.log"; check "log WARNs about the untracked file" 0 $?
 
 # Passing control: a script that always failed would pass the checks above.
 run 0 "$T/ship2"; check "exit code = 0 on passed verify" 0 $?
@@ -141,6 +145,20 @@ mkdir -p "$T/cwd/rel"
 (cd "$T/cwd" && OUTDIR=rel run 0 "$T/ship17" >/dev/null); check "relative RV_OUT_DIR run exits 0" 0 $?
 check "relative RV_OUT_DIR .out under the caller's cwd" "verify exit=0" "$(cat "$T/cwd/rel/rv-probe.out" 2>/dev/null)"
 check "relative RV_OUT_DIR log under the caller's cwd" 0 "$(exists "$T/cwd/rel/rverify-probe.log")"
+
+# Pass-8: a checked-out submodule marked inactive is still shipped (git's
+# --recurse-submodules skips it; red against fdfd5b1).
+git -C "$R2" config submodule.vendor.active false
+REPO="$R2" run 0 "$T/ship18" >/dev/null
+check "inactive submodule contents shipped" 0 "$(exists "$T/ship18/vendor/s.txt")"
+git -C "$R2" config --unset submodule.vendor.active
+
+# Pass-8: a nested repository that isn't a submodule is named in the log
+# when the opt-in can't ship it.
+mkdir -p "$R2/local-repo"; git -C "$R2/local-repo" init -q; echo n > "$R2/local-repo/n.txt"
+REPO="$R2" OUTDIR="$T/out19" run 0 "$T/ship19" RV_INCLUDE_UNTRACKED=1 >/dev/null
+grep -q "not shipping local-repo/" "$T/out19/rverify-probe.log"; check "nested repository named in the log" 0 $?
+rm -rf "$R2/local-repo"
 
 # A local tar failure is 99, not masked by ssh's 0. A tar stub that writes a
 # good stream and then exits 2 keeps this independent of file permissions.
