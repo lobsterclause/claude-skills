@@ -67,7 +67,7 @@ Read `references/triage.md` before the first step; it has each command, the `dec
 
 1. `intake`: fetch the issues, leave out the ineligible, record why.
 2. Readers: batches of five, two `issue-triage-reader` agents at a time, `haiku` at `low` effort, brief from `references/briefs.md`. Save each result to `verdicts/`.
-3. `evidence-check verdicts/*.json`: hold every quote against the base branch.
+3. `evidence-check "$ISSUE_DRAIN_WORKDIR"/verdicts/*.json`: hold every quote against the base branch.
 4. Re-read each closable `already_fixed` yourself. Do this one inline; do not hand it to a subagent.
 5. `overlap`: read the proposed pairs and groups, and decide the units.
 6. Write `decisions.json`, then `tracker render` until it exits 0.
@@ -81,10 +81,12 @@ Lead with the tracker link. Then, briefly: how many issues were taken in and how
 
 ## After the user approves
 
-1. `tracker parse` shows what the body says now. If `unknown` is not empty, show the user those lines and stop: nothing runs while the tracker has a ticked line the run never offered.
+1. `tracker parse` shows what the body says now. Go on only when `tracker_state` is `OPEN`, `stop` is `false` and `unknown` is empty (`tracker_state` is `null` only when a dry run parsed a file). A closed tracker or a `STOP` line means the user called the run off: write nothing, release no claim, and say so. If `unknown` is not empty, show the user those lines and stop: nothing runs while the tracker has a ticked line the run never offered.
 2. `close-verified` closes the ticked closures.
-3. `gh-write remove-label <number> <claim label>` for each claim the user ticked for release.
+3. For each claim the user ticked for release, check the issue again (`references/triage.md`, "After the user says go"), then `gh-write remove-label <number> <claim label>`.
 4. Tell the user what the queue holds and that the units wait for the unit runner.
+
+`gh-write` has no verb that closes an issue. `close-verified` is the only way this skill closes one.
 
 ### What `close-verified` requires
 
@@ -95,7 +97,9 @@ An issue is closed only when all of this is true at the moment of closing:
 - the evidence check, run again on the base branch as it is now, still says `already_fixed` and closable, and names the same fixing commit the tracker showed
 - the issue is open and carries no hold label and no claim label
 
-It posts the comment first, then closes, then reads the issue back. Run again after an interruption, it finishes the job without posting the comment twice. It never takes the tracker body from a file outside a dry run, so the tick it acts on is one a person made on GitHub.
+It posts the comment first, then closes, then reads the issue back. Run again after an interruption, it finishes the job without posting the comment twice.
+
+Outside a dry run it takes no `--body-file`, `--ref` or `--no-fetch`: the tick it acts on is one a person made on GitHub, and the code it checks is the base branch it has just fetched. For that, `ISSUE_DRAIN_REPO_DIR` must be a checkout whose `origin` is the repo being drained. Those three options exist for dry runs and tests.
 
 Its lines: `closed #N (fixed by <sha>)`, `skipped #N: already closed`, `refused #N: <why>`. A refusal is the tool working. Report it; do not try another way to close the issue.
 
@@ -123,6 +127,7 @@ Every subcommand uses the same four, and prints one line saying why on anything 
 | `decisions.json` | you | units, confirmed closures, issues left out |
 | `queue.json`, `tracker.md` | `tracker render` | the queue as data and as the tracker body |
 | `tracker.json` | `tracker publish` | the tracker's number and URL |
+| `publish.lock` | `tracker publish` | present only while a publish runs |
 | `closures/<n>.md` | `close-verified` | each closing comment |
 | `events.jsonl` | every command | one line per thing that happened; the record of the run |
 

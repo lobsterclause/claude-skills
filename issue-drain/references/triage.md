@@ -14,6 +14,10 @@ $ID intake --search '<query>'     # or a GitHub search
 
 Writes `issues/<n>.json`, `issues/<n>.md` and `intake.json`, and prints a one-line summary. An issue is left out, with the reason recorded under `skipped`, when it is closed, carries a hold label or the claim label, has an open PR, belongs to another repo by the profile's classifier, or falls over the cap. Report the skipped ones to the user with their reasons; issues with an open PR belong to `pr-drain`.
 
+An issue is also skipped when GitHub returned only part of it: more labels, linked PRs or timeline events than one page holds. The reason names what was cut. Intake does not judge an issue it could not read whole, so a person looks at those.
+
+`--label` and `--search` list up to three times the cap, because held and claimed issues do not count against it, and intake stops reading once the cap is full.
+
 `stale_claims` lists issues whose claim label is older than the profile allows and which have no open PR. They are not taken in. They appear on the tracker for the user to tick for release.
 
 If intake takes in nothing, say so and stop.
@@ -31,8 +35,10 @@ Readers read the base checkout, so it must be at the base branch's tip (SKILL.md
 ## 3. Check the evidence
 
 ```
-$ID evidence-check verdicts/*.json
+$ID evidence-check "$ISSUE_DRAIN_WORKDIR"/verdicts/*.json
 ```
+
+Name the run folder: a bare `verdicts/*.json` is read from wherever the shell happens to be.
 
 Writes `verdicts.checked.json` and prints what it downgraded and why. This step is not optional and its output replaces the readers' verdicts everywhere after it. It:
 
@@ -41,6 +47,7 @@ Writes `verdicts.checked.json` and prints what it downgraded and why. This step 
 - sets `closable` on an `already_fixed` verdict only when the bug is not behavioural
 - turns a fix on a protected path into `needs_human`, and marks `risk` on a risk path
 - gives an eligible issue with no verdict an `unclear` one, and drops a verdict for an issue this run did not take in
+- makes a verdict `unclear` when one of its `likely_files` is not a path inside the repo (absolute, starting with `-`, or with an empty, `.` or `..` part), and does not keep that path
 
 Do not edit `verdicts.checked.json` by hand. If you think a downgrade is wrong, read the code; if the reader misquoted a line that is there, fix the quote in the `verdicts/` file and run the check again.
 
@@ -115,7 +122,7 @@ For each unit:
 - `est_minutes`: implementation through review, not counting CI. Above about 90, split the unit.
 - `test_command`: the targeted test run that proves the acceptance checks, as the repo runs tests. One line.
 - `waits_for`: required on a risk-path unit. Name the role or person who reviews its PR.
-- Optional overrides: `files`, `size`, `kind`, and `acceptance` (an object keyed by issue number) when the reader's check is vague. Every issue needs an acceptance check that fails before the fix and passes after it.
+- Optional overrides: `files`, `size`, `kind`, and `acceptance` (an object keyed by issue number) when the reader's check is vague. Every issue needs an acceptance check that fails before the fix and passes after it. `files` are repo-relative paths, and a risk path among them makes the unit a risk unit even when no verdict named one.
 
 `left_out` is for a `live` or `duplicate_of` issue you are deliberately not queueing, with the reason.
 
@@ -125,7 +132,7 @@ Then:
 $ID tracker render
 ```
 
-It writes `queue.json` and `tracker.md`, or prints every rule the decisions break and writes nothing (exit 3). The rules: every live issue is in exactly one unit or in `left_out` with a reason; a unit holds only live issues and duplicates of its own members; the caps; the risk and protected path rules; a title, an allowed model and effort, a positive estimate and a one-line test command per unit; a closure must be `already_fixed` and closable. Fix `decisions.json` and render again until it exits 0.
+It writes `queue.json` and `tracker.md`, or prints every rule the decisions break and writes nothing (exit 3). The rules: every live issue is in exactly one unit or in `left_out` with a reason; a unit holds only live issues and duplicates of its own members; the caps; the risk and protected path rules; a title, an allowed model and effort, a whole positive number of minutes and a one-line test command per unit; `kind`, `test_command` and `waits_for` are strings; a unit has at least one live issue (duplicates of each other alone are nothing to fix); a closure must be `already_fixed` and closable. Fix `decisions.json` and render again until it exits 0.
 
 The renderer orders the queue: priority label, then smaller units first, with units that share a file back to back. It decides which sections each issue lands in. Do not edit `tracker.md`.
 
@@ -139,6 +146,12 @@ $ID tracker publish
 
 It creates the tracker issue with the profile's tracker label, records it in `tracker.json`, and prints the URL. A run publishes once; a second call is refused. In a dry run it prints the call it would make and creates nothing, and `tracker.md` is the deliverable.
 
+Before it creates anything it lists your own open issues with the tracker label. If one already carries this run's marker line (a publish that was cut off after GitHub created the issue), it records that issue and creates no second one. If the list cannot be read, it exits 1 and creates nothing.
+
+`publish.lock` in the run folder exists while a publish runs. A publish that finds it is refused. If no publish is running (the process was killed), remove the file and run it again.
+
+`tracker publish` and `tracker parse` refuse a `queue.json` rendered for a repo other than `ISSUE_DRAIN_REPO` (exit 2).
+
 Give the user the link and a short summary: how many units, how many closures offered, what needs a person, what was skipped at intake. Then stop. This is the one pause. The user edits the tracker body: deletes or reorders queue lines, ticks closures, ticks risk units, ticks claims to release, or writes `STOP`.
 
 ## After the user says go
@@ -148,11 +161,20 @@ $ID tracker parse          # what the body says now
 $ID close-verified         # close every ticked closure
 ```
 
-`tracker parse` prints JSON: the units still on the queue in the user's order, `approved_closures`, `release_claims`, `stop`, the tracker's state, and `unknown` (ticked lines the run never offered). Anything in `unknown` means the body was edited in a way the drain does not understand: show it to the user and do nothing else until it is gone.
+`tracker parse` prints JSON: the units still on the queue in the user's order, `approved_closures`, `release_claims`, `stop`, the tracker's state (`tracker_state`), and `unknown` (ticked lines the run never offered). Anything in `unknown` means the body was edited in a way the drain does not understand: show it to the user and do nothing else until it is gone.
+
+If `stop` is `true` or `tracker_state` is not `OPEN`, the user called the run off. Close nothing and release no claim.
 
 `close-verified` re-checks each ticked closure against the base branch as it is now, then comments and closes. Its conditions and exit codes are in SKILL.md. Report each line it prints. A refused closure is not an error to work around: tell the user which issue and why.
 
-For each number in `release_claims`, remove the claim label and nothing else:
+For each number in `release_claims`, look at the issue as it is now before touching it. The claim was stale when the tracker was rendered, and the user may have ticked it days later:
+
+```
+gh issue view <number> --repo <owner>/<repo> --json state,labels,closedByPullRequestsReferences
+gh pr list --repo <owner>/<repo> --state open --search "<number> in:title,body" --json number,title
+```
+
+Release it only when the issue is open, still carries the claim label and has no open PR. If someone picked it up again, leave the label and tell the user. Then remove the claim label and nothing else:
 
 ```
 $ID gh-write remove-label <number> <claim label>

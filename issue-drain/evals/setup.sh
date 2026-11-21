@@ -20,9 +20,8 @@ export ISSUE_DRAIN_REPO_DIR="$dir/repo"
 export ISSUE_DRAIN_PROFILE="$here/fixtures/tidepool.toml"
 "$here/../bin/issue-drain" intake --from-file "$here/fixtures/issues.json" >/dev/null
 
-cat <<EOF
-export ISSUE_DRAIN_WORKDIR="$dir/run"
-export ISSUE_DRAIN_REPO="example/tidepool"
-export ISSUE_DRAIN_REPO_DIR="$dir/repo"
-export ISSUE_DRAIN_PROFILE="$here/fixtures/tidepool.toml"
-EOF
+# %q, so a path with a space, a quote or a "$" survives being sourced.
+printf 'export ISSUE_DRAIN_WORKDIR=%q\n' "$dir/run"
+printf 'export ISSUE_DRAIN_REPO=%q\n' "example/tidepool"
+printf 'export ISSUE_DRAIN_REPO_DIR=%q\n' "$dir/repo"
+printf 'export ISSUE_DRAIN_PROFILE=%q\n' "$here/fixtures/tidepool.toml"

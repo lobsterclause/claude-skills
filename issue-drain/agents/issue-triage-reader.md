@@ -34,8 +34,8 @@ Return these fields, all of them, for every issue in the batch:
 | `likely_files` | repo-relative paths a fix would change |
 | `symbols` | the functions, types or components involved |
 | `reuse` | a list of `{ "file", "line", "quote" }`: code already in the repo that the fix should call, or `[]` |
-| `change_kind` | `bugfix`, `feature`, `refactor`, `docs`, `test` or `chore` |
-| `pattern` | when the same mechanical change is needed at several sites, a short name for it; else `""` |
+| `change_kind` | `bugfix`, `feature`, `refactor`, `docs`, `test`, `chore`, or `mechanical` for the same small edit repeated at several sites |
+| `pattern` | when `change_kind` is `mechanical`, a short name for the edit, the same for every issue that needs it; else `""` |
 | `size` | `S` (under about 50 changed lines), `M` (up to about 200) or `L` |
 | `behavioural` | `true` when only running the app can show whether the bug is there (layout, focus, timing, anything on screen); `false` when reading the code settles it |
 | `task` | for a `live` or `duplicate_of` issue, one or two sentences an implementer can act on without the issue body; else `""` |

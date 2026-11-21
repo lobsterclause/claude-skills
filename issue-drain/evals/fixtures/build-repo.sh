@@ -1,7 +1,7 @@
 #!/bin/bash
 # build-repo.sh <dest> — build the small git repo the triage evals and the
-# script tests read. Dates are fixed, so `git blame` gives the same answer on
-# every machine.
+# script tests read. Dates, identities and the hash are fixed, so the commit
+# ids and `git blame` are the same on every machine.
 #
 # History (the fixture issues are all "opened" on 2026-10-01):
 #   2026-09-01  init                      everything below, with its bugs
@@ -13,9 +13,11 @@ dest="${1:?usage: build-repo.sh <dest>}"
 [ ! -e "$dest/.git" ] || { echo "build-repo.sh: $dest is already a repo" >&2; exit 2; }
 mkdir -p "$dest"
 cd "$dest"
-git init -q -b develop
-git config user.name "Fixture"
-git config user.email "fixture@example.invalid"
+# The environment outranks git config, so the identity is set there: a
+# GIT_AUTHOR_NAME in the caller's shell would otherwise change every commit id.
+export GIT_AUTHOR_NAME="Fixture" GIT_AUTHOR_EMAIL="fixture@example.invalid"
+export GIT_COMMITTER_NAME="Fixture" GIT_COMMITTER_EMAIL="fixture@example.invalid"
+git init -q -b develop --object-format=sha1
 git config commit.gpgsign false
 
 commit() { # commit <iso date> <message>
