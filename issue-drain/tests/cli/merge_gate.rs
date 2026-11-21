@@ -1088,6 +1088,16 @@ fn an_older_record_by_someone_who_is_not_trusted_is_refused_by_name() {
         let out = env.run(&ARGS);
         assert_eq!(out.code, 0, "{verdict}: {}", out.stderr);
     }
+    // Two verdict fields: the script reads the last one (CLEAN) and may count
+    // the record, so the first one (BLOCKED) earns no exemption.
+    let env = ready();
+    let both = record(BASE_TIP, "BLOCKED").replace("verdict=BLOCKED", "verdict=BLOCKED verdict=CLEAN");
+    assert!(both.contains("verdict=BLOCKED verdict=CLEAN"), "{both}");
+    comments(&env, &[comment(&both, "NONE"), real]);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["review_author"]);
+    assert!(merged_calls(&env).is_empty());
 }
 
 #[test]

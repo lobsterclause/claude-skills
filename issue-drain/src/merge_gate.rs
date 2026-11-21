@@ -1361,10 +1361,16 @@ fn stamp_of(body: &str) -> Option<(String, String)> {
     if !body.starts_with("## Cross-review") {
         return None;
     }
-    let marker = Regex::new(r"<!-- cross-review: sha=([0-9a-f]{40})[^>]*-->").ok()?;
+    // One line only, as the script's grep reads it.
+    let marker = Regex::new(r"<!-- cross-review: sha=([0-9a-f]{40})[^>\n]*-->").ok()?;
     if let Some(found) = marker.captures(body) {
+        // The script reads the last `verdict=` field of the marker and this
+        // reads the first, so a marker with more than one has no verdict here:
+        // it cannot match a CLEAN report, nor pass as BLOCKED.
+        let single = found[0].matches("verdict=").count() == 1;
         let verdict = Regex::new(r"\sverdict=([A-Z_]+)(?:\s|-->)")
             .ok()
+            .filter(|_| single)
             .and_then(|re| re.captures(&found[0]).map(|v| v[1].to_string()))
             .filter(|v| matches!(v.as_str(), "CLEAN" | "FIXES_APPLIED" | "NEEDS_DECISION" | "BLOCKED"))
             .unwrap_or_default();
@@ -2782,6 +2788,19 @@ mod tests {
         // No verdict, or one outside the vocabulary, reads as none.
         assert_eq!(stamp_of(&record_body(HEAD, "")).unwrap().1, "");
         assert_eq!(stamp_of(&record_body(HEAD, "verdict=GREAT ")).unwrap().1, "");
+        // Two verdict fields: the script reads the last, so the gate reads
+        // none, and such a record never earns the BLOCKED exemption.
+        for tail in [
+            "verdict=BLOCKED verdict=CLEAN ",
+            "verdict=CLEAN verdict=BLOCKED ",
+            "xverdict=BLOCKED verdict=CLEAN ",
+        ] {
+            assert_eq!(stamp_of(&record_body(HEAD, tail)).unwrap().1, "", "{tail}");
+        }
+        // A marker broken across lines is not one the script reads.
+        let split =
+            format!("## Cross-review\n\n<!-- cross-review: sha={HEAD}\nverdict=BLOCKED -->\nReviewed `0123456789`");
+        assert_eq!(stamp_of(&split).unwrap(), ("0123456789".to_string(), String::new()));
         // The prose alone is a stamp, abbreviated.
         let prose = stamp_of("## Cross-review\n\nReviewed `0123456789`").unwrap();
         assert_eq!(prose, ("0123456789".to_string(), String::new()));
