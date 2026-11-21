@@ -98,12 +98,13 @@ Lead with the tracker link. Then, briefly: how many issues were taken in and how
 
 An issue is closed only when all of this is true at the moment of closing:
 
-- the run offered it as a closure and its box is ticked on the published tracker
+- the run offered it as a closure and its box is ticked on the published tracker. A ticked line inside a code block or an HTML comment is text, not a tick
 - the tracker is open, has no `STOP` line, and has no ticked line the run never offered, read when the run starts and again for each issue after its evidence check
 - the evidence check, run again on the base branch as it is now, still says `already_fixed` and closable, and names the same fixing commit the tracker showed
 - every file the closure quotes is the same on the base branch now as at the commit the tracker was rendered at
+- the base branch, fetched again after that issue's check, is still the commit the check ran on. If it moved, the run stops there; run it again
 - the issue is open and carries no hold label and no claim label, read before the evidence check and again right before the comment
-- the issue's title and body are the ones intake saved
+- the issue's title and body are the ones `queue.json` recorded when the tracker was rendered
 
 The file comparison covers the quoted files only. A change somewhere else that undoes the fix (a caller removed, a flag turned off) is not seen, which is one reason a bug that only shows in the running app is never offered for closing.
 
@@ -137,7 +138,7 @@ Every subcommand uses the same four, and prints one line saying why on anything 
 | `decisions.json` | you | units, confirmed closures, issues left out |
 | `queue.json`, `tracker.md` | `tracker render` | the queue as data and as the tracker body |
 | `tracker.json` | `tracker publish` | the tracker's number and URL |
-| `publish.lock` | `tracker publish` | present only while a publish runs |
+| `publish.lock` | `tracker render`, `tracker publish` | present only while a render or a publish runs |
 | `closures/<n>.md` | `close-verified` | each closing comment |
 | `events.jsonl` | every command | one line per thing that happened; the record of the run |
 

@@ -1,6 +1,6 @@
 # Triage
 
-From a set of issues to a tracker issue the user approves. Seven steps, in order. Each command reads the run folder's files and writes the next one, so a step can be re-run without redoing the ones before it.
+From a set of issues to a tracker issue the user approves. Seven steps, in order. Each command reads the run folder's files and writes the next one, so a step can be re-run without redoing the ones before it. The exception is `intake`: once `evidence-check` has written `verdicts.checked.json` it is refused (exit 3), because the verdicts and the tracker are about the reports already saved. Start a new run to take issues in again.
 
 `$ID` below is the launcher, `<skill folder>/bin/issue-drain`, called with the run's environment (SKILL.md, "Setting up a run").
 
@@ -16,7 +16,7 @@ Writes `issues/<n>.json`, `issues/<n>.md` and `intake.json`, and prints a one-li
 
 An issue is also skipped when GitHub returned only part of it: more labels, linked PRs or timeline events than one page holds. The reason names what was cut. Intake does not judge an issue it could not read whole, so a person looks at those.
 
-`--label` and `--search` list up to three times the cap, because held and claimed issues do not count against it, and intake stops reading once the cap is full.
+`--label` and `--search` list up to three times the cap, because held and claimed issues do not count against it, and intake stops reading once the cap is full. A label or search that matches nothing writes an empty `intake.json` and exits 0; tell the user there was nothing to triage.
 
 `stale_claims` lists issues whose claim label is older than the profile allows and which have no open PR. They are not taken in. They appear on the tracker for the user to tick for release.
 
@@ -133,7 +133,7 @@ Then:
 $ID tracker render
 ```
 
-It writes `queue.json` and `tracker.md`, or prints every rule the decisions break and writes nothing (exit 3). The rules: every live issue is in exactly one unit or in `left_out` with a reason; a unit holds only live issues and duplicates of its own members; the caps; the risk and protected path rules; a title, an allowed model and effort, a whole positive number of minutes and a one-line test command per unit; `kind`, `test_command` and `waits_for` are strings; a unit has at least one live issue (duplicates of each other alone are nothing to fix); a closure must be `already_fixed` and closable. Fix `decisions.json` and render again until it exits 0.
+It writes `queue.json` and `tracker.md`, or prints every rule the decisions break and writes nothing (exit 3). The rules: every live issue is in exactly one unit or in `left_out` with a reason; a unit holds only live issues and duplicates of its own members; the caps; the risk and protected path rules; a title, an allowed model and effort, a whole positive number of minutes and a one-line test command per unit; `kind`, `test_command` and `waits_for` are strings; a unit has at least one live issue, and every duplicate in it leads to one (two that name each other lead nowhere, whatever else is in the unit); a closure must be `already_fixed` and closable. Fix `decisions.json` and render again until it exits 0.
 
 The renderer orders the queue: priority label, then smaller units first, with units that share a file back to back. It decides which sections each issue lands in. Do not edit `tracker.md`.
 
@@ -149,9 +149,9 @@ It creates the tracker issue with the profile's tracker label, records it in `tr
 
 Before it creates anything it lists your own open issues with the tracker label. If one already carries this run's marker line (a publish that was cut off after GitHub created the issue), and its body is the `tracker.md` rendered now, it records that issue and creates no second one. If the body differs (the run was rendered again after the cut-off publish), it is refused (exit 3): close that issue and publish again. If the list cannot be read, it exits 1 and creates nothing.
 
-`publish.lock` in the run folder exists while a publish runs. A publish that finds it is refused. If no publish is running (the process was killed), remove the file and run it again.
+`publish.lock` in the run folder exists while a render or a publish runs. A render or a publish that finds it is refused (exit 3). If neither is running (the process was killed), remove the file and run it again.
 
-`tracker render` refuses an `intake.json` fetched from a repo other than `ISSUE_DRAIN_REPO`, and `tracker publish` and `tracker parse` refuse a `queue.json` rendered for one (exit 2). Render removes the old `tracker.md` before it writes the queue, so a render that was cut off leaves nothing to publish.
+`tracker render` refuses an `intake.json` fetched from a repo other than `ISSUE_DRAIN_REPO`, and `tracker publish` and `tracker parse` refuse a `queue.json` rendered for one (exit 2). Render removes the old `tracker.md` before it writes the queue, so a render that was cut off leaves nothing to publish. For each closure it copies the title and body from `issues/<n>.json` into `queue.json`, and `close-verified` later holds the live issue against that copy; a closure whose saved report is missing is a usage error (exit 2).
 
 Give the user the link and a short summary: how many units, how many closures offered, what needs a person, what was skipped at intake. Then stop. This is the one pause. The user edits the tracker body: deletes or reorders queue lines, ticks closures, ticks risk units, ticks claims to release, or writes `STOP`.
 
@@ -162,7 +162,7 @@ $ID tracker parse          # what the body says now
 $ID close-verified         # close every ticked closure
 ```
 
-`tracker parse` prints JSON: the units still on the queue in the user's order, `approved_closures`, `release_claims`, `stop`, the tracker's state (`tracker_state`), and `unknown` (ticked lines the run never offered). Anything in `unknown` means the body was edited in a way the drain does not understand: show it to the user and do nothing else until it is gone.
+`tracker parse` prints JSON: the units still on the queue in the user's order, `approved_closures`, `release_claims`, `stop`, the tracker's state (`tracker_state`), and `unknown` (ticked lines the run never offered). It reads only lines GitHub shows as lines: a box inside a fenced code block or an HTML comment counts for nothing, except `STOP`, which counts wherever it stands. A risk unit runs only with its box ticked; its line with the box deleted is ignored. Anything in `unknown` means the body was edited in a way the drain does not understand: show it to the user and do nothing else until it is gone.
 
 If `stop` is `true` or `tracker_state` is not `OPEN`, the user called the run off. Close nothing and release no claim.
 
