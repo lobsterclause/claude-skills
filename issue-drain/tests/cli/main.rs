@@ -9,6 +9,7 @@ mod evalscore;
 mod evidence;
 mod gh_write;
 mod intake;
+mod merge_gate;
 mod overlap;
 mod packaging;
 mod render;

@@ -47,6 +47,29 @@ pub enum Write<'a> {
     CloseIssue {
         number: u64,
     },
+    /// Squash-merge a PR, only if its head is still `head`. Reached only from
+    /// `merge-gate`, which holds every condition a merge needs.
+    MergePr {
+        number: u64,
+        head: &'a str,
+    },
+}
+
+/// The argument list of the merge call. It is built here and nowhere else, and
+/// it carries no flag that skips a requirement or defers the merge.
+pub fn merge_argv(repo: &str, number: u64, head: &str) -> Vec<String> {
+    [
+        "pr",
+        "merge",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--squash",
+        "--match-head-commit",
+        head,
+    ]
+    .map(str::to_string)
+    .to_vec()
 }
 
 impl Write<'_> {
@@ -58,6 +81,7 @@ impl Write<'_> {
             Write::AddLabel { .. } => "add-label",
             Write::RemoveLabel { .. } => "remove-label",
             Write::CloseIssue { .. } => "close-issue",
+            Write::MergePr { .. } => "merge-pr",
         }
     }
 }
@@ -262,6 +286,12 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
                 own("completed"),
             ],
         ),
+        Write::MergePr { number, head } => {
+            if !head.bytes().all(|b| b.is_ascii_hexdigit()) || head.len() < 40 {
+                return Err(Fail::usage(format!("'{head}' is not a full commit SHA")));
+            }
+            (format!("merge #{number} at {head}"), merge_argv(&repo, *number, head))
+        }
     };
 
     if ctx.dry_run {

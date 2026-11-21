@@ -26,6 +26,10 @@
 #   fail-create           `gh issue create` exits 1
 #   fail-comment          `gh issue comment` exits 1
 #   labels.txt            answer to `gh label list`, one name per line
+#   pr-view-<n>.json      answer to `gh pr view <n>`
+#   protection.json       answer to `gh api repos/<o>/<r>/branches/<b>/protection`
+#   compare.json          answer to `gh api repos/<o>/<r>/compare/<b>...<sha>`
+#   fail-merge            `gh pr merge` exits 1
 # GH_STUB_NEW_ISSUE       the number `gh issue create` reports (default 900)
 # GH_STUB_CLOSE_NOOP=1    `gh issue close` exits 0 but closes nothing
 #
@@ -85,6 +89,16 @@ case "${1:-} ${2:-}" in
     if [ "${GH_STUB_CLOSE_NOOP:-}" != "1" ]; then : > "$dir/closed-$3"; fi ;;
   "issue comment")
     if [ -e "$dir/fail-comment" ]; then echo "gh stub: comment failed" >&2; exit 1; fi ;;
+  "pr view")
+    answer "pr-view-$3.json" ;;
+  "pr merge")
+    if [ -e "$dir/fail-merge" ]; then echo "gh stub: merge failed" >&2; exit 1; fi ;;
+  "api repos/"*)
+    case "$2" in
+      */protection) answer protection.json ;;
+      */compare/*) answer compare.json ;;
+      *) echo "gh stub: unexpected call: $*" >&2; exit 9 ;;
+    esac ;;
   "issue edit" | "label create") ;;
   "label list")
     if [ -f "$dir/labels.txt" ]; then cat "$dir/labels.txt"; fi ;;

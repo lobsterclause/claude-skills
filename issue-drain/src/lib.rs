@@ -10,6 +10,7 @@ pub mod evidence;
 pub mod gh;
 pub mod git;
 pub mod intake;
+pub mod merge_gate;
 pub mod model;
 pub mod overlap;
 pub mod profile;

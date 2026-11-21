@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use issue_drain::ctx::Ctx;
 use issue_drain::error::Res;
-use issue_drain::{close, evalscore, evidence, gh, intake, overlap, state, tracker};
+use issue_drain::{close, evalscore, evidence, gh, intake, merge_gate, overlap, state, tracker};
 
 /// Triage a set of GitHub issues and carry each one through to a merged PR.
 ///
@@ -41,6 +41,8 @@ enum Command {
     /// Where each unit of the drain is, kept as a log of moves.
     #[command(subcommand)]
     State(state::Command),
+    /// Judge every condition for a PR and merge it only if none refuses.
+    MergeGate(merge_gate::Args),
 }
 
 fn name(command: &Command) -> &'static str {
@@ -61,11 +63,15 @@ fn name(command: &Command) -> &'static str {
         Command::State(state::Command::Show(_)) => "state show",
         Command::State(state::Command::Next) => "state next",
         Command::State(state::Command::Rebuild) => "state rebuild",
+        Command::MergeGate(_) => "merge-gate",
     }
 }
 
 fn run(command: &Command) -> Res<()> {
-    let ctx = Ctx::load()?;
+    let mut ctx = Ctx::load()?;
+    if matches!(command, Command::MergeGate(args) if args.dry_run) {
+        ctx.dry_run = true;
+    }
     match command {
         Command::Intake(args) => intake::run(&ctx, args),
         Command::EvidenceCheck(args) => evidence::run(&ctx, args),
@@ -75,6 +81,7 @@ fn run(command: &Command) -> Res<()> {
         Command::GhWrite { args } => gh::cli(&ctx, args),
         Command::EvalScore(args) => evalscore::run(&ctx, args),
         Command::State(command) => state::run(&ctx, command),
+        Command::MergeGate(args) => merge_gate::run(&ctx, args),
     }
 }
 
