@@ -66,6 +66,12 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         })?;
     let intake: Intake = read_json(&intake_path)
         .ok_or_else(|| Fail::usage(format!("{} is not an intake file", intake_path.display())))?;
+    if !intake.repo.eq_ignore_ascii_case(&repo) {
+        return Err(Fail::usage(format!(
+            "this run's intake is of {}, and ISSUE_DRAIN_REPO is {repo}",
+            intake.repo
+        )));
+    }
     let checked: Vec<Checked> = read_json(&checked_path)
         .ok_or_else(|| Fail::usage(format!("{} is not a list of checked verdicts", checked_path.display())))?;
 
@@ -96,8 +102,18 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             "refused: the queue breaks the rules above; fix decisions.json and render again",
         ));
     }
+    // The body of an earlier render goes first, so a render cut off between
+    // the two writes leaves nothing to publish, not a new queue beside the
+    // old body.
+    let body_path = ctx.path("tracker.md");
+    match fs::remove_file(&body_path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(Fail::failed(format!("cannot replace {}: {e}", body_path.display())));
+        }
+        _ => {}
+    }
     write_json(&ctx.path("queue.json"), &result.queue)?;
-    write_atomic(&ctx.path("tracker.md"), result.md.as_bytes())?;
+    write_atomic(&body_path, result.md.as_bytes())?;
     let size = |key: &str| result.queue[key].as_array().map_or(0, Vec::len);
     let summary = json!({
         "units": size("units"),

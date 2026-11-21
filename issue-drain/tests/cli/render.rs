@@ -111,6 +111,39 @@ fn the_decisions_file_can_be_named() {
 }
 
 #[test]
+fn an_intake_of_another_repo_is_a_usage_error() {
+    // The queue is stamped with the configured repo, so an intake fetched
+    // from somewhere else would become a queue of the wrong repo's numbers.
+    let mut env = rendered_env();
+    env.set("ISSUE_DRAIN_REPO", "example/other");
+    let out = render(&env);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("this run's intake is of example/tidepool, and ISSUE_DRAIN_REPO is example/other"),
+        "{}",
+        out.stderr
+    );
+    assert!(!env.workdir.join("queue.json").exists());
+
+    // Control: GitHub does not tell owner and repo names apart by case.
+    let mut same = rendered_env();
+    same.set("ISSUE_DRAIN_REPO", "Example/Tidepool");
+    assert_eq!(render(&same).code, 0);
+}
+
+#[test]
+fn a_tracker_that_cannot_be_written_leaves_no_queue_beside_the_old_one() {
+    // publish sends tracker.md and reads queue.json. A render that got only
+    // as far as the queue would leave a new queue beside an older body.
+    let env = rendered_env();
+    fs::create_dir_all(env.workdir.join("tracker.md/keep")).expect("block the body");
+    let out = render(&env);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(!env.workdir.join("queue.json").exists());
+}
+
+#[test]
 fn missing_inputs_exit_2() {
     // Control: all there, renders.
     assert_eq!(render(&rendered_env()).code, 0);

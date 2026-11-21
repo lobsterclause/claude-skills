@@ -327,10 +327,10 @@ pub fn publish(ctx: &Ctx, _args: &PublishArgs) -> Res<()> {
     let queue = load_queue(ctx)?;
 
     // A dry run reads nothing from GitHub, as everywhere else.
-    if !ctx.dry_run
-        && let Some((number, url)) = existing(ctx, &run)?
-    {
-        return record(ctx, "tracker_adopted", number, &url, run);
+    if !ctx.dry_run {
+        if let Some((number, url)) = existing(ctx, &run)? {
+            return record(ctx, "tracker_adopted", number, &url, run);
+        }
     }
 
     gh::write(
