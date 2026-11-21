@@ -206,7 +206,7 @@ fn a_unit_is_refused_the_drivers_verbs_and_allowed_the_rest() {
 
     let allowed: [&[&str]; 6] = [
         &["gh-write", "comment", "7", "--body-file", &body],
-        &["gh-write", "add-label", "7", "agent-in-progress"],
+        &["gh-write", "add-label", "7", "needs-human"],
         &["gh-write", "ensure-label", "issue-drain"],
         &[
             "gh-write",
@@ -229,6 +229,28 @@ fn a_unit_is_refused_the_drivers_verbs_and_allowed_the_rest() {
     }
     // ensure-label makes a list call then a create call; the rest one each.
     assert_eq!(env.gh_calls().len(), 7, "{:?}", env.gh_calls());
+}
+
+/// A claim is the label plus a marker comment, and only `claim take` makes
+/// both. A unit adding the label alone would make a claim with no marker.
+#[test]
+fn a_unit_may_not_add_the_claim_label_whatever_its_case() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_MODE", "unit");
+    for label in ["agent-in-progress", "Agent-In-Progress"] {
+        let out = env.run(&["gh-write", "add-label", "7", label]);
+        assert_eq!(out.code, 3, "{label}: {}", out.stderr);
+        assert!(out.stderr.contains("claim label"), "{}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+    let why = env.events_named("gh_write_refused");
+    assert_eq!(why.len(), 2);
+    assert_eq!(why[0]["mode"], "unit");
+
+    // Controls: the other label a unit may add, and the claim label outside a unit.
+    assert_eq!(env.run(&["gh-write", "add-label", "7", "needs-human"]).code, 0);
+    env.set("ISSUE_DRAIN_MODE", "driver");
+    assert_eq!(env.run(&["gh-write", "add-label", "7", "agent-in-progress"]).code, 0);
 }
 
 #[test]

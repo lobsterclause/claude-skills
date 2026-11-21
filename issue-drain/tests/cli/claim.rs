@@ -21,14 +21,48 @@ fn setup() -> Env {
     env
 }
 
-/// What `gh issue view <n> --json labels,comments` says.
+/// Where the comments of `view` sit in time, and the start of the timeline
+/// events a test builds with `at`.
+const T1: &str = "2026-11-21T01:00:00Z";
+const T2: &str = "2026-11-21T02:00:00Z";
+const T3: &str = "2026-11-21T03:00:00Z";
+
+/// What `gh issue view <n> --json labels,comments` says, every comment made at T1.
 fn view(env: &Env, n: u64, labels: &[&str], comments: &[&str]) {
+    let timed: Vec<(&str, &str)> = comments.iter().map(|c| (*c, T1)).collect();
+    view_at(env, n, labels, &timed);
+}
+
+/// The same, with each comment's creation time.
+fn view_at(env: &Env, n: u64, labels: &[&str], comments: &[(&str, &str)]) {
     let labels: Vec<Value> = labels.iter().map(|l| json!({"name": l})).collect();
-    let comments: Vec<Value> = comments.iter().map(|c| json!({"body": c})).collect();
+    let comments: Vec<Value> = comments
+        .iter()
+        .map(|(body, at)| json!({"body": body, "createdAt": at}))
+        .collect();
     env.stub_file(
         &format!("issue-view-{n}.json"),
         &json!({"labels": labels, "comments": comments}).to_string(),
     );
+}
+
+/// `gh api .../issues/<n>/timeline` as one page: (event, label, time).
+fn timeline_page(events: &[(&str, &str, &str)]) -> Value {
+    Value::Array(
+        events
+            .iter()
+            .map(|(event, label, at)| json!({"event": event, "created_at": at, "label": {"name": label}}))
+            .collect(),
+    )
+}
+
+fn timeline(env: &Env, n: u64, events: &[(&str, &str, &str)]) {
+    env.stub_file(&format!("timeline-{n}.json"), &timeline_page(events).to_string());
+}
+
+/// What a run with another tracker (13) would have posted.
+fn theirs() -> String {
+    ours().replace("tracker=12", "tracker=13")
 }
 
 fn clean(env: &Env) {
@@ -44,7 +78,7 @@ fn ours() -> String {
 fn writes(env: &Env) -> Vec<String> {
     env.gh_calls()
         .into_iter()
-        .filter(|c| !c.starts_with("issue view") && !c.starts_with("label list"))
+        .filter(|c| !c.starts_with("issue view") && !c.starts_with("label list") && !c.starts_with("api "))
         .collect()
 }
 
@@ -291,6 +325,189 @@ fn a_read_error_is_exit_1_and_never_read_as_not_claimed() {
             assert_eq!(after_read_of_103, Vec::<String>::new());
         }
     }
+}
+
+fn removals(env: &Env) -> Vec<String> {
+    writes(env)
+        .into_iter()
+        .filter(|c| c.contains("--remove-label"))
+        .collect()
+}
+
+/// take, release, take: the first marker no longer proves the second claim, so
+/// the second take posts its own, and a release afterwards removes that claim.
+#[test]
+fn take_release_take_posts_a_fresh_marker_and_a_later_release_still_works() {
+    let env = setup();
+    clean(&env);
+    assert_eq!(run(&env, "take").code, 0);
+    assert_eq!(
+        writes(&env).iter().filter(|c| c.starts_with("issue comment")).count(),
+        2
+    );
+
+    // Released: the label is off and the timeline says when.
+    for n in [103, 106] {
+        view_at(&env, n, &["bug"], &[(&ours(), T1)]);
+        timeline(&env, n, &[("labeled", LABEL, T1), ("unlabeled", LABEL, T2)]);
+    }
+    let before = writes(&env).len();
+    let out = run(&env, "take");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let second = writes(&env)[before..].to_vec();
+    assert_eq!(
+        second.iter().filter(|c| c.starts_with("issue comment")).count(),
+        2,
+        "a fresh marker for each issue: {second:?}"
+    );
+    assert_eq!(
+        second.iter().filter(|c| c.contains("--add-label")).count(),
+        2,
+        "{second:?}"
+    );
+
+    // GitHub now shows the second claim.
+    for n in [103, 106] {
+        view_at(&env, n, &["bug", LABEL], &[(&ours(), T1), (&ours(), T3)]);
+        timeline(
+            &env,
+            n,
+            &[("labeled", LABEL, T1), ("unlabeled", LABEL, T2), ("labeled", LABEL, T3)],
+        );
+    }
+    let out = run(&env, "release");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(removals(&env).len(), 2, "{:?}", writes(&env));
+}
+
+/// Run A took and released; run B (another tracker) took. A's retried release
+/// must not call B's claim its own, whichever order the comments are listed in.
+#[test]
+fn a_later_runs_claim_is_not_ours_though_our_old_marker_is_still_there() {
+    for comments in [[(ours(), T1), (theirs(), T3)], [(theirs(), T3), (ours(), T1)]] {
+        let env = setup();
+        for n in [103, 106] {
+            let listed: Vec<(&str, &str)> = comments.iter().map(|(b, t)| (b.as_str(), *t)).collect();
+            view_at(&env, n, &["bug", LABEL], &listed);
+            timeline(
+                &env,
+                n,
+                &[("labeled", LABEL, T1), ("unlabeled", LABEL, T2), ("labeled", LABEL, T3)],
+            );
+        }
+        let out = run(&env, "release");
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(writes(&env), Vec::<String>::new());
+        assert!(out.stdout.contains("not_ours"), "{}", out.stdout);
+
+        let out = run(&env, "take");
+        assert_eq!(out.code, 3, "{}", out.stderr);
+        assert!(out.stderr.contains("claimed by someone else"), "{}", out.stderr);
+        assert_eq!(writes(&env), Vec::<String>::new());
+
+        let out = run(&env, "check");
+        assert!(out.stdout.contains("\"ours\":false"), "{}", out.stdout);
+    }
+}
+
+/// Someone else adds the label after our release: our old marker is still the
+/// newest, but the claim it described ended with the unlabel.
+#[test]
+fn a_label_a_stranger_added_after_our_release_is_not_ours() {
+    let env = setup();
+    for n in [103, 106] {
+        view_at(&env, n, &["bug", LABEL], &[(&ours(), T1)]);
+        timeline(
+            &env,
+            n,
+            &[("labeled", LABEL, T1), ("unlabeled", LABEL, T2), ("labeled", LABEL, T3)],
+        );
+    }
+    let out = run(&env, "release");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(removals(&env), Vec::<String>::new());
+    assert!(out.stdout.contains("not_ours"), "{}", out.stdout);
+    let out = run(&env, "take");
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(writes(&env), Vec::<String>::new());
+}
+
+#[test]
+fn only_an_unlabel_of_the_claim_label_after_the_marker_ends_the_claim() {
+    let env = setup();
+    for n in [103, 106] {
+        view_at(&env, n, &["bug", LABEL], &[(&theirs(), T1), (&ours(), T2)]);
+        timeline(
+            &env,
+            n,
+            &[
+                ("unlabeled", LABEL, T1),
+                ("labeled", LABEL, T2),
+                ("unlabeled", "bug", T3),
+                ("labeled", "bug", T3),
+            ],
+        );
+    }
+    let out = run(&env, "release");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(removals(&env).len(), 2, "{:?}", writes(&env));
+}
+
+#[test]
+fn the_timeline_is_read_page_by_page_and_an_unlabel_on_a_later_page_counts() {
+    let env = setup();
+    for n in [103, 106] {
+        view_at(&env, n, &["bug", LABEL], &[(&ours(), T1)]);
+    }
+    // What `gh api --paginate` prints for two pages: two arrays, one after the other.
+    let page1 = timeline_page(&[("labeled", LABEL, T1)]);
+    let page2 = timeline_page(&[("unlabeled", LABEL, T2), ("labeled", LABEL, T3)]);
+    for n in [103, 106] {
+        env.stub_file(&format!("timeline-{n}.json"), &format!("{page1}\n{page2}\n"));
+    }
+    let out = run(&env, "check");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(!out.stdout.contains("\"ours\":true"), "{}", out.stdout);
+    let call = format!("api repos/{REPO}/issues/103/timeline?per_page=100 --paginate");
+    assert!(env.gh_calls().contains(&call), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn a_timeline_that_cannot_be_read_is_exit_1_and_never_read_as_still_ours() {
+    for verb in ["take", "release", "check"] {
+        let env = setup();
+        view(&env, 103, &["bug", LABEL], &[&ours()]);
+        view(&env, 106, &["bug", LABEL], &[&ours()]);
+        env.stub_file("fail-timeline", "");
+        let out = run(&env, verb);
+        assert_eq!(out.code, 1, "{verb}: {}", out.stderr);
+        assert!(out.stderr.contains("timeline"), "{verb}: {}", out.stderr);
+        assert_eq!(writes(&env), Vec::<String>::new(), "{verb}");
+
+        // A timeline that is not JSON, and one that is not a list of events.
+        for bad in ["not json", r#"{"message":"Not Found"}"#, r#"[{"event":"unlabeled"}]"#] {
+            let env = setup();
+            view(&env, 103, &["bug", LABEL], &[&ours()]);
+            view(&env, 106, &["bug", LABEL], &[&ours()]);
+            env.stub_file("timeline-103.json", bad);
+            let out = run(&env, verb);
+            assert_eq!(out.code, 1, "{verb} {bad}: {}", out.stderr);
+            assert_eq!(writes(&env), Vec::<String>::new(), "{verb} {bad}");
+        }
+    }
+}
+
+#[test]
+fn our_marker_with_no_usable_creation_time_is_a_read_error() {
+    let env = setup();
+    let body = ours();
+    env.stub_file(
+        "issue-view-103.json",
+        &json!({"labels": [{"name": LABEL}], "comments": [{"body": body}]}).to_string(),
+    );
+    view(&env, 106, &["bug"], &[]);
+    let out = run(&env, "check");
+    assert_eq!(out.code, 1, "{}", out.stderr);
 }
 
 #[test]

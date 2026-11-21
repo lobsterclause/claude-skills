@@ -7,6 +7,10 @@
 //! rule is reported, not the first. A git call that fails is an error (exit 1),
 //! never an `ok: true`.
 //!
+//! `deliver.json` records `merge_base`, the commit the diff started from.
+//! `merge-gate` refuses a report whose `merge_base` is not the PR's merge base
+//! with the live base branch, so run it without `--base` before a merge.
+//!
 //! Exit: 0 ok; 3 a rule refused (deliver.json is written with `ok: false`);
 //! 2 bad arguments or no queue; 1 git or the filesystem failed.
 
@@ -283,6 +287,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             ))
         })?,
     };
+    // `base...head` diffs from this commit. It is recorded so that merge-gate
+    // can tell a `--base` that audited only part of the PR from the whole one.
+    let merge_base = git::merge_base(dir, &base, &head)
+        .ok_or_else(|| Fail::failed(format!("git finds no merge base of {base} and {head}")))?;
     let range = format!("{base}...{head}");
     let numstat = git_out(
         dir,
@@ -329,6 +337,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         "ok": ok,
         "head": head,
         "base": base,
+        "merge_base": merge_base,
         "files_changed": input.changes.len(),
         "additions": added,
         "deletions": deleted,

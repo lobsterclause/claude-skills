@@ -120,19 +120,72 @@ fn init_leaves_other_commands_lines_in_the_log_alone() {
     assert_eq!(env.run(&["state", "rebuild"]).code, 0);
 }
 
+/// What `tracker parse` prints, with `units` and whatever else a test changes.
+fn parsed_json(units: Value, over: Value) -> String {
+    let mut parsed = json!({
+        "run": "run", "stop": false, "units": units, "approved_closures": [], "release_claims": [],
+        "tracker_state": "OPEN", "unknown": []
+    });
+    parsed
+        .as_object_mut()
+        .unwrap()
+        .extend(over.as_object().unwrap().clone());
+    parsed.to_string()
+}
+
+/// `state init --parsed` on a saved parse, in a fresh run.
+fn init_from(parsed: &str, dry_run: bool) -> (Env, Out) {
+    let mut env = Env::new();
+    env.seed(&["queue.json"]);
+    if dry_run {
+        env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    }
+    let file = env.write("parsed.json", parsed);
+    let out = env.run(&["state", "init", "--parsed", &file.display().to_string()]);
+    (env, out)
+}
+
 #[test]
 fn init_follows_the_order_of_a_saved_tracker_parse() {
-    let env = Env::new();
-    env.seed(&["queue.json"]);
-    let parsed = env.write("parsed.json", r#"{"units":["U3","U1"]}"#);
-    let out = env.run(&["state", "init", "--parsed", &parsed.display().to_string()]);
+    let (env, out) = init_from(&parsed_json(json!(["U3", "U1"]), json!({})), false);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(snapshot(&env)["queue"], json!([3, 1]));
-    let bad = Env::new();
-    bad.seed(&["queue.json"]);
-    let parsed = bad.write("parsed.json", r#"{"units":["U9"]}"#);
-    let out = bad.run(&["state", "init", "--parsed", &parsed.display().to_string()]);
+    let (_, out) = init_from(&parsed_json(json!(["U9"]), json!({})), false);
     assert_eq!(out.code, 2, "{}", out.stderr);
+}
+
+#[test]
+fn init_refuses_a_parse_where_the_user_called_the_run_off_or_something_is_unknown() {
+    let refused = [
+        (json!({"stop": true}), "STOP"),
+        (json!({"tracker_state": "CLOSED"}), "CLOSED"),
+        (json!({"tracker_state": null}), "tracker_state"),
+        (json!({"unknown": ["unit U9", "line 12 is a code fence"]}), "unit U9"),
+    ];
+    for (over, word) in refused {
+        let (env, out) = init_from(&parsed_json(json!(["U1"]), over.clone()), false);
+        assert_eq!(out.code, 3, "{over}: {}", out.stderr);
+        assert!(out.stderr.contains(word), "{over}: {}", out.stderr);
+        assert!(!env.workdir.join("state.json").exists(), "{over}: nothing is queued");
+        assert!(state_events(&env).is_empty(), "{over}");
+    }
+}
+
+#[test]
+fn init_takes_a_null_tracker_state_only_in_a_dry_run() {
+    let parsed = parsed_json(json!(["U1"]), json!({"tracker_state": null}));
+    let (_, out) = init_from(&parsed, true);
+    assert_eq!(out.code, 0, "a dry run may parse a file: {}", out.stderr);
+}
+
+#[test]
+fn init_refuses_a_parse_that_leaves_out_what_decides_whether_to_go_on() {
+    for key in ["stop", "tracker_state", "unknown"] {
+        let mut parsed: Value = serde_json::from_str(&parsed_json(json!(["U1"]), json!({}))).unwrap();
+        parsed.as_object_mut().unwrap().remove(key);
+        let (_, out) = init_from(&parsed.to_string(), true);
+        assert_eq!(out.code, 2, "{key}: {}", out.stderr);
+    }
 }
 
 #[test]
@@ -231,6 +284,24 @@ fn a_fifth_base_sync_is_refused() {
     );
     // control: the gate can still park
     ok(&env, &["1", "parked"]);
+}
+
+/// references/unit.md step 1: a unit whose base already has the fix ends as
+/// skipped, which it finds out after the worktree is prepared and while it works.
+#[test]
+fn a_prepared_or_implementing_unit_can_end_as_skipped() {
+    let env = ready();
+    walk(&env, "1", &["claimed", "prepared", "skipped"]);
+    assert_eq!(unit_state(&env, 1), "skipped");
+    walk(&env, "2", &["claimed", "prepared", "implementing", "skipped"]);
+    assert_eq!(unit_state(&env, 2), "skipped");
+    // a unit in review has a PR and may not skip: control that the table still refuses
+    walk(
+        &env,
+        "3",
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+    );
+    assert_eq!(ev(&env, &["3", "skipped"]).code, 3);
 }
 
 #[test]

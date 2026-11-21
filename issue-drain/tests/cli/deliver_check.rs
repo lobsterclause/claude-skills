@@ -126,6 +126,33 @@ fn the_base_defaults_to_the_profile_branch_on_origin() {
 }
 
 #[test]
+fn the_merge_base_the_diff_started_from_is_recorded() {
+    let c = case();
+    let fork = git(&c.repo, &["rev-parse", "develop"]);
+    commit(&c.repo, &[("src/timer/a.ts", "a\n")], "first");
+    let first = git(&c.repo, &["rev-parse", "HEAD"]);
+    commit(&c.repo, &[("src/timer/b.ts", "b\n")], "second");
+    assert_eq!(c.check(&[]).code, 0);
+    assert_eq!(c.deliver()["merge_base"], fork, "the fork point, not the base's tip");
+
+    // develop moves on: the diff is still taken from the fork point.
+    git(&c.repo, &["checkout", "-q", "develop"]);
+    commit(&c.repo, &[("docs/note.md", "n\n")], "develop moves");
+    git(&c.repo, &["checkout", "-q", "unit"]);
+    assert_eq!(c.check(&[]).code, 0);
+    assert_eq!(c.deliver()["merge_base"], fork);
+
+    // A --base that is part-way up the branch audits only part of the PR; the
+    // report says where it started so the gate can see that.
+    let part = c
+        .env
+        .run_in(Some(&c.repo), &["deliver-check", "--unit", "3", "--base", &first]);
+    assert_eq!(part.code, 0, "{}", part.stderr);
+    assert_eq!(c.deliver()["merge_base"], first);
+    assert_ne!(c.deliver()["merge_base"], fork);
+}
+
+#[test]
 fn an_empty_diff_is_refused() {
     let c = case();
     let out = c.check(&[]);

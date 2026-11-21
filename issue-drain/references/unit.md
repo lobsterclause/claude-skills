@@ -49,7 +49,7 @@ If the implementer hands a cluster member back as not the same change, drop that
 issue-drain deliver-check --unit <n>
 ```
 
-It fails on an empty diff, a path outside scope, a protected or frozen path, deletions that dwarf additions, or a missing acceptance test, and it lists added dependencies and `shortcut:` comments. Then read the diff and the code it touches (callers, callees, tests) against each acceptance check yourself. A green test that does not exercise the issue is not a pass.
+It fails on an empty diff, a path outside scope, a protected or frozen path, deletions that dwarf additions, or an acceptance test named in the queue that is not in the diff, and it lists added dependencies and `shortcut:` comments. The queue does not carry `acceptance_tests` yet, so `deliver.json` says `acceptance_checked: false` and the program checks no test at all: you confirm, for each acceptance check in `unit.json`, that the diff holds a test for it. Run it without `--base` for the record the gate reads: `deliver.json` carries the merge base it diffed from, and the gate refuses a record whose merge base is not the PR's merge base with the live base branch. Then read the diff and the code it touches (callers, callees, tests) against each acceptance check yourself. A green test that does not exercise the issue is not a pass.
 
 One trim round at most: anything that could be deleted, or replaced by code the repo already has, goes back to the same implementer once. Then run `deliver-check` again; the merge gate needs its record at the final head.
 
@@ -77,6 +77,8 @@ Run the `cross-review` skill on the PR. Reviewers that are out of quota are expe
   ```
   issue-drain review-proof --unit <n> --run-dir <run_dir> --head <sha>
   ```
+
+  A reviewer counts as having output only when it printed a real review and its `meta.json` shows it ran to the end (`exit_code` 0, no timeout, no `failure_kind`). One that printed a page and then hit its quota has no output. The run folder is read from `raw/`, or from its root when there is no `raw/` (the rewritten-history procedure writes there). Nothing in the run folder names the commit it reviewed, so `--head` is on your word: give the head the reviewers saw.
 
 ### 6. Write `result.json` and stop
 
@@ -113,3 +115,7 @@ issue-drain merge-gate --unit <n> --pr <pr>
 ```
 
 It prints every condition that refuses the merge. Fix what it names; do not merge another way.
+
+A unit whose queue line names someone in `waits_for` (a risk-path unit) is always refused (`waits_for`): that person merges it, and the gate does not check their approval. A PR that closes an issue in another repository is refused (`closing_issue_repo`). After a merge call the gate reads the PR again and prints `merged: true` (with `merge_commit`) only when GitHub says MERGED. On a merge-queue branch the call only queues the PR: the gate then prints `merged: false, queued: true` and exits 4; ask again later, and a PR found merged is reported as already merged. If that read fails the gate exits 1 and the PR may have been merged.
+
+A unit never adds the claim label itself: `gh-write add-label` refuses it in a unit, since a claim is the label plus the marker comment `claim take` posts.

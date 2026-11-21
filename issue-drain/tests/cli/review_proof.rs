@@ -11,6 +11,8 @@ use serde_json::json;
 use crate::common::*;
 
 const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+/// What run_reviewers.sh writes for a reviewer that ran to the end.
+const OK: &str = r#"{"exit_code": 0, "timed_out": false, "failure_kind": null}"#;
 
 fn review() -> String {
     "a finding about the change. ".repeat(20)
@@ -42,6 +44,15 @@ fn proof_file(env: &Env) -> serde_json::Value {
     json(&env.workdir.join("units/3/review-proof.json"))
 }
 
+fn names(env: &Env) -> Vec<serde_json::Value> {
+    proof_file(env)["reviewers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].clone())
+        .collect()
+}
+
 #[test]
 fn each_reviewer_is_recorded_with_its_output_and_failure_kind() {
     let env = Env::new();
@@ -50,9 +61,9 @@ fn each_reviewer_is_recorded_with_its_output_and_failure_kind() {
         &env,
         &[
             ("codex.stdout", &text),
-            ("codex.meta.json", r#"{"failure_kind": null}"#),
+            ("codex.meta.json", OK),
             ("kimi.stdout", "short"),
-            ("kimi.meta.json", r#"{"failure_kind": "timeout"}"#),
+            ("kimi.meta.json", r#"{"exit_code": 1, "failure_kind": "timeout"}"#),
             ("gemini.meta.json", "{}"),
         ],
     );
@@ -70,6 +81,54 @@ fn each_reviewer_is_recorded_with_its_output_and_failure_kind() {
 }
 
 #[test]
+fn a_reviewer_that_printed_enough_and_then_failed_has_no_output() {
+    let env = Env::new();
+    let text = review();
+    let dir = run_dir(
+        &env,
+        &[
+            ("codex.stdout", &text),
+            (
+                "codex.meta.json",
+                r#"{"exit_code": 0, "failure_kind": "quota_exhausted"}"#,
+            ),
+            ("kimi.stdout", &text),
+            (
+                "kimi.meta.json",
+                r#"{"exit_code": 124, "timed_out": true, "failure_kind": null}"#,
+            ),
+            ("glm.stdout", &text),
+            ("glm.meta.json", r#"{"exit_code": 1, "failure_kind": null}"#),
+            ("agy.stdout", &text),
+            ("agy.meta.json", r#"{"failure_kind": null}"#),
+            ("mimo.stdout", &text),
+            ("mimo.meta.json", "not json"),
+        ],
+    );
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
+    let proof = proof_file(&env);
+    assert_eq!(proof["reviewers"].as_array().unwrap().len(), 5);
+    for reviewer in proof["reviewers"].as_array().unwrap() {
+        assert_eq!(reviewer["has_output"], false, "{reviewer}");
+    }
+    let codex = proof["reviewers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "codex")
+        .expect("codex");
+    assert_eq!(codex["failure_kind"], "quota_exhausted", "still recorded");
+}
+
+#[test]
+fn a_reviewer_with_no_meta_file_is_not_proven() {
+    let env = Env::new();
+    let dir = run_dir(&env, &[("codex.stdout", &review())]);
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
+    assert_eq!(proof_file(&env)["reviewers"][0]["has_output"], false);
+}
+
+#[test]
 fn retries_and_failed_primaries_are_not_listed() {
     let env = Env::new();
     let text = review();
@@ -83,13 +142,7 @@ fn retries_and_failed_primaries_are_not_listed() {
         ],
     );
     assert_eq!(prove(&env, &dir, HEAD).code, 0);
-    let names: Vec<_> = proof_file(&env)["reviewers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["name"].clone())
-        .collect();
-    assert_eq!(names, [json!("codex")]);
+    assert_eq!(names(&env), [json!("codex")]);
 }
 
 #[test]
@@ -97,7 +150,15 @@ fn output_below_the_floor_counts_whitespace_for_nothing() {
     let env = Env::new();
     let thin = format!("{}{}", "x".repeat(199), " \n".repeat(400));
     let edge = "x".repeat(200);
-    let dir = run_dir(&env, &[("thin.stdout", &thin), ("edge.stdout", &edge)]);
+    let dir = run_dir(
+        &env,
+        &[
+            ("thin.stdout", &thin),
+            ("thin.meta.json", OK),
+            ("edge.stdout", &edge),
+            ("edge.meta.json", OK),
+        ],
+    );
     assert_eq!(prove(&env, &dir, HEAD).code, 0);
     let proof = proof_file(&env);
     assert_eq!(proof["reviewers"][0]["name"], "edge");
@@ -113,6 +174,39 @@ fn a_run_folder_without_raw_is_refused() {
     let out = prove(&env, &dir, HEAD);
     assert_eq!(out.code, 3, "{}", out.stderr);
     assert!(!env.workdir.join("units/3/review-proof.json").exists());
+}
+
+/// The rewritten-history procedure in cross-review's SKILL.md passes
+/// `--out "$run_dir"`, so the reviewers' files sit at the run folder's root.
+#[test]
+fn reviewer_files_at_the_run_root_are_read_when_there_is_no_raw_folder() {
+    let env = Env::new();
+    let dir = env.dir.path().join("cr-root");
+    fs::create_dir_all(&dir).expect("the folder");
+    for (name, text) in [
+        ("codex.stdout", review()),
+        ("codex.meta.json", OK.to_string()),
+        ("run.meta.json", r#"{"skipped": true}"#.to_string()),
+        ("context.files.meta.json", "{}".to_string()),
+    ] {
+        fs::write(dir.join(name), text).expect("a file");
+    }
+    let out = prove(&env, &dir, HEAD);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        proof_file(&env),
+        json!({"head": HEAD, "reviewers": [{"name": "codex", "has_output": true, "failure_kind": null}]})
+    );
+}
+
+#[test]
+fn a_raw_folder_is_read_instead_of_files_at_the_root() {
+    let env = Env::new();
+    let dir = run_dir(&env, &[("kimi.stdout", &review()), ("kimi.meta.json", OK)]);
+    fs::write(dir.join("codex.stdout"), review()).expect("a stale root file");
+    fs::write(dir.join("codex.meta.json"), OK).expect("a stale root file");
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
+    assert_eq!(names(&env), [json!("kimi")]);
 }
 
 #[test]
@@ -141,7 +235,8 @@ fn merge_gate_reads_what_review_proof_wrote() {
         &env,
         &[
             ("codex.stdout", &review()),
-            ("kimi.meta.json", r#"{"failure_kind":"quota"}"#),
+            ("codex.meta.json", OK),
+            ("kimi.meta.json", r#"{"exit_code": 3, "failure_kind":"quota"}"#),
         ],
     );
     assert_eq!(prove(&env, &dir, HEAD).code, 0);

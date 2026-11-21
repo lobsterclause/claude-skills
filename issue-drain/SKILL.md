@@ -15,7 +15,7 @@ description: >
 
 Takes a set of issues and produces a queue a person approves. Each unit on the queue is one issue, or a few issues that one change fixes, sized and routed to the cheapest model that can do it. Issues the code already fixes are offered for closing with proof.
 
-This version does triage and verified closures. Carrying each unit to a merged PR (the unit runner, the merge gate and the driver) is the next build; until it lands the queue is a plan, and nothing here opens a PR or merges. The driver's per-unit commands exist and are run by hand until then: `unit-prepare --unit <n>` (cut the worktree, write `units/<n>/unit.json` and `guards-unit.json`), `claim take|release|check --unit <n>`, and `stamp-remote-pass --unit <n> --log <file> --head <sha>` (record the local verify stamp after a passing homelab verify). `unit-prepare` and `claim` refuse to run inside a unit process; `stamp-remote-pass` does not.
+This version does triage and verified closures. Carrying each unit to a merged PR (the unit runner, the merge gate and the driver) is the next build; until it lands the queue is a plan, and nothing here opens a PR or merges. The driver's per-unit commands exist and are run by hand until then: `unit-prepare --unit <n>` (cut the worktree, write `units/<n>/unit.json` and `guards-unit.json`), `claim take|release|check --unit <n>`, and `stamp-remote-pass --unit <n> --log <file> --head <sha>` (record the local verify stamp after a passing homelab verify). `unit-prepare` and `claim` refuse to run inside a unit process; `stamp-remote-pass` does not. A claim is ours when the newest claim marker comment on the issue is this run's and the issue's timeline shows the claim label was not removed after it, so `claim release` never removes a later run's claim or a label a stranger added.
 
 The work is split between you and one program. You judge: which closures hold up, which issues are one change, what each unit should cost. The program, `bin/issue-drain`, does everything that can be checked mechanically and is the only thing that writes to GitHub.
 
@@ -117,7 +117,7 @@ Its lines: `closed #N (fixed by <sha>)`, `skipped #N: already closed`, `refused 
 
 ## Exit codes
 
-Every subcommand uses the same four, and prints one line saying why on anything but 0.
+Every subcommand uses the first four, and prints one line saying why on anything but 0. `merge-gate` alone also has code 4.
 
 | Code | Meaning | What to do |
 |---|---|---|
@@ -125,6 +125,9 @@ Every subcommand uses the same four, and prints one line saying why on anything 
 | 1 | GitHub, git or the filesystem failed | Read the message. A transient failure can be retried once; otherwise report it |
 | 2 | Bad arguments or a missing input | An earlier step did not run, or the environment is not set. Fix that; do not work around it |
 | 3 | A rule refused the action | Report the reason. Change the input (for `tracker render`, fix `decisions.json`), never the rule |
+| 4 | `merge-gate` only: the merge call was accepted but the PR is not merged yet (a merge queue) | The output says `merged: false, queued: true`. Do not report it merged; ask the gate again later |
+
+`state init --parsed` takes the same go-ahead as step 1 above: it refuses (exit 3) a saved `tracker parse` that has `stop: true`, a `tracker_state` other than `OPEN` (null only in a dry run), or a non-empty `unknown`.
 
 ## The run folder
 

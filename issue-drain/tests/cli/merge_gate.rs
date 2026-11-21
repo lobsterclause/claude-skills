@@ -12,13 +12,20 @@ use crate::common::*;
 const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
 const MERGE: &str =
     "pr merge 12 --repo example/tidepool --squash --match-head-commit 0123456789abcdef0123456789abcdef01234567";
+const BASE_TIP: &str = "1dc973bdb697cc0a92e481f73e5d6599b8f7be66";
 const ARGS: [&str; 5] = ["merge-gate", "--unit", "3", "--pr", "12"];
+
+/// One entry of `closingIssuesReferences`, shaped as `gh pr view --json` prints it.
+fn closing(number: u64, owner: &str, name: &str) -> Value {
+    json!({"number": number, "repository": {"name": name, "owner": {"login": owner}},
+        "url": format!("https://github.com/{owner}/{name}/issues/{number}")})
+}
 
 fn pr_view(state: &str, labels: &[&str], body: &str) -> Value {
     let labels: Vec<Value> = labels.iter().map(|l| json!({"name": l})).collect();
     json!({
         "state": state, "headRefOid": HEAD, "baseRefName": "develop", "body": body,
-        "labels": labels, "closingIssuesReferences": [{"number": 5}], "changedFiles": 2,
+        "labels": labels, "closingIssuesReferences": [closing(5, "example", "tidepool")], "changedFiles": 2,
         "statusCheckRollup": [
             {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-11-21T01:00:00Z"},
             {"__typename": "StatusContext", "context": "lint", "state": "SUCCESS", "startedAt": "2026-11-21T01:00:00Z"},
@@ -62,7 +69,13 @@ fn ready() -> Env {
         "protection.json",
         &json!({"required_status_checks": {"contexts": ["build"], "checks": [{"context": "lint"}]}}),
     );
-    put(&env, "compare.json", &json!({"behind_by": 0, "ahead_by": 2}));
+    put(
+        &env,
+        "compare.json",
+        &json!({"behind_by": 0, "ahead_by": 2, "merge_base_commit": {"sha": BASE_TIP}}),
+    );
+    env.write("queue.json", &queue_with_unit(json!({})).to_string());
+    put(&env, "pr-view-12.after-merge.json", &merged_view());
     put(
         &env,
         "graphql-12.json",
@@ -79,9 +92,17 @@ fn ready() -> Env {
             {"name": "kimi", "has_output": true, "failure_kind": null}
         ]),
     );
-    env.write("units/3/deliver.json", &json!({"ok": true, "head": HEAD}).to_string());
+    env.write(
+        "units/3/deliver.json",
+        &json!({"ok": true, "head": HEAD, "merge_base": BASE_TIP}).to_string(),
+    );
     env.write("units/3/guards-marker", "");
     env
+}
+
+/// What GitHub says about PR 12 after a merge that went through.
+fn merged_view() -> Value {
+    json!({"state": "MERGED", "mergeCommit": {"oid": "fedcba9876543210fedcba9876543210fedcba98"}})
 }
 
 fn result(out: &Out) -> Value {
@@ -261,6 +282,7 @@ fn a_review_script_that_exits_1_with_clear_json_still_counts_only_the_json() {
     clean_preflight(&mut env);
     let out = env.run(&ARGS);
     assert_eq!(out.code, 0);
+    fs::remove_file(env.stub.join("merged-12")).expect("the stub forgets the merge");
     preflight(
         &mut env,
         &json!({"status": "clear", "head": HEAD, "verdict": "CLEAN"}).to_string(),
@@ -295,7 +317,11 @@ fn several_refusals_come_back_together() {
             "pageInfo": {"hasNextPage": false, "endCursor": null},
             "nodes": [{"isResolved": false}, {"isResolved": false}, {"isResolved": true}]}}}}}),
     );
-    put(&env, "compare.json", &json!({"behind_by": 4}));
+    put(
+        &env,
+        "compare.json",
+        &json!({"behind_by": 4, "merge_base_commit": {"sha": BASE_TIP}}),
+    );
     fs::remove_file(env.workdir.join("units/3/deliver.json")).expect("remove");
     let out = env.run(&ARGS);
     assert_eq!(out.code, 3);
@@ -388,4 +414,140 @@ fn bad_arguments_exit_2() {
     let env = ready();
     assert_eq!(env.run(&["merge-gate", "--unit", "3"]).code, 2);
     assert_eq!(env.run(&["merge-gate", "--unit", "0", "--pr", "12"]).code, 2);
+}
+
+fn queue_waiting_for(who: Value) -> String {
+    queue_with_unit(json!({"waits": true, "waits_for": who})).to_string()
+}
+
+#[test]
+fn a_unit_that_waits_for_a_person_is_never_merged_by_the_gate() {
+    let env = ready();
+    env.write("queue.json", &queue_waiting_for(json!("clinical review")));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["waits_for"]);
+    let detail = r["refusals"][0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("clinical review") && detail.contains("a person merges"),
+        "{detail}"
+    );
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_blank_waits_for_does_not_refuse_and_an_unreadable_queue_does() {
+    let env = ready();
+    env.write("queue.json", &queue_waiting_for(json!("  ")));
+    assert_eq!(env.run(&ARGS).code, 0);
+
+    let env = ready();
+    fs::remove_file(env.workdir.join("queue.json")).expect("remove");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["read_error"]);
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_delivery_audited_from_another_base_than_the_live_one_refuses() {
+    let env = ready();
+    let other = "2".repeat(40);
+    env.write(
+        "units/3/deliver.json",
+        &json!({"ok": true, "head": HEAD, "merge_base": other}).to_string(),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["deliver_check"]);
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains(&other));
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_delivery_report_with_no_merge_base_refuses() {
+    let env = ready();
+    env.write("units/3/deliver.json", &json!({"ok": true, "head": HEAD}).to_string());
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["deliver_check"]);
+}
+
+#[test]
+fn a_compare_answer_with_no_merge_base_is_a_read_error() {
+    let env = ready();
+    put(&env, "compare.json", &json!({"behind_by": 0}));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(codes(&result(&out)).contains(&"read_error".to_string()));
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_merge_that_only_queued_the_pr_is_not_reported_merged() {
+    let env = ready();
+    put(
+        &env,
+        "pr-view-12.after-merge.json",
+        &pr_view("OPEN", &["bug"], "Fixes #5"),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 4, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(r["merged"], false);
+    assert_eq!(r["queued"], true);
+    assert_eq!(merged_calls(&env), [MERGE]);
+}
+
+#[test]
+fn a_merged_pr_reports_its_merge_commit() {
+    let env = ready();
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(r["merged"], true);
+    assert_eq!(r["merge_commit"], "fedcba9876543210fedcba9876543210fedcba98");
+}
+
+#[test]
+fn a_read_that_fails_after_the_merge_call_says_the_merge_may_have_happened() {
+    let env = ready();
+    fs::remove_file(env.stub.join("pr-view-12.after-merge.json")).expect("remove");
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("may have been merged"), "{}", out.stderr);
+    assert_eq!(merged_calls(&env), [MERGE]);
+}
+
+#[test]
+fn an_issue_the_pr_closes_in_another_repository_refuses_naming_it() {
+    let env = ready();
+    let mut view = pr_view("OPEN", &["bug"], "Fixes #5");
+    view["closingIssuesReferences"] = json!([closing(5, "example", "tidepool"), closing(7, "other", "elsewhere")]);
+    put(&env, "pr-view-12.json", &view);
+    put(&env, "issue-view-7.json", &json!({"labels": [{"name": "bug"}]}));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(codes(&r), ["closing_issue_repo"]);
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("other/elsewhere"));
+    assert!(
+        env.gh_calls().iter().all(|c| !c.starts_with("issue view 7")),
+        "the other repository's issue is not read by number here"
+    );
+    assert!(merged_calls(&env).is_empty());
+}
+
+#[test]
+fn a_closing_issue_with_no_repository_does_not_parse() {
+    let env = ready();
+    let mut view = pr_view("OPEN", &["bug"], "Fixes #5");
+    view["closingIssuesReferences"] = json!([{"number": 5}]);
+    put(&env, "pr-view-12.json", &view);
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(codes(&result(&out)).contains(&"read_error".to_string()));
+    assert!(merged_calls(&env).is_empty());
 }

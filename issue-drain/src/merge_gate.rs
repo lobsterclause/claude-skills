@@ -13,8 +13,20 @@
 //! read once, and the merge call carries it as `--match-head-commit`, so a
 //! head that moves after the decision cannot be merged.
 //!
+//! A unit whose queue entry names someone in `waits_for` is never merged here:
+//! a person merges it, and the gate does not try to verify that person's
+//! approval. The delivery check must have diffed from the same merge base the
+//! PR has against the live base branch (GitHub's compare answer), so a
+//! `deliver-check --base` that audited only part of the PR is refused.
+//!
+//! `gh pr merge` exiting 0 does not mean merged: on a merge-queue branch it
+//! means queued. The PR is read again after the call, and `merged: true` is
+//! printed only when GitHub says MERGED.
+//!
 //! Exit: 0 merged (or already merged, or a dry run that would have); 3 a
-//! condition refused; 1 the merge call itself failed; 2 bad arguments.
+//! condition refused; 1 the merge call itself failed, or the read after it did
+//! (the PR may then have been merged); 4 the merge call was accepted but the PR
+//! is not merged yet (queued: `merged: false, queued: true`); 2 bad arguments.
 
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
@@ -74,6 +86,13 @@ pub struct Run {
     pub started: String,
 }
 
+/// An issue the PR will close, and the repository it is in (`owner/name`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Closing {
+    pub number: u64,
+    pub repo: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct PrView {
     pub state: PrState,
@@ -81,7 +100,7 @@ pub struct PrView {
     pub base_ref: String,
     pub labels: Vec<String>,
     pub body: String,
-    pub closing: Vec<u64>,
+    pub closing: Vec<Closing>,
     pub changed_files: u64,
     pub runs: Vec<Run>,
 }
@@ -113,12 +132,18 @@ pub struct Deliver {
     pub ok: bool,
     #[serde(default)]
     pub head: String,
+    /// The merge base `deliver-check` diffed from. Absent in a report written
+    /// before the field existed, which the gate does not accept.
+    #[serde(default)]
+    pub merge_base: String,
 }
 
 /// Everything the decision depends on. `Err` is a field that could not be read.
 pub struct Facts {
     pub unit: u64,
     pub pr: u64,
+    /// `owner/name`, as the run names it.
+    pub repo: String,
     pub base: String,
     /// The profile's hold labels.
     pub hold_labels: Vec<String>,
@@ -134,6 +159,10 @@ pub struct Facts {
     /// Labels of each issue the PR will close.
     pub issue_labels: Vec<(u64, Read<Vec<String>>)>,
     pub behind_by: Read<u64>,
+    /// The merge base of the PR head and the live base branch, from GitHub.
+    pub merge_base: Read<String>,
+    /// Who the unit's queue entry says reviews its PR; `None` when nobody.
+    pub waits_for: Read<Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -317,6 +346,15 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
         if v.body.to_lowercase().contains("held for human") {
             out.push(refusal("hold_label", format!("PR #{n} says it is held for human")));
         }
+        for closing in v.closing.iter().filter(|c| !c.repo.eq_ignore_ascii_case(&f.repo)) {
+            out.push(refusal(
+                "closing_issue_repo",
+                format!(
+                    "PR #{n} closes {}#{}, which is not in {}; its labels are not read here",
+                    closing.repo, closing.number, f.repo
+                ),
+            ));
+        }
         for (issue, labels) in &f.issue_labels {
             match labels {
                 Err(what) => out.push(refusal("read_error", format!("could not read {what}"))),
@@ -358,6 +396,25 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                     format!("units/{unit}/deliver.json is for '{}', not the head", d.head),
                 ));
             }
+            if d.merge_base.is_empty() {
+                out.push(refusal(
+                    "deliver_check",
+                    format!("units/{unit}/deliver.json records no merge_base; run deliver-check again"),
+                ));
+            } else {
+                match &f.merge_base {
+                    Err(what) => out.push(refusal("read_error", format!("could not read {what}"))),
+                    Ok(live) if *live != d.merge_base => out.push(refusal(
+                        "deliver_check",
+                        format!(
+                            "units/{unit}/deliver.json diffed from {}, but the PR's merge base with {} is {live}; \
+                             run deliver-check again without --base, after fetching",
+                            d.merge_base, f.base
+                        ),
+                    )),
+                    Ok(_) => {}
+                }
+            }
         }
     }
     if !f.guards_marker {
@@ -365,6 +422,19 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
             "guards_marker",
             format!("units/{unit}/guards-marker is missing"),
         ));
+    }
+
+    // 12. a person's merge
+    match &f.waits_for {
+        Err(what) => out.push(refusal("read_error", format!("could not read {what}"))),
+        Ok(Some(who)) if !who.trim().is_empty() => out.push(refusal(
+            "waits_for",
+            format!(
+                "unit {unit} waits for {}; a person merges it, this gate does not",
+                who.trim()
+            ),
+        )),
+        Ok(_) => {}
     }
     out
 }
@@ -449,16 +519,42 @@ fn parse_run(entry: &Value) -> Read<Run> {
     })
 }
 
-/// `gh pr view --json state,headRefOid,baseRefName,labels,body,
-/// closingIssuesReferences,changedFiles,statusCheckRollup`.
-pub fn parse_view(raw: &str) -> Read<PrView> {
-    let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
-    let state = match text(&v, "state")?.as_str() {
+fn pr_state(v: &Value) -> Read<PrState> {
+    Ok(match text(v, "state")?.as_str() {
         "OPEN" => PrState::Open,
         "CLOSED" => PrState::Closed,
         "MERGED" => PrState::Merged,
         _ => PrState::Other,
-    };
+    })
+}
+
+/// One `closingIssuesReferences` entry: `{number, repository: {name, owner:
+/// {login}}}`. An entry that does not say which repository it is in cannot be
+/// looked up, so it does not parse.
+fn parse_closing(entry: &Value) -> Read<Closing> {
+    let number = entry
+        .get("number")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "a closing issue has no number".to_string())?;
+    let repo = entry.get("repository");
+    let name = repo.and_then(|r| r.get("name")).and_then(Value::as_str);
+    let owner = repo.and_then(|r| r.pointer("/owner/login")).and_then(Value::as_str);
+    match (owner, name) {
+        (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => Ok(Closing {
+            number,
+            repo: format!("{owner}/{name}"),
+        }),
+        _ => Err(format!(
+            "closing issue #{number} does not say which repository it is in"
+        )),
+    }
+}
+
+/// `gh pr view --json state,headRefOid,baseRefName,labels,body,
+/// closingIssuesReferences,changedFiles,statusCheckRollup`.
+pub fn parse_view(raw: &str) -> Read<PrView> {
+    let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
+    let state = pr_state(&v)?;
     let head = text(&v, "headRefOid")?;
     if !is_sha(&head) {
         return Err(format!("the head '{head}' is not a commit SHA"));
@@ -467,12 +563,8 @@ pub fn parse_view(raw: &str) -> Read<PrView> {
         .as_array()
         .ok_or("'closingIssuesReferences' is not a list")?
         .iter()
-        .map(|i| {
-            i.get("number")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| "a closing issue has no number".to_string())
-        })
-        .collect::<Read<Vec<u64>>>()?;
+        .map(parse_closing)
+        .collect::<Read<Vec<Closing>>>()?;
     let runs = field(&v, "statusCheckRollup")?
         .as_array()
         .ok_or("'statusCheckRollup' is not a list")?
@@ -571,6 +663,29 @@ fn parse_behind(raw: &str) -> Read<u64> {
         .ok_or_else(|| "no behind_by in the answer".to_string())
 }
 
+/// `merge_base_commit.sha` of the same compare answer.
+fn parse_merge_base(raw: &str) -> Read<String> {
+    let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
+    v.pointer("/merge_base_commit/sha")
+        .and_then(Value::as_str)
+        .filter(|sha| is_sha(sha))
+        .map(str::to_string)
+        .ok_or_else(|| "no merge_base_commit in the answer".to_string())
+}
+
+/// `gh pr view --json state,mergeCommit` after the merge call: whether the PR
+/// is merged, and the merge commit when GitHub names one.
+fn parse_after_merge(raw: &str) -> Read<(PrState, Option<String>)> {
+    let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
+    let state = pr_state(&v)?;
+    let oid = v
+        .pointer("/mergeCommit/oid")
+        .and_then(Value::as_str)
+        .filter(|oid| is_sha(oid))
+        .map(str::to_string);
+    Ok((state, oid))
+}
+
 fn parse_preflight(raw: &str) -> Read<Preflight> {
     let v: Value = serde_json::from_str(raw.trim()).map_err(|_| "its output is not JSON".to_string())?;
     if !v.is_object() {
@@ -652,22 +767,40 @@ fn unit_file<T: serde::de::DeserializeOwned>(ctx: &Ctx, unit: u64, name: &str) -
 fn gather(ctx: &Ctx, repo: &str, unit: u64, pr: u64, view: Read<PrView>) -> Facts {
     let base = ctx.profile.base_branch.clone();
     let head = view.as_ref().ok().map(|v| v.head.clone());
-    let issues: Vec<u64> = view.as_ref().map(|v| v.closing.clone()).unwrap_or_default();
+    // An issue in another repository is refused by `judge`, not looked up here
+    // by a number that means something else in this repo.
+    let issues: Vec<u64> = view
+        .as_ref()
+        .map(|v| {
+            v.closing
+                .iter()
+                .filter(|c| c.repo.eq_ignore_ascii_case(repo))
+                .map(|c| c.number)
+                .collect()
+        })
+        .unwrap_or_default();
 
     let protection = format!("repos/{repo}/branches/{base}/protection");
     let required = read_gh(&["api", &protection])
         .and_then(|raw| parse_protection(&raw))
         .map_err(|e| format!("the branch protection of {base} ({e})"));
 
-    let behind_by = match &head {
-        None => Err("how far the PR is behind the base (its head is unknown)".to_string()),
-        Some(head) => {
-            let compare = format!("repos/{repo}/compare/{base}...{head}");
-            read_gh(&["api", &compare])
-                .and_then(|raw| parse_behind(&raw))
-                .map_err(|e| format!("how far the PR is behind {base} ({e})"))
-        }
+    // One compare answer, read live from GitHub, gives both how far behind the
+    // PR is and the merge base the delivery check must have diffed from.
+    let compare = match &head {
+        None => Err("its head is unknown".to_string()),
+        Some(head) => read_gh(&["api", &format!("repos/{repo}/compare/{base}...{head}")]),
     };
+    let behind_by = compare
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|raw| parse_behind(raw))
+        .map_err(|e| format!("how far the PR is behind {base} ({e})"));
+    let merge_base = compare
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|raw| parse_merge_base(raw))
+        .map_err(|e| format!("the merge base of the PR and {base} ({e})"));
 
     let issue_labels = issues
         .iter()
@@ -685,6 +818,7 @@ fn gather(ctx: &Ctx, repo: &str, unit: u64, pr: u64, view: Read<PrView>) -> Fact
     Facts {
         unit,
         pr,
+        repo: repo.to_string(),
         base,
         hold_labels: ctx.profile.hold_labels.clone(),
         view,
@@ -696,6 +830,11 @@ fn gather(ctx: &Ctx, repo: &str, unit: u64, pr: u64, view: Read<PrView>) -> Fact
         threads: threads(repo, pr).map_err(|e| format!("the review threads of PR #{pr} ({e})")),
         issue_labels,
         behind_by,
+        merge_base,
+        waits_for: ctx
+            .queue_unit(unit)
+            .map(|u| u.waits_for)
+            .map_err(|e| format!("the queue entry of unit {unit} ({})", e.msg)),
     }
 }
 
@@ -710,6 +849,20 @@ fn read_view(repo: &str, pr: u64) -> Read<PrView> {
         "state,headRefOid,baseRefName,labels,body,closingIssuesReferences,changedFiles,statusCheckRollup",
     ])?;
     parse_view(&raw)
+}
+
+/// The PR's state and merge commit, read again after the merge call.
+fn read_after_merge(repo: &str, pr: u64) -> Read<(PrState, Option<String>)> {
+    read_gh(&[
+        "pr",
+        "view",
+        &pr.to_string(),
+        "--repo",
+        repo,
+        "--json",
+        "state,mergeCommit",
+    ])
+    .and_then(|raw| parse_after_merge(&raw))
 }
 
 fn report(ctx: &Ctx, unit: u64, pr: u64, head: &str, merged: bool, refusals: &[Refusal]) {
@@ -748,6 +901,14 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             .collect();
         json!({"pr": pr, "unit": unit, "head": head, "merged": merged, "refusals": list, "reviewers": reviewers(&facts)})
     };
+    // `output` plus the fields only a merge call has.
+    let output_with = |merged: bool, extra: Value| {
+        let mut out = output(merged);
+        if let (Some(out), Value::Object(extra)) = (out.as_object_mut(), extra) {
+            out.extend(extra);
+        }
+        out
+    };
 
     if !refusals.is_empty() {
         report(ctx, unit, pr, &head, false, &refusals);
@@ -764,10 +925,36 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             head: &head,
         },
     ) {
-        Ok(written) => {
-            report(ctx, unit, pr, &head, written.called, &[]);
-            println!("{}", output(written.called));
+        Ok(written) if !written.called => {
+            // A dry run: nothing was sent.
+            report(ctx, unit, pr, &head, false, &[]);
+            println!("{}", output(false));
             Ok(())
+        }
+        Ok(_) => {
+            // Exit 0 from `gh pr merge` also means "queued" on a merge-queue
+            // branch, so ask GitHub what became of the PR.
+            match read_after_merge(&repo, pr) {
+                Ok((PrState::Merged, oid)) => {
+                    report(ctx, unit, pr, &head, true, &[]);
+                    println!("{}", output_with(true, json!({"merge_commit": oid})));
+                    Ok(())
+                }
+                Ok((state, _)) => {
+                    report(ctx, unit, pr, &head, false, &[]);
+                    println!("{}", output_with(false, json!({"queued": true})));
+                    Err(Fail::queued(format!(
+                        "PR #{pr}: the merge call was accepted but the PR is {state:?}, not merged (queued?); ask again later"
+                    )))
+                }
+                Err(what) => {
+                    report(ctx, unit, pr, &head, false, &[]);
+                    println!("{}", output_with(false, json!({"state_unknown": true})));
+                    Err(Fail::failed(format!(
+                        "PR #{pr}: the merge call exited 0 but the PR could not be read afterwards ({what}); it may have been merged"
+                    )))
+                }
+            }
         }
         Err(fail) => {
             report(ctx, unit, pr, &head, false, &[]);
@@ -782,6 +969,7 @@ mod tests {
     use super::*;
 
     const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+    const BASE_TIP: &str = "1dc973bdb697cc0a92e481f73e5d6599b8f7be66";
 
     fn run_of(name: &str, outcome: Outcome, word: &str, started: &str) -> Run {
         Run {
@@ -808,6 +996,7 @@ mod tests {
         Facts {
             unit: 3,
             pr: 12,
+            repo: "example/tidepool".into(),
             base: "develop".into(),
             hold_labels: vec!["blocked".into()],
             view: Ok(PrView {
@@ -816,7 +1005,10 @@ mod tests {
                 base_ref: "develop".into(),
                 labels: vec!["bug".into()],
                 body: "Fixes #5".into(),
-                closing: vec![5],
+                closing: vec![Closing {
+                    number: 5,
+                    repo: "example/tidepool".into(),
+                }],
                 changed_files: 2,
                 runs: vec![pass("build"), pass("lint")],
             }),
@@ -833,11 +1025,14 @@ mod tests {
             deliver: Ok(Deliver {
                 ok: true,
                 head: HEAD.into(),
+                merge_base: BASE_TIP.into(),
             }),
             guards_marker: true,
             threads: Ok(0),
             issue_labels: vec![(5, Ok(vec!["bug".into()]))],
             behind_by: Ok(0),
+            merge_base: Ok(BASE_TIP.into()),
+            waits_for: Ok(None),
         }
     }
 
@@ -1101,6 +1296,48 @@ mod tests {
     }
 
     #[test]
+    fn a_unit_that_waits_for_someone_is_refused_whatever_else_is_clear() {
+        let mut f = clear();
+        f.waits_for = Ok(Some(" clinical review ".into()));
+        let found = judge(&f);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].code, "waits_for");
+        assert!(found[0].detail.contains("clinical review"), "{}", found[0].detail);
+        f.waits_for = Ok(Some("  ".into()));
+        assert!(codes(&f).is_empty());
+        f.waits_for = Err("the queue entry of unit 3 (no queue)".into());
+        assert_eq!(codes(&f), ["read_error"]);
+    }
+
+    #[test]
+    fn the_deliver_check_must_name_the_live_merge_base() {
+        let mut f = clear();
+        f.deliver.as_mut().unwrap().merge_base = "2".repeat(40);
+        assert_eq!(codes(&f), ["deliver_check"]);
+        let mut f = clear();
+        f.deliver.as_mut().unwrap().merge_base = String::new();
+        assert_eq!(codes(&f), ["deliver_check"]);
+        let mut f = clear();
+        f.merge_base = Err("the merge base (gh exit 1)".into());
+        assert_eq!(codes(&f), ["read_error"]);
+    }
+
+    #[test]
+    fn an_issue_in_another_repository_is_refused_and_a_case_difference_is_not() {
+        let mut f = clear();
+        view(&mut f).closing[0].repo = "Example/Tidepool".into();
+        assert!(codes(&f).is_empty());
+        view(&mut f).closing.push(Closing {
+            number: 9,
+            repo: "other/elsewhere".into(),
+        });
+        let found = judge(&f);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].code, "closing_issue_repo");
+        assert!(found[0].detail.contains("other/elsewhere#9"), "{}", found[0].detail);
+    }
+
+    #[test]
     fn the_guards_marker_must_exist() {
         let mut f = clear();
         f.guards_marker = false;
@@ -1131,7 +1368,7 @@ mod tests {
     fn a_view_parses_checks_of_both_kinds_and_keeps_unstarted_runs_newest() {
         let raw = json!({
             "state": "OPEN", "headRefOid": HEAD, "baseRefName": "develop", "body": "x",
-            "labels": [{"name": "bug"}], "closingIssuesReferences": [{"number": 5}], "changedFiles": 1,
+            "labels": [{"name": "bug"}], "closingIssuesReferences": [{"number": 5, "repository": {"name": "tidepool", "owner": {"login": "example"}}}], "changedFiles": 1,
             "statusCheckRollup": [
                 {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-11-20T01:00:00Z"},
                 {"__typename": "CheckRun", "name": "build", "status": "QUEUED", "conclusion": "", "startedAt": "0001-01-01T00:00:00Z"},
@@ -1141,7 +1378,11 @@ mod tests {
         .to_string();
         let v = parse_view(&raw).unwrap();
         assert_eq!(v.runs.len(), 3);
-        assert_eq!(v.closing, [5]);
+        assert_eq!(v.closing.len(), 1);
+        assert_eq!(
+            (v.closing[0].number, v.closing[0].repo.as_str()),
+            (5, "example/tidepool")
+        );
         let mut f = clear();
         f.view = Ok(v);
         f.required = Ok(vec!["build".into()]);

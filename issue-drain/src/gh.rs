@@ -8,8 +8,9 @@
 //!     "WOULD: ..." and calls nothing;
 //!   - labels are limited to the three the drain owns (claim, blocked,
 //!     tracker), and only the claim label can be removed;
-//!   - a unit process (ISSUE_DRAIN_MODE=unit) can use the verbs in `unit_may` and nothing else.
-//!     Claims, hold labels and closures belong to the driver and the session.
+//!   - a unit process (ISSUE_DRAIN_MODE=unit) can use the verbs in `unit_may` and nothing else,
+//!     and may not add the claim label (a claim is the label plus a marker comment, which only
+//!     `claim take` makes). Claims, hold labels and closures belong to the driver and the session.
 //!
 //! Bodies come from a file, never from an argument, so issue text never meets
 //! argument parsing.
@@ -21,6 +22,7 @@ use serde_json::json;
 
 use crate::ctx::{Ctx, Mode};
 use crate::error::{Fail, Res};
+use crate::profile::same_label;
 use crate::text::parse_number;
 
 pub enum Write<'a> {
@@ -156,6 +158,25 @@ pub fn unit_may(verb: &str) -> bool {
     matches!(
         verb,
         "comment" | "add-label" | "ensure-label" | "pr-create" | "thread-reply" | "thread-resolve"
+    )
+}
+
+/// Whether a unit is asking to add the claim label. A claim is that label plus
+/// a marker comment, and only `claim take` makes both; the label alone would
+/// be a claim nobody can tell from someone else's.
+fn unit_adds_claim_label(mode: Mode, label: &str, claim_label: &str) -> bool {
+    mode == Mode::Unit && same_label(label, claim_label)
+}
+
+fn claim_label_refused(ctx: &Ctx, verb: &str, mode: Mode) -> Fail {
+    refuse(
+        ctx,
+        verb,
+        mode,
+        format!(
+            "'{}' is the claim label, which only `claim take` adds (with its marker comment)",
+            ctx.profile.claim_label
+        ),
     )
 }
 
@@ -317,6 +338,9 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
             )
         }
         Write::AddLabel { number, label } => {
+            if unit_adds_claim_label(mode, label, &p.claim_label) {
+                return Err(claim_label_refused(ctx, verb, mode));
+            }
             if *label != p.claim_label && *label != p.blocked_label {
                 return Err(refuse(
                     ctx,
@@ -531,10 +555,15 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             body_file: body()?,
         },
         "ensure-label" => Write::EnsureLabel { label: arg(0) },
-        "add-label" => Write::AddLabel {
-            number: number()?,
-            label: arg(1),
-        },
+        "add-label" => {
+            if unit_adds_claim_label(mode, arg(1), &ctx.profile.claim_label) {
+                return Err(claim_label_refused(ctx, verb, mode));
+            }
+            Write::AddLabel {
+                number: number()?,
+                label: arg(1),
+            }
+        }
         "remove-label" => Write::RemoveLabel {
             number: number()?,
             label: arg(1),
@@ -594,6 +623,26 @@ mod tests {
         let resolve = thread_resolve_argv("PRRT_kw-1=");
         assert!(resolve[3].contains("resolveReviewThread(input:{threadId:$id})"));
         assert_eq!(resolve[4..], ["-f", "id=PRRT_kw-1="]);
+    }
+
+    #[test]
+    fn only_a_unit_is_kept_from_the_claim_label_and_case_does_not_matter() {
+        assert!(unit_adds_claim_label(
+            Mode::Unit,
+            "Agent-In-Progress",
+            "agent-in-progress"
+        ));
+        assert!(!unit_adds_claim_label(Mode::Unit, "needs-human", "agent-in-progress"));
+        assert!(!unit_adds_claim_label(
+            Mode::Driver,
+            "agent-in-progress",
+            "agent-in-progress"
+        ));
+        assert!(!unit_adds_claim_label(
+            Mode::Session,
+            "agent-in-progress",
+            "agent-in-progress"
+        ));
     }
 
     #[test]

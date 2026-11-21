@@ -104,8 +104,8 @@ impl State {
         match self {
             Queued => &[Claimed, Skipped],
             Claimed => &[Prepared, Skipped, Blocked],
-            Prepared => &[Implementing, Blocked],
-            Implementing => &[PrOpen, Blocked],
+            Prepared => &[Implementing, Skipped, Blocked],
+            Implementing => &[PrOpen, Skipped, Blocked],
             PrOpen => &[Reviewing, Parked, Blocked, Skipped],
             Reviewing => &[CiWait, Parked, Blocked],
             CiWait => &[Gate, Repairing, Blocked],
@@ -465,6 +465,59 @@ fn unit_number(id: &str) -> Option<u64> {
     id.strip_prefix('U')?.parse().ok()
 }
 
+/// The go-ahead SKILL.md asks for before anything runs: the tracker is open,
+/// has no STOP line, and holds nothing the run never offered. A saved parse
+/// that does not say all three is not the output of `tracker parse`. A null
+/// `tracker_state` means the body came from a file, which only a dry run does.
+fn called_off(parsed: &Value, path: &std::path::Path, dry_run: bool) -> Res<()> {
+    let missing = |key: &str| {
+        Fail::usage(format!(
+            "{} has no \"{key}\"; it is not what `tracker parse` prints",
+            path.display()
+        ))
+    };
+    let stop = parsed
+        .get("stop")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| missing("stop"))?;
+    let unknown = parsed
+        .get("unknown")
+        .and_then(Value::as_array)
+        .ok_or_else(|| missing("unknown"))?;
+    let tracker_state = match parsed.get("tracker_state") {
+        Some(Value::String(state)) => Some(state.as_str()),
+        Some(Value::Null) => None,
+        _ => return Err(missing("tracker_state")),
+    };
+    if stop {
+        return Err(Fail::refused(
+            "the tracker has a STOP line: the user called the run off",
+        ));
+    }
+    match tracker_state {
+        Some("OPEN") => {}
+        Some(state) => {
+            return Err(Fail::refused(format!(
+                "the tracker is {state}, not OPEN: the user called the run off"
+            )));
+        }
+        None if dry_run => {}
+        None => {
+            return Err(Fail::refused(
+                "tracker_state is null, so this parse did not read the live tracker (only a dry run may start from a file)",
+            ));
+        }
+    }
+    if !unknown.is_empty() {
+        let lines: Vec<&str> = unknown.iter().filter_map(Value::as_str).collect();
+        return Err(Fail::refused(format!(
+            "the tracker has lines the run never offered: {}",
+            lines.join("; ")
+        )));
+    }
+    Ok(())
+}
+
 fn init(ctx: &Ctx, args: &InitArgs) -> Res<()> {
     let replay = replay(ctx)?;
     if replay.events > 0 {
@@ -498,6 +551,7 @@ fn init(ctx: &Ctx, args: &InitArgs) -> Res<()> {
             .get("units")
             .and_then(Value::as_array)
             .ok_or_else(|| Fail::usage(format!("{} has no \"units\" list", path.display())))?;
+        called_off(&parsed, path, ctx.dry_run)?;
         let mut ordered = Vec::new();
         for id in listed {
             let id = id.as_str().unwrap_or_default();

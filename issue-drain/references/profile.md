@@ -12,13 +12,13 @@ To add a repo, copy an existing profile, then check each label against `gh label
 |---|---|---|
 | `base_branch` | `main` | The branch issues are read against and PRs target |
 | `hold_labels` | `needs-human`, `blocked` | An open issue carrying any of these is left out at intake, and is not closed by `close-verified` |
-| `claim_label` | `agent-in-progress` | Marks an issue some agent is working on. Left out at intake; listed as a stale claim when older than `stale_claim_days` |
+| `claim_label` | `agent-in-progress` | Marks an issue some agent is working on. Left out at intake; listed as a stale claim when older than `stale_claim_days`. A unit process may not add it with `gh-write`; only `claim take` does, with its marker comment |
 | `blocked_label` | `needs-human` | Added to a draft PR the drain could not finish (used by units) |
 | `tracker_label` | `issue-drain` | Put on the tracker issue. Created if the repo lacks it |
 | `priority_labels` | none | Highest priority first. An issue with none of these sorts last |
 | `protected_path_re` | workflows, `.husky`, `.claude` | A fix on a matching path becomes `needs_human`; no unit touches it |
 | `frozen_paths` | none | Files or folders (trailing slash optional) a unit's diff may not touch; `deliver-check` fails with `frozen_path` |
-| `risk_path_re` | none | A unit touching a matching path is never clustered with another live issue, must name its reviewer in `waits_for`, and waits for that person after opening its PR |
+| `risk_path_re` | none | A unit touching a matching path is never clustered with another live issue, must name its reviewer in `waits_for`, and waits for that person after opening its PR. `merge-gate` never merges such a unit; that person does |
 | `trusted_associations` | `OWNER`, `MEMBER`, `COLLABORATOR` | Author associations whose issue text may be shown to agents with write tools |
 | `intake_cap` | 40 | The most issues one run takes in |
 | `stale_claim_days` | 3 | Age at which a claim is listed for release |

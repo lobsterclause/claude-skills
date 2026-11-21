@@ -13,7 +13,8 @@ use issue_drain::{
 /// Every command reads ISSUE_DRAIN_WORKDIR (the run folder, an absolute path)
 /// and ISSUE_DRAIN_REPO (<owner>/<repo>). Exit codes: 2 for bad arguments or
 /// a missing input, 3 when a rule refused the action, 1 when GitHub, git or
-/// the filesystem failed.
+/// the filesystem failed. `merge-gate` alone also exits 4: the merge call was
+/// accepted but the PR is not merged yet (queued).
 #[derive(Parser)]
 #[command(name = "issue-drain", version)]
 struct Cli {
