@@ -35,7 +35,7 @@ use crate::gh::{self, Write};
 use crate::git;
 use crate::model::{Checked, Closure, FixCommit, Line, Queue};
 use crate::text::{parse_number, safe, sha7, span, uri_segment};
-use crate::tracker::io::{Published, fetch_tracker, parse_body};
+use crate::tracker::io::{Published, fetch_tracker, parse_body, why_refused};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -301,10 +301,7 @@ fn close_one(r: &Run, number: u64, offered: &Closure) -> Res<Result<(), Stop>> {
         }
         let now = fetch_tracker(ctx, r.queue)?;
         let halt = if !now.unknown.is_empty() {
-            Some(format!(
-                "the tracker now has a ticked line this run never offered ({})",
-                now.unknown.join(", ")
-            ))
+            Some(format!("the tracker now has {}", why_refused(&now.unknown)))
         } else if now.stop {
             Some("the tracker now says STOP".to_string())
         } else if now.tracker_state.as_deref().unwrap_or("OPEN") != "OPEN" {
@@ -427,8 +424,8 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         return Err(refuse_all(
             ctx,
             format!(
-                "the tracker has a ticked line this run never offered ({}); nothing is closed until that line is gone",
-                parsed.unknown.join(", ")
+                "the tracker has {}; nothing is closed while it does",
+                why_refused(&parsed.unknown)
             ),
         ));
     }

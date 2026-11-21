@@ -62,8 +62,9 @@ pub struct Parsed {
     /// OPEN or CLOSED for a live read; null when the body came from a file.
     pub tracker_state: Option<String>,
     /// Lines that name something the queue never offered, as "unit U9",
-    /// "close #999" or "release #55". Not empty means a caller must refuse:
-    /// a box can approve only what render offered.
+    /// "close #999" or "release #55"; or, when the body has markup that can
+    /// hide a box, those lines as "line 12 is a code fence", with nothing
+    /// read from the body. Not empty means a caller must refuse.
     pub unknown: Vec<String>,
 }
 
@@ -110,55 +111,58 @@ fn split_numbers(found: &[&str], offered: &[u64]) -> (Vec<u64>, Vec<String>) {
     (approved, unknown)
 }
 
-/// A line's run of `mark` and what follows it, when the line can be a code
-/// fence: at most three spaces come before the run. A line indented further,
-/// or with a tab, is text.
-fn fence_run(line: &str, mark: char) -> Option<(usize, &str)> {
-    let text = line.trim_start_matches(' ');
-    if line.len() - text.len() > 3 {
-        return None;
+/// The two HTML lines render writes. Each stands before a blank line.
+pub(crate) const DETAILS_OPEN: &str = "<details><summary>Acceptance checks, files and reuse for each unit</summary>";
+pub(crate) const DETAILS_CLOSE: &str = "</details>";
+
+/// The lines that can make GitHub show a box as text: a code fence, an HTML
+/// comment, or a line of HTML, each as "line <n> is ...". Which lines such a
+/// block covers depends on the list or quote it sits in, and this does not
+/// work that out. It names every line that could start one, wherever the line
+/// is indented or nested, so a caller can refuse the whole body.
+///
+/// The run's marker line is not named. Nor are the two `<details>` lines as
+/// render wrote them, when a blank line follows: that is where GitHub stops
+/// reading HTML.
+fn hiding_markup(lines: &[&str]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if MARKER.is_match(line) {
+            continue;
+        }
+        // Past any indentation, quote mark or list marker.
+        let text = line.trim_start_matches(|c: char| " \t>*+-.)".contains(c) || c.is_ascii_digit());
+        let rendered = *line == DETAILS_OPEN || *line == DETAILS_CLOSE;
+        let ends_here = lines.get(at + 1).is_none_or(|next| next.trim().is_empty());
+        let what = if text.starts_with("```") || text.starts_with("~~~") {
+            "is a code fence"
+        } else if line.contains("<!--") {
+            "has an HTML comment"
+        } else if text.starts_with('<') && !(rendered && ends_here) {
+            "is HTML"
+        } else {
+            continue;
+        };
+        found.push(format!("line {} {what}", at + 1));
     }
-    let run = text.chars().take_while(|c| *c == mark).count();
-    Some((run, &text[run..]))
+    found
 }
 
-/// The lines GitHub shows as lines: not those inside a fenced code block
-/// (``` or ~~~) and not those inside an HTML comment that spans lines. A box
-/// in either is text, and nobody can tick it.
-fn shown<'a>(lines: &[&'a str]) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
-    let mut in_comment = false;
-    for line in lines {
-        if in_comment {
-            in_comment = !line.contains("-->");
-            continue;
-        }
-        if let Some((mark, opened)) = fence {
-            // A block closes on a run of its own mark, at least as long as
-            // the one that opened it, with nothing after it.
-            if fence_run(line, mark).is_some_and(|(run, rest)| run >= opened && rest.trim().is_empty()) {
-                fence = None;
-            }
-            continue;
-        }
-        // A backtick fence has no backtick after its run.
-        fence = ['`', '~'].into_iter().find_map(|mark| {
-            let (run, rest) = fence_run(line, mark)?;
-            (run >= 3 && !(mark == '`' && rest.contains('`'))).then_some((mark, run))
-        });
-        if fence.is_some() {
-            continue;
-        }
-        let text = line.trim_start();
-        // A comment that opens here and closes on a later line. What stands
-        // before it on this line is still shown.
-        in_comment = line.rfind("<!--").is_some_and(|at| !line[at..].contains("-->"));
-        if !(in_comment && text.starts_with("<!--")) {
-            out.push(*line);
-        }
+/// Whether an entry of `Parsed::unknown` names markup and not a line the run
+/// never offered.
+fn names_markup(entry: &str) -> bool {
+    entry.starts_with("line ")
+}
+
+/// Why a caller must refuse a tracker whose `unknown` is not empty, as a
+/// clause to finish a sentence with.
+pub(crate) fn why_refused(unknown: &[String]) -> String {
+    let named = unknown.join(", ");
+    if unknown.iter().any(|entry| names_markup(entry)) {
+        format!("markup that can hide a box ({named}); nothing on it is read until that is removed")
+    } else {
+        format!("a ticked line this run never offered ({named})")
     }
-    out
 }
 
 /// Read what a person left on the tracker. No I/O.
@@ -171,9 +175,10 @@ fn shown<'a>(lines: &[&'a str]) -> Vec<&'a str> {
 ///   `- [x] close #101 ...`  an approved closure
 ///   `- [x] release #9 ...`  a stale claim to release
 ///   `STOP`                  alone on a line
-/// `[X]` counts as `[x]` and CRLF line endings are fine. A line inside a
-/// fenced code block or an HTML comment is not read, except STOP, which
-/// counts wherever it stands. The marker line
+/// `[X]` counts as `[x]` and CRLF line endings are fine. A body with a code
+/// fence, an HTML comment or a line of HTML that render did not write gives
+/// no units, closures or releases, and names each such line in `unknown`.
+/// STOP counts wherever it stands. The marker line
 /// `<!-- issue-drain:tracker v1 run=<id> -->` must name `queue.run`, or the
 /// body is some other tracker and this fails with a usage error (exit 2).
 /// `tracker_state` is left null; a live read sets it.
@@ -197,8 +202,19 @@ fn parse_body_for(body: &str, queue: &Queue, run: &str) -> Res<Parsed> {
         )));
     }
 
-    let raw = lines;
-    let lines = shown(&raw);
+    let stop = lines.iter().any(|line| STOP.is_match(line));
+    let markup = hiding_markup(&lines);
+    if !markup.is_empty() {
+        return Ok(Parsed {
+            run: queue.run.clone(),
+            stop,
+            units: Vec::new(),
+            approved_closures: Vec::new(),
+            release_claims: Vec::new(),
+            tracker_state: None,
+            unknown: markup,
+        });
+    }
     // A waiting unit runs on a ticked box only. Its line with the box
     // deleted says nothing, like its line with the box left empty.
     let waits = |id: &str| queue.units.iter().any(|u| u.id == id && u.waits);
@@ -224,7 +240,7 @@ fn parse_body_for(body: &str, queue: &Queue, run: &str) -> Res<Parsed> {
 
     Ok(Parsed {
         run: queue.run.clone(),
-        stop: raw.iter().any(|line| STOP.is_match(line)),
+        stop,
         units,
         approved_closures,
         release_claims,
@@ -472,7 +488,13 @@ pub fn parse(ctx: &Ctx, args: &ParseArgs) -> Res<()> {
     let said: Vec<String> = parsed
         .unknown
         .iter()
-        .map(|what| format!("the tracker asks for something this run never offered: {what}"))
+        .map(|what| {
+            if names_markup(what) {
+                format!("the tracker has markup that can hide a box, so nothing on it is read: {what}")
+            } else {
+                format!("the tracker asks for something this run never offered: {what}")
+            }
+        })
         .collect();
     Err(Fail::failed(said.join("\n")))
 }

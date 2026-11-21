@@ -87,7 +87,7 @@ Lead with the tracker link. Then, briefly: how many issues were taken in and how
 
 ## After the user approves
 
-1. `tracker parse` shows what the body says now. Go on only when `tracker_state` is `OPEN`, `stop` is `false` and `unknown` is empty (`tracker_state` is `null` only when a dry run parsed a file). A closed tracker or a `STOP` line means the user called the run off: write nothing, release no claim, and say so. If `unknown` is not empty, show the user those lines and stop: nothing runs while the tracker has a ticked line the run never offered.
+1. `tracker parse` shows what the body says now. Go on only when `tracker_state` is `OPEN`, `stop` is `false` and `unknown` is empty (`tracker_state` is `null` only when a dry run parsed a file). A closed tracker or a `STOP` line means the user called the run off: write nothing, release no claim, and say so. If `unknown` is not empty, show the user those lines and stop: nothing runs while the tracker has a ticked line the run never offered, or markup that can hide a box. A code fence, an HTML comment or a line of HTML the tracker was not rendered with makes `tracker parse` read nothing from the body: it returns no units and no approvals and names each such line ("line 12 is a code fence") until the user removes it.
 2. `close-verified` closes the ticked closures.
 3. For each claim the user ticked for release, check the issue again (`references/triage.md`, "After the user says go"), then `gh-write remove-label <number> <claim label>`.
 4. Tell the user what the queue holds and that the units wait for the unit runner.
@@ -98,7 +98,7 @@ Lead with the tracker link. Then, briefly: how many issues were taken in and how
 
 An issue is closed only when all of this is true at the moment of closing:
 
-- the run offered it as a closure and its box is ticked on the published tracker. A ticked line inside a code block or an HTML comment is text, not a tick
+- the run offered it as a closure and its box is ticked on the published tracker. A tracker body with a code fence, an HTML comment or added HTML approves nothing
 - the tracker is open, has no `STOP` line, and has no ticked line the run never offered, read when the run starts and again for each issue after its evidence check
 - the evidence check, run again on the base branch as it is now, still says `already_fixed` and closable, and names the same fixing commit the tracker showed
 - the run's checked verdict quotes the same lines the tracker showed

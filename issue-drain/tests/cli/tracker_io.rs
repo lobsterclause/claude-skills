@@ -645,32 +645,84 @@ fn publish_needs_a_rendered_tracker_and_no_arguments() {
 }
 
 #[test]
-fn a_ticked_line_nobody_can_see_approves_nothing() {
-    // GitHub shows neither a fenced block's boxes nor a comment's: a tick in
-    // one is text someone pasted, not a box a person ticked.
+fn markup_that_can_hide_a_box_stops_every_approval() {
+    // A box inside a code block or raw HTML is text nobody ticked. Which
+    // lines a block covers is GitHub's to decide, so the reader does not
+    // decide it: a body with any such markup approves nothing and runs
+    // nothing until the markup is gone.
     let env = Env::new();
-    let ticked_line = format!("{TICKED_CLOSURE} pasted");
-    for hidden in [
-        format!("```\n{ticked_line}\n```"),
-        format!("````md\n```\n{ticked_line}\n```\n````"),
-        format!("~~~\n{ticked_line}\n~~~"),
-        format!("<!--\n{ticked_line}\n-->"),
-        format!("<!-- a note\n{ticked_line}\nends -->"),
+    let tick = format!("{TICKED_CLOSURE} pasted");
+    for markup in [
+        format!("```\n{tick}\n```"),
+        format!("~~~\n{tick}\n~~~"),
+        // A fence in a list item closes on a line indented past three
+        // spaces, so the next fence opens a block and does not close one.
+        format!("- note\n  ```\n  code\n    ```\n```\n{tick}\n```"),
+        format!("    ```\n{tick}"),
+        format!("> ```\n{tick}"),
+        format!("1. ~~~\n{tick}"),
+        format!("<!--\n{tick}\n-->"),
+        format!("{tick}\ntext <!-- a note -->"),
+        format!("<pre>\n{tick}\n</pre>"),
+        format!("<div>\n{tick}\n</div>"),
+        format!("  - <table>\n{tick}"),
     ] {
-        let body = format!("{}\n{hidden}\n", tracker_md());
+        let body = format!("{}\n{markup}\n", tracker_md());
         let out = parse_body(&env, &body);
-        assert_eq!(out.code, 0, "{}", out.stderr);
-        assert_eq!(parsed(&out)["approved_closures"], json!([]), "{hidden}");
-        assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]), "{hidden}");
+        assert_eq!(out.code, 1, "{markup}: {}", out.stderr);
+        let found = parsed(&out);
+        assert_eq!(found["approved_closures"], json!([]), "{markup}");
+        assert_eq!(found["release_claims"], json!([]), "{markup}");
+        assert_eq!(found["units"], json!([]), "{markup}");
+        let named = found["unknown"].as_array().expect("a list");
+        assert!(!named.is_empty(), "{markup}");
+        assert!(
+            named.iter().all(|what| what.as_str().unwrap().starts_with("line ")),
+            "{markup}: {named:?}"
+        );
+        assert!(
+            out.stderr.contains("markup that can hide a box"),
+            "{markup}: {}",
+            out.stderr
+        );
     }
 
-    // Control: the same line after the block has ended is a tick.
-    let body = format!("{}\n```\ncode\n```\n<!-- a\nnote -->\n{ticked_line}\n", tracker_md());
-    assert_eq!(parsed(&parse_body(&env, &body))["approved_closures"], json!([101]));
+    // The line is named by its number in the body: a blank line, then it.
+    let lines = tracker_md().lines().count();
+    let out = parse_body(&env, &format!("{}\n```\n", tracker_md()));
+    assert_eq!(
+        parsed(&out)["unknown"],
+        json!([format!("line {} is a code fence", lines + 2)])
+    );
+
+    // Control: the same tick with no markup beside it is a tick.
+    let out = parse_body(&env, &format!("{}\n{tick}\n", tracker_md()));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(parsed(&out)["approved_closures"], json!([101]));
 
     // STOP is read everywhere: stopping on a line nobody sees costs a re-run.
     let body = format!("{}\n```\nSTOP\n```\n", tracker_md());
     assert_eq!(parsed(&parse_body(&env, &body))["stop"], true);
+}
+
+#[test]
+fn the_rendered_details_block_is_read_only_as_render_wrote_it() {
+    // The two <details> lines are the only HTML render writes. Each stands
+    // before a blank line, which is where GitHub ends the HTML and reads
+    // Markdown again. Without the blank line what follows is raw HTML.
+    let env = Env::new();
+    let opener = "each unit</summary>\n";
+    let out = parse_body(&env, &replaced(&format!("{opener}\n"), opener));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(parsed(&out)["units"], json!([]));
+
+    let out = parse_body(&env, &format!("{}{TICKED_CLOSURE} pasted\n", tracker_md()));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert_eq!(parsed(&out)["approved_closures"], json!([]));
+
+    // Any other HTML line is refused, the details lines changed included.
+    let out = parse_body(&env, &replaced("<details><summary>", "<details open><summary>"));
+    assert_eq!(out.code, 1, "{}", out.stderr);
 }
 
 #[test]
@@ -682,39 +734,4 @@ fn a_waiting_unit_runs_only_with_its_box_ticked() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(parsed(&out)["units"], json!(["U1", "U2", "U3"]));
     assert_eq!(parsed(&out)["unknown"], json!([]));
-}
-
-#[test]
-fn a_fence_is_one_only_where_github_draws_one() {
-    // A fence line has at most three spaces before it, and a backtick fence
-    // has no backtick after its run. Anything else is text, and reading it as
-    // a fence would turn the lines inside the real block into visible ones.
-    let env = Env::new();
-    let ticked_line = format!("{TICKED_CLOSURE} pasted");
-    for hidden in [
-        // The indented line does not close the block.
-        format!("```\n    ```\n{ticked_line}\n```"),
-        format!("```\n\t```\n{ticked_line}\n```"),
-        format!("~~~\n     ~~~\n{ticked_line}\n~~~"),
-        // The first line opens nothing, so the second opens the block.
-        format!("    ```\n```\n{ticked_line}\n```"),
-        format!("``` a ` b\n```\n{ticked_line}\n```"),
-        // Up to three spaces is still a fence.
-        format!("   ```\n{ticked_line}\n   ```"),
-    ] {
-        let body = format!("{}\n{hidden}\n", tracker_md());
-        let out = parse_body(&env, &body);
-        assert_eq!(out.code, 0, "{}", out.stderr);
-        assert_eq!(parsed(&out)["approved_closures"], json!([]), "{hidden}");
-    }
-    for shown in [
-        format!("    ```\n{ticked_line}"),
-        format!("``` a ` b\n{ticked_line}"),
-        format!("```\ncode\n   ```\n{ticked_line}"),
-    ] {
-        let body = format!("{}\n{shown}\n", tracker_md());
-        let out = parse_body(&env, &body);
-        assert_eq!(out.code, 0, "{}", out.stderr);
-        assert_eq!(parsed(&out)["approved_closures"], json!([101]), "{shown}");
-    }
 }

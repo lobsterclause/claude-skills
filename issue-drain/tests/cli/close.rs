@@ -766,3 +766,10 @@ fn a_verdict_checked_again_after_render_does_not_replace_the_evidence_shown() {
         "its checked evidence is not the evidence the tracker showed",
     );
 }
+
+#[test]
+fn markup_that_can_hide_a_box_refuses_every_closure() {
+    let env = ready();
+    tracker(&env, &format!("{}\n```\ncode\n```\n", ticked()), "OPEN");
+    refused_all(&env, &env.run(&ARGS), "markup that can hide a box");
+}

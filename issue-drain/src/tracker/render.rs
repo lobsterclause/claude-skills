@@ -880,11 +880,7 @@ fn body(input: &Input, all: &[&Draft], closures: &[ClosureOut], el: &HashMap<u64
             .collect(),
     ));
     if !all.is_empty() {
-        lines.extend([
-            String::new(),
-            "<details><summary>Acceptance checks, files and reuse for each unit</summary>".into(),
-            String::new(),
-        ]);
+        lines.extend([String::new(), super::io::DETAILS_OPEN.into(), String::new()]);
         for (id, u) in &numbered {
             lines.push(format!(
                 "**U{id}** · {} · {} · size {}",
@@ -906,7 +902,7 @@ fn body(input: &Input, all: &[&Draft], closures: &[ClosureOut], el: &HashMap<u64
             }
             lines.push(String::new());
         }
-        lines.push("</details>".into());
+        lines.push(super::io::DETAILS_CLOSE.into());
     }
     lines.join("\n") + "\n"
 }
