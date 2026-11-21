@@ -64,15 +64,16 @@ if [ -n "${RV_SSH:-}" ]; then
   case "$RV_SSH" in /*) ;; */*) RV_SSH="$PWD/$RV_SSH";; esac
   SSH=("$RV_SSH")
 fi
-# Image-build mode touches neither the log nor .out, so it runs first.
-if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | "${SSH[@]}" "docker build -q -t kma-verify:22 -"; exit $?; fi
 D=$BASE/$N; LOG=$OUTD/rverify-$N.log; OUT=$OUTD/rv-$N.out; rm -f "$OUT"
+# Image-build mode keeps the last verify's log but not its .out (removed
+# above), so a poller can't read an old result as this run's.
+if [ "${RV_BUILD_IMAGE:-0}" = 1 ]; then printf '%s\n' "$IMAGE_DOCKERFILE" | "${SSH[@]}" "docker build -q -t kma-verify:22 -"; exit $?; fi
 # Every exit after this point writes the result a caller polls for. If that
 # write fails, exit 94: never report a result nobody can read.
 finish() { echo "verify exit=$1" > "$OUT" || { echo "cannot write $OUT"; exit 94; }; exit "$1"; }
-# The block's output goes to $LOG; if that can't be opened, the block never
-# runs, so fail here instead of exiting with whatever status came before.
-: > "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
+# The block's output goes to $LOG, opened once on fd 3 (a second open of a
+# FIFO log can block forever). If it can't be opened, fail here with 93.
+exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
 {
   cd "$WT" || finish 97
   echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
@@ -83,8 +84,18 @@ finish() { echo "verify exit=$1" > "$OUT" || { echo "cannot write $OUT"; exit 94
     UNTR=$(/usr/bin/git ls-files --others --exclude-standard)
     [ -n "$UNTR" ] && { echo "WARN: not shipping $(printf '%s\n' "$UNTR" | wc -l | tr -d ' ') untracked file(s) (RV_INCLUDE_UNTRACKED=1 to ship them):"; printf '%s\n' "$UNTR" | sed 's/^/  /'; }
   fi
+  # Ship exactly git's list as it stands in the working copy: tracked files
+  # deleted locally are skipped (the box sees what you see), and
+  # --no-recursion keeps a directory that replaced a tracked file from
+  # dragging its untracked contents along. pipefail: a local git or tar
+  # failure is not masked by ssh's status.
   # shellcheck disable=SC2086 # LSF is a deliberate flag list
-  /usr/bin/git ls-files -z $LSF | COPYFILE_DISABLE=1 tar --null -T - -czf - 2>/dev/null | "${SSH[@]}" "tar -xzf - -C $D/w" || finish 99
+  ( set -o pipefail
+    /usr/bin/git ls-files -z $LSF \
+      | while IFS= read -r -d '' f; do if [ -e "$f" ] || [ -L "$f" ]; then printf '%s\0' "$f"; fi; done \
+      | COPYFILE_DISABLE=1 tar --null --no-recursion -T - -czf - \
+      | "${SSH[@]}" "tar -xzf - -C $D/w"
+  ) || { echo "shipping the tree failed (git ls-files, tar or ssh)"; finish 99; }
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""
@@ -98,4 +109,4 @@ finish() { echo "verify exit=$1" > "$OUT" || { echo "cannot write $OUT"; exit 94
   echo "remote rc=$rc"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N"
   finish "$rc"
-} > "$LOG" 2>&1
+} >&3 2>&1

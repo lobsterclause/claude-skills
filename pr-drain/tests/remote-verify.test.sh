@@ -13,7 +13,8 @@
 # (ssh path with a space, inherited RV_INCLUDE_UNTRACKED, unwritable .out):
 # 8 of 10 fail against the first #205 commit. Pass-2 cases (early failure
 # with unwritable .out, unopenable log, relative RV_SSH): 4 fail against the
-# pass-1 fix commit.
+# pass-1 fix commit. Pass-4 cases (stale .out after an image build, tar
+# recursion, masked tar failure, FIFO log): checked red against c6d811c.
 #
 # Usage: bash pr-drain/tests/remote-verify.test.sh   (exit 0 = all pass)
 set -u
@@ -55,7 +56,7 @@ run() { # rc ship-dir [env...]
   local rc=$1 ship=$2; shift 2
   # Pin the knobs a caller's shell may have exported; cases override after.
   env RV_INCLUDE_UNTRACKED=0 RV_BUILD_IMAGE=0 RV_GH_TOKEN=0 RV_SSH="$FSSH" RV_OUT_DIR="${OUTDIR:-$T/out}" SHIP="$ship" FAKE_RC="$rc" "$@" \
-    bash "$S/remote-verify.sh" "$R" probe firebird
+    bash "$S/remote-verify.sh" "${REPO:-$R}" probe firebird
 }
 
 run 1 "$T/ship1"; check "exit code = 1 on failed verify" 1 $?
@@ -94,5 +95,33 @@ check "unopenable log still writes .out" "verify exit=93" "$(cat "$T/out7/rv-pro
 echo keep > "$T/out8/rverify-probe.log"
 env RV_GH_TOKEN=0 RV_BUILD_IMAGE=1 RV_SSH="$FSSH" RV_OUT_DIR="$T/out8" bash "$S/remote-verify.sh" "$R" probe firebird >/dev/null
 check "image build keeps the verify log" keep "$(cat "$T/out8/rverify-probe.log")"
+check "image build removes a stale .out" 1 "$(exists "$T/out8/rv-probe.out")"
+
+# Pass-4 cases. A repo whose working copy has drifted from git's list:
+# b.txt deleted, and tracked file d replaced by a directory of untracked files.
+R2="$T/repo2"; mkdir -p "$R2"
+git -C "$R2" init -q
+echo a > "$R2/a.txt"; echo b > "$R2/b.txt"; echo d > "$R2/d"; echo u > "$R2/u.txt"
+git -C "$R2" add a.txt b.txt d u.txt
+git -C "$R2" -c user.email=t@t -c user.name=t commit -q -m init
+rm "$R2/b.txt" "$R2/d"; mkdir "$R2/d"; echo secret > "$R2/d/secret.txt"
+REPO="$R2" run 0 "$T/ship10"; check "locally deleted tracked file doesn't fail the ship" 0 $?
+check "untracked file under a dir that replaced a tracked file not shipped" 1 "$(exists "$T/ship10/d/secret.txt")"
+check "other tracked files still shipped" 0 "$(exists "$T/ship10/a.txt")"
+
+# A local tar failure (unreadable tracked file) is 99, not masked by ssh's 0.
+chmod 000 "$R2/u.txt"
+REPO="$R2" OUTDIR="$T/out11" run 0 "$T/ship11"; check "local tar failure exits 99" 99 $?
+chmod 644 "$R2/u.txt"
+
+# A FIFO log is opened once: a reader that stops at the first EOF still gets
+# the whole run, and the script finishes instead of blocking on a second open.
+mkdir -p "$T/out12"; mkfifo "$T/out12/rverify-probe.log"
+cat "$T/out12/rverify-probe.log" > "$T/fifo.txt" &
+OUTDIR="$T/out12" run 0 "$T/ship12" & pid=$!
+for _ in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$pid" 2>/dev/null; then kill "$pid"; pkill -P $$ cat 2>/dev/null; check "FIFO log run finishes" finished hung
+else wait "$pid"; check "FIFO log run finishes" 0 $?; fi
+grep -q "remote rc=0" "$T/fifo.txt"; check "FIFO reader saw the whole log" 0 $?
 
 exit $fail
