@@ -115,8 +115,10 @@ fn split_numbers(found: &[&str], offered: &[u64]) -> (Vec<u64>, Vec<String>) {
 pub(crate) const DETAILS_OPEN: &str = "<details><summary>Acceptance checks, files and reuse for each unit</summary>";
 pub(crate) const DETAILS_CLOSE: &str = "</details>";
 
-/// The lines that can make GitHub show a box as text: a code fence, an HTML
-/// comment, or a line of HTML, each as "line <n> is ...". Which lines such a
+/// The lines that can make GitHub show a box as text: a line that starts with
+/// a code fence, an HTML comment or other HTML, each as "line <n> is ...".
+/// HTML later in a line is not named: it starts no block, and a line that
+/// starts with "- " is a list item whatever paragraph stands above it. Which lines such a
 /// block covers depends on the list or quote it sits in, and this does not
 /// work that out. It names every line that could start one, wherever the line
 /// is indented or nested, so a caller can refuse the whole body.
@@ -133,11 +135,14 @@ fn hiding_markup(lines: &[&str]) -> Vec<String> {
         // Past any indentation, quote mark or list marker.
         let text = line.trim_start_matches(|c: char| " \t>*+-.)".contains(c) || c.is_ascii_digit());
         let rendered = *line == DETAILS_OPEN || *line == DETAILS_CLOSE;
-        let ends_here = lines.get(at + 1).is_none_or(|next| next.trim().is_empty());
+        // Blank as GitHub reads it: spaces and tabs only.
+        let ends_here = lines
+            .get(at + 1)
+            .is_none_or(|next| next.chars().all(|c| c == ' ' || c == '\t'));
         let what = if text.starts_with("```") || text.starts_with("~~~") {
             "is a code fence"
-        } else if line.contains("<!--") {
-            "has an HTML comment"
+        } else if text.starts_with("<!--") {
+            "is an HTML comment"
         } else if text.starts_with('<') && !(rendered && ends_here) {
             "is HTML"
         } else {
@@ -175,8 +180,8 @@ pub(crate) fn why_refused(unknown: &[String]) -> String {
 ///   `- [x] close #101 ...`  an approved closure
 ///   `- [x] release #9 ...`  a stale claim to release
 ///   `STOP`                  alone on a line
-/// `[X]` counts as `[x]` and CRLF line endings are fine. A body with a code
-/// fence, an HTML comment or a line of HTML that render did not write gives
+/// `[X]` counts as `[x]` and CRLF line endings are fine. A body with a line
+/// that starts with a code fence, an HTML comment or HTML render did not write gives
 /// no units, closures or releases, and names each such line in `unknown`.
 /// STOP counts wherever it stands. The marker line
 /// `<!-- issue-drain:tracker v1 run=<id> -->` must name `queue.run`, or the
