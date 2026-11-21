@@ -1367,8 +1367,10 @@ fn stamp_of(body: &str) -> Option<(String, String)> {
         // The script reads the last `verdict=` field of the marker and this
         // reads the first, so a marker with more than one has no verdict here:
         // it cannot match a CLEAN report, nor pass as BLOCKED.
-        let single = found[0].matches("verdict=").count() == 1;
-        let verdict = Regex::new(r"\sverdict=([A-Z_]+)(?:\s|-->)")
+        // The script splits fields on ASCII whitespace only, so the pattern
+        // does too, and a marker with any non-ASCII character has no verdict.
+        let single = found[0].is_ascii() && found[0].matches("verdict=").count() == 1;
+        let verdict = Regex::new(r"(?-u:\s)verdict=([A-Z_]+)(?:(?-u:\s)|-->)")
             .ok()
             .filter(|_| single)
             .and_then(|re| re.captures(&found[0]).map(|v| v[1].to_string()))
@@ -2796,6 +2798,16 @@ mod tests {
             "xverdict=BLOCKED verdict=CLEAN ",
         ] {
             assert_eq!(stamp_of(&record_body(HEAD, tail)).unwrap().1, "", "{tail}");
+        }
+        // Only ASCII spaces separate fields for the script, and a marker with
+        // any other character is not one it wrote: no verdict.
+        for tail in [
+            "\u{a0}verdict=BLOCKED ",
+            "verdict=BLOCKED\u{a0}",
+            "verdict=BLOCKED\u{2003}",
+            "é verdict=BLOCKED ",
+        ] {
+            assert_eq!(stamp_of(&record_body(HEAD, tail)).unwrap().1, "", "{tail:?}");
         }
         // A marker broken across lines is not one the script reads.
         let split =
