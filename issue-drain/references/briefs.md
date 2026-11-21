@@ -29,4 +29,34 @@ One retry, one tier up (`sonnet`, `low`), for a batch whose reader returned noth
 
 ## Implementer
 
-Arrives with the unit-and-gate build. Triage does not launch an implementer.
+Launched by a unit (`unit.md`, step 2), never by triage. Agent type `general-purpose`, model and effort from `unit.json`; set both on the call. Give it the task statement, not the issue body.
+
+```
+You are implementing one change in <owner>/<repo>, in the git worktree that is your working directory. Stay in it. You are on branch <branch>; do not switch, rebase, push or open a pull request.
+
+Task: <task statement from unit.json>
+
+Issues and their acceptance checks (one check per issue):
+- #<n>: <acceptance check>
+
+Scope, the only paths you may change: <scope paths>
+Existing code to reuse (quoted by the triage reader; check it still reads this way): <reuse pointers, or "none found">
+Targeted test command: <test command, wrapped in a hard timeout>
+
+How to work:
+1. For each issue, write its acceptance check first and run it to see it fail. Then make it pass. If a check cannot be written first, say why and stop.
+2. Follow the rules below under "Ponytail". Where they differ from this brief, this brief wins: the check comes before the code; never trim validation at a trust boundary, data-loss handling, security, accessibility, or <the profile's named fail-safes>; never add a dependency. If the right fix is a library this repo does not have, say so and stop.
+3. To find code and callers use Grep and the LSP tool. If CodeGraph says it is not initialised, do not initialise it and do not ask.
+4. Do not edit <protected paths> or <frozen paths>. If the fix needs one, say so and stop.
+5. Run only the targeted tests here. The full verify runs elsewhere.
+6. Commit early and small, staging files by name, never `git add -A`.
+7. If an issue in this unit turns out to be a different change from the rest, leave it and say so.
+8. Give any background command an explicit timeout.
+
+End your report with: the commits you made; for each issue, the check and whether you saw it fail and then pass; anything handed back; and a last section "Skipped or not checked".
+
+## Ponytail
+<the text of references/ponytail-rules.md between its begin and end markers>
+```
+
+On a repair or a review fix, resume the same implementer with the evidence (the failing check's name and log, or the finding with its file and line) and nothing else. One tier up on its second failure, with the first attempt's evidence passed along.

@@ -31,6 +31,9 @@ priority_labels = ["p0", "CRITICAL", "p1", "priority/high", "HIGH", "p2", "prior
 # Matched against repo-relative paths, ignoring case.
 # Protected: an issue whose fix lives here goes to "needs a person" and no unit runs.
 protected_path_re = '^(\.github/(workflows|actions)/|\.husky/|\.claude/|infra/|ci/)|^(firestore|storage)\.rules$'
+# Frozen: files or folders (a trailing slash is optional) a unit's diff may not touch;
+# deliver-check fails the unit if it does. Nothing is frozen until this is filled in.
+frozen_paths = []
 # Risk: the unit runs, opens its PR, then waits for a named reviewer. Never clustered.
 risk_path_re = '(^|/)[^/]*(crisis|clinical|billing|stripe|auth)[^/]*(/|$)'
 
@@ -49,6 +52,27 @@ cluster_max_lines = 400
 
 evidence_line_slack = 3
 evidence_min_quote = 8
+
+# The unit-prepare step. The guards mod matches these as path prefixes, so the
+# list says in files and folders what protected_path_re says in a pattern
+# (a test holds the two together).
+guard_protected_paths = [".github/workflows", ".github/actions", ".husky", ".claude", "infra", "ci", "firestore.rules", "storage.rules"]
+
+# Run in the new worktree. .claude/scripts/worktree-bootstrap.sh clones node_modules from
+# the main checkout (its line: `[ ! -d "$MAIN/node_modules" ]` stops it), so that must exist.
+bootstrap_command = ".claude/scripts/worktree-bootstrap.sh {worktree}"
+bootstrap_requires = ["node_modules"]
+
+# `codegraph init -i` in the worktree; a unit falls back to Grep and LSP if it is absent or fails.
+codegraph_init = true
+
+# What the homelab verify runs (pr-drain/scripts/remote-verify.sh: ${RV_CMD:-pnpm verify};
+# package.json "verify": "./.claude/verify.sh").
+full_verify_command = "pnpm verify"
+# scripts/verify-stamp.sh `write <tree>` records <tree> as passed in <git common dir>/verify-pass/.
+# .husky/pre-push looks for the stamp of `git rev-parse <pushed sha>^{tree}`, which is the tree
+# stamp-remote-pass hands over: the worktree is clean and at the verified commit.
+stamp_command = "bash scripts/verify-stamp.sh write {tree}"
 
 # Shown in the tracker header. Units arrive with the unit-and-gate build;
 # until then triage is the only part that runs.

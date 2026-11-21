@@ -208,21 +208,19 @@ fn ensure_label_creates_only_a_missing_label_the_drain_owns() {
 }
 
 #[test]
-fn a_unit_process_may_comment_and_nothing_else() {
+fn a_unit_process_cannot_close_unlabel_or_open_an_issue() {
     let mut env = Env::new();
     let body = body(&env);
     env.set("ISSUE_DRAIN_MODE", "unit");
-    let refusals: [&[&str]; 5] = [
+    let refusals: [&[&str]; 3] = [
         &["gh-write", "close-issue", "7"],
-        &["gh-write", "add-label", "7", "agent-in-progress"],
         &["gh-write", "remove-label", "7", "agent-in-progress"],
-        &["gh-write", "ensure-label", "issue-drain"],
         &["gh-write", "issue-create", "--title", "x", "--body-file", &body],
     ];
     for args in refusals {
         let out = env.run(args);
         assert_eq!(out.code, 3, "{args:?}: {}", out.stderr);
-        assert!(out.stderr.contains("a unit process may only comment"), "{}", out.stderr);
+        assert!(out.stderr.contains("is the driver's job in a unit"), "{}", out.stderr);
     }
     assert!(env.gh_calls().is_empty());
     let why = env.events_named("gh_write_refused");

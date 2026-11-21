@@ -8,8 +8,9 @@
 //!     "WOULD: ..." and calls nothing;
 //!   - labels are limited to the three the drain owns (claim, blocked,
 //!     tracker), and only the claim label can be removed;
-//!   - a unit process (ISSUE_DRAIN_MODE=unit) can comment and nothing else.
-//!     Claims, hold labels and closures belong to the driver and the session.
+//!   - a unit process (ISSUE_DRAIN_MODE=unit) can use the verbs in `unit_may` and nothing else,
+//!     and may not add the claim label (a claim is the label plus a marker comment, which only
+//!     `claim take` makes). Claims, hold labels and closures belong to the driver and the session.
 //!
 //! Bodies come from a file, never from an argument, so issue text never meets
 //! argument parsing.
@@ -21,6 +22,7 @@ use serde_json::json;
 
 use crate::ctx::{Ctx, Mode};
 use crate::error::{Fail, Res};
+use crate::profile::same_label;
 use crate::text::parse_number;
 
 pub enum Write<'a> {
@@ -47,6 +49,144 @@ pub enum Write<'a> {
     CloseIssue {
         number: u64,
     },
+    /// Squash-merge a PR, only if its head is still `head`. Reached only from
+    /// `merge-gate`, which holds every condition a merge needs.
+    MergePr {
+        number: u64,
+        head: &'a str,
+    },
+    /// Turn auto-merge off on a PR. Reached only from `merge-gate`, when the
+    /// merge call armed it instead of merging.
+    DisableAutoMerge {
+        number: u64,
+    },
+    /// Open a PR. The body comes from a file.
+    PrCreate {
+        head: &'a str,
+        base: &'a str,
+        title: &'a str,
+        body_file: &'a Path,
+        draft: bool,
+        labels: &'a [String],
+    },
+    /// Reply on a review thread (a GraphQL node id).
+    ThreadReply {
+        thread: &'a str,
+        body_file: &'a Path,
+    },
+    ThreadResolve {
+        thread: &'a str,
+    },
+}
+
+/// The argument list of the merge call. It is built here and nowhere else, and
+/// it carries no flag that skips a requirement or defers the merge.
+pub fn merge_argv(repo: &str, number: u64, head: &str) -> Vec<String> {
+    [
+        "pr",
+        "merge",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--squash",
+        "--match-head-commit",
+        head,
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
+pub fn pr_create_argv(
+    repo: &str,
+    head: &str,
+    base: &str,
+    title: &str,
+    body_file: &Path,
+    draft: bool,
+    labels: &[String],
+) -> Vec<String> {
+    let mut argv: Vec<String> = [
+        "pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", title,
+    ]
+    .map(str::to_string)
+    .to_vec();
+    argv.push("--body-file".into());
+    argv.push(body_file.display().to_string());
+    if draft {
+        argv.push("--draft".into());
+    }
+    for label in labels {
+        argv.push("--label".into());
+        argv.push(label.clone());
+    }
+    argv
+}
+
+const THREAD_REPLY_QUERY: &str = "mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}";
+const THREAD_RESOLVE_QUERY: &str =
+    "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}";
+
+/// `-f id=` sends the id as a string, whatever it looks like; `-F body=@file`
+/// reads the body from the file, so it never passes through an argument.
+pub fn thread_reply_argv(thread: &str, body_file: &Path) -> Vec<String> {
+    let body = format!("body=@{}", body_file.display());
+    [
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={THREAD_REPLY_QUERY}"),
+        "-f",
+        &format!("id={thread}"),
+        "-F",
+        &body,
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
+pub fn thread_resolve_argv(thread: &str) -> Vec<String> {
+    [
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={THREAD_RESOLVE_QUERY}"),
+        "-f",
+        &format!("id={thread}"),
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
+/// What a unit (ISSUE_DRAIN_MODE=unit) may ask of `gh-write`. A verb is refused
+/// until it is listed here, so a verb added later is the driver's by default.
+pub fn unit_may(verb: &str) -> bool {
+    matches!(
+        verb,
+        "comment" | "add-label" | "ensure-label" | "pr-create" | "thread-reply" | "thread-resolve"
+    )
+}
+
+/// Whether a unit is asking to add the claim label. A claim is that label plus
+/// a marker comment, and only `claim take` makes both; the label alone would
+/// be a claim nobody can tell from someone else's.
+fn unit_adds_claim_label(mode: Mode, label: &str, claim_label: &str) -> bool {
+    mode == Mode::Unit && same_label(label, claim_label)
+}
+
+fn claim_label_refused(ctx: &Ctx, verb: &str, mode: Mode) -> Fail {
+    refuse(
+        ctx,
+        verb,
+        mode,
+        format!(
+            "'{}' is the claim label, which only `claim take` adds (with its marker comment)",
+            ctx.profile.claim_label
+        ),
+    )
+}
+
+fn thread_ok(thread: &str) -> bool {
+    !thread.is_empty() && thread.bytes().all(|b| b.is_ascii_alphanumeric() || b"_=-".contains(&b))
 }
 
 impl Write<'_> {
@@ -58,6 +198,11 @@ impl Write<'_> {
             Write::AddLabel { .. } => "add-label",
             Write::RemoveLabel { .. } => "remove-label",
             Write::CloseIssue { .. } => "close-issue",
+            Write::MergePr { .. } => "merge-pr",
+            Write::DisableAutoMerge { .. } => "disable-auto-merge",
+            Write::PrCreate { .. } => "pr-create",
+            Write::ThreadReply { .. } => "thread-reply",
+            Write::ThreadResolve { .. } => "thread-resolve",
         }
     }
 }
@@ -123,13 +268,8 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
     let mode = ctx.mode()?;
     let p = &ctx.profile;
     let verb = w.verb();
-    if mode == Mode::Unit && !matches!(w, Write::Comment { .. }) {
-        return Err(refuse(
-            ctx,
-            verb,
-            mode,
-            format!("a unit process may only comment (asked for '{verb}')"),
-        ));
+    if mode == Mode::Unit && !unit_may(verb) {
+        return Err(refuse(ctx, verb, mode, format!("{verb} is the driver's job in a unit")));
     }
 
     let own = |s: &str| s.to_string();
@@ -204,6 +344,9 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
             )
         }
         Write::AddLabel { number, label } => {
+            if unit_adds_claim_label(mode, label, &p.claim_label) {
+                return Err(claim_label_refused(ctx, verb, mode));
+            }
             if *label != p.claim_label && *label != p.blocked_label {
                 return Err(refuse(
                     ctx,
@@ -262,6 +405,62 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
                 own("completed"),
             ],
         ),
+        Write::MergePr { number, head } => {
+            if !head.bytes().all(|b| b.is_ascii_hexdigit()) || head.len() < 40 {
+                return Err(Fail::usage(format!("'{head}' is not a full commit SHA")));
+            }
+            (format!("merge #{number} at {head}"), merge_argv(&repo, *number, head))
+        }
+        Write::DisableAutoMerge { number } => (
+            format!("turn auto-merge off on #{number}"),
+            ["pr", "merge", &number.to_string(), "--repo", &repo, "--disable-auto"]
+                .map(str::to_string)
+                .to_vec(),
+        ),
+        Write::PrCreate {
+            head,
+            base,
+            title,
+            body_file,
+            draft,
+            labels,
+        } => {
+            if head.starts_with("agent/") {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!("'{head}' is an agent/ branch: a workflow rewrites closing keywords on those"),
+                ));
+            }
+            if head == base {
+                return Err(refuse(ctx, verb, mode, format!("head and base are both '{head}'")));
+            }
+            if head.is_empty() || base.is_empty() || title.is_empty() {
+                return Err(Fail::usage("pr-create needs --head, --base and --title"));
+            }
+            need_body(body_file)?;
+            (
+                format!("pr {head} into {base}"),
+                pr_create_argv(&repo, head, base, title, body_file, *draft, labels),
+            )
+        }
+        Write::ThreadReply { thread, body_file } => {
+            if !thread_ok(thread) {
+                return Err(refuse(ctx, verb, mode, format!("'{thread}' is not a review thread id")));
+            }
+            need_body(body_file)?;
+            (
+                format!("reply on thread {thread}"),
+                thread_reply_argv(thread, body_file),
+            )
+        }
+        Write::ThreadResolve { thread } => {
+            if !thread_ok(thread) {
+                return Err(refuse(ctx, verb, mode, format!("'{thread}' is not a review thread id")));
+            }
+            (format!("resolve thread {thread}"), thread_resolve_argv(thread))
+        }
     };
 
     if ctx.dry_run {
@@ -303,7 +502,7 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
     Ok(Written { called: true, stdout })
 }
 
-const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label>";
+const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|pr-create|thread-reply|thread-resolve>";
 
 /// `issue-drain gh-write <verb> ...`. The verb and its options are read by
 /// hand, not by clap, so that a unit process asking for a forbidden verb is
@@ -318,23 +517,29 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     let Some(verb) = argv.first().map(String::as_str).filter(|v| !v.is_empty()) else {
         return Err(Fail::usage(format!("usage: issue-drain gh-write {VERBS} ...")));
     };
-    if mode == Mode::Unit && verb != "comment" {
-        return Err(refuse(
-            ctx,
-            verb,
-            mode,
-            format!("a unit process may only comment (asked for '{verb}')"),
-        ));
+    if mode == Mode::Unit && !unit_may(verb) {
+        return Err(refuse(ctx, verb, mode, format!("{verb} is the driver's job in a unit")));
     }
 
     let mut body_file = String::new();
     let mut title = String::new();
+    let (mut head, mut base, mut thread) = (String::new(), String::new(), String::new());
+    let mut draft = false;
+    let mut labels: Vec<String> = Vec::new();
     let mut args: Vec<&str> = Vec::new();
     let mut rest = argv[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--body-file" => body_file = rest.next().cloned().unwrap_or_default(),
             "--title" => title = rest.next().cloned().unwrap_or_default(),
+            "--head" => head = rest.next().cloned().unwrap_or_default(),
+            "--base" => base = rest.next().cloned().unwrap_or_default(),
+            "--thread" => thread = rest.next().cloned().unwrap_or_default(),
+            "--draft" => draft = true,
+            "--label" => match rest.next() {
+                Some(label) if !label.is_empty() => labels.push(label.clone()),
+                _ => return Err(Fail::usage("--label needs a name")),
+            },
             option if option.starts_with("--") => return Err(Fail::usage(format!("unknown option {option}"))),
             other => args.push(other),
         }
@@ -362,14 +567,32 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             body_file: body()?,
         },
         "ensure-label" => Write::EnsureLabel { label: arg(0) },
-        "add-label" => Write::AddLabel {
-            number: number()?,
-            label: arg(1),
-        },
+        "add-label" => {
+            if unit_adds_claim_label(mode, arg(1), &ctx.profile.claim_label) {
+                return Err(claim_label_refused(ctx, verb, mode));
+            }
+            Write::AddLabel {
+                number: number()?,
+                label: arg(1),
+            }
+        }
         "remove-label" => Write::RemoveLabel {
             number: number()?,
             label: arg(1),
         },
+        "pr-create" => Write::PrCreate {
+            head: &head,
+            base: &base,
+            title: &title,
+            body_file: body()?,
+            draft,
+            labels: &labels,
+        },
+        "thread-reply" => Write::ThreadReply {
+            thread: &thread,
+            body_file: body()?,
+        },
+        "thread-resolve" => Write::ThreadResolve { thread: &thread },
         "close-issue" => {
             return Err(refuse(
                 ctx,
@@ -382,4 +605,90 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     };
     print!("{}", write(ctx, &w)?.stdout);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_create_argv_is_exact() {
+        let labels = ["a".to_string(), "b".to_string()];
+        let argv = pr_create_argv("o/r", "feat/x", "develop", "T", Path::new("/b.md"), true, &labels);
+        assert_eq!(
+            argv.join(" "),
+            "pr create --repo o/r --head feat/x --base develop --title T --body-file /b.md --draft --label a --label b"
+        );
+        let plain = pr_create_argv("o/r", "h", "b", "T", Path::new("/b.md"), false, &[]);
+        assert_eq!(
+            plain.join(" "),
+            "pr create --repo o/r --head h --base b --title T --body-file /b.md"
+        );
+    }
+
+    #[test]
+    fn thread_argv_passes_the_body_from_the_file() {
+        let reply = thread_reply_argv("PRRT_kw-1=", Path::new("/b.md"));
+        assert_eq!(&reply[..3], ["api", "graphql", "-f"]);
+        assert!(reply[3].starts_with("query=mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply("));
+        assert_eq!(reply[4..], ["-f", "id=PRRT_kw-1=", "-F", "body=@/b.md"]);
+        let resolve = thread_resolve_argv("PRRT_kw-1=");
+        assert!(resolve[3].contains("resolveReviewThread(input:{threadId:$id})"));
+        assert_eq!(resolve[4..], ["-f", "id=PRRT_kw-1="]);
+    }
+
+    #[test]
+    fn only_a_unit_is_kept_from_the_claim_label_and_case_does_not_matter() {
+        assert!(unit_adds_claim_label(
+            Mode::Unit,
+            "Agent-In-Progress",
+            "agent-in-progress"
+        ));
+        assert!(!unit_adds_claim_label(Mode::Unit, "needs-human", "agent-in-progress"));
+        assert!(!unit_adds_claim_label(
+            Mode::Driver,
+            "agent-in-progress",
+            "agent-in-progress"
+        ));
+        assert!(!unit_adds_claim_label(
+            Mode::Session,
+            "agent-in-progress",
+            "agent-in-progress"
+        ));
+    }
+
+    #[test]
+    fn thread_ids_are_checked() {
+        assert!(thread_ok("PRRT_kwDOAbc-1="));
+        for bad in ["", "a b", "a;b", "@x", "a\nb", "a/b"] {
+            assert!(!thread_ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_unit_may_only_use_the_listed_verbs() {
+        let allowed = [
+            "comment",
+            "add-label",
+            "ensure-label",
+            "pr-create",
+            "thread-reply",
+            "thread-resolve",
+        ];
+        let refused = [
+            "issue-create",
+            "remove-label",
+            "close-issue",
+            "merge-pr",
+            "merge",
+            "frobnicate",
+            "",
+        ];
+        for verb in allowed {
+            assert!(unit_may(verb), "{verb}");
+        }
+        for verb in refused {
+            assert!(!unit_may(verb), "{verb}");
+        }
+    }
 }

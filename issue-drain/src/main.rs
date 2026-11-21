@@ -3,14 +3,18 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use issue_drain::ctx::Ctx;
 use issue_drain::error::Res;
-use issue_drain::{close, evalscore, evidence, gh, intake, overlap, tracker};
+use issue_drain::{
+    claim, close, deliver_check, evalscore, evidence, gh, intake, merge_gate, overlap, review_proof, stamp, state,
+    tracker, unit_prepare,
+};
 
 /// Triage a set of GitHub issues and carry each one through to a merged PR.
 ///
 /// Every command reads ISSUE_DRAIN_WORKDIR (the run folder, an absolute path)
 /// and ISSUE_DRAIN_REPO (<owner>/<repo>). Exit codes: 2 for bad arguments or
 /// a missing input, 3 when a rule refused the action, 1 when GitHub, git or
-/// the filesystem failed.
+/// the filesystem failed. `merge-gate` alone also exits 4: the merge call was
+/// accepted but the PR is not merged yet (queued).
 #[derive(Parser)]
 #[command(name = "issue-drain", version)]
 struct Cli {
@@ -38,6 +42,22 @@ enum Command {
     },
     /// Score a triage run against the fixture's expected answers.
     EvalScore(evalscore::Args),
+    /// Where each unit of the drain is, kept as a log of moves.
+    #[command(subcommand)]
+    State(state::Command),
+    /// Judge every condition for a PR and merge it only if none refuses.
+    MergeGate(merge_gate::Args),
+    /// Check a unit's diff against its scope and the profile's path rules.
+    DeliverCheck(deliver_check::Args),
+    /// Record which reviewers of a cross-review run produced output.
+    ReviewProof(review_proof::Args),
+    /// Cut a unit's worktree from the fresh base and write the files its process starts from.
+    UnitPrepare(unit_prepare::Args),
+    /// Label a unit's issues as claimed, release them, or say whose claim they carry.
+    #[command(subcommand)]
+    Claim(claim::Command),
+    /// Record the local verify stamp after a homelab verify passed at an exact commit.
+    StampRemotePass(stamp::Args),
 }
 
 fn name(command: &Command) -> &'static str {
@@ -51,11 +71,29 @@ fn name(command: &Command) -> &'static str {
         Command::CloseVerified(_) => "close-verified",
         Command::GhWrite { .. } => "gh-write",
         Command::EvalScore(_) => "eval-score",
+        Command::State(state::Command::Init(_)) => "state init",
+        Command::State(state::Command::Event(_)) => "state event",
+        Command::State(state::Command::Stop(_)) => "state stop",
+        Command::State(state::Command::Resume) => "state resume",
+        Command::State(state::Command::Show(_)) => "state show",
+        Command::State(state::Command::Next) => "state next",
+        Command::State(state::Command::Rebuild) => "state rebuild",
+        Command::MergeGate(_) => "merge-gate",
+        Command::DeliverCheck(_) => "deliver-check",
+        Command::ReviewProof(_) => "review-proof",
+        Command::UnitPrepare(_) => "unit-prepare",
+        Command::Claim(claim::Command::Take(_)) => "claim take",
+        Command::Claim(claim::Command::Release(_)) => "claim release",
+        Command::Claim(claim::Command::Check(_)) => "claim check",
+        Command::StampRemotePass(_) => "stamp-remote-pass",
     }
 }
 
 fn run(command: &Command) -> Res<()> {
-    let ctx = Ctx::load()?;
+    let mut ctx = Ctx::load()?;
+    if matches!(command, Command::MergeGate(args) if args.dry_run) {
+        ctx.dry_run = true;
+    }
     match command {
         Command::Intake(args) => intake::run(&ctx, args),
         Command::EvidenceCheck(args) => evidence::run(&ctx, args),
@@ -64,6 +102,13 @@ fn run(command: &Command) -> Res<()> {
         Command::CloseVerified(args) => close::run(&ctx, args),
         Command::GhWrite { args } => gh::cli(&ctx, args),
         Command::EvalScore(args) => evalscore::run(&ctx, args),
+        Command::State(command) => state::run(&ctx, command),
+        Command::MergeGate(args) => merge_gate::run(&ctx, args),
+        Command::DeliverCheck(args) => deliver_check::run(&ctx, args),
+        Command::ReviewProof(args) => review_proof::run(&ctx, args),
+        Command::UnitPrepare(args) => unit_prepare::run(&ctx, args),
+        Command::Claim(command) => claim::run(&ctx, command),
+        Command::StampRemotePass(args) => stamp::run(&ctx, args),
     }
 }
 

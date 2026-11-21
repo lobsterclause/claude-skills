@@ -25,6 +25,8 @@
 # Pass-10: a file replacing a submodule, box cleanup on a local failure
 # (red against 1ddd75f).
 # Pass-11: submodule list for the box (red against 14e5587).
+# Pass-13: the `shipped head= dirty=` line written after the stream (for
+# issue-drain's stamp-remote-pass); no such line before it existed.
 # Pass-12: the box's own git setup, run locally on the shipped tree: an
 # empty submodule and force-tracked ignored files (red against d04df8c).
 #
@@ -57,7 +59,9 @@ cat > "$FSSH" <<'FAKE'
 #!/bin/bash
 cmd="$*"
 case "$cmd" in
-  *"tar -xzf -"*) mkdir -p "$SHIP" && "$REAL_TAR" -xzf - -C "$SHIP" ;;
+  *"tar -xzf -"*) mkdir -p "$SHIP" && "$REAL_TAR" -xzf - -C "$SHIP"; rc=$?
+    # EDIT_FILE: an edit made while the working copy streams.
+    [ -n "${EDIT_FILE:-}" ] && echo edit >> "$EDIT_FILE"; exit $rc ;;
   *"git init -q"*) [ -n "${CMDLOG:-}" ] && printf '%s' "$cmd" > "$CMDLOG"; exit "$FAKE_RC" ;;
   *"mkdir -p $"*|*"mkdir -p /"*) [ -n "${FAKE_SETUP_FAIL:-}" ] && exit 1; exit 0 ;;
   *"rm -rf /b/"*) [ -n "${RMLOG:-}" ] && echo cleanup >> "$RMLOG"; exit 0 ;;
@@ -179,6 +183,21 @@ R5="$T/repo5"; cp -R "$R2" "$R5"; rm -rf "$R5/vendor"; mkdir "$R5/vendor"
 REPO="$R5" OUTDIR="$T/out21" run 0 "$T/ship21" >/dev/null; check "submodule without a checkout still exits 0" 0 $?
 grep -q "note: submodule vendor has no checkout" "$T/out21/rverify-probe.log"; check "submodule without a checkout named in the log" 0 $?
 
+# Pass-14: an uninitialised submodule leaves git status clean but its contents
+# never ship; the shipped line counts it (unshipped=), for stamp-remote-pass.
+R7="$T/repo7"; mkdir -p "$R7"; git -C "$R7" init -q; echo t > "$R7/a.txt"
+git -C "$R7" add a.txt
+git -C "$R7" update-index --add --cacheinfo 160000,"$(git -C "$S3" rev-parse HEAD)",vendor
+git -C "$R7" -c user.email=t@t -c user.name=t commit -q -m gitlink
+H7=$(git -C "$R7" rev-parse HEAD)
+mkdir "$R7/vendor"
+REPO="$R7" OUTDIR="$T/out27" run 0 "$T/ship27" >/dev/null
+check "uninitialised submodule: git status is clean" "host=firebird head=$H7 dirty=0" "$(sed -n 1p "$T/out27/rverify-probe.log")"
+check "uninitialised submodule counted" "shipped head=$H7 dirty=0 unshipped=1" "$(grep '^shipped head=' "$T/out27/rverify-probe.log")"
+rmdir "$R7/vendor"
+REPO="$R7" OUTDIR="$T/out28" run 0 "$T/ship28" >/dev/null
+check "missing submodule directory counted" 1 "$(grep -c '^shipped head=.* unshipped=1$' "$T/out28/rverify-probe.log")"
+
 # Pass-11: the box is told which checked-out submodules to keep as gitlinks,
 # innermost first (red against 14e5587).
 S4="$T/inner"; mkdir -p "$S4"; git -C "$S4" init -q; echo i > "$S4/i.txt"
@@ -257,5 +276,68 @@ else wait "$pid"; check "FIFO log run finishes" 0 $?; fi
 for _ in $(seq 1 50); do kill -0 "$rpid" 2>/dev/null || break; sleep 0.1; done
 kill "$rpid" 2>/dev/null; wait "$rpid" 2>/dev/null
 grep -q "remote rc=0" "$T/fifo.txt"; check "FIFO reader saw the whole log" 0 $?
+
+# Pass-13: after the stream the script records what was shipped, computed like
+# the header, so a stamp cannot be written for a tree that changed meanwhile.
+R13="$T/repo13"; mkdir -p "$R13"
+git -C "$R13" init -q
+echo tracked > "$R13/a.txt"
+git -C "$R13" add a.txt
+git -C "$R13" -c user.email=t@t -c user.name=t commit -q -m init
+H13=$(git -C "$R13" rev-parse HEAD)
+REPO="$R13" OUTDIR="$T/out13" run 0 "$T/ship13b"; check "clean run exits 0" 0 $?
+check "log has the header first" "host=firebird head=$H13 dirty=0" "$(sed -n 1p "$T/out13/rverify-probe.log")"
+check "log has one shipped line" 1 "$(grep -c '^shipped head=' "$T/out13/rverify-probe.log")"
+check "shipped line says head, dirty=0 and unshipped=0" "shipped head=$H13 dirty=0 unshipped=0" "$(grep '^shipped head=' "$T/out13/rverify-probe.log")"
+# An edit made while the stream runs shows in the shipped line, not the header.
+REPO="$R13" OUTDIR="$T/out14" run 0 "$T/ship14b" EDIT_FILE="$R13/a.txt"; check "edit during stream: run still exits 0" 0 $?
+check "edit during stream: header dirty=0" "host=firebird head=$H13 dirty=0" "$(sed -n 1p "$T/out14/rverify-probe.log")"
+check "edit during stream: shipped line dirty=1" "shipped head=$H13 dirty=1 unshipped=0" "$(grep '^shipped head=' "$T/out14/rverify-probe.log")"
+git -C "$R13" checkout -q a.txt
+# A failed ship writes no shipped line.
+REPO="$R2" OUTDIR="$T/out15" run 0 "$T/ship15" PATH="$T/badtar:$PATH" >/dev/null
+check "failed ship has no shipped line" 0 "$(grep -c '^shipped head=' "$T/out15/rverify-probe.log")"
+
+# Pass-15: a sparse checkout reads clean while tracked files are absent from
+# the working copy (skip-worktree), so they never ship: the shipped line counts
+# them, but not a file that was deleted locally (git status reports that one).
+R16="$T/repo16"; mkdir -p "$R16/a" "$R16/b"; git -C "$R16" init -q
+echo x > "$R16/a/x"; echo y > "$R16/b/y"; echo t > "$R16/top"
+git -C "$R16" add -A
+git -C "$R16" -c user.email=t@t -c user.name=t commit -q -m sparse
+git -C "$R16" sparse-checkout set --no-cone a
+H16=$(git -C "$R16" rev-parse HEAD)
+REPO="$R16" OUTDIR="$T/out40" run 0 "$T/ship40" >/dev/null
+check "sparse checkout: git status is clean" "host=firebird head=$H16 dirty=0" "$(sed -n 1p "$T/out40/rverify-probe.log")"
+check "sparse checkout: absent tracked files counted" "shipped head=$H16 dirty=0 unshipped=2" "$(grep '^shipped head=' "$T/out40/rverify-probe.log")"
+check "sparse checkout: the checked-out file still ships" 0 "$(exists "$T/ship40/a/x")"
+# Control: a locally deleted tracked file is dirty, and not unshipped.
+rm "$R16/a/x"
+REPO="$R16" OUTDIR="$T/out41" run 0 "$T/ship41" >/dev/null; check "sparse checkout with a deleted file exits 0" 0 $?
+check "deleted tracked file is dirty, not unshipped" "shipped head=$H16 dirty=1 unshipped=2" "$(grep '^shipped head=' "$T/out41/rverify-probe.log")"
+REPO="$R2" OUTDIR="$T/out42" run 0 "$T/ship42" >/dev/null
+check "ordinary deleted tracked file is not unshipped" 1 "$(grep -c '^shipped head=.* unshipped=0$' "$T/out42/rverify-probe.log")"
+
+# Pass-6: a submodule configured ignore=dirty or ignore=all (or a global
+# diff.ignoreSubmodules) makes plain `git status` read clean while a modified
+# tracked file inside it is shipped; dirty must count it.
+R17="$T/repo17"; S17="$T/sub17"; mkdir -p "$R17" "$S17"
+git -C "$S17" init -q; echo s > "$S17/s.txt"; git -C "$S17" add s.txt
+git -C "$S17" -c user.email=t@t -c user.name=t commit -q -m s
+git -C "$R17" init -q; echo a > "$R17/a.txt"; git -C "$R17" add a.txt
+git -C "$R17" -c protocol.file.allow=always submodule -q add "$S17" vendor 2>/dev/null
+git -C "$R17" -c user.email=t@t -c user.name=t commit -q -m sub
+H17=$(git -C "$R17" rev-parse HEAD)
+echo changed > "$R17/vendor/s.txt"
+for mode in dirty all; do
+  git -C "$R17" config submodule.vendor.ignore $mode
+  REPO="$R17" OUTDIR="$T/out50$mode" run 0 "$T/ship50$mode" >/dev/null
+  check "submodule ignore=$mode: header counts the modified file" "host=firebird head=$H17 dirty=1" "$(sed -n 1p "$T/out50$mode/rverify-probe.log")"
+  check "submodule ignore=$mode: shipped line counts it" "shipped head=$H17 dirty=1 unshipped=0" "$(grep '^shipped head=' "$T/out50$mode/rverify-probe.log")"
+done
+git -C "$R17" config --unset submodule.vendor.ignore
+git -C "$R17" config diff.ignoreSubmodules all
+REPO="$R17" OUTDIR="$T/out50g" run 0 "$T/ship50g" >/dev/null
+check "diff.ignoreSubmodules=all: header counts the modified file" "host=firebird head=$H17 dirty=1" "$(sed -n 1p "$T/out50g/rverify-probe.log")"
 
 exit $fail

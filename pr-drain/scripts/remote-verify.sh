@@ -81,7 +81,10 @@ finish() { echo "verify exit=$1" > "$OUT" || { echo "cannot write $OUT"; exit 94
 exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
 {
   cd "$WT" || finish 97
-  echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain | wc -l | tr -d ' ')"
+  echo "host=$HOSTK head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain --ignore-submodules=none | wc -l | tr -d ' ')"
+  # Which command this run is for. issue-drain's stamp-remote-pass reads it: a
+  # run of one test file must not count as the full verify.
+  echo "cmd=${RV_CMD:-pnpm verify}"
   "${SSH[@]}" "docker run --rm -v $BASE:/b $IMAGE rm -rf /b/$N; mkdir -p $D/w $D/tmp" || finish 98
   # From here a local failure still removes what was set up on the box; the
   # cleanup's own status never replaces the failure code.
@@ -150,6 +153,33 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
     rm -f "$idx"
     return "$rc"
   }
+  # count_unshipped <dir>: how many tracked paths never had their contents
+  # shipped: a gitlink (submodule) whose directory has no checkout or nothing
+  # there, and a file that a sparse checkout left out of the working copy
+  # (skip-worktree, tag S in `ls-files -t`, and absent). A clean `git status`
+  # says nothing about either (an empty directory is clean, and so is a sparse
+  # checkout), so the shipped line counts them. A tracked file that is simply
+  # deleted is not skip-worktree: git status reports it, so it is not counted.
+  # Checked-out submodules are walked into, as list_tree does; a file that
+  # replaced a gitlink ships as itself.
+  count_unshipped() {
+    local dir=$1 ent tag mode path n=0 sub
+    while IFS= read -r -d '' ent; do
+      tag=${ent%% *}; ent=${ent#* }
+      mode=${ent%% *}; path=${ent#*$'\t'}
+      if [ "$mode" != 160000 ]; then
+        if [ "$tag" = S ] && [ ! -e "$dir/$path" ] && [ ! -L "$dir/$path" ]; then n=$((n + 1)); fi
+        continue
+      fi
+      if [ -L "$dir/$path" ] || [ -f "$dir/$path" ]; then continue
+      elif [ -d "$dir/$path" ] && [ -e "$dir/$path/.git" ]; then
+        sub=$(count_unshipped "$dir/$path") || return 1
+        n=$((n + sub))
+      else n=$((n + 1))
+      fi
+    done < <(/usr/bin/git -C "$dir" ls-files -z -s -t)
+    echo "$n"
+  }
   INCL=0
   if [ "${RV_INCLUDE_UNTRACKED:-0}" = 1 ]; then INCL=1
   else
@@ -186,6 +216,11 @@ exec 3> "$LOG" || { echo "cannot write $LOG" >&2; finish 93; }
   ) || { echo "shipping the tree failed (git ls-files, tar or ssh)"; fail_clean 99; }
   ( set -o pipefail; list_subs . "" | "${SSH[@]}" "cat > $D/gitlinks" ) \
     || { echo "shipping the submodule list failed"; fail_clean 99; }
+  # The working copy is on the box now. Record what it was at this moment,
+  # computed like the header: a stamp must be for the tree that was shipped,
+  # not the one the header saw before the stream ran.
+  UNSHIPPED=$(count_unshipped .) || { echo "counting unshipped submodules failed"; fail_clean 99; }
+  echo "shipped head=$(/usr/bin/git rev-parse HEAD) dirty=$(/usr/bin/git status --porcelain --ignore-submodules=none | wc -l | tr -d ' ') unshipped=$UNSHIPPED"
   # RV_GH_TOKEN=1: ship `gh auth token` as NODE_AUTH_TOKEN for GitHub Packages installs, via a
   # mode-600 env file outside the repo dir (never on a command line, never logged; removed with $D).
   ENVF=""

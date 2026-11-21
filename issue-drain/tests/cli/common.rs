@@ -162,6 +162,11 @@ impl Env {
 
     /// Run `issue-drain <args>` with the stub gh first on PATH.
     pub fn run(&self, args: &[&str]) -> Out {
+        self.run_in(None, args)
+    }
+
+    /// `run`, started in `dir` (a command that works on the current folder).
+    pub fn run_in(&self, dir: Option<&Path>, args: &[&str]) -> Out {
         let stub_bin = manifest_dir().join("tests/stub");
         let path = format!("{}:{}", stub_bin.display(), std::env::var("PATH").unwrap_or_default());
         let mut command = Command::new(env!("CARGO_BIN_EXE_issue-drain"));
@@ -174,6 +179,9 @@ impl Env {
             .args(args)
             .env("PATH", path)
             .envs(self.vars.iter().map(|(k, v)| (k, v)));
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
         command.output().expect("the binary runs").into()
     }
 
@@ -239,4 +247,47 @@ pub fn json(path: &Path) -> Value {
 /// A file of the reference run, as JSON.
 pub fn golden(name: &str) -> Value {
     json(&fixtures().join("run").join(name))
+}
+
+/// A whole queue.json holding one unit, U3 unless `unit` says otherwise, over
+/// issues 103 and 106. `unit` overrides any field of the default unit.
+pub fn queue_with_unit(unit: Value) -> Value {
+    let mut entry = serde_json::json!({
+        "id": "U3",
+        "issues": [103, 106],
+        "live": [103],
+        "title": "Zero-pad the countdown seconds with formatDuration",
+        "kind": "bugfix",
+        "size": "S",
+        "model": "haiku",
+        "effort": "low",
+        "est_minutes": 30,
+        "test_command": "pnpm vitest run src/timer",
+        "files": ["src/timer/countdown.ts"],
+        "acceptance": {
+            "103": "countdownLabel(65000) returns \"1:05\".",
+            "106": "countdownLabel(127000) returns \"2:07\"."
+        },
+        "reuse": ["src/lib/format.ts:2"],
+        "risk": false,
+        "risk_paths": [],
+        "waits": false,
+        "waits_for": null,
+        "priority": 1
+    });
+    entry
+        .as_object_mut()
+        .expect("an object")
+        .extend(unit.as_object().expect("an object").clone());
+    serde_json::json!({
+        "version": 1,
+        "run": "run",
+        "repo": REPO,
+        "base": "develop",
+        "base_sha": "1dc973bdb697cc0a92e481f73e5d6599b8f7be66",
+        "units": [entry],
+        "closures": [],
+        "stale_claims": [],
+        "title": "Drain"
+    })
 }

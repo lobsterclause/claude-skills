@@ -40,6 +40,14 @@ pub fn base_commit(dir: &Path, base: &str) -> Option<String> {
     commit(dir, &format!("refs/remotes/origin/{base}"))
 }
 
+/// The best common ancestor of two commits: where `a...b` starts. `None` when
+/// they share none, or git cannot say.
+pub fn merge_base(dir: &Path, a: &str, b: &str) -> Option<String> {
+    out(dir, &["merge-base", a, b])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Whether the checkout is shallow and `sha` is a commit its history was cut
 /// at. Such a commit's parents are missing, so blame credits it with every
 /// line older than the cut.

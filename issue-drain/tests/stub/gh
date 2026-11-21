@@ -26,6 +26,42 @@
 #   fail-create           `gh issue create` exits 1
 #   fail-comment          `gh issue comment` exits 1
 #   labels.txt            answer to `gh label list`, one name per line
+#   pr-view-<n>.json      answer to `gh pr view <n>`
+#   pr-view-<n>.after-merge.json  the answer to `gh pr view <n>` once `gh pr
+#                         merge <n>` has exited 0 (a merge queue leaves the PR
+#                         OPEN); without the file that view fails
+#   protection.json       answer to `gh api repos/<o>/<r>/branches/<b>/protection`
+#   protection.unprotected  that call answers GitHub's 404 "Branch not protected"
+#                         body (on stdout, as gh prints it) and exits 1
+#   rules.json            answer to `gh api repos/<o>/<r>/rules/branches/<b>...
+#                         --paginate` (one array, or several one after another);
+#                         without the file, []
+#   fail-rules            that call exits 1
+#   compare.json          answer to `gh api repos/<o>/<r>/compare/<b>...<sha>`
+#   compare-reviewed.json answer to a compare whose first side is not the base
+#                         branch (is the reviewed commit an ancestor of the head)
+#   check-runs.json       answer to `gh api repos/<o>/<r>/commits/<sha>/check-runs`
+#                         (one object, or several one after another); a missing
+#                         file fails the call
+#   merged-<n> and pr-view-<n>.after-merge.json: see above; `gh pr merge <n>
+#                         --disable-auto` writes disable-auto-<n>, and from then
+#                         on the view is pr-view-<n>.after-disable.json when it
+#                         exists
+#   fail-disable-auto     `gh pr merge --disable-auto` exits 1
+#   merge-queue.json      answer to the graphql read of `isInMergeQueue`; without
+#                         the file that read fails
+#   comments.json         answer to `gh api repos/<o>/<r>/issues/<n>/comments`
+#                         (one array, or several one after another, as
+#                         `--paginate` prints them); without the file the call
+#                         fails
+#   timeline-<n>.json     answer to `gh api repos/<o>/<r>/issues/<n>/timeline`
+#                         (what `--paginate` prints: one JSON array, or
+#                         several one after another); without the file, []
+#   fail-timeline         the timeline read exits 1
+#   fail-add-label        `gh issue edit ... --add-label` exits 1
+#   fail-merge            `gh pr merge` exits 1
+#   fail-thread           the thread-reply and thread-resolve mutations exit 1
+# GH_STUB_NEW_PR          the number `gh pr create` reports (default 901)
 # GH_STUB_NEW_ISSUE       the number `gh issue create` reports (default 900)
 # GH_STUB_CLOSE_NOOP=1    `gh issue close` exits 0 but closes nothing
 #
@@ -43,6 +79,14 @@ answer() { # answer <file>: print it, or fail the way gh does for a missing thin
 
 case "${1:-} ${2:-}" in
   "api graphql")
+    case "$*" in
+      *addPullRequestReviewThreadReply* | *resolveReviewThread*)
+        if [ -e "$dir/fail-thread" ]; then echo "gh stub: thread call failed" >&2; exit 1; fi
+        echo '{"data":{}}'; exit 0 ;;
+    esac
+    case "$*" in
+      *isInMergeQueue*) answer merge-queue.json; exit 0 ;;
+    esac
     n=""
     for arg in "$@"; do
       case "$arg" in number=*) n="${arg#number=}" ;; esac
@@ -85,7 +129,45 @@ case "${1:-} ${2:-}" in
     if [ "${GH_STUB_CLOSE_NOOP:-}" != "1" ]; then : > "$dir/closed-$3"; fi ;;
   "issue comment")
     if [ -e "$dir/fail-comment" ]; then echo "gh stub: comment failed" >&2; exit 1; fi ;;
-  "issue edit" | "label create") ;;
+  "pr create")
+    echo "https://github.com/example/tidepool/pull/${GH_STUB_NEW_PR:-901}" ;;
+  "pr view")
+    if [ -e "$dir/disable-auto-$3" ] && [ -f "$dir/pr-view-$3.after-disable.json" ]; then answer "pr-view-$3.after-disable.json"
+    elif [ -e "$dir/merged-$3" ]; then answer "pr-view-$3.after-merge.json"; else answer "pr-view-$3.json"; fi ;;
+  "pr merge")
+    case "$*" in
+      *--disable-auto*)
+        if [ -e "$dir/fail-disable-auto" ]; then echo "gh stub: disable-auto failed" >&2; exit 1; fi
+        : > "$dir/disable-auto-$3"; exit 0 ;;
+    esac
+    if [ -e "$dir/fail-merge" ]; then echo "gh stub: merge failed" >&2; exit 1; fi
+    : > "$dir/merged-$3" ;;
+  "api repos/"*)
+    case "$2" in
+      */protection)
+        if [ -e "$dir/protection.unprotected" ]; then
+          echo '{"message":"Branch not protected","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"404"}'
+          echo "gh stub: Branch not protected (HTTP 404)" >&2; exit 1
+        fi
+        answer protection.json ;;
+      */rules/branches/*)
+        if [ -e "$dir/fail-rules" ]; then echo "gh stub: rules failed" >&2; exit 1; fi
+        if [ -f "$dir/rules.json" ]; then cat "$dir/rules.json"; else echo "[]"; fi ;;
+      */compare/develop...*) answer compare.json ;;
+      */compare/*) answer compare-reviewed.json ;;
+      */commits/*/check-runs*) answer check-runs.json ;;
+      */issues/*/comments*) answer comments.json ;;
+      */issues/*/timeline*)
+        if [ -e "$dir/fail-timeline" ]; then echo "gh stub: timeline failed" >&2; exit 1; fi
+        t="${2#*/issues/}"
+        if [ -f "$dir/timeline-${t%%/*}.json" ]; then cat "$dir/timeline-${t%%/*}.json"; else echo "[]"; fi ;;
+      *) echo "gh stub: unexpected call: $*" >&2; exit 9 ;;
+    esac ;;
+  "issue edit")
+    case "$*" in
+      *--add-label*) if [ -e "$dir/fail-add-label" ]; then echo "gh stub: add-label failed" >&2; exit 1; fi ;;
+    esac ;;
+  "label create") ;;
   "label list")
     if [ -f "$dir/labels.txt" ]; then cat "$dir/labels.txt"; fi ;;
   *)

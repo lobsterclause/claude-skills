@@ -24,6 +24,7 @@ pub struct Profile {
     pub tracker_label: String,
     pub priority_labels: Vec<String>,
     pub protected_path_re: String,
+    pub frozen_paths: Vec<String>,
     pub risk_path_re: String,
     pub trusted_associations: Vec<String>,
     pub intake_cap: usize,
@@ -36,6 +37,14 @@ pub struct Profile {
     pub allowed_models: Vec<String>,
     pub allowed_efforts: Vec<String>,
     pub unit_permissions: String,
+    pub guard_protected_paths: Vec<String>,
+    pub bootstrap_command: String,
+    pub bootstrap_requires: Vec<String>,
+    pub bootstrap_timeout_secs: u64,
+    pub codegraph_init: bool,
+    pub codegraph_timeout_secs: u64,
+    pub full_verify_command: String,
+    pub stamp_command: String,
     #[serde(skip)]
     protected: Option<Regex>,
     #[serde(skip)]
@@ -58,6 +67,7 @@ impl Default for Profile {
             tracker_label: "issue-drain".into(),
             priority_labels: Vec::new(),
             protected_path_re: r"^(\.github/workflows/|\.husky/|\.claude/)".into(),
+            frozen_paths: Vec::new(),
             risk_path_re: String::new(),
             trusted_associations: words("OWNER MEMBER COLLABORATOR"),
             intake_cap: 40,
@@ -70,11 +80,26 @@ impl Default for Profile {
             allowed_models: words("haiku sonnet opus"),
             allowed_efforts: words("low medium high"),
             unit_permissions: "not set in the profile".into(),
+            guard_protected_paths: words(".github/workflows .husky .claude"),
+            bootstrap_command: String::new(),
+            bootstrap_requires: Vec::new(),
+            bootstrap_timeout_secs: 900,
+            codegraph_init: false,
+            codegraph_timeout_secs: 300,
+            full_verify_command: String::new(),
+            stamp_command: String::new(),
             protected: None,
             risk: None,
             file: PathBuf::new(),
         }
     }
+}
+
+/// Whether `path` is `entry` or lies under the folder `entry` (a trailing
+/// slash on the entry is optional).
+pub fn path_within(path: &str, entry: &str) -> bool {
+    let entry = entry.trim_end_matches('/');
+    !entry.is_empty() && (path == entry || path.strip_prefix(entry).is_some_and(|rest| rest.starts_with('/')))
 }
 
 /// GitHub treats label names as case-insensitive, so `Blocked` is the hold
@@ -154,12 +179,32 @@ impl Profile {
                 "profile keys intake_cap and cluster_max_issues must be above 0",
             ));
         }
+        if self.bootstrap_timeout_secs == 0 || self.codegraph_timeout_secs == 0 {
+            return Err(Fail::usage(
+                "profile keys bootstrap_timeout_secs and codegraph_timeout_secs must be above 0",
+            ));
+        }
+        // A required path is joined onto the main checkout: it stays inside it.
+        for path in &self.bootstrap_requires {
+            let inside = !path.is_empty() && !path.starts_with('/') && !path.split('/').any(|part| part == "..");
+            if !inside {
+                return Err(Fail::usage(format!(
+                    "profile key bootstrap_requires must hold paths inside the checkout (got '{path}')"
+                )));
+            }
+        }
         Ok(())
     }
 
     /// A path no agent may change: the unit parks for a person.
     pub fn is_protected(&self, path: &str) -> bool {
         self.protected.as_ref().is_some_and(|re| re.is_match(path))
+    }
+
+    /// A path the unit's diff may not touch: a listed file, or anything under
+    /// a listed folder.
+    pub fn is_frozen(&self, path: &str) -> bool {
+        self.frozen_paths.iter().any(|entry| path_within(path, entry))
     }
 
     /// A path whose PR waits for a named reviewer.
@@ -209,6 +254,18 @@ mod tests {
     }
 
     #[test]
+    fn frozen_paths_match_a_file_or_a_folder_but_not_a_name_prefix() {
+        let p = load("frozen_paths = [\"Cargo.lock\", \"vendor/\", \"docs\"]\n").unwrap();
+        assert!(p.is_frozen("Cargo.lock"));
+        assert!(p.is_frozen("vendor/a/b.rs"));
+        assert!(p.is_frozen("docs/readme.md"));
+        assert!(!p.is_frozen("docs-extra/readme.md"));
+        assert!(!p.is_frozen("src/Cargo.lock"));
+        assert!(!load("").unwrap().is_frozen("vendor/a"));
+        assert_eq!(load("frozen_path = []\n").unwrap_err().code, 2);
+    }
+
+    #[test]
     fn a_bad_regex_names_its_key() {
         let err = load("risk_path_re = \"(\"\n").unwrap_err();
         assert_eq!(err.code, 2);
@@ -232,6 +289,28 @@ mod tests {
     #[test]
     fn a_base_branch_that_looks_like_an_option_is_rejected() {
         assert_eq!(load("base_branch = \"--upload-pack=x\"\n").unwrap_err().code, 2);
+    }
+
+    #[test]
+    fn the_unit_keys_default_to_off() {
+        let p = load("").unwrap();
+        assert_eq!(p.guard_protected_paths, [".github/workflows", ".husky", ".claude"]);
+        assert!(p.bootstrap_command.is_empty() && p.bootstrap_requires.is_empty());
+        assert!(!p.codegraph_init);
+        assert_eq!((p.bootstrap_timeout_secs, p.codegraph_timeout_secs), (900, 300));
+        assert!(p.full_verify_command.is_empty() && p.stamp_command.is_empty());
+    }
+
+    #[test]
+    fn a_required_path_outside_the_checkout_or_a_zero_timeout_is_rejected() {
+        for bad in ["/etc", "../x", "a/../b", ""] {
+            let err = load(&format!("bootstrap_requires = [\"{bad}\"]\n")).unwrap_err();
+            assert_eq!(err.code, 2, "{bad}");
+            assert!(err.msg.contains("bootstrap_requires"), "{}", err.msg);
+        }
+        assert!(load("bootstrap_requires = [\"node_modules\", \"a/b\"]\n").is_ok());
+        assert_eq!(load("bootstrap_timeout_secs = 0\n").unwrap_err().code, 2);
+        assert_eq!(load("codegraph_timeout_secs = 0\n").unwrap_err().code, 2);
     }
 
     #[test]

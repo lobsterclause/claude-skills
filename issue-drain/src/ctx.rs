@@ -19,6 +19,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::error::{Fail, Res};
 use crate::git;
+use crate::model::{Queue, Unit};
 use crate::profile::Profile;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -136,8 +137,12 @@ impl Ctx {
         Ok(root.unwrap_or(dir))
     }
 
+    /// The mode of this process. With no ISSUE_DRAIN_MODE, a set
+    /// ISSUE_DRAIN_UNIT_FILE (the driver gives one to each unit process) means
+    /// a unit: a unit that lost the mode variable must not become a session.
     pub fn mode(&self) -> Res<Mode> {
         match env_str("ISSUE_DRAIN_MODE").as_str() {
+            "" if !env_str("ISSUE_DRAIN_UNIT_FILE").is_empty() => Ok(Mode::Unit),
             "" | "session" => Ok(Mode::Session),
             "driver" => Ok(Mode::Driver),
             "unit" => Ok(Mode::Unit),
@@ -145,6 +150,29 @@ impl Ctx {
                 "ISSUE_DRAIN_MODE must be session, driver or unit (got '{other}')"
             ))),
         }
+    }
+
+    /// Refuse when this is a unit process: `command` is the driver's job.
+    pub fn require_driver(&self, command: &str) -> Res<()> {
+        match self.mode()? {
+            Mode::Unit => Err(Fail::refused(format!(
+                "{command} is the driver's job; a unit process may not run it"
+            ))),
+            Mode::Session | Mode::Driver => Ok(()),
+        }
+    }
+
+    /// Unit `n` of this run's queue.json.
+    pub fn queue_unit(&self, n: u64) -> Res<Unit> {
+        let path = self.path("queue.json");
+        let queue: Queue = read_json(&path)
+            .ok_or_else(|| Fail::usage(format!("no queue in {}; run `tracker render` first", path.display())))?;
+        let id = format!("U{n}");
+        queue
+            .units
+            .into_iter()
+            .find(|u| u.id == id)
+            .ok_or_else(|| Fail::usage(format!("queue.json has no unit {id}")))
     }
 
     /// The run id is the run folder's name. It goes into the tracker's marker

@@ -4,6 +4,8 @@
 //!   2  bad arguments, a missing input file or a missing setting
 //!   3  a rule refused the action
 //!   1  GitHub, git or the filesystem failed
+//!   4  only `merge-gate`: the merge call was accepted but the PR is not merged
+//!      yet (a merge queue)
 
 #[derive(Debug)]
 pub struct Fail {
@@ -24,6 +26,13 @@ impl Fail {
     pub fn refused(msg: impl Into<String>) -> Fail {
         Fail {
             code: 3,
+            msg: msg.into(),
+        }
+    }
+
+    pub fn queued(msg: impl Into<String>) -> Fail {
+        Fail {
+            code: 4,
             msg: msg.into(),
         }
     }

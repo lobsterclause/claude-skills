@@ -8,6 +8,7 @@ blocked_label = "needs-human"
 tracker_label = "issue-drain"
 priority_labels = ["p0", "p1", "p2", "p3"]
 protected_path_re = '^(\.github/workflows/|\.husky/|\.claude/)'
+frozen_paths = ["vendor/"]
 risk_path_re = '(^|/)[^/]*(crisis|billing)[^/]*(/|$)'
 trusted_associations = ["OWNER", "MEMBER", "COLLABORATOR"]
 intake_cap = 40
