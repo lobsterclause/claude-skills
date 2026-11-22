@@ -3160,7 +3160,24 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   local bytes
   bytes=$(output_bytes_of "$out/kimi.stdout")
   local fk_json="null"
-  if [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/kimi.stdout"; then
+  # Kimi Code usage limit: the CLI prints a 429 with error type
+  # exceeded_current_quota_error and writes no review. Stamp it like codex's
+  # wall (sentinel + quota_exhausted) so the retry loop skips the doomed
+  # attempt 2 and downstream tools see a failure_kind. Gated on a failed or
+  # empty run so a review that merely quotes "429" never self-classifies.
+  # Only the quota-specific error type counts: a bare 429 can be a transient
+  # throttle, which stays on the normal retry path. The token must sit in the
+  # provider's error object ("type": "..."), so a partial review that merely
+  # mentions it does not count. grep reads the files
+  # itself; piping through cat lets grep -q exit early and SIGPIPE cat, which
+  # pipefail turns into a miss.
+  if { [[ $rc -ne 0 ]] || [[ "$bytes" -eq 0 ]]; } \
+     && grep -qsiE "[\"']type[\"'][[:space:]]*:[[:space:]]*[\"']exceeded_current_quota_error" "$out/kimi.stdout" "$out/kimi.stderr"; then
+    printf '%s\n' "reset time not reported" >"$out/kimi.quota_exhausted"
+    echo "kimi: usage limit reached (429 exceeded_current_quota_error) — classifying as quota_exhausted" >&2
+    fk_json='"quota_exhausted"'
+    [[ $rc -eq 0 ]] && rc=5
+  elif [[ $rc -eq 0 && "$bytes" -gt 0 ]] && output_degenerate "$out/kimi.stdout"; then
     echo "kimi: output is a degenerate repetition loop (gzip ratio >15:1) — classifying as failed" >&2
     fk_json='"degenerate_output"'
     rc=5
