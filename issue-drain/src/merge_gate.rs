@@ -535,6 +535,24 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                         )
                     }
                 };
+                // Another app's failed run under a pinned name is not what the
+                // pin asks for, but it is a failed check all the same. The
+                // scan of optional checks below skips required names, so it is
+                // caught here.
+                if let Some(id) = check.app_id {
+                    let source = format!("app:{id}");
+                    if let Some(bad) = latest_apps
+                        .iter()
+                        .filter(|((name, src), _)| *name == context.as_str() && *src != source)
+                        .flat_map(|(_, group)| group.iter())
+                        .find(|r| r.outcome == Outcome::Fail)
+                    {
+                        out.push(refusal(
+                            "check_failed",
+                            format!("check '{context}' from another source is {}", bad.word),
+                        ));
+                    }
+                }
                 if groups.is_empty() {
                     if check.app_id.is_some() && f.app_runs.is_err() {
                         continue; // the read error is already named
@@ -1351,9 +1369,11 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
         pages += 1;
         for entry in list {
             let context = text(entry, "context")?.to_lowercase();
-            let Some(name) = wanted.iter().find(|w| w.to_lowercase() == context) else {
+            // Two rules can spell one context two ways; each gets the status.
+            let names: Vec<&str> = wanted.iter().copied().filter(|w| w.to_lowercase() == context).collect();
+            if names.is_empty() {
                 continue;
-            };
+            }
             // The list comes newest first, so the first status of a context is
             // the current one. Two posted within a second carry the same
             // `created_at`, which is why the order decides and not it.
@@ -1387,20 +1407,19 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
                 "pending" => Outcome::Pending,
                 _ => Outcome::Other,
             };
-            runs.push(Run {
-                name: name.to_string(),
-                source: format!("app:{id}"),
-                // A bucket of its own: a check run with no workflow run id has
-                // an empty one, and the two must not hide each other.
-                run: "status".to_string(),
-                outcome,
-                word: state,
-                started: entry
-                    .get("created_at")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            });
+            let started = entry.get("created_at").and_then(Value::as_str).unwrap_or_default();
+            for name in names {
+                runs.push(Run {
+                    name: name.to_string(),
+                    source: format!("app:{id}"),
+                    // A bucket of its own: a check run with no workflow run id
+                    // has an empty one, and the two must not hide each other.
+                    run: "status".to_string(),
+                    outcome,
+                    word: state.clone(),
+                    started: started.to_string(),
+                });
+            }
         }
     }
     if pages == 0 {
@@ -2822,6 +2841,12 @@ mod tests {
         assert_eq!(codes(&f), ["required_check"]);
         f.app_runs = Ok(vec![from(15368, Outcome::Pass, "success")]);
         assert!(codes(&f).is_empty());
+        // The pin is met, but another app's run of the same name failed.
+        f.app_runs = Ok(vec![
+            from(15368, Outcome::Pass, "success"),
+            from(99, Outcome::Fail, "failure"),
+        ]);
+        assert_eq!(codes(&f), ["check_failed"]);
         f.app_runs = Err("the check runs at the head (gh exit 1)".into());
         assert_eq!(codes(&f), ["read_error"]);
         // Unpinned: the unreadable runs do not matter.
@@ -2924,6 +2949,15 @@ mod tests {
         .unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!((runs[0].name.as_str(), runs[0].outcome), ("build", Outcome::Fail));
+        // Two spellings wanted: each gets the one status.
+        let runs = parse_statuses(
+            &json!([bot("success", at)]).to_string(),
+            &["Build", "build"],
+            &mut app_of,
+        )
+        .unwrap();
+        let names: Vec<&str> = runs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Build", "build"]);
         // No page at all is not "no statuses".
         assert!(parse_statuses("", &["build"], &mut app_of).is_err());
         assert!(parse_statuses("{}", &["build"], &mut app_of).is_err());
