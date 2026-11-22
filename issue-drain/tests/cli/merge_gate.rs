@@ -443,6 +443,69 @@ fn a_check_pinned_to_an_app_needs_a_run_from_that_app() {
     assert_eq!(env.run(&ARGS).code, 0);
 }
 
+fn status_of(login: &str, kind: &str, state: &str, at: &str) -> Value {
+    json!({"context": "build", "state": state, "created_at": at, "creator": {"login": login, "type": kind}})
+}
+
+#[test]
+fn a_check_pinned_to_an_app_is_satisfied_by_a_commit_status_that_apps_bot_posted() {
+    let env = ready();
+    put(&env, "rules.json", &pinned_ruleset());
+    // No check run named `build` from the app: a status is the only source.
+    put(&env, "check-runs.json", &json!({"total_count": 0, "check_runs": []}));
+    put(
+        &env,
+        "app-github-actions.json",
+        &json!({"id": 15368, "slug": "github-actions"}),
+    );
+    put(&env, "app-other.json", &json!({"id": 7}));
+    let at = "2026-11-21T02:00:00Z";
+    let bot = "github-actions[bot]";
+    let refused = |statuses: Value| {
+        put(&env, "statuses.json", &statuses);
+        let r = result(&env.run(&ARGS));
+        assert_eq!(codes(&r), ["required_check"], "{statuses}");
+        assert!(merged_calls(&env).is_empty());
+        r
+    };
+    // A status from a person counts for no app.
+    let r = refused(json!([status_of("mallory", "User", "success", at)]));
+    assert!(r["refusals"][0]["detail"].as_str().unwrap().contains("app 15368"));
+    // Nor does one from a user who only carries the bot's name, or from another app's bot.
+    refused(json!([status_of(bot, "User", "success", at)]));
+    refused(json!([status_of("other[bot]", "Bot", "success", at)]));
+    // The newest status from the right app decides: a later failure refuses.
+    refused(json!([
+        status_of(bot, "Bot", "failure", "2026-11-21T03:00:00Z"),
+        status_of(bot, "Bot", "success", at)
+    ]));
+    // The right app's bot, passing.
+    put(&env, "statuses.json", &json!([status_of(bot, "Bot", "success", at)]));
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+}
+
+#[test]
+fn an_app_that_cannot_be_looked_up_refuses_the_pinned_check() {
+    let env = ready();
+    put(&env, "rules.json", &pinned_ruleset());
+    put(&env, "check-runs.json", &json!({"total_count": 0, "check_runs": []}));
+    put(
+        &env,
+        "statuses.json",
+        &json!([status_of(
+            "github-actions[bot]",
+            "Bot",
+            "success",
+            "2026-11-21T02:00:00Z"
+        )]),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["read_error"]);
+    assert!(merged_calls(&env).is_empty());
+}
+
 #[test]
 fn an_unreadable_check_run_list_refuses_a_pinned_check_and_is_not_read_for_an_unpinned_one() {
     let env = ready();

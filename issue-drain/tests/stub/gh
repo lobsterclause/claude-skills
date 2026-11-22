@@ -43,6 +43,10 @@
 #   check-runs.json       answer to `gh api repos/<o>/<r>/commits/<sha>/check-runs`
 #                         (one object, or several one after another); a missing
 #                         file fails the call
+#   statuses.json         answer to `gh api repos/<o>/<r>/commits/<sha>/statuses`
+#                         (default: an empty list)
+#   app-<slug>.json       answer to `gh api apps/<slug>`; a missing file fails
+#                         the call
 #   merged-<n> and pr-view-<n>.after-merge.json: see above; `gh pr merge <n>
 #                         --disable-auto` writes disable-auto-<n>, and from then
 #                         on the view is pr-view-<n>.after-disable.json when it
@@ -142,6 +146,7 @@ case "${1:-} ${2:-}" in
     esac
     if [ -e "$dir/fail-merge" ]; then echo "gh stub: merge failed" >&2; exit 1; fi
     : > "$dir/merged-$3" ;;
+  "api apps/"*) answer "app-${2#apps/}.json" ;;
   "api repos/"*)
     case "$2" in
       */protection)
@@ -156,6 +161,8 @@ case "${1:-} ${2:-}" in
       */compare/develop...*) answer compare.json ;;
       */compare/*) answer compare-reviewed.json ;;
       */commits/*/check-runs*) answer check-runs.json ;;
+      */commits/*/statuses*)
+        if [ -f "$dir/statuses.json" ]; then cat "$dir/statuses.json"; else echo "[]"; fi ;;
       */issues/*/comments*) answer comments.json ;;
       */issues/*/timeline*)
         if [ -e "$dir/fail-timeline" ]; then echo "gh stub: timeline failed" >&2; exit 1; fi

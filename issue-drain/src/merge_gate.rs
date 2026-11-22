@@ -77,14 +77,18 @@
 //! later pass. A re-run of failed jobs keeps the run id, so it still replaces the
 //! earlier attempt. The limit: a fresh run of the same workflow at the same head
 //! (a second event, or a manual dispatch) is a second run id, so an earlier
-//! failed run keeps blocking until it is re-run itself. An entry with no
-//! parseable URL (a commit status, a pinned-app read without one) shares one
-//! bucket, as before.
+//! failed run keeps blocking until it is re-run itself. Entries with no
+//! parseable URL share one bucket, as before, except a commit status read for
+//! a pinned check, which has a bucket of its own (`status`).
 //!
 //! A required check pinned to an app (classic `app_id`, ruleset
 //! `integration_id`; null and -1 mean any app) needs a run from that app. The
 //! rollup carries no app id, so a pinned check reads
-//! `commits/<head>/check-runs`; a failed read refuses (`read_error`).
+//! `commits/<head>/check-runs`; a failed read refuses (`read_error`). A pinned
+//! check can also be a commit status (a workflow posting one with its token),
+//! which is not a check run: `commits/<head>/statuses` is read too, and a
+//! status counts for the app whose bot posted it (`<slug>[bot]`, the id from
+//! `apps/<slug>`). A status a person posted counts for no app.
 //!
 //! A unit with no file scope (`scope_checked` not true in `deliver.json`) is
 //! refused (`deliver_check`): a person merges it. The gate may not be run by a
@@ -110,7 +114,7 @@
 //! not merged yet, or was already in the merge queue (queued: `merged: false,
 //! queued: true`); 2 bad arguments.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
@@ -164,10 +168,13 @@ pub enum Outcome {
 pub struct Run {
     pub name: String,
     /// What produced it: the workflow of a check run, `status` for a commit
-    /// status. Two sources can use one display name; they are two checks.
+    /// status in the rollup, `app:<id>` for a check run or commit status read
+    /// for a pinned check. Two sources can use one display name; they are two
+    /// checks.
     pub source: String,
     /// The Actions workflow run this entry belongs to (from its details URL);
-    /// empty for a commit status and for an entry that names none.
+    /// empty for a rollup commit status and for an entry that names none,
+    /// `status` for a commit status read for a pinned check.
     pub run: String,
     pub outcome: Outcome,
     /// The conclusion or state as GitHub words it, for messages.
@@ -528,6 +535,24 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                         )
                     }
                 };
+                // Another app's failed run under a pinned name is not what the
+                // pin asks for, but it is a failed check all the same. The
+                // scan of optional checks below skips required names, so it is
+                // caught here.
+                if let Some(id) = check.app_id {
+                    let source = format!("app:{id}");
+                    if let Some(bad) = latest_apps
+                        .iter()
+                        .filter(|((name, src), _)| *name == context.as_str() && *src != source)
+                        .flat_map(|(_, group)| group.iter())
+                        .find(|r| r.outcome == Outcome::Fail)
+                    {
+                        out.push(refusal(
+                            "check_failed",
+                            format!("check '{context}' from another source is {}", bad.word),
+                        ));
+                    }
+                }
                 if groups.is_empty() {
                     if check.app_id.is_some() && f.app_runs.is_err() {
                         continue; // the read error is already named
@@ -1323,6 +1348,88 @@ pub fn parse_check_runs(raw: &str) -> Read<Vec<Run>> {
     Ok(runs)
 }
 
+/// One page of `commits/<head>/statuses`, or several one after another
+/// (`--paginate`): the statuses whose context is in `wanted`, each with the
+/// app whose bot posted it (`source` is `app:<id>`). `app_of` turns an app
+/// slug into its id; it is asked once per slug, and its failure fails the
+/// read. A status posted by anything but an app's bot is kept under `app:0`,
+/// which satisfies no pinned check. The list is newest first, and only the
+/// first status of each context is kept, whoever posted it: a later status
+/// from another source replaces the pinned app's, so the pin is then unmet.
+/// GitHub compares contexts without regard to case, and so does this; a kept
+/// status carries the name as `wanted` spells it.
+pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -> Read<u64>) -> Read<Vec<Run>> {
+    let mut runs = Vec::new();
+    let mut ids: BTreeMap<String, u64> = BTreeMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut pages = 0;
+    for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
+        let page = page.map_err(|_| "the answer is not JSON".to_string())?;
+        let list = page.as_array().ok_or("a page is not a list")?;
+        pages += 1;
+        for entry in list {
+            let context = text(entry, "context")?.to_lowercase();
+            // Two rules can spell one context two ways; each gets the status.
+            let names: Vec<&str> = wanted.iter().copied().filter(|w| w.to_lowercase() == context).collect();
+            if names.is_empty() {
+                continue;
+            }
+            // The list comes newest first, so the first status of a context is
+            // the current one. Two posted within a second carry the same
+            // `created_at`, which is why the order decides and not it.
+            if !seen.insert(context.clone()) {
+                continue;
+            }
+            let login = entry
+                .pointer("/creator/login")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let is_bot = entry.pointer("/creator/type").and_then(Value::as_str) == Some("Bot");
+            let id = match login.strip_suffix("[bot]") {
+                Some(slug) if is_bot && !slug.is_empty() => match ids.get(slug) {
+                    Some(id) => *id,
+                    None => {
+                        let id = app_of(slug)?;
+                        ids.insert(slug.to_string(), id);
+                        id
+                    }
+                },
+                _ => 0,
+            };
+            let state = entry
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase();
+            let outcome = match state.as_str() {
+                "success" => Outcome::Pass,
+                "failure" | "error" => Outcome::Fail,
+                "pending" => Outcome::Pending,
+                // GitHub documents these four and no others. A current status
+                // that cannot be read must not pass for one that does not fail.
+                _ => return Err(format!("a status of '{context}' has the state '{state}'")),
+            };
+            let started = entry.get("created_at").and_then(Value::as_str).unwrap_or_default();
+            for name in names {
+                runs.push(Run {
+                    name: name.to_string(),
+                    source: format!("app:{id}"),
+                    // A bucket of its own: a check run with no workflow run id
+                    // has an empty one, and the two must not hide each other.
+                    run: "status".to_string(),
+                    outcome,
+                    word: state.clone(),
+                    started: started.to_string(),
+                });
+            }
+        }
+    }
+    if pages == 0 {
+        return Err("the answer is empty".into());
+    }
+    Ok(runs)
+}
+
 /// `status` of a compare answer: whether the first commit is an ancestor of
 /// (or the same as) the second.
 fn parse_ancestry(raw: &str) -> Read<bool> {
@@ -1617,7 +1724,30 @@ fn gather(
             "--paginate",
         ])
         .and_then(|raw| parse_check_runs(&raw))
-        .map_err(|e| format!("the check runs at the head ({e})")),
+        .map_err(|e| format!("the check runs at the head ({e})"))
+        .and_then(|mut runs| {
+            let wanted: Vec<&str> = required
+                .iter()
+                .filter(|c| c.app_id.is_some())
+                .map(|c| c.context.as_str())
+                .collect();
+            let mut app_of = |slug: &str| {
+                let raw = read_gh(&["api", &format!("apps/{slug}")])?;
+                let v: Value = serde_json::from_str(&raw).map_err(|_| "the answer is not JSON".to_string())?;
+                v.get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("app '{slug}' has no id"))
+            };
+            let statuses = read_gh(&[
+                "api",
+                &format!("repos/{repo}/commits/{head}/statuses?per_page=100"),
+                "--paginate",
+            ])
+            .and_then(|raw| parse_statuses(&raw, &wanted, &mut app_of))
+            .map_err(|e| format!("the commit statuses at the head ({e})"))?;
+            runs.extend(statuses);
+            Ok(runs)
+        }),
         _ => Ok(Vec::new()),
     };
     let preflight = preflight(ctx, repo, pr);
@@ -2713,6 +2843,12 @@ mod tests {
         assert_eq!(codes(&f), ["required_check"]);
         f.app_runs = Ok(vec![from(15368, Outcome::Pass, "success")]);
         assert!(codes(&f).is_empty());
+        // The pin is met, but another app's run of the same name failed.
+        f.app_runs = Ok(vec![
+            from(15368, Outcome::Pass, "success"),
+            from(99, Outcome::Fail, "failure"),
+        ]);
+        assert_eq!(codes(&f), ["check_failed"]);
         f.app_runs = Err("the check runs at the head (gh exit 1)".into());
         assert_eq!(codes(&f), ["read_error"]);
         // Unpinned: the unreadable runs do not matter.
@@ -2758,6 +2894,90 @@ mod tests {
         assert_eq!((runs[1].source.as_str(), runs[1].outcome), ("app:7", Outcome::Pending));
         assert!(parse_check_runs("").is_err());
         assert!(parse_check_runs("{}").is_err());
+    }
+
+    #[test]
+    fn statuses_keep_the_newest_of_each_context_apart_from_check_runs() {
+        let bot = |state: &str, at: &str| {
+            json!({"context": "build", "state": state, "created_at": at,
+                "creator": {"login": "github-actions[bot]", "type": "Bot"}})
+        };
+        let asked = std::cell::Cell::new(0);
+        let mut app_of = |_: &str| {
+            asked.set(asked.get() + 1);
+            Ok(15368)
+        };
+        // Newest first, the two posted within the same second: the first is current.
+        let at = "2026-11-21T02:00:00Z";
+        let page1 = json!([bot("success", at), bot("pending", at)]);
+        let page2 = json!([bot("failure", "2026-11-21T01:00:00Z"), {"context": "other", "state": "failure"}]);
+        let runs = parse_statuses(&format!("{page1}\n{page2}"), &["build"], &mut app_of).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].source.as_str(), runs[0].outcome), ("app:15368", Outcome::Pass));
+        assert_eq!(asked.get(), 1, "one lookup per slug");
+        // A failed check run of the same app with no workflow run id is not hidden
+        // by the newer passing status.
+        let mut all = parse_check_runs(
+            &json!({"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure",
+                "started_at": "2026-11-21T00:00:00Z", "app": {"id": 15368}}]})
+            .to_string(),
+        )
+        .unwrap();
+        all.extend(runs);
+        let outcomes: Vec<Outcome> = newest(&all)[&("build", "app:15368")]
+            .iter()
+            .map(|r| r.outcome)
+            .collect();
+        assert_eq!(outcomes, [Outcome::Fail, Outcome::Pass]);
+        // A later status from anyone else replaces the app's: the pin is unmet.
+        let person = json!({"context": "Build", "state": "success", "created_at": at,
+            "creator": {"login": "someone", "type": "User"}});
+        let runs = parse_statuses(
+            &json!([person, bot("success", at)]).to_string(),
+            &["build"],
+            &mut app_of,
+        )
+        .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].name.as_str(), runs[0].source.as_str()), ("build", "app:0"));
+        // A context that differs only in case is the same context.
+        let shouted = json!({"context": "BUILD", "state": "failure", "created_at": at,
+            "creator": {"login": "github-actions[bot]", "type": "Bot"}});
+        let runs = parse_statuses(
+            &json!([shouted, bot("success", at)]).to_string(),
+            &["build"],
+            &mut app_of,
+        )
+        .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].name.as_str(), runs[0].outcome), ("build", Outcome::Fail));
+        // Two spellings wanted: each gets the one status.
+        let runs = parse_statuses(
+            &json!([bot("success", at)]).to_string(),
+            &["Build", "build"],
+            &mut app_of,
+        )
+        .unwrap();
+        let names: Vec<&str> = runs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Build", "build"]);
+        // A current status with a state GitHub does not document, or none, fails
+        // the read, whoever posted it. An older one is never looked at.
+        let odd = json!({"context": "build", "state": "stale", "created_at": at,
+            "creator": {"login": "someone", "type": "User"}});
+        let none = json!({"context": "build", "created_at": at});
+        for newest_first in [json!([odd, bot("success", at)]), json!([none])] {
+            assert!(parse_statuses(&newest_first.to_string(), &["build"], &mut app_of).is_err());
+        }
+        assert_eq!(
+            parse_statuses(&json!([bot("success", at), odd]).to_string(), &["build"], &mut app_of)
+                .unwrap()
+                .len(),
+            1
+        );
+        // No page at all is not "no statuses".
+        assert!(parse_statuses("", &["build"], &mut app_of).is_err());
+        assert!(parse_statuses("{}", &["build"], &mut app_of).is_err());
+        assert_eq!(parse_statuses("[]", &["build"], &mut app_of).unwrap().len(), 0);
     }
 
     #[test]
