@@ -117,7 +117,7 @@ Its lines: `closed #N (fixed by <sha>)`, `skipped #N: already closed`, `refused 
 
 ## Exit codes
 
-Every subcommand uses the first four, and prints one line saying why on anything but 0. `merge-gate` alone also has code 4.
+Every subcommand uses the first four, and prints one line saying why on anything but 0. `merge-gate` alone also has code 4. `merge-gate` also takes `--note-file <path>`, posted as a PR comment after a successful merge (its URL is `note_url`; a failed post only warns). It treats a cancelled run as passed only when a later run of the same workflow, event and head passed, and it fails closed on any other source's non-passing run of a required check.
 
 | Code | Meaning | What to do |
 |---|---|---|

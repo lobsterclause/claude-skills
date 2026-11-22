@@ -45,6 +45,9 @@
 #                         file fails the call
 #   statuses.json         answer to `gh api repos/<o>/<r>/commits/<sha>/statuses`
 #                         (default: an empty list)
+#   workflow-runs.json    answer to `gh api repos/<o>/<r>/actions/runs?head_sha=...`
+#                         (one object, or several one after another); a missing
+#                         file fails the call
 #   app-<slug>.json       answer to `gh api apps/<slug>`; a missing file fails
 #                         the call
 #   merged-<n> and pr-view-<n>.after-merge.json: see above; `gh pr merge <n>
@@ -132,7 +135,8 @@ case "${1:-} ${2:-}" in
   "issue close")
     if [ "${GH_STUB_CLOSE_NOOP:-}" != "1" ]; then : > "$dir/closed-$3"; fi ;;
   "issue comment")
-    if [ -e "$dir/fail-comment" ]; then echo "gh stub: comment failed" >&2; exit 1; fi ;;
+    if [ -e "$dir/fail-comment" ]; then echo "gh stub: comment failed" >&2; exit 1; fi
+    echo "https://github.com/example/tidepool/pull/$3#issuecomment-5001" ;;
   "pr create")
     echo "https://github.com/example/tidepool/pull/${GH_STUB_NEW_PR:-901}" ;;
   "pr view")
@@ -161,6 +165,7 @@ case "${1:-} ${2:-}" in
       */compare/develop...*) answer compare.json ;;
       */compare/*) answer compare-reviewed.json ;;
       */commits/*/check-runs*) answer check-runs.json ;;
+      */actions/runs*) answer workflow-runs.json ;;
       */commits/*/statuses*)
         if [ -f "$dir/statuses.json" ]; then cat "$dir/statuses.json"; else echo "[]"; fi ;;
       */issues/*/comments*) answer comments.json ;;
