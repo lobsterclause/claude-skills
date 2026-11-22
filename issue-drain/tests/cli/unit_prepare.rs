@@ -530,3 +530,118 @@ fn the_shipped_kma_profile_guards_what_its_protected_pattern_protects() {
     assert_eq!(p.full_verify_command, "pnpm verify");
     assert_eq!(p.stamp_command, "bash scripts/verify-stamp.sh write {tree}");
 }
+
+#[test]
+fn a_prepare_with_no_state_starts_the_state_log() {
+    let c = case("");
+    assert!(!c.env.workdir.join("state.json").exists());
+    c.prepared();
+    let state = json(&c.env.workdir.join("state.json"));
+    assert_eq!(state["queue"], json!([3]));
+    assert_eq!(state["units"][0]["state"], "queued");
+    let events = c.env.events();
+    assert_eq!(events.len(), 2, "the queued event, then the unit's start: {events:?}");
+    assert_eq!(events[0]["to"], "queued");
+    assert_eq!(events[0]["unit"], 3);
+    assert_eq!(events[1]["event"], "unit_prepared");
+    // A second prepare finds the state and starts nothing new.
+    c.prepared();
+    assert_eq!(c.env.events().len(), 3);
+    assert_eq!(c.env.events().iter().filter(|e| e["to"] == "queued").count(), 1);
+}
+
+#[test]
+fn a_prepare_leaves_a_started_state_as_it_is() {
+    let c = case("");
+    assert_eq!(c.env.run(&["state", "init"]).code, 0);
+    c.env.run(&["state", "event", "3", "claimed"]);
+    let before = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("the log");
+    c.prepared();
+    let after = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("the log");
+    assert!(after.starts_with(&before), "nothing earlier is rewritten");
+    assert_eq!(
+        after.lines().count(),
+        before.lines().count() + 1,
+        "only unit_prepared is new"
+    );
+    assert_eq!(json(&c.env.workdir.join("state.json"))["units"][0]["state"], "claimed");
+}
+
+fn two_unit_queue() -> Value {
+    let mut queue = queue_with_unit(json!({}));
+    let mut second = queue["units"][0].clone();
+    second["id"] = json!("U4");
+    second["issues"] = json!([104]);
+    queue["units"].as_array_mut().expect("units").insert(0, second);
+    queue
+}
+
+fn publish_tracker(c: &Case, body: &str) {
+    c.env.write("queue.json", &two_unit_queue().to_string());
+    c.env.write(
+        "tracker.json",
+        &json!({"number": 12, "url": "https://example.invalid/12", "run": "run", "published_at": "2026-11-21T00:00:00Z"})
+            .to_string(),
+    );
+    c.env.stub_file(
+        "issue-view-12.json",
+        &json!({"body": body, "state": "OPEN"}).to_string(),
+    );
+}
+
+#[test]
+fn an_auto_started_state_follows_the_approved_tracker_not_the_queue() {
+    let c = case("");
+    // The person deleted U4's line and kept U3's ticked.
+    publish_tracker(
+        &c,
+        "<!-- issue-drain:tracker v1 run=run -->\n- [x] U3 · Zero-pad the countdown\n",
+    );
+    c.prepared();
+    let state = json(&c.env.workdir.join("state.json"));
+    assert_eq!(state["queue"], json!([3]), "U4 stays out: {state}");
+}
+
+#[test]
+fn an_auto_started_state_takes_the_trackers_order() {
+    let c = case("");
+    publish_tracker(
+        &c,
+        "<!-- issue-drain:tracker v1 run=run -->\n- [x] U3 · a\n- [x] U4 · b\n",
+    );
+    c.prepared();
+    assert_eq!(json(&c.env.workdir.join("state.json"))["queue"], json!([3, 4]));
+}
+
+#[test]
+fn an_unreadable_tracker_stops_the_auto_start_and_names_state_init_parsed() {
+    let c = case("");
+    publish_tracker(&c, "<!-- issue-drain:tracker v1 run=run -->\n- [x] U3 · a\n");
+    c.env.stub_file("fail", "");
+    let out = c.prepare();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("state init --parsed"), "{}", out.stderr);
+    assert!(!c.worktree().exists(), "nothing was made");
+    assert!(!c.env.workdir.join("state.json").exists());
+}
+
+#[test]
+fn a_tracker_with_a_stop_line_stops_the_auto_start() {
+    let c = case("");
+    publish_tracker(&c, "<!-- issue-drain:tracker v1 run=run -->\nSTOP\n- [x] U3 · a\n");
+    let out = c.prepare();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("STOP"), "{}", out.stderr);
+}
+
+#[test]
+fn a_unit_the_approved_tracker_dropped_gets_no_branch_and_no_worktree() {
+    let c = case("");
+    // The person kept only U4; unit 3 was deleted from the tracker.
+    publish_tracker(&c, "<!-- issue-drain:tracker v1 run=run -->\n- [x] U4 · b\n");
+    let out = c.prepare();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("unit 3"), "{}", out.stderr);
+    assert!(!c.worktree().exists());
+    assert_eq!(git(&c.checkout, &["branch", "--list", BRANCH]), "");
+}
