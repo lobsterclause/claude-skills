@@ -77,9 +77,9 @@
 //! later pass. A re-run of failed jobs keeps the run id, so it still replaces the
 //! earlier attempt. The limit: a fresh run of the same workflow at the same head
 //! (a second event, or a manual dispatch) is a second run id, so an earlier
-//! failed run keeps blocking until it is re-run itself. An entry with no
-//! parseable URL (a commit status, a pinned-app read without one) shares one
-//! bucket, as before.
+//! failed run keeps blocking until it is re-run itself. Entries with no
+//! parseable URL share one bucket, as before, except a commit status read for
+//! a pinned check, which has a bucket of its own (`status`).
 //!
 //! A required check pinned to an app (classic `app_id`, ruleset
 //! `integration_id`; null and -1 mean any app) needs a run from that app. The
@@ -168,10 +168,13 @@ pub enum Outcome {
 pub struct Run {
     pub name: String,
     /// What produced it: the workflow of a check run, `status` for a commit
-    /// status. Two sources can use one display name; they are two checks.
+    /// status in the rollup, `app:<id>` for a check run or commit status read
+    /// for a pinned check. Two sources can use one display name; they are two
+    /// checks.
     pub source: String,
     /// The Actions workflow run this entry belongs to (from its details URL);
-    /// empty for a commit status and for an entry that names none.
+    /// empty for a rollup commit status and for an entry that names none,
+    /// `status` for a commit status read for a pinned check.
     pub run: String,
     pub outcome: Outcome,
     /// The conclusion or state as GitHub words it, for messages.
@@ -1333,19 +1336,28 @@ pub fn parse_check_runs(raw: &str) -> Read<Vec<Run>> {
 /// slug into its id; it is asked once per slug, and its failure fails the
 /// read. A status posted by anything but an app's bot is kept under `app:0`,
 /// which satisfies no pinned check. The list is newest first, and only the
-/// first status of each context from each app is kept.
+/// first status of each context is kept, whoever posted it: a later status
+/// from another source replaces the pinned app's, so the pin is then unmet.
+/// GitHub compares contexts without regard to case, and so does this; a kept
+/// status carries the name as `wanted` spells it.
 pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -> Read<u64>) -> Read<Vec<Run>> {
     let mut runs = Vec::new();
     let mut ids: BTreeMap<String, u64> = BTreeMap::new();
-    let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut pages = 0;
     for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
         let page = page.map_err(|_| "the answer is not JSON".to_string())?;
         let list = page.as_array().ok_or("a page is not a list")?;
         pages += 1;
         for entry in list {
-            let name = text(entry, "context")?;
-            if !wanted.contains(&name.as_str()) {
+            let context = text(entry, "context")?.to_lowercase();
+            let Some(name) = wanted.iter().find(|w| w.to_lowercase() == context) else {
+                continue;
+            };
+            // The list comes newest first, so the first status of a context is
+            // the current one. Two posted within a second carry the same
+            // `created_at`, which is why the order decides and not it.
+            if !seen.insert(context) {
                 continue;
             }
             let login = entry
@@ -1364,12 +1376,6 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
                 },
                 _ => 0,
             };
-            // The list comes newest first, so the first status of a context
-            // from an app is the current one. Two posted within a second carry
-            // the same `created_at`, which is why the order decides and not it.
-            if !seen.insert((name.clone(), id)) {
-                continue;
-            }
             let state = entry
                 .get("state")
                 .and_then(Value::as_str)
@@ -1382,7 +1388,7 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
                 _ => Outcome::Other,
             };
             runs.push(Run {
-                name,
+                name: name.to_string(),
                 source: format!("app:{id}"),
                 // A bucket of its own: a check run with no workflow run id has
                 // an empty one, and the two must not hide each other.
@@ -2864,7 +2870,7 @@ mod tests {
     }
 
     #[test]
-    fn statuses_keep_the_newest_of_each_context_from_each_app_apart_from_check_runs() {
+    fn statuses_keep_the_newest_of_each_context_apart_from_check_runs() {
         let bot = |state: &str, at: &str| {
             json!({"context": "build", "state": state, "created_at": at,
                 "creator": {"login": "github-actions[bot]", "type": "Bot"}})
@@ -2896,6 +2902,28 @@ mod tests {
             .map(|r| r.outcome)
             .collect();
         assert_eq!(outcomes, [Outcome::Fail, Outcome::Pass]);
+        // A later status from anyone else replaces the app's: the pin is unmet.
+        let person = json!({"context": "Build", "state": "success", "created_at": at,
+            "creator": {"login": "someone", "type": "User"}});
+        let runs = parse_statuses(
+            &json!([person, bot("success", at)]).to_string(),
+            &["build"],
+            &mut app_of,
+        )
+        .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].name.as_str(), runs[0].source.as_str()), ("build", "app:0"));
+        // A context that differs only in case is the same context.
+        let shouted = json!({"context": "BUILD", "state": "failure", "created_at": at,
+            "creator": {"login": "github-actions[bot]", "type": "Bot"}});
+        let runs = parse_statuses(
+            &json!([shouted, bot("success", at)]).to_string(),
+            &["build"],
+            &mut app_of,
+        )
+        .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].name.as_str(), runs[0].outcome), ("build", Outcome::Fail));
         // No page at all is not "no statuses".
         assert!(parse_statuses("", &["build"], &mut app_of).is_err());
         assert!(parse_statuses("{}", &["build"], &mut app_of).is_err());
