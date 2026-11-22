@@ -240,6 +240,19 @@ if [[ "$record" == 1 ]]; then
       fi
     fi
   fi
+  # A LATE WRITER FROM AN OLDER PASS. A trailing seat dispatched for pass N can
+  # finish after pass N+1 has recorded. Its head is then an ancestor of the
+  # head on disk, and writing would both bump the count and point --prev-run-dir
+  # back at pass N's findings, so the escalation would read the wrong pass. Keep
+  # the newer record. (Found by codex on claude-skills PR #228.)
+  if [[ -f "$rec" ]]; then
+    _pe2="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+    _ph2="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$rec" 2>/dev/null)"
+    if record_is_fresh "$_pe2" && [[ -n "$_ph2" && "$_ph2" != "$head_sha" ]] \
+       && git merge-base --is-ancestor "$head_sha" "$_ph2" 2>/dev/null; then
+      exit 0
+    fi
+  fi
   # Write via temp-and-rename so a reader never sees a half-written record, and
   # so two lanes finishing together produce one whole record rather than an
   # interleaved one. This does not order the writers -- last rename still wins

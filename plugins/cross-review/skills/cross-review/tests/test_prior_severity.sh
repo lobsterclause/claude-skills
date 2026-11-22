@@ -41,5 +41,29 @@ assert_eq "premerged High counts (positive evidence)" "$(bash "$S" "$T/c/raw")" 
 case_dir; printf '{"findings":[{"severity":"Low"}]}\n' >"$T/c/findings.premerged.json"
 assert_eq "premerged without High -> unknown (codex not in it)" "$(bash "$S" "$T/c/raw")" "unknown"
 
+
+echo "── review fixes (PR #228 round 1) ──"
+case_dir
+printf '{"findings":[{"severity":"High","factcheck":{"verdict":"drop"}},{"severity":"Low"}]}\n' >"$T/c/findings.verified.json"
+printf '{"findings":[{"severity":"High"}]}\n' >"$T/c/findings.scored.json"
+assert_eq "verified (fact-check vetoes) beats scored" "$(bash "$S" "$T/c/raw")" "low"
+case_dir
+printf '{"findings":[{"severity":"Critical"}]}\n' >"$T/c/raw/findings.json"
+printf '{"findings":[{"severity":"Low","disposition":"keep"}]}\n' >"$T/c/findings.scored.json"
+assert_eq "source rank beats directory: parent scored wins over raw findings.json" "$(bash "$S" "$T/c/raw")" "low"
+case_dir
+printf '# x\n\n## High\n- real one\n' >"$T/c/raw/findings.md"
+printf '{"findings":[]}\n' >"$T/c/findings.json"
+assert_eq "parent findings.json beats raw findings.md" "$(bash "$S" "$T/c/raw")" "none"
+for bad in '{}' 'null' '{"findings":null}' '{"findings":"x"}'; do
+  case_dir; printf '%s\n' "$bad" >"$T/c/findings.json"
+  printf '# x\n\n## High\n- kept\n' >"$T/c/findings.md"
+  assert_eq "no findings array ($bad) falls through to findings.md" "$(bash "$S" "$T/c/raw")" "high"
+done
+case_dir; printf '{}\n' >"$T/c/findings.json"
+assert_eq "no findings array and nothing else -> unknown" "$(bash "$S" "$T/c/raw")" "unknown"
+case_dir; printf '# x\n\n## High\n- ~~**[a.ts:1]** vetoed~~ (fact-check: drop)\n\n## Low\n- small\n' >"$T/c/findings.md"
+assert_eq "md: struck-through High does not count" "$(bash "$S" "$T/c/raw")" "low"
+
 echo; echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

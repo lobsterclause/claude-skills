@@ -38,8 +38,9 @@
 #   measure_codex_effort.sh [--since <YYYY-MM-DD>] [--runlog <path>] [--if-due]
 #
 #   --since   the cutover — rows on/after it are "after", earlier ones
-#             "before". Defaults to the date the ladder went LIVE, which is not
-#             the date it was written; see LADDER_LIVE below for why.
+#             "before". Defaults to ESCALATION_LIVE (2026-11-22), when the
+#             escalate-on-findings ladder replaced the step-down one. Use
+#             --since 2026-09-01 (LADDER_LIVE) to re-run the step-down review.
 #   --runlog  defaults to ~/.claude/skills/cross-review/runlog.jsonl
 #   --if-due  print nothing before the review date, the banner and the report
 #             on or after it. This is the hook: SKILL.md step 1.5 calls it on
@@ -67,6 +68,10 @@ set -uo pipefail
 # wrong days, which is the failure this whole mechanism exists to avoid.
 LADDER_WRITTEN="2026-08-29"
 LADDER_LIVE="2026-09-01"
+# The escalate-on-findings ladder replaced the step-down one on this date. It is
+# the default cutover now, so the 2026-12-22 review compares the two policies
+# instead of folding step-down runs into the "after" window. --since overrides.
+ESCALATION_LIVE="2026-11-22"
 
 # A week of real rounds after the LIVE date. Written out rather than computed
 # because `date -d` and `date -v` disagree across BSD and GNU, and a date this
@@ -99,7 +104,7 @@ LADDER_LIVE="2026-09-01"
 # ones -- does `high` find more on a pass that follows a Critical/High?
 REVIEW_DUE="${CROSS_REVIEW_EFFORT_REVIEW_DUE:-2026-12-22}"
 
-since="$LADDER_LIVE"
+since="$ESCALATION_LIVE"
 if_due=0
 runlog="${CROSS_REVIEW_RUNLOG:-$HOME/.claude/skills/cross-review/runlog.jsonl}"
 
@@ -133,9 +138,9 @@ fi
 if [[ "$if_due" == 1 ]]; then
   cat <<BANNER
 ─────────────────────────────────────────────────────────────────────────────
- REVIEW DUE: the codex reasoning-effort ladder was written $LADDER_WRITTEN on a
- projection and went live $LADDER_LIVE (it was inert before that -- see the
- header). It is now past $REVIEW_DUE. The numbers below are the check.
+ REVIEW DUE: the codex effort ladder has escalated on findings since
+ $ESCALATION_LIVE ("after" below; "before" is the step-down ladder). It is now
+ past $REVIEW_DUE. The numbers below are the check.
  Decide one of: keep it, change the escalation rule, or revert — then update
  REVIEW_DUE in this script (or delete the --if-due call in SKILL.md step 1.5)
  so this stops asking.
