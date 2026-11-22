@@ -148,6 +148,8 @@ struct Pending {
     pr: Option<u64>,
     pr_head: Option<String>,
     local_head: Option<String>,
+    /// The base commit the request aimed at; old lines lack it.
+    base_head: Option<String>,
 }
 
 fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<Pending> {
@@ -163,6 +165,7 @@ fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<Pending> {
         pr: line["pr"].as_u64(),
         pr_head: text("pr_head"),
         local_head: text("local_head"),
+        base_head: text("base_head"),
     })
 }
 
@@ -225,6 +228,29 @@ pub fn require_ready(wt: &Path, branch: &str) -> Res<()> {
     }
 }
 
+/// Fetch the unit's branch and the base into the worktree's remote-tracking refs.
+fn fetch(wt: &Path, branch: &str, base: &str, log: &Path) -> Res<()> {
+    let refspecs = [
+        format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
+        format!("+refs/heads/{base}:refs/remotes/origin/{base}"),
+    ];
+    let fetched = exec::git(
+        wt,
+        &["fetch", "--quiet", "origin", &refspecs[0], &refspecs[1]],
+        GIT_LIMIT,
+        log,
+    )?;
+    if fetched.ok() {
+        Ok(())
+    } else {
+        Err(Fail::failed(format!(
+            "could not fetch {branch} and {base} in {}: {}",
+            wt.display(),
+            fetched.failure(GIT_LIMIT)
+        )))
+    }
+}
+
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     ctx.require_driver("base-sync")?;
     let unit = args.unit;
@@ -248,17 +274,43 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     require_ready(&wt, &branch)?;
     let local_head = git::commit(&wt, "HEAD").ok_or_else(|| Fail::failed("git finds no HEAD in the worktree"))?;
 
-    // A remote update whose local follow-up failed already spent its slot. If it
-    // was for this PR and the PR's head has moved on from the head recorded
-    // before the request, GitHub did its part: the retry only does the local steps.
-    let pending = follow_up_pending(ctx, unit).filter(|p| {
-        p.pr == Some(pr)
-            && p.pr_head
+    // A remote update whose local follow-up failed already spent its slot, so
+    // the retry for the same PR may only do the local steps. Whether GitHub did
+    // its part is read from the base commit the request aimed at: not in the PR's
+    // head yet means wait (no new request, no new slot); in it, and the base has
+    // not moved again, means resume; in it, but the base has moved on, means a
+    // fresh sync. A line with no recorded base falls back to the PR head having
+    // moved on from the one recorded before the request.
+    let log_dir = ctx.path(&format!("units/{unit}"));
+    let log = |step: &str| log_dir.join(format!("base-sync-{step}.log"));
+    let base = ctx.profile.base_branch.clone();
+    let base_ref = format!("refs/remotes/origin/{base}");
+    let mut resume = false;
+    let mut old_head = local_head;
+    if let Some(p) = follow_up_pending(ctx, unit).filter(|p| p.pr == Some(pr)) {
+        resume = match &p.base_head {
+            Some(aimed) if !ctx.dry_run => {
+                fetch(&wt, &branch, &base, &log("fetch"))?;
+                if !git::ok(&wt, &["merge-base", "--is-ancestor", aimed, &before.head]) {
+                    return Err(Fail::failed(format!(
+                        "the update of PR #{pr} to base {aimed} is still pending: the base is not in the PR's head {} yet. Wait, then run base-sync again (no slot is spent)",
+                        before.head
+                    )));
+                }
+                git::ok(&wt, &["merge-base", "--is-ancestor", &base_ref, &before.head])
+            }
+            Some(_) => false,
+            None => p
+                .pr_head
                 .as_deref()
-                .is_some_and(|head| !before.head.eq_ignore_ascii_case(head))
-    });
-    let resume = pending.is_some();
-    let old_head = pending.and_then(|p| p.local_head).unwrap_or(local_head);
+                .is_some_and(|head| !before.head.eq_ignore_ascii_case(head)),
+        };
+        if resume {
+            if let Some(recorded) = p.local_head {
+                old_head = recorded;
+            }
+        }
+    }
     let taken = syncs_taken(ctx, unit);
     if !resume && taken >= MAX_BASE_SYNCS {
         return Err(Fail::refused(format!(
@@ -281,6 +333,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let new_head = if resume {
         before.head.clone()
     } else {
+        // The base the request aims at, read before it is made.
+        fetch(&wt, &branch, &base, &log("fetch"))?;
+        let aimed = git::commit(&wt, &base_ref).unwrap_or_default();
         let pr_arg = pr.to_string();
         let (rc, _) = gh::read_raw(&["pr", "update-branch", &pr_arg, "--repo", &repo]);
         if rc != 0 {
@@ -289,31 +344,12 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         // The slot is spent now, before any local step can fail.
         ctx.event(
             "base_sync_remote",
-            json!({"unit": unit, "pr": pr, "pr_head": before.head, "local_head": old_head}),
+            json!({"unit": unit, "pr": pr, "pr_head": before.head, "local_head": old_head, "base_head": aimed}),
         )?;
         owned_view(ctx, &repo, unit, pr, &branch)?.head
     };
 
-    let log_dir = ctx.path(&format!("units/{unit}"));
-    let log = |step: &str| log_dir.join(format!("base-sync-{step}.log"));
-    let base = &ctx.profile.base_branch;
-    let refspecs = [
-        format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
-        format!("+refs/heads/{base}:refs/remotes/origin/{base}"),
-    ];
-    let fetched = exec::git(
-        &wt,
-        &["fetch", "--quiet", "origin", &refspecs[0], &refspecs[1]],
-        GIT_LIMIT,
-        &log("fetch"),
-    )?;
-    if !fetched.ok() {
-        return Err(Fail::failed(format!(
-            "could not fetch {branch} and {base} in {}: {}",
-            wt.display(),
-            fetched.failure(GIT_LIMIT)
-        )));
-    }
+    fetch(&wt, &branch, &base, &log("fetch"))?;
     let remote = format!("refs/remotes/origin/{branch}");
     let moved = exec::git(
         &wt,
@@ -338,7 +374,6 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     // GitHub may not have applied the update yet: the fetched base must be in
     // the PR's head before the sync counts as done. If it is not, the request
     // stays pending and a retry asks again.
-    let base_ref = format!("refs/remotes/origin/{base}");
     if !git::ok(&wt, &["merge-base", "--is-ancestor", &base_ref, &new_head]) {
         return Err(Fail::failed(format!(
             "{base} is not in the PR's head {new_head} yet; GitHub has not applied the update. Run base-sync again"

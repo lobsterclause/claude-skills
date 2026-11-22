@@ -394,3 +394,69 @@ fn the_base_clone_is_forced_out_only_when_the_caller_forces() {
     assert_eq!(forced.code, 0, "{}{}", forced.stdout, forced.stderr);
     assert!(!base.exists());
 }
+
+#[test]
+fn with_no_pr_a_detached_local_only_commit_is_not_removed() {
+    let c = case();
+    git(&c.wt, &["checkout", "-q", "--detach"]);
+    fs::write(c.wt.join("src/timer/countdown.ts"), "export const lost = 2;\n").expect("the file");
+    git(&c.wt, &["add", "src/timer/countdown.ts"]);
+    identity(&c.wt, &["commit", "-q", "-m", "only here"]);
+    let out = c.env.run(&["cleanup", "--unit", "3"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("not reachable"), "{}", out.stderr);
+    assert!(c.wt.exists());
+}
+
+#[test]
+fn with_no_pr_a_worktree_on_its_kept_branch_is_removed() {
+    let c = case();
+    let out = printed(&c.env.run(&["cleanup", "--unit", "3"]));
+    assert_eq!(out["worktree"], "removed");
+    assert_eq!(out["branch"], "kept_unmerged");
+    assert!(branches(&c).contains(BRANCH));
+}
+
+#[test]
+fn a_dry_run_does_not_fetch_to_check_ancestry() {
+    let mut c = case();
+    // A PR head only GitHub has: a child of the unit's tip, in refs/pull/7/head of the origin.
+    let other = c.env.dir.path().join("other");
+    git(
+        c.env.dir.path(),
+        &[
+            "clone",
+            "-q",
+            &c.bare.display().to_string(),
+            &other.display().to_string(),
+        ],
+    );
+    git(&other, &["checkout", "-q", "--detach", &c.old_head]);
+    fs::write(other.join("PR.md"), "pr\n").expect("the file");
+    git(&other, &["add", "PR.md"]);
+    identity(&other, &["commit", "-q", "-m", "pr head"]);
+    let head = git(&other, &["rev-parse", "HEAD"]);
+    git(&other, &["push", "-q", "origin", "HEAD:refs/pull/7/head"]);
+    c.pr_with(&pr_json("MERGED", &head, "example", "develop"));
+    let checkout_dir = checkout(&c);
+    let have = || {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout_dir)
+            .args(["cat-file", "-e", &format!("{head}^{{commit}}")])
+            .status()
+            .expect("git runs")
+            .success()
+    };
+    assert!(!have());
+
+    c.env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    let out = cleanup(&c, &[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("needs a fetch"), "{}", out.stdout);
+    assert!(!have(), "the checkout was left as it was");
+
+    c.env.set("ISSUE_DRAIN_DRY_RUN", "");
+    let real = printed(&cleanup(&c, &[]));
+    assert_eq!(real["branch"], "deleted", "a real run fetches and checks");
+}

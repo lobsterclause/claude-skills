@@ -105,10 +105,25 @@ fn remove_worktree(repo_dir: &Path, wt: &Path, force: bool, log: &Path) -> Res<(
 /// Refuse unless `tip` is the PR's head or one of its ancestors. A PR head this
 /// checkout has not seen (the PR's branch is often deleted on merge) is fetched
 /// from GitHub's `refs/pull/<n>/head` first.
-fn unpushed_work_check(repo_dir: &Path, pr: u64, head: &str, tip: &str, branch: &str, log: &Path) -> Res<()> {
+fn unpushed_work_check(
+    repo_dir: &Path,
+    pr: u64,
+    head: &str,
+    tip: &str,
+    branch: &str,
+    log: &Path,
+    dry_run: bool,
+) -> Res<()> {
     let have = |sha: &str| git::ok(repo_dir, &["cat-file", "-e", &format!("{sha}^{{commit}}")]);
     if !have(head) {
         let spec = format!("refs/pull/{pr}/head");
+        if dry_run {
+            // A dry run leaves the checkout as it is: the check is not made.
+            println!(
+                "WOULD: git fetch origin {spec} (the ancestry check of {branch} needs a fetch, skipped in a dry run)"
+            );
+            return Ok(());
+        }
         let _ = exec::git(repo_dir, &["fetch", "--quiet", "origin", &spec], GIT_LIMIT, log);
     }
     if have(head) && git::ok(repo_dir, &["merge-base", "--is-ancestor", tip, head]) {
@@ -195,7 +210,30 @@ fn unit(ctx: &Ctx, args: &Args, n: u64, only_finished: bool) -> Res<Value> {
             present.then(|| git::commit(&wt, "HEAD")).flatten(),
         ];
         for tip in tips.into_iter().flatten() {
-            unpushed_work_check(&repo_dir, pr, &view.head, &tip, &branch, &log)?;
+            unpushed_work_check(&repo_dir, pr, &view.head, &tip, &branch, &log, ctx.dry_run)?;
+        }
+    }
+    // With no PR the branch is kept, but a detached HEAD is not on it: a commit
+    // no kept ref reaches would be lost with the worktree.
+    if view.is_none() && present {
+        if let Some(head) = git::commit(&wt, "HEAD") {
+            let kept = git::out(
+                &repo_dir,
+                &[
+                    "for-each-ref",
+                    "--contains",
+                    &head,
+                    "refs/heads",
+                    "refs/remotes",
+                    "refs/tags",
+                ],
+            );
+            if kept.is_none_or(|refs| refs.trim().is_empty()) {
+                return Err(Fail::refused(format!(
+                    "the worktree {} is at {head}, which is not reachable from any branch, remote ref or tag; it would be lost. Push or save it first; --force does not cover this",
+                    wt.display()
+                )));
+            }
         }
     }
     let (worktree_result, branch_result) = if ctx.dry_run {

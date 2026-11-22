@@ -93,7 +93,8 @@ pub fn case() -> Case {
 impl Case {
     /// A new commit on origin's develop.
     pub fn advance_base(&self) -> String {
-        fs::write(self.work.join("NEW.md"), "new\n").expect("the file");
+        let before = fs::read_to_string(self.work.join("NEW.md")).unwrap_or_default();
+        fs::write(self.work.join("NEW.md"), format!("{before}new\n")).expect("the file");
         git(&self.work, &["add", "NEW.md"]);
         identity(&self.work, &["commit", "-q", "-m", "new"]);
         git(&self.work, &["push", "-q", &self.bare.display().to_string(), "develop"]);
@@ -409,10 +410,6 @@ fn the_remote_update_is_logged_before_the_local_steps_and_spends_a_slot() {
     assert_eq!(c.sync().code, 1);
     assert_eq!(c.env.events_named("base_sync_remote").len(), 4);
     assert_eq!(c.env.events_named("base_sync").len(), 3, "no new finished sync");
-    // The PR head has not moved past the one recorded, so this is a new attempt: the 5th.
-    c.pr_is_at(&"f".repeat(40));
-    let out = c.sync();
-    assert_eq!(out.code, 3, "{}", out.stderr);
 }
 
 #[test]
@@ -501,4 +498,45 @@ fn a_review_read_of_another_head_does_not_clear_the_new_one() {
     c.proof_for(&c.old_head);
     preflight(&c.env, "clear", &"b".repeat(40));
     assert_eq!(printed(&c.sync())["review_round_needed"], true);
+}
+
+#[test]
+fn a_pending_update_whose_base_is_not_in_the_pr_yet_waits_without_a_new_request() {
+    let c = case();
+    let base = c.advance_base();
+    // The PR head has moved (someone pushed), but the base the request aimed at is not in it.
+    c.pr_is_at(&c.old_head);
+    let line = json!({"ts": "t", "event": "base_sync_remote", "unit": 3, "pr": 7,
+        "pr_head": "e".repeat(40), "local_head": c.old_head, "base_head": base});
+    c.env.write("events.jsonl", &format!("{line}\n"));
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("still pending"), "{}", out.stderr);
+    assert_eq!(c.update_calls(), 0);
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 1, "no second slot");
+}
+
+#[test]
+fn a_pending_update_that_landed_but_whose_base_moved_again_gets_a_fresh_sync() {
+    let c = case();
+    let first = c.advance_base();
+    let new_head = c.update_branch(true);
+    c.advance_base();
+    c.pr_is_at(&new_head);
+    let line = json!({"ts": "t", "event": "base_sync_remote", "unit": 3, "pr": 7,
+        "pr_head": c.old_head, "local_head": c.old_head, "base_head": first});
+    c.env.write("events.jsonl", &format!("{line}\n"));
+    let out = c.sync();
+    assert_eq!(c.update_calls(), 1, "{}", out.stderr);
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 2);
+}
+
+#[test]
+fn a_request_records_the_base_it_aimed_at() {
+    let c = case();
+    let base = c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    printed(&c.sync());
+    assert_eq!(c.env.events_named("base_sync_remote")[0]["base_head"], base);
 }
