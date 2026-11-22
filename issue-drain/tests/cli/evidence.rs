@@ -239,11 +239,11 @@ fn a_likely_file_that_is_no_repo_path_makes_the_verdict_unclear() {
 }
 
 #[test]
-fn a_likely_file_that_is_a_folder_on_the_ref_is_kept_without_its_slash() {
+fn a_likely_file_that_is_a_folder_on_the_ref_is_kept_as_a_folder() {
     for number in [103, 101] {
         let r = check_one(&with(good(number), "likely_files", json!([COUNTDOWN, "src/timer/"])));
         assert_ne!(r["status"], "unclear", "#{number} {r}");
-        assert_eq!(r["likely_files"], json!([COUNTDOWN, "src/timer"]));
+        assert_eq!(r["likely_files"], json!([COUNTDOWN, "src/timer/"]));
     }
     // Controls: a folder that is not on the ref, and a file with a slash, still fail.
     for bad in ["src/nowhere/", "src/timer/countdown.ts/"] {
@@ -251,6 +251,12 @@ fn a_likely_file_that_is_a_folder_on_the_ref_is_kept_without_its_slash() {
         assert_eq!(r["status"], "unclear", "{bad}");
         assert_eq!(r["downgrade_reason"], "a likely file is not a repo-relative path");
     }
+}
+
+#[test]
+fn a_protected_folder_named_with_its_slash_still_sends_a_live_issue_to_a_person() {
+    let r = check_one(&with(good(103), "likely_files", json!([".github/workflows/"])));
+    assert_eq!(r["status"], "needs_human", "{r}");
 }
 
 #[test]

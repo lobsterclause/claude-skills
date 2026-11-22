@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::ctx::{Ctx, read_json, rfc3339, write_atomic, write_json};
 use crate::error::{Fail, Res};
-use crate::model::Queue;
+use crate::git;
 use crate::text::repo_path;
 
 #[derive(clap::Args)]
@@ -77,6 +77,20 @@ pub fn guards_marker(ctx: &Ctx, args: &MarkerArgs) -> Res<()> {
     )
 }
 
+/// Whether `file` is a folder at the unit's worktree HEAD, or at the queue's
+/// base commit when there is no worktree yet. A path git cannot find is not.
+fn is_folder(ctx: &Ctx, queue: &Value, unit: u64, file: &str) -> Res<bool> {
+    let copy: Value = read_json(&ctx.path(&format!("units/{unit}/unit.json"))).unwrap_or(Value::Null);
+    let (dir, rev) = match copy["worktree"].as_str() {
+        Some(worktree) => (std::path::PathBuf::from(worktree), "HEAD".to_string()),
+        None => (
+            ctx.repo_dir()?,
+            queue["base_sha"].as_str().unwrap_or("HEAD").to_string(),
+        ),
+    };
+    Ok(git::out(&dir, &["cat-file", "-t", &format!("{rev}:{file}")]).is_some_and(|t| t.trim() == "tree"))
+}
+
 pub fn scope(ctx: &Ctx, command: &ScopeCommand) -> Res<()> {
     let ScopeCommand::Widen(args) = command;
     ctx.require_driver("scope widen")?;
@@ -92,21 +106,29 @@ pub fn scope(ctx: &Ctx, command: &ScopeCommand) -> Res<()> {
         )));
     }
     let queue_path = ctx.path("queue.json");
-    let mut queue: Queue = read_json(&queue_path).ok_or_else(|| {
+    let mut queue: Value = read_json(&queue_path).ok_or_else(|| {
         Fail::usage(format!(
             "no queue in {}; run `tracker render` first",
             queue_path.display()
         ))
     })?;
     let id = format!("U{}", args.unit);
-    let unit = queue
-        .units
-        .iter_mut()
-        .find(|u| u.id == id)
-        .ok_or_else(|| Fail::usage(format!("queue.json has no unit {id}")))?;
-    let added = !unit.files.contains(&args.file);
+    if is_folder(ctx, &queue, args.unit, &args.file)? {
+        return Err(Fail::refused(format!(
+            "{} is a folder; name a file, or a new path",
+            args.file
+        )));
+    }
+    // Only the target unit's `files` changes; every other key is left as it is.
+    let files = queue["units"]
+        .as_array_mut()
+        .and_then(|units| units.iter_mut().find(|u| u["id"] == id))
+        .ok_or_else(|| Fail::usage(format!("queue.json has no unit {id}")))?["files"]
+        .as_array_mut()
+        .ok_or_else(|| Fail::usage(format!("{id} in queue.json has no files list")))?;
+    let added = !files.iter().any(|f| f == &args.file);
     if added {
-        unit.files.push(args.file.clone());
+        files.push(json!(args.file));
         write_json(&queue_path, &queue)?;
     }
     // The unit's own copy, when `unit-prepare` has made one.

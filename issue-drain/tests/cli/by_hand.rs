@@ -113,3 +113,33 @@ fn scope_widen_refuses_a_protected_path_and_a_bad_path() {
     // Control: an ordinary path goes in.
     assert_eq!(run("src/a.ts", "x").code, 0);
 }
+
+#[test]
+fn scope_widen_changes_only_the_files_of_its_unit() {
+    let env = Env::new();
+    let mut queue = queue_with_unit(json!({"acceptance_tests": ["src/timer/a.test.ts"]}));
+    let mut second = queue["units"][0].clone();
+    second["id"] = json!("U4");
+    second["acceptance_tests"] = json!(["src/list/b.test.ts"]);
+    second["extra_key"] = json!({"kept": true});
+    queue["units"].as_array_mut().expect("units").push(second);
+    env.write("queue.json", &queue.to_string());
+    let out = env.run(&["scope", "widen", "--unit", "3", "--file", "src/a.ts", "--reason", "x"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let after = json(&env.workdir.join("queue.json"));
+    queue["units"][0]["files"] = json!(["src/timer/countdown.ts", "src/a.ts"]);
+    assert_eq!(after, queue);
+}
+
+#[test]
+fn scope_widen_refuses_a_folder_without_a_slash_but_allows_a_file_not_there_yet() {
+    let env = Env::new();
+    let sha = git(fixture_repo(), &["rev-parse", "develop"]);
+    let mut queue = queue_with_unit(json!({}));
+    queue["base_sha"] = json!(sha);
+    env.write("queue.json", &queue.to_string());
+    let run = |file: &str| env.run(&["scope", "widen", "--unit", "3", "--file", file, "--reason", "x"]);
+    assert_eq!(run("src/timer").code, 3);
+    assert_eq!(run("src/lib/format.ts").code, 0);
+    assert_eq!(run("src/new/file.ts").code, 0);
+}

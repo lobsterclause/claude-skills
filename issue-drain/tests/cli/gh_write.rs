@@ -396,3 +396,29 @@ fn help_prints_the_verbs_and_each_verbs_usage_and_calls_nothing() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert!(env.gh_calls().is_empty());
 }
+
+#[test]
+fn the_word_help_as_an_option_value_is_not_a_help_request() {
+    let env = Env::new();
+    let body = body(&env);
+    let out = env.run(&["gh-write", "issue-create", "--title", "help", "--body-file", &body]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(env.gh_calls().len(), 1);
+    let out = env.run(&["gh-write", "comment", "7", "--body-file", &body, "-h"]);
+    // Not right after the verb, so not help: the call goes through.
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(env.gh_calls().len(), 2);
+}
+
+#[test]
+fn help_needs_no_run_folder_or_profile() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_WORKDIR", "")
+        .set("ISSUE_DRAIN_REPO", "")
+        .set("ISSUE_DRAIN_PROFILE", "");
+    let out = env.run(&["gh-write", "--help"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("run-rerun"));
+    let out = env.run(&["gh-write", "pr-edit", "--help"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+}

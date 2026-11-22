@@ -585,21 +585,20 @@ const USAGES: &[(&str, &str)] = &[
     ),
 ];
 
-fn is_help(arg: &str) -> bool {
-    matches!(arg, "--help" | "-h" | "help")
-}
-
-/// The help for `gh-write`, or for one verb, when that is what was asked.
-fn help(argv: &[String]) -> Option<String> {
+/// The help for `gh-write`, or for one verb, when that is what was asked:
+/// `help`, `--help` or `-h` alone, or `--help` or `-h` right after a verb.
+/// Anywhere else the word is an option's value, not a request for help.
+pub fn help(argv: &[String]) -> Option<String> {
+    let flag = |a: &String| matches!(a.as_str(), "--help" | "-h");
     match argv {
-        [first] if is_help(first) => {
+        [first] if flag(first) || first == "help" => {
             let all: Vec<String> = USAGES.iter().map(|(_, text)| format!("  {text}")).collect();
             Some(format!(
                 "usage: issue-drain gh-write {VERBS} ...\n\nThe one path by which issue-drain writes to GitHub. Bodies come from a file.\nISSUE_DRAIN_DRY_RUN=1 prints WOULD: lines and calls nothing.\n\n{}\n\nRun `gh-write <verb> --help` for one verb.\n",
                 all.join("\n")
             ))
         }
-        [verb, rest @ ..] if rest.iter().any(|a| is_help(a)) => USAGES
+        [verb, second, ..] if flag(second) => USAGES
             .iter()
             .find(|(name, _)| name == verb)
             .map(|(_, text)| format!("usage: issue-drain gh-write {text}\n")),
@@ -615,10 +614,6 @@ fn help(argv: &[String]) -> Option<String> {
 /// There is no verb that closes an issue. `Write::CloseIssue` is reached only
 /// from `close-verified`, which holds every condition a closure needs.
 pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
-    if let Some(text) = help(argv) {
-        print!("{text}");
-        return Ok(());
-    }
     ctx.repo()?;
     let mode = ctx.mode()?;
     let Some(verb) = argv.first().map(String::as_str).filter(|v| !v.is_empty()) else {

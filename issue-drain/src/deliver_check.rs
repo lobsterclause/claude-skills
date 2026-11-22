@@ -592,6 +592,10 @@ mod tests {
         ] {
             assert!(!is_test_path(no, &scope), "{no}");
         }
+        // A folder entry keeps its slash: its tests are inside it, not beside it.
+        let folder = ["src/timer/".to_string()];
+        assert!(is_test_path("src/timer/a.test.ts", &folder));
+        assert!(!is_test_path("src/badge.test.ts", &folder));
     }
 
     #[test]
