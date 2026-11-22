@@ -36,13 +36,12 @@ pub fn pr_json(state: &str, head: &str, owner: &str, base: &str) -> Value {
 }
 
 /// A stand-in merge_preflight.sh that reads `status` with a CLEAN verdict.
-pub fn preflight(env: &mut Env, status: &str) {
+pub fn preflight(env: &Env, status: &str, head: &str) {
     use std::os::unix::fs::PermissionsExt;
     let path = env.dir.path().join("preflight.sh");
-    let out = json!({"status": status, "verdict": "CLEAN", "head": "a".repeat(40), "reviewed": "a".repeat(40)});
+    let out = json!({"status": status, "verdict": "CLEAN", "head": head, "reviewed": head});
     fs::write(&path, format!("#!/bin/sh\ncat <<'EOF'\n{out}\nEOF\n")).expect("the script");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
-    env.set("ISSUE_DRAIN_MERGE_PREFLIGHT", &path.display().to_string());
 }
 
 pub fn identity(dir: &Path, args: &[&str]) -> String {
@@ -79,7 +78,9 @@ pub fn case() -> Case {
     identity(&wt, &["commit", "-q", "-m", "pad"]);
     git(&wt, &["push", "-q", "origin", BRANCH]);
     let old_head = git(&wt, &["rev-parse", "HEAD"]);
-    preflight(&mut env, "clear");
+    preflight(&env, "clear", &"a".repeat(40));
+    let script = env.dir.path().join("preflight.sh").display().to_string();
+    env.set("ISSUE_DRAIN_MERGE_PREFLIGHT", &script);
     Case {
         env,
         bare,
@@ -130,6 +131,8 @@ impl Case {
 
     pub fn pr_is_at(&self, head: &str) {
         self.pr_with(&pr_json("OPEN", head, "example", "develop"));
+        // The review read is of this head, as it would be live.
+        preflight(&self.env, "clear", head);
     }
 
     pub fn pr_with(&self, view: &Value) {
@@ -263,7 +266,7 @@ fn the_fifth_sync_of_a_unit_is_refused_before_anything_is_called() {
     let new_head = c.update_branch(true);
     c.pr_is_at(&new_head);
     let lines: Vec<String> = (0..4)
-        .map(|_| json!({"ts": "2026-11-21T03:53:00Z", "event": "base_sync", "unit": 3}).to_string())
+        .map(|_| json!({"ts": "2026-11-21T03:53:00Z", "event": "base_sync_remote", "unit": 3}).to_string())
         .collect();
     c.env.write("events.jsonl", &format!("{}\n", lines.join("\n")));
 
@@ -285,9 +288,11 @@ fn a_fourth_sync_still_goes_through_and_another_units_syncs_do_not_count() {
     let new_head = c.update_branch(true);
     c.pr_is_at(&new_head);
     let mut lines: Vec<String> = (0..3)
-        .map(|_| json!({"ts": "2026-11-21T03:53:00Z", "event": "base_sync", "unit": 3}).to_string())
+        .map(|_| json!({"ts": "2026-11-21T03:53:00Z", "event": "base_sync_remote", "unit": 3}).to_string())
         .collect();
-    lines.extend((0..5).map(|_| json!({"ts": "2026-11-21T03:53:00Z", "event": "base_sync", "unit": 9}).to_string()));
+    lines.extend(
+        (0..5).map(|_| json!({"ts": "2026-11-21T03:53:00Z", "event": "base_sync_remote", "unit": 9}).to_string()),
+    );
     c.env.write("events.jsonl", &format!("{}\n", lines.join("\n")));
     assert_eq!(c.sync().code, 0);
 }
@@ -362,13 +367,13 @@ fn a_fork_pr_or_a_pr_for_another_base_is_never_updated() {
 
 #[test]
 fn a_review_record_that_is_not_clear_needs_a_round_even_for_a_two_parent_head() {
-    let mut c = case();
+    let c = case();
     c.advance_base();
     let new_head = c.update_branch(true);
     c.pr_is_at(&new_head);
     c.proof_for(&c.old_head);
     // The merge changed the reviewed diff's digest, so the script says stale.
-    preflight(&mut c.env, "stale");
+    preflight(&c.env, "stale", &new_head);
     assert_eq!(printed(&c.sync())["review_round_needed"], true);
 }
 
@@ -404,8 +409,8 @@ fn the_remote_update_is_logged_before_the_local_steps_and_spends_a_slot() {
     assert_eq!(c.sync().code, 1);
     assert_eq!(c.env.events_named("base_sync_remote").len(), 4);
     assert_eq!(c.env.events_named("base_sync").len(), 3, "no new finished sync");
-    // The PR head is the worktree's again, so this is a new attempt: the 5th.
-    c.pr_is_at(&c.old_head);
+    // The PR head has not moved past the one recorded, so this is a new attempt: the 5th.
+    c.pr_is_at(&"f".repeat(40));
     let out = c.sync();
     assert_eq!(out.code, 3, "{}", out.stderr);
 }
@@ -427,4 +432,73 @@ fn a_retry_after_a_failed_follow_up_resumes_without_another_update_or_slot() {
     assert_eq!(c.env.events_named("base_sync_remote").len(), 1);
     assert_eq!(c.env.events_named("base_sync").len(), 1);
     assert_eq!(git(&c.wt, &["rev-parse", "HEAD"]), new_head);
+}
+
+#[test]
+fn three_recorded_syncs_and_one_unmatched_request_reach_the_cap() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    // Three gate-to-ci_wait moves a person recorded by hand, then a request no move accounts for.
+    let mut lines: Vec<String> = (0..3)
+        .map(|_| json!({"ts": "t", "unit": 3, "from": "gate", "to": "ci_wait"}).to_string())
+        .collect();
+    lines.push(json!({"ts": "t", "event": "base_sync_remote", "unit": 3, "pr": 7, "pr_head": new_head}).to_string());
+    c.env.write("events.jsonl", &format!("{}\n", lines.join("\n")));
+    let out = c.sync();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(c.update_calls(), 0);
+}
+
+#[test]
+fn a_request_a_later_transition_records_is_counted_once() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    let mut lines: Vec<String> = Vec::new();
+    for _ in 0..3 {
+        lines.push(json!({"ts": "t", "event": "base_sync_remote", "unit": 3}).to_string());
+        lines.push(json!({"ts": "t", "event": "base_sync", "unit": 3}).to_string());
+        lines.push(json!({"ts": "t", "unit": 3, "from": "gate", "to": "ci_wait"}).to_string());
+    }
+    c.env.write("events.jsonl", &format!("{}\n", lines.join("\n")));
+    assert_eq!(c.sync().code, 0, "3 syncs, each recorded twice, are 3");
+}
+
+#[test]
+fn a_pending_request_for_another_pr_is_not_resumed() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    let line = json!({"ts": "t", "event": "base_sync_remote", "unit": 3, "pr": 8, "pr_head": "e".repeat(40)});
+    c.env.write("events.jsonl", &format!("{line}\n"));
+    assert_eq!(c.sync().code, 0);
+    assert_eq!(c.update_calls(), 1, "PR 7 gets its own request");
+}
+
+#[test]
+fn an_update_github_has_not_applied_yet_is_not_recorded_as_done() {
+    let c = case();
+    c.advance_base();
+    // The PR still stands at the old head: the base is not in it.
+    c.pr_is_at(&c.old_head);
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("not in the PR"), "{}", out.stderr);
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 1);
+    assert!(c.env.events_named("base_sync").is_empty());
+}
+
+#[test]
+fn a_review_read_of_another_head_does_not_clear_the_new_one() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    c.proof_for(&c.old_head);
+    preflight(&c.env, "clear", &"b".repeat(40));
+    assert_eq!(printed(&c.sync())["review_round_needed"], true);
 }

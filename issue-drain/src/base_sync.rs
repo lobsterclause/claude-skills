@@ -24,11 +24,13 @@
 //! A unit takes at most `MAX_BASE_SYNCS` syncs (the plan's cap). A slot is spent
 //! when GitHub is asked to update the branch: a `base_sync_remote` line is
 //! logged right after that call, before any local step. They are counted from
-//! those lines, from the finished `base_sync` lines and from the state snapshot's
-//! `base_syncs`, whichever is highest, so a driver that also records the move back
-//! to `ci_wait` is not counted twice. The next one is refused. A retry that finds
-//! the PR head moved on from the head recorded with the last unfinished remote
-//! update only does the local steps and spends no slot.
+//! those lines, each once; a `gate` to `ci_wait` move the driver records for a
+//! request already logged is not counted again, and one with no request behind it
+//! (a sync recorded by hand) is. The next one is refused. A sync is done only when
+//! the fetched base is in the PR's head; if GitHub has not applied the update yet
+//! the request stays pending. A retry for the same PR whose head has moved on from
+//! the head recorded before the request only does the local steps and spends no
+//! slot. `review_round_needed` is false only if the review read is of the new head.
 //!
 //! With ISSUE_DRAIN_DRY_RUN=1 it prints what it would call and changes nothing.
 //! A unit process may not run it, as with `merge-gate`.
@@ -53,7 +55,7 @@ use crate::exec;
 use crate::gh;
 use crate::git;
 use crate::merge_gate::{PrState, PrView, Proof, binding, preflight, read_view};
-use crate::state::{MAX_BASE_SYNCS, Snapshot};
+use crate::state::MAX_BASE_SYNCS;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -117,30 +119,51 @@ fn unit_events(ctx: &Ctx, unit: u64) -> Vec<Value> {
 }
 
 /// Base syncs already taken by `unit`. A sync is spent when GitHub is asked to
-/// update the branch (`base_sync_remote`), not when the local follow-up is
-/// done (`base_sync`); a finished sync has both, so the higher count is the
-/// number of syncs. The state snapshot's `base_syncs` counts too.
+/// update the branch: each `base_sync_remote` line counts once. A recorded
+/// `gate` to `ci_wait` move accounts for the earliest request not yet accounted
+/// for, and counts as a sync of its own when there is none (a sync a person
+/// recorded by hand). Finished `base_sync` lines add nothing: their request is
+/// already counted.
 fn syncs_taken(ctx: &Ctx, unit: u64) -> u32 {
-    let events = unit_events(ctx, unit);
-    let count = |name: &str| events.iter().filter(|v| v["event"] == name).count() as u32;
-    let snapshot: Option<Snapshot> = read_json(&ctx.path("state.json"));
-    let counted = snapshot
-        .and_then(|s| s.units.into_iter().find(|u| u.unit == unit))
-        .map_or(0, |u| u.base_syncs);
-    count("base_sync").max(count("base_sync_remote")).max(counted)
+    let (mut total, mut unaccounted) = (0u32, 0u32);
+    for v in unit_events(ctx, unit) {
+        if v["event"] == "base_sync_remote" {
+            total += 1;
+            unaccounted += 1;
+        } else if v.get("event").is_none() && v["from"] == "gate" && v["to"] == "ci_wait" {
+            if unaccounted > 0 {
+                unaccounted -= 1;
+            } else {
+                total += 1;
+            }
+        }
+    }
+    total
 }
 
-/// The head the worktree had when the last remote update was asked for, if that
-/// update has no finished local follow-up after it. Empty when the line did
-/// not record one.
-fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<String> {
+/// What the last remote update's line says, if that update has no finished
+/// local follow-up after it: the PR it was for, the PR's head and the worktree's
+/// head before the request. Fields the line lacks are `None`.
+struct Pending {
+    pr: Option<u64>,
+    pr_head: Option<String>,
+    local_head: Option<String>,
+}
+
+fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<Pending> {
     let events = unit_events(ctx, unit);
     let last = |name: &str| events.iter().rposition(|v| v["event"] == name);
     let remote = last("base_sync_remote")?;
     if last("base_sync").is_some_and(|done| done > remote) {
         return None;
     }
-    Some(events[remote]["local_head"].as_str().unwrap_or_default().to_string())
+    let line = &events[remote];
+    let text = |key: &str| line[key].as_str().map(str::to_string);
+    Some(Pending {
+        pr: line["pr"].as_u64(),
+        pr_head: text("pr_head"),
+        local_head: text("local_head"),
+    })
 }
 
 /// The PR, read now, and held to the same ownership `merge-gate` holds it to:
@@ -225,12 +248,17 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     require_ready(&wt, &branch)?;
     let local_head = git::commit(&wt, "HEAD").ok_or_else(|| Fail::failed("git finds no HEAD in the worktree"))?;
 
-    // A remote update whose local follow-up failed already spent its slot. If
-    // the PR's head has moved on from the head recorded with that update,
-    // GitHub did its part: the retry only does the local steps.
-    let pending = follow_up_pending(ctx, unit).filter(|recorded| !before.head.eq_ignore_ascii_case(recorded));
+    // A remote update whose local follow-up failed already spent its slot. If it
+    // was for this PR and the PR's head has moved on from the head recorded
+    // before the request, GitHub did its part: the retry only does the local steps.
+    let pending = follow_up_pending(ctx, unit).filter(|p| {
+        p.pr == Some(pr)
+            && p.pr_head
+                .as_deref()
+                .is_some_and(|head| !before.head.eq_ignore_ascii_case(head))
+    });
     let resume = pending.is_some();
-    let old_head = pending.filter(|recorded| !recorded.is_empty()).unwrap_or(local_head);
+    let old_head = pending.and_then(|p| p.local_head).unwrap_or(local_head);
     let taken = syncs_taken(ctx, unit);
     if !resume && taken >= MAX_BASE_SYNCS {
         return Err(Fail::refused(format!(
@@ -261,7 +289,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         // The slot is spent now, before any local step can fail.
         ctx.event(
             "base_sync_remote",
-            json!({"unit": unit, "pr": pr, "local_head": old_head}),
+            json!({"unit": unit, "pr": pr, "pr_head": before.head, "local_head": old_head}),
         )?;
         owned_view(ctx, &repo, unit, pr, &branch)?.head
     };
@@ -307,11 +335,21 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         )));
     }
 
+    // GitHub may not have applied the update yet: the fetched base must be in
+    // the PR's head before the sync counts as done. If it is not, the request
+    // stays pending and a retry asks again.
+    let base_ref = format!("refs/remotes/origin/{base}");
+    if !git::ok(&wt, &["merge-base", "--is-ancestor", &base_ref, &new_head]) {
+        return Err(Fail::failed(format!(
+            "{base} is not in the PR's head {new_head} yet; GitHub has not applied the update. Run base-sync again"
+        )));
+    }
+
     let checked = deliver_check::evaluate(ctx, unit, &wt, None, None)?;
     // The proof must cover the head, and the gate's own review read must say
     // `clear` (a merge that changed the reviewed diff's digest does not). A read
     // that fails needs a round.
-    let clear = preflight(ctx, &repo, pr).is_ok_and(|p| p.status == "clear");
+    let clear = preflight(ctx, &repo, pr).is_ok_and(|p| p.status == "clear" && p.head.eq_ignore_ascii_case(&new_head));
     let needed = !clear || review_round_needed(ctx, unit, &wt, &new_head);
     let out = json!({
         "unit": unit,

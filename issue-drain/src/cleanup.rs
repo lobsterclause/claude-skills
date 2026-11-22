@@ -188,9 +188,13 @@ fn unit(ctx: &Ctx, args: &Args, n: u64, only_finished: bool) -> Res<Value> {
     // a dirty tree, never those. The comparison is with the PR's head, not with
     // the squash commit the merge made.
     if let (Some(view), Some(pr)) = (&view, pr) {
-        let tip = git::commit(&repo_dir, &format!("refs/heads/{branch}"))
-            .or_else(|| present.then(|| git::commit(&wt, "HEAD")).flatten());
-        if let Some(tip) = tip {
+        // The branch's tip, and the worktree's own HEAD: a worktree detached at
+        // an unpushed commit would leave that commit unreachable once removed.
+        let tips = [
+            git::commit(&repo_dir, &format!("refs/heads/{branch}")),
+            present.then(|| git::commit(&wt, "HEAD")).flatten(),
+        ];
+        for tip in tips.into_iter().flatten() {
             unpushed_work_check(&repo_dir, pr, &view.head, &tip, &branch, &log)?;
         }
     }
@@ -263,7 +267,7 @@ fn prepared_units(ctx: &Ctx) -> BTreeSet<u64> {
 }
 
 /// `<run folder>/base`, once no unit worktree remains outside `cleaned`.
-fn base_clone(ctx: &Ctx, cleaned: &BTreeSet<u64>) -> Res<Option<Value>> {
+fn base_clone(ctx: &Ctx, force: bool, cleaned: &BTreeSet<u64>) -> Res<Option<Value>> {
     let run_dir = real(&ctx.workdir);
     let base = run_dir.join("base");
     // A link is looked at before it is followed: `git worktree remove --force`
@@ -300,11 +304,11 @@ fn base_clone(ctx: &Ctx, cleaned: &BTreeSet<u64>) -> Res<Option<Value>> {
     }
     not_the_cwd(&base)?;
     if ctx.dry_run {
-        println!("WOULD: git worktree remove --force {}", base.display());
+        let flag = if force { " --force" } else { "" };
+        println!("WOULD: git worktree remove{flag} {}", base.display());
         return Ok(Some(json!({"base": "would_remove"})));
     }
-    // The readers' scratch worktree: nothing in it is worth keeping.
-    remove_worktree(&ctx.repo_dir()?, &base, true, &ctx.path("cleanup-base.log"))?;
+    remove_worktree(&ctx.repo_dir()?, &base, force, &ctx.path("cleanup-base.log"))?;
     Ok(Some(json!({"base": "removed"})))
 }
 
@@ -334,7 +338,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             }
         }
     }
-    match base_clone(ctx, &cleaned) {
+    match base_clone(ctx, args.force, &cleaned) {
         Ok(Some(out)) => println!("{out}"),
         Ok(None) => {}
         Err(fail) => {

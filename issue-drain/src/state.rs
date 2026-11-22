@@ -616,6 +616,17 @@ fn init_from(ctx: &Ctx, source: Option<(Value, String)>) -> Res<usize> {
     Ok(events.len())
 }
 
+/// Refuse (exit 3) a unit that is not in the run's state queue: the approved
+/// tracker left it out, so it is not to be worked.
+pub fn require_queued(ctx: &Ctx, unit: u64) -> Res<()> {
+    if replay(ctx)?.snapshot.queue.contains(&unit) {
+        return Ok(());
+    }
+    Err(Fail::refused(format!(
+        "unit {unit} is not in the run's state queue: the approved tracker does not list it, so no branch or worktree is made for it"
+    )))
+}
+
 /// Start the state log with `state init`'s own code when the run has none: no
 /// state event in `events.jsonl` and no `state.json`. A by-hand run that never
 /// ran `state init` gets one this way. `Ok(true)` when it started the log.

@@ -356,3 +356,41 @@ fn a_base_that_is_a_symlink_is_never_followed() {
     assert!(out.stdout.contains("symlink"), "{}", out.stdout);
     assert!(elsewhere.exists(), "the link's target survives");
 }
+
+#[test]
+fn a_worktree_detached_at_an_unpushed_commit_is_not_removed() {
+    let c = case();
+    pr_is(&c, "MERGED");
+    // The branch itself is still at the pushed tip; only this worktree has moved.
+    git(&c.wt, &["checkout", "-q", "--detach"]);
+    fs::write(c.wt.join("src/timer/countdown.ts"), "export const lost = 1;\n").expect("the file");
+    git(&c.wt, &["add", "src/timer/countdown.ts"]);
+    identity(&c.wt, &["commit", "-q", "-m", "only here"]);
+    let out = cleanup(&c, &["--force"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("not on the PR"), "{}", out.stderr);
+    assert!(c.wt.exists());
+}
+
+#[test]
+fn the_base_clone_is_forced_out_only_when_the_caller_forces() {
+    let c = case();
+    pr_is(&c, "MERGED");
+    c.env.write(
+        "events.jsonl",
+        &format!(
+            "{}\n",
+            json!({"ts": "t", "event": "merge_gate", "unit": 3, "pr": 7, "refusals": []})
+        ),
+    );
+    let base = add_base(&c);
+    fs::write(base.join("scratch.txt"), "x\n").expect("the file");
+    let out = c.env.run(&["cleanup", "--run"]);
+    assert_ne!(out.code, 0, "{}", out.stdout);
+    assert!(base.exists(), "a dirty base is kept without --force");
+
+    // The unit's worktree is already gone from the first run; force clears the base.
+    let forced = c.env.run(&["cleanup", "--run", "--force"]);
+    assert_eq!(forced.code, 0, "{}{}", forced.stdout, forced.stderr);
+    assert!(!base.exists());
+}

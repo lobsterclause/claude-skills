@@ -633,3 +633,15 @@ fn a_tracker_with_a_stop_line_stops_the_auto_start() {
     assert_eq!(out.code, 3, "{}", out.stderr);
     assert!(out.stderr.contains("STOP"), "{}", out.stderr);
 }
+
+#[test]
+fn a_unit_the_approved_tracker_dropped_gets_no_branch_and_no_worktree() {
+    let c = case("");
+    // The person kept only U4; unit 3 was deleted from the tracker.
+    publish_tracker(&c, "<!-- issue-drain:tracker v1 run=run -->\n- [x] U4 · b\n");
+    let out = c.prepare();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("unit 3"), "{}", out.stderr);
+    assert!(!c.worktree().exists());
+    assert_eq!(git(&c.checkout, &["branch", "--list", BRANCH]), "");
+}
