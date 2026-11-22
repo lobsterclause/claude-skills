@@ -114,7 +114,7 @@
 //! not merged yet, or was already in the merge queue (queued: `merged: false,
 //! queued: true`); 2 bad arguments.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
@@ -1332,13 +1332,17 @@ pub fn parse_check_runs(raw: &str) -> Read<Vec<Run>> {
 /// app whose bot posted it (`source` is `app:<id>`). `app_of` turns an app
 /// slug into its id; it is asked once per slug, and its failure fails the
 /// read. A status posted by anything but an app's bot is kept under `app:0`,
-/// which satisfies no pinned check.
+/// which satisfies no pinned check. The list is newest first, and only the
+/// first status of each context from each app is kept.
 pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -> Read<u64>) -> Read<Vec<Run>> {
     let mut runs = Vec::new();
     let mut ids: BTreeMap<String, u64> = BTreeMap::new();
+    let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+    let mut pages = 0;
     for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
         let page = page.map_err(|_| "the answer is not JSON".to_string())?;
         let list = page.as_array().ok_or("a page is not a list")?;
+        pages += 1;
         for entry in list {
             let name = text(entry, "context")?;
             if !wanted.contains(&name.as_str()) {
@@ -1360,6 +1364,12 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
                 },
                 _ => 0,
             };
+            // The list comes newest first, so the first status of a context
+            // from an app is the current one. Two posted within a second carry
+            // the same `created_at`, which is why the order decides and not it.
+            if !seen.insert((name.clone(), id)) {
+                continue;
+            }
             let state = entry
                 .get("state")
                 .and_then(Value::as_str)
@@ -1374,7 +1384,9 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
             runs.push(Run {
                 name,
                 source: format!("app:{id}"),
-                run: String::new(),
+                // A bucket of its own: a check run with no workflow run id has
+                // an empty one, and the two must not hide each other.
+                run: "status".to_string(),
                 outcome,
                 word: state,
                 started: entry
@@ -1384,6 +1396,9 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
                     .to_string(),
             });
         }
+    }
+    if pages == 0 {
+        return Err("the answer is empty".into());
     }
     Ok(runs)
 }
@@ -2846,6 +2861,45 @@ mod tests {
         assert_eq!((runs[1].source.as_str(), runs[1].outcome), ("app:7", Outcome::Pending));
         assert!(parse_check_runs("").is_err());
         assert!(parse_check_runs("{}").is_err());
+    }
+
+    #[test]
+    fn statuses_keep_the_newest_of_each_context_from_each_app_apart_from_check_runs() {
+        let bot = |state: &str, at: &str| {
+            json!({"context": "build", "state": state, "created_at": at,
+                "creator": {"login": "github-actions[bot]", "type": "Bot"}})
+        };
+        let asked = std::cell::Cell::new(0);
+        let mut app_of = |_: &str| {
+            asked.set(asked.get() + 1);
+            Ok(15368)
+        };
+        // Newest first, the two posted within the same second: the first is current.
+        let at = "2026-11-21T02:00:00Z";
+        let page1 = json!([bot("success", at), bot("pending", at)]);
+        let page2 = json!([bot("failure", "2026-11-21T01:00:00Z"), {"context": "other", "state": "failure"}]);
+        let runs = parse_statuses(&format!("{page1}\n{page2}"), &["build"], &mut app_of).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].source.as_str(), runs[0].outcome), ("app:15368", Outcome::Pass));
+        assert_eq!(asked.get(), 1, "one lookup per slug");
+        // A failed check run of the same app with no workflow run id is not hidden
+        // by the newer passing status.
+        let mut all = parse_check_runs(
+            &json!({"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure",
+                "started_at": "2026-11-21T00:00:00Z", "app": {"id": 15368}}]})
+            .to_string(),
+        )
+        .unwrap();
+        all.extend(runs);
+        let outcomes: Vec<Outcome> = newest(&all)[&("build", "app:15368")]
+            .iter()
+            .map(|r| r.outcome)
+            .collect();
+        assert_eq!(outcomes, [Outcome::Fail, Outcome::Pass]);
+        // No page at all is not "no statuses".
+        assert!(parse_statuses("", &["build"], &mut app_of).is_err());
+        assert!(parse_statuses("{}", &["build"], &mut app_of).is_err());
+        assert_eq!(parse_statuses("[]", &["build"], &mut app_of).unwrap().len(), 0);
     }
 
     #[test]
