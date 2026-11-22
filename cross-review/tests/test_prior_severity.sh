@@ -82,5 +82,10 @@ printf '{"findings":[{"id":"f-a","local_id":"f1","severity":"High"},{"id":"f-b",
 printf '{"findings":[{"id":"f1","severity":"High"},{"id":"f2","severity":"Low","disposition":"drop"}]}\n' >"$T/c/findings.scored.json"
 assert_eq "matched by id: a High kept by both counts" "$(bash "$S" "$T/c/raw")" "high"
 
+case_dir  # a scored High with no verified row did not survive fact-checking
+printf '{"findings":[{"id":"f-a","local_id":"f1","severity":"Medium"}]}\n' >"$T/c/findings.verified.json"
+printf '{"findings":[{"id":"f1","severity":"Medium"},{"id":"f2","severity":"High"}]}\n' >"$T/c/findings.scored.json"
+assert_eq "matched by id: a High missing from verified does not count" "$(bash "$S" "$T/c/raw")" "medium"
+
 echo; echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

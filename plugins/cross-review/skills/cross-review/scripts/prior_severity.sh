@@ -86,7 +86,7 @@ first_rank() {
 # The fact-check and the scoring pass both start from findings.json, so each
 # can drop a finding the other kept. When both exist a finding must survive
 # both to count. Match them on the findings.json id (verified carries it as
-# `local_id`, scored as `id`) and apply both vetoes before taking the maximum.
+# `local_id`, scored as `id`) and count only findings kept by both files.
 # Findings without a matchable id fall back to the lower of the two maxima.
 # (codex, cross-review of claude-skills PR #228, passes 2 and 3.)
 first_file() {
@@ -106,9 +106,14 @@ if [[ -n "$rv" && -n "$rs" ]]; then
     (.[0].findings | map(. + {k: (.local_id // .id)})) as $v
     | (.[1].findings | map(. + {k: .id})) as $s
     | if ([$v[], $s[]] | any(.k == null)) then empty else
-      ([$v[], $s[]] | map(select(dropped) | .k)) as $drop
-      | [ $v[], $s[] | select((dropped | not) and ((.k as $k | $drop | index($k)) == null))
-          | (.severity // "" | rank) ] | (max // 0) end' \
+      ($s | map(select(dropped | not) | .k)) as $ks
+      # Intersection: a finding counts only if BOTH files kept it. One absent
+      # from either file did not survive that check. Its rank is the lower of
+      # the two severities.
+      | [ $v[] | select((dropped | not) and (.k as $k | $ks | index($k)) != null)
+          | . as $f | ($s | map(select(.k == $f.k and (dropped | not))) | first) as $m
+          | [($f.severity // "" | rank), ($m.severity // "" | rank)] | min ]
+      | (max // 0) end' \
     "$(first_file findings.verified.json)" "$(first_file findings.scored.json)" 2>/dev/null)"
   [[ "$r" =~ ^[0-4]$ ]] || r=$(( rv < rs ? rv : rs ))
   rank_to_word "$r"; exit 0
