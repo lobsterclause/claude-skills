@@ -1403,3 +1403,328 @@ fn two_workflows_sharing_a_display_name_cannot_mask_each_others_failure() {
     let out = env.run(&ARGS);
     assert_eq!(out.code, 0, "{}", out.stderr);
 }
+
+#[test]
+fn an_app_known_from_a_check_run_is_not_looked_up_so_a_private_app_does_not_fail_the_read() {
+    let env = ready();
+    put(&env, "rules.json", &pinned_ruleset());
+    // `apps/github-actions` answers 404 (no app file); the run carries the id.
+    put(
+        &env,
+        "check-runs.json",
+        &json!({"total_count": 1, "check_runs": [
+            {"name": "lint", "status": "completed", "conclusion": "success", "started_at": "2026-11-21T01:00:00Z",
+             "app": {"id": 15368, "slug": "github-actions"}}]}),
+    );
+    put(
+        &env,
+        "statuses.json",
+        &json!([status_of(
+            "github-actions[bot]",
+            "Bot",
+            "success",
+            "2026-11-21T02:00:00Z"
+        )]),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(env.gh_calls().iter().all(|c| !c.starts_with("api apps/")));
+}
+
+#[test]
+fn a_cancelled_required_run_is_excused_by_a_later_pass_of_the_same_workflow() {
+    let env = ready();
+    let entry = |run: u64, conclusion: &str, at: &str| {
+        json!({"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "COMPLETED",
+            "conclusion": conclusion, "startedAt": at,
+            "detailsUrl": format!("https://github.com/example/tidepool/actions/runs/{run}/job/1")})
+    };
+    let mut view = pr_view("OPEN", &["bug"], "Fixes #5");
+    view["statusCheckRollup"] = json!([
+        entry(10, "CANCELLED", "2026-11-21T01:00:00Z"),
+        entry(11, "SUCCESS", "2026-11-21T01:05:00Z"),
+        {"__typename": "StatusContext", "context": "lint", "state": "SUCCESS", "startedAt": "2026-11-21T01:00:00Z"}
+    ]);
+    put(&env, "pr-view-12.json", &view);
+    let workflow = |id: u64, workflow_id: u64| json!({"id": id, "workflow_id": workflow_id, "event": "pull_request", "head_sha": HEAD, "status": "completed", "conclusion": "success"});
+    // Another workflow's later pass does not excuse it.
+    put(
+        &env,
+        "workflow-runs.json",
+        &json!({"total_count": 2, "workflow_runs": [workflow(10, 7), workflow(11, 8)]}),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(codes(&result(&out)), ["required_check"]);
+    // The same workflow's does.
+    put(
+        &env,
+        "workflow-runs.json",
+        &json!({"total_count": 2, "workflow_runs": [workflow(10, 7), workflow(11, 7)]}),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+}
+
+fn note(env: &Env) -> String {
+    env.write("note.md", "Merged by the gate.\n").display().to_string()
+}
+
+#[test]
+fn a_note_file_is_posted_after_the_merge_and_its_url_is_printed() {
+    let env = ready();
+    let file = note(&env);
+    let out = env.run(&["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(r["merged"], true);
+    assert_eq!(
+        r["note_url"],
+        "https://github.com/example/tidepool/pull/12#issuecomment-5001"
+    );
+    let calls = env.gh_calls();
+    let at = |what: &str| calls.iter().position(|c| c.starts_with(what)).expect(what);
+    assert!(at("issue comment") > at("pr merge"), "{calls:?}");
+    assert!(
+        calls[at("issue comment")].starts_with("issue comment 12 --repo example/tidepool --body-file"),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn a_note_that_fails_to_post_leaves_the_merge_standing() {
+    let env = ready();
+    env.stub_file("fail-comment", "");
+    let file = note(&env);
+    let out = env.run(&["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(r["merged"], true);
+    assert_eq!(r["note_url"], Value::Null);
+    assert!(
+        out.stderr.contains("warning") && out.stderr.contains(&file),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_dry_run_says_it_would_comment_and_posts_nothing() {
+    let env = ready();
+    let file = note(&env);
+    let out = env.run(&[
+        "merge-gate",
+        "--unit",
+        "3",
+        "--pr",
+        "12",
+        "--dry-run",
+        "--note-file",
+        &file,
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("WOULD: gh issue comment 12"), "{}", out.stdout);
+    assert_eq!(result(&out)["note_url"], Value::Null);
+    assert!(env.gh_calls().iter().all(|c| !c.starts_with("issue comment")));
+}
+
+#[test]
+fn a_note_that_is_not_there_is_refused_before_anything_is_merged() {
+    let env = ready();
+    let out = env.run(&[
+        "merge-gate",
+        "--unit",
+        "3",
+        "--pr",
+        "12",
+        "--note-file",
+        "/no/such/note.md",
+    ]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(merged_calls(&env).is_empty());
+}
+
+const MARKER: &str = "<!-- issue-drain:merge-note head=0123456789abcdef0123456789abcdef01234567 -->";
+
+fn comment_calls(env: &Env) -> Vec<String> {
+    env.gh_calls()
+        .into_iter()
+        .filter(|c| c.starts_with("issue comment"))
+        .collect()
+}
+
+/// PR 12 already merged and the unit's own, as a driver retrying after exit 4 sees it.
+fn merged_pr(env: &Env) {
+    let mut view = pr_view("MERGED", &[], "");
+    view["mergeCommit"] = json!({"oid": "fedcba9876543210fedcba9876543210fedcba98"});
+    put(env, "pr-view-12.json", &view);
+}
+
+#[test]
+fn a_retry_after_a_queued_merge_posts_the_note_once() {
+    let env = ready();
+    merged_pr(&env);
+    env.stub_file("user.txt", "someone\n");
+    let file = note(&env);
+    let args = ["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file];
+    comments(&env, &[comment("an unrelated comment", "OWNER")]);
+    let out = env.run(&args);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(
+        (r["merged"].as_bool(), r["already"].as_bool()),
+        (Some(true), Some(true))
+    );
+    assert_eq!(
+        r["note_url"],
+        "https://github.com/example/tidepool/pull/12#issuecomment-5001"
+    );
+    assert_eq!(comment_calls(&env).len(), 1);
+    let body = fs::read_to_string(env.stub.join("last-comment-body")).expect("the posted body");
+    assert_eq!(body.lines().next(), Some(MARKER), "{body}");
+    assert!(body.contains("Merged by the gate."), "{body}");
+    // The posted note is now on the PR: a second retry posts nothing.
+    comments(&env, &[comment(&body, "OWNER")]);
+    let out = env.run(&args);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(result(&out)["note_url"], Value::Null);
+    assert_eq!(comment_calls(&env).len(), 1);
+    // A marker for another head does not count.
+    comments(&env, &[comment(&MARKER.replace("0123", "9999"), "OWNER")]);
+    env.run(&args);
+    assert_eq!(comment_calls(&env).len(), 2);
+}
+
+#[test]
+fn a_retry_that_cannot_read_the_comments_warns_and_posts_nothing() {
+    let env = ready();
+    merged_pr(&env);
+    fs::remove_file(env.stub.join("comments.json")).expect("remove");
+    let file = note(&env);
+    let out = env.run(&["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stderr.contains("warning"), "{}", out.stderr);
+    assert!(comment_calls(&env).is_empty());
+}
+
+#[test]
+fn a_note_file_named_dash_is_refused_not_read_from_stdin() {
+    let env = ready();
+    let dir = env.dir.path().join("cwd");
+    fs::create_dir_all(&dir).expect("dir");
+    fs::write(dir.join("-"), "text\n").expect("a file named -");
+    let out = env.run_in(
+        Some(&dir),
+        &["merge-gate", "--unit", "3", "--pr", "12", "--note-file", "-"],
+    );
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(merged_calls(&env).is_empty());
+}
+
+fn comment_by(login: &str, body: &str) -> Value {
+    json!({"body": body, "author_association": "OWNER", "user": {"login": login}})
+}
+
+#[test]
+fn only_our_own_comment_that_opens_with_the_marker_counts_as_the_posted_note() {
+    let env = ready();
+    merged_pr(&env);
+    env.stub_file("user.txt", "someone\n");
+    let file = note(&env);
+    let args = ["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file];
+    let marked = format!("{MARKER}\n\nMerged by the gate.\n");
+    // Someone else's comment with the marker does not count.
+    comments(&env, &[comment_by("mallory", &marked)]);
+    env.run(&args);
+    assert_eq!(comment_calls(&env).len(), 1);
+    // Nor does our own comment that only quotes it further down.
+    comments(&env, &[comment_by("someone", &format!("quoting\n{marked}"))]);
+    env.run(&args);
+    assert_eq!(comment_calls(&env).len(), 2);
+    // Ours, opening with it, does.
+    comments(&env, &[comment_by("someone", &marked)]);
+    env.run(&args);
+    assert_eq!(comment_calls(&env).len(), 2);
+}
+
+#[test]
+fn a_retry_that_cannot_tell_who_it_is_warns_and_posts_nothing() {
+    let env = ready();
+    merged_pr(&env);
+    comments(&env, &[comment("an unrelated comment", "OWNER")]);
+    let file = note(&env);
+    let out = env.run(&["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stderr.contains("warning"), "{}", out.stderr);
+    assert!(comment_calls(&env).is_empty());
+}
+
+#[test]
+fn posting_a_note_leaves_every_existing_file_in_the_unit_folder_alone() {
+    let env = ready();
+    // A draft where the old code staged its copy, and the note file itself.
+    let draft = env.write("units/3/merge-note.md", "my draft\n");
+    let out = env.run(&[
+        "merge-gate",
+        "--unit",
+        "3",
+        "--pr",
+        "12",
+        "--note-file",
+        &draft.display().to_string(),
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(fs::read_to_string(&draft).unwrap(), "my draft\n");
+    let body = fs::read_to_string(env.stub.join("last-comment-body")).expect("the posted body");
+    assert!(body.starts_with(MARKER) && body.contains("my draft"), "{body}");
+    // The staged copy is gone.
+    let staged: Vec<_> = fs::read_dir(draft.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("merge-note"))
+        .collect();
+    assert_eq!(staged, ["merge-note.md"]);
+}
+
+#[test]
+fn a_dry_run_writes_no_file() {
+    let env = ready();
+    let draft = env.write("units/3/merge-note.md", "my draft\n");
+    let out = env.run(&[
+        "merge-gate",
+        "--unit",
+        "3",
+        "--pr",
+        "12",
+        "--dry-run",
+        "--note-file",
+        &draft.display().to_string(),
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(fs::read_to_string(&draft).unwrap(), "my draft\n");
+    let names: Vec<_> = fs::read_dir(draft.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("merge-note"))
+        .collect();
+    assert_eq!(names, ["merge-note.md"]);
+}
+
+#[test]
+fn a_retry_on_a_merged_pr_reports_it_merged_even_when_the_note_file_is_gone() {
+    let env = ready();
+    merged_pr(&env);
+    for bad in ["/no/such/note.md", "-"] {
+        let out = env.run(&["merge-gate", "--unit", "3", "--pr", "12", "--note-file", bad]);
+        assert_eq!(out.code, 0, "{bad}: {}", out.stderr);
+        let r = result(&out);
+        assert_eq!(
+            (r["merged"].as_bool(), r["already"].as_bool()),
+            (Some(true), Some(true))
+        );
+        assert_eq!(r["note_url"], Value::Null);
+        assert!(r["note_warning"].as_str().unwrap().contains(bad), "{r}");
+        assert!(out.stderr.contains("warning"), "{}", out.stderr);
+    }
+    assert!(comment_calls(&env).is_empty());
+}

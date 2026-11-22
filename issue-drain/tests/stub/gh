@@ -25,6 +25,7 @@
 #                         `gh issue view <n>` reports the state CLOSED
 #   fail-create           `gh issue create` exits 1
 #   fail-comment          `gh issue comment` exits 1
+#   last-comment-body     written by `gh issue comment ... --body-file <f>`: a copy of f
 #   labels.txt            answer to `gh label list`, one name per line
 #   pr-view-<n>.json      answer to `gh pr view <n>`
 #   pr-view-<n>.after-merge.json  the answer to `gh pr view <n>` once `gh pr
@@ -45,6 +46,11 @@
 #                         file fails the call
 #   statuses.json         answer to `gh api repos/<o>/<r>/commits/<sha>/statuses`
 #                         (default: an empty list)
+#   workflow-runs.json    answer to `gh api repos/<o>/<r>/actions/runs?head_sha=...`
+#                         (one object, or several one after another); a missing
+#                         file fails the call
+#   user.txt              answer to `gh api user --jq .login` (the gh identity); a
+#                         missing file fails the call
 #   app-<slug>.json       answer to `gh api apps/<slug>`; a missing file fails
 #                         the call
 #   merged-<n> and pr-view-<n>.after-merge.json: see above; `gh pr merge <n>
@@ -135,7 +141,13 @@ case "${1:-} ${2:-}" in
   "issue close")
     if [ "${GH_STUB_CLOSE_NOOP:-}" != "1" ]; then : > "$dir/closed-$3"; fi ;;
   "issue comment")
-    if [ -e "$dir/fail-comment" ]; then echo "gh stub: comment failed" >&2; exit 1; fi ;;
+    if [ -e "$dir/fail-comment" ]; then echo "gh stub: comment failed" >&2; exit 1; fi
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--body-file" ]; then cp "$arg" "$dir/last-comment-body"; fi
+      prev="$arg"
+    done
+    echo "https://github.com/example/tidepool/pull/$3#issuecomment-5001" ;;
   "pr create")
     echo "https://github.com/example/tidepool/pull/${GH_STUB_NEW_PR:-901}" ;;
   "pr view")
@@ -151,6 +163,7 @@ case "${1:-} ${2:-}" in
     esac
     if [ -e "$dir/fail-merge" ]; then echo "gh stub: merge failed" >&2; exit 1; fi
     : > "$dir/merged-$3" ;;
+  "api user") answer user.txt ;;
   "api apps/"*) answer "app-${2#apps/}.json" ;;
   "api repos/"*)
     case "$2" in
@@ -166,6 +179,7 @@ case "${1:-} ${2:-}" in
       */compare/develop...*) answer compare.json ;;
       */compare/*) answer compare-reviewed.json ;;
       */commits/*/check-runs*) answer check-runs.json ;;
+      */actions/runs*) answer workflow-runs.json ;;
       */commits/*/statuses*)
         if [ -f "$dir/statuses.json" ]; then cat "$dir/statuses.json"; else echo "[]"; fi ;;
       */issues/*/comments*) answer comments.json ;;
