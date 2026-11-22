@@ -1377,7 +1377,7 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
             // The list comes newest first, so the first status of a context is
             // the current one. Two posted within a second carry the same
             // `created_at`, which is why the order decides and not it.
-            if !seen.insert(context) {
+            if !seen.insert(context.clone()) {
                 continue;
             }
             let login = entry
@@ -1405,7 +1405,9 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
                 "success" => Outcome::Pass,
                 "failure" | "error" => Outcome::Fail,
                 "pending" => Outcome::Pending,
-                _ => Outcome::Other,
+                // GitHub documents these four and no others. A current status
+                // that cannot be read must not pass for one that does not fail.
+                _ => return Err(format!("a status of '{context}' has the state '{state}'")),
             };
             let started = entry.get("created_at").and_then(Value::as_str).unwrap_or_default();
             for name in names {
@@ -2958,6 +2960,20 @@ mod tests {
         .unwrap();
         let names: Vec<&str> = runs.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["Build", "build"]);
+        // A current status with a state GitHub does not document, or none, fails
+        // the read, whoever posted it. An older one is never looked at.
+        let odd = json!({"context": "build", "state": "stale", "created_at": at,
+            "creator": {"login": "someone", "type": "User"}});
+        let none = json!({"context": "build", "created_at": at});
+        for newest_first in [json!([odd, bot("success", at)]), json!([none])] {
+            assert!(parse_statuses(&newest_first.to_string(), &["build"], &mut app_of).is_err());
+        }
+        assert_eq!(
+            parse_statuses(&json!([bot("success", at), odd]).to_string(), &["build"], &mut app_of)
+                .unwrap()
+                .len(),
+            1
+        );
         // No page at all is not "no statuses".
         assert!(parse_statuses("", &["build"], &mut app_of).is_err());
         assert!(parse_statuses("{}", &["build"], &mut app_of).is_err());
