@@ -3165,9 +3165,12 @@ Return your findings as prose, organized by severity (Critical / High / Medium /
   # wall (sentinel + quota_exhausted) so the retry loop skips the doomed
   # attempt 2 and downstream tools see a failure_kind. Gated on a failed or
   # empty run so a review that merely quotes "429" never self-classifies.
+  # Only the quota-specific error type counts: a bare 429 can be a transient
+  # throttle, which stays on the normal retry path. grep reads the files
+  # itself; piping through cat lets grep -q exit early and SIGPIPE cat, which
+  # pipefail turns into a miss.
   if { [[ $rc -ne 0 ]] || [[ "$bytes" -eq 0 ]]; } \
-     && cat "$out/kimi.stdout" "$out/kimi.stderr" 2>/dev/null \
-        | grep -qiE "exceeded_current_quota_error|HTTP[ /0-9.]*429|status[ _]?(code)?[\"': =]+429|\b429\b[^0-9]*(too many|rate.?limit|quota)"; then
+     && grep -qsi "exceeded_current_quota_error" "$out/kimi.stdout" "$out/kimi.stderr"; then
     printf '%s\n' "reset time not reported" >"$out/kimi.quota_exhausted"
     echo "kimi: usage limit reached (429 exceeded_current_quota_error) — classifying as quota_exhausted" >&2
     fk_json='"quota_exhausted"'

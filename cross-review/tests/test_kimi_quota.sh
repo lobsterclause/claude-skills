@@ -35,7 +35,14 @@ if grep -q "attempt 1 failed" "$T/o1.log"; then bad "retried a quota wall"; else
 
 kimi_shim 1 "" 'HTTP 429 Too Many Requests'
 run "$T/o2"
-assert_eq "plain HTTP 429 -> quota_exhausted" "$(fk "$T/o2")" "quota_exhausted"
+assert_eq "plain HTTP 429 is a transient throttle, not quota" "$(jq -r '.failure_kind == "quota_exhausted"' "$T/o2/kimi.meta.json")" "false"
+[[ -f "$T/o2/kimi.quota_exhausted" ]] && bad "sentinel written for a plain 429" || ok "no sentinel for a plain 429"
+
+# Marker first, then far more diagnostics than a pipe buffer holds.
+printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\necho exceeded_current_quota_error >&2\nyes diagnostic-line-padding | head -n 200000 >&2\nexit 1\n' >"$T/bin/kimi"
+chmod +x "$T/bin/kimi"
+run "$T/o5"
+assert_eq "marker before large output -> quota_exhausted" "$(fk "$T/o5")" "quota_exhausted"
 
 kimi_shim 1 'exceeded_current_quota_error' ""
 run "$T/o3"
