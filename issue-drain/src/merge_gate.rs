@@ -84,7 +84,11 @@
 //! A required check pinned to an app (classic `app_id`, ruleset
 //! `integration_id`; null and -1 mean any app) needs a run from that app. The
 //! rollup carries no app id, so a pinned check reads
-//! `commits/<head>/check-runs`; a failed read refuses (`read_error`).
+//! `commits/<head>/check-runs`; a failed read refuses (`read_error`). A pinned
+//! check can also be a commit status (a workflow posting one with its token),
+//! which is not a check run: `commits/<head>/statuses` is read too, and a
+//! status counts for the app whose bot posted it (`<slug>[bot]`, the id from
+//! `apps/<slug>`). A status a person posted counts for no app.
 //!
 //! A unit with no file scope (`scope_checked` not true in `deliver.json`) is
 //! refused (`deliver_check`): a person merges it. The gate may not be run by a
@@ -1323,6 +1327,67 @@ pub fn parse_check_runs(raw: &str) -> Read<Vec<Run>> {
     Ok(runs)
 }
 
+/// One page of `commits/<head>/statuses`, or several one after another
+/// (`--paginate`): the statuses whose context is in `wanted`, each with the
+/// app whose bot posted it (`source` is `app:<id>`). `app_of` turns an app
+/// slug into its id; it is asked once per slug, and its failure fails the
+/// read. A status posted by anything but an app's bot is kept under `app:0`,
+/// which satisfies no pinned check.
+pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -> Read<u64>) -> Read<Vec<Run>> {
+    let mut runs = Vec::new();
+    let mut ids: BTreeMap<String, u64> = BTreeMap::new();
+    for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
+        let page = page.map_err(|_| "the answer is not JSON".to_string())?;
+        let list = page.as_array().ok_or("a page is not a list")?;
+        for entry in list {
+            let name = text(entry, "context")?;
+            if !wanted.contains(&name.as_str()) {
+                continue;
+            }
+            let login = entry
+                .pointer("/creator/login")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let is_bot = entry.pointer("/creator/type").and_then(Value::as_str) == Some("Bot");
+            let id = match login.strip_suffix("[bot]") {
+                Some(slug) if is_bot && !slug.is_empty() => match ids.get(slug) {
+                    Some(id) => *id,
+                    None => {
+                        let id = app_of(slug)?;
+                        ids.insert(slug.to_string(), id);
+                        id
+                    }
+                },
+                _ => 0,
+            };
+            let state = entry
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase();
+            let outcome = match state.as_str() {
+                "success" => Outcome::Pass,
+                "failure" | "error" => Outcome::Fail,
+                "pending" => Outcome::Pending,
+                _ => Outcome::Other,
+            };
+            runs.push(Run {
+                name,
+                source: format!("app:{id}"),
+                run: String::new(),
+                outcome,
+                word: state,
+                started: entry
+                    .get("created_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+    }
+    Ok(runs)
+}
+
 /// `status` of a compare answer: whether the first commit is an ancestor of
 /// (or the same as) the second.
 fn parse_ancestry(raw: &str) -> Read<bool> {
@@ -1617,7 +1682,30 @@ fn gather(
             "--paginate",
         ])
         .and_then(|raw| parse_check_runs(&raw))
-        .map_err(|e| format!("the check runs at the head ({e})")),
+        .map_err(|e| format!("the check runs at the head ({e})"))
+        .and_then(|mut runs| {
+            let wanted: Vec<&str> = required
+                .iter()
+                .filter(|c| c.app_id.is_some())
+                .map(|c| c.context.as_str())
+                .collect();
+            let mut app_of = |slug: &str| {
+                let raw = read_gh(&["api", &format!("apps/{slug}")])?;
+                let v: Value = serde_json::from_str(&raw).map_err(|_| "the answer is not JSON".to_string())?;
+                v.get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("app '{slug}' has no id"))
+            };
+            let statuses = read_gh(&[
+                "api",
+                &format!("repos/{repo}/commits/{head}/statuses?per_page=100"),
+                "--paginate",
+            ])
+            .and_then(|raw| parse_statuses(&raw, &wanted, &mut app_of))
+            .map_err(|e| format!("the commit statuses at the head ({e})"))?;
+            runs.extend(statuses);
+            Ok(runs)
+        }),
         _ => Ok(Vec::new()),
     };
     let preflight = preflight(ctx, repo, pr);
