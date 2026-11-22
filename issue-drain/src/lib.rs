@@ -2,7 +2,9 @@
 //! merged PR. One module per subcommand; `ctx`, `exec`, `gh`, `git`, `model`,
 //! `profile` and `text` are shared by all of them.
 
+pub mod base_sync;
 pub mod claim;
+pub mod cleanup;
 pub mod close;
 pub mod ctx;
 pub mod deliver_check;

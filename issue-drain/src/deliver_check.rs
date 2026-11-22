@@ -368,12 +368,40 @@ fn in_the_units_worktree(ctx: &Ctx, unit: u64, dir: &Path) -> Res<()> {
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
-    let dir = Path::new(".");
-    let unit = args.unit;
+    let done = evaluate(
+        ctx,
+        args.unit,
+        Path::new("."),
+        args.base.as_deref(),
+        args.head.as_deref(),
+    )?;
+    println!("{}", done.report);
+    if done.ok {
+        Ok(())
+    } else {
+        Err(Fail::refused(format!(
+            "unit {} is not deliverable: {}",
+            args.unit,
+            done.codes.join(", ")
+        )))
+    }
+}
+
+/// What one delivery check found: the report it wrote to `deliver.json`.
+pub struct Checked {
+    pub ok: bool,
+    pub report: Value,
+    pub codes: Vec<&'static str>,
+}
+
+/// The check itself, run in `dir` (the unit's worktree): write
+/// `units/<n>/deliver.json` and log the result. A failed check is `ok: false`,
+/// not an error; only a check that could not run is an `Err`.
+pub fn evaluate(ctx: &Ctx, unit: u64, dir: &Path, base: Option<&str>, head: Option<&str>) -> Res<Checked> {
     in_the_units_worktree(ctx, unit, dir)?;
     let (scope, acceptance) = unit_rules(ctx, unit)?;
-    let head = resolve(dir, args.head.as_deref().unwrap_or("HEAD"), "--head")?;
-    let base = match &args.base {
+    let head = resolve(dir, head.unwrap_or("HEAD"), "--head")?;
+    let base = match base {
         Some(base) => resolve(dir, base, "--base")?,
         None => git::base_commit(dir, &ctx.profile.base_branch).ok_or_else(|| {
             Fail::failed(format!(
@@ -471,15 +499,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             e.msg
         );
     }
-    println!("{out}");
-    if ok {
-        Ok(())
-    } else {
-        Err(Fail::refused(format!(
-            "unit {unit} is not deliverable: {}",
-            codes.join(", ")
-        )))
-    }
+    Ok(Checked { ok, report: out, codes })
 }
 
 #[cfg(test)]

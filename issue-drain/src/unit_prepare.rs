@@ -359,6 +359,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         }),
     )?;
 
+    // A by-hand run may never have run `state init`; the unit's start is then
+    // the first thing in a log of its own.
+    if crate::state::init_if_missing(ctx)? {
+        eprintln!("issue-drain unit-prepare: no state in the run folder, so it was started (state init)");
+    }
     ctx.event(
         "unit_prepared",
         json!({"unit": unit, "branch": branch, "worktree": wt, "base_sha": base_sha,

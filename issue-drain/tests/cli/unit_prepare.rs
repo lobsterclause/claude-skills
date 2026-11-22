@@ -530,3 +530,39 @@ fn the_shipped_kma_profile_guards_what_its_protected_pattern_protects() {
     assert_eq!(p.full_verify_command, "pnpm verify");
     assert_eq!(p.stamp_command, "bash scripts/verify-stamp.sh write {tree}");
 }
+
+#[test]
+fn a_prepare_with_no_state_starts_the_state_log() {
+    let c = case("");
+    assert!(!c.env.workdir.join("state.json").exists());
+    c.prepared();
+    let state = json(&c.env.workdir.join("state.json"));
+    assert_eq!(state["queue"], json!([3]));
+    assert_eq!(state["units"][0]["state"], "queued");
+    let events = c.env.events();
+    assert_eq!(events.len(), 2, "the queued event, then the unit's start: {events:?}");
+    assert_eq!(events[0]["to"], "queued");
+    assert_eq!(events[0]["unit"], 3);
+    assert_eq!(events[1]["event"], "unit_prepared");
+    // A second prepare finds the state and starts nothing new.
+    c.prepared();
+    assert_eq!(c.env.events().len(), 3);
+    assert_eq!(c.env.events().iter().filter(|e| e["to"] == "queued").count(), 1);
+}
+
+#[test]
+fn a_prepare_leaves_a_started_state_as_it_is() {
+    let c = case("");
+    assert_eq!(c.env.run(&["state", "init"]).code, 0);
+    c.env.run(&["state", "event", "3", "claimed"]);
+    let before = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("the log");
+    c.prepared();
+    let after = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("the log");
+    assert!(after.starts_with(&before), "nothing earlier is rewritten");
+    assert_eq!(
+        after.lines().count(),
+        before.lines().count() + 1,
+        "only unit_prepared is new"
+    );
+    assert_eq!(json(&c.env.workdir.join("state.json"))["units"][0]["state"], "claimed");
+}

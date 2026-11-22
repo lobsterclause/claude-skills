@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use issue_drain::ctx::Ctx;
 use issue_drain::error::Res;
 use issue_drain::{
-    claim, close, deliver_check, evalscore, evidence, gh, intake, merge_gate, overlap, review_proof, stamp, state,
-    tracker, unit_prepare,
+    base_sync, claim, cleanup, close, deliver_check, evalscore, evidence, gh, intake, merge_gate, overlap,
+    review_proof, stamp, state, tracker, unit_prepare,
 };
 
 /// Triage a set of GitHub issues and carry each one through to a merged PR.
@@ -58,6 +58,10 @@ enum Command {
     Claim(claim::Command),
     /// Record the local verify stamp after a homelab verify passed at an exact commit.
     StampRemotePass(stamp::Args),
+    /// Bring a unit's PR up to date with the base branch and re-run the delivery check.
+    BaseSync(base_sync::Args),
+    /// Remove a finished unit's worktree, its merged branch and its claim; or the whole run's.
+    Cleanup(cleanup::Args),
 }
 
 fn name(command: &Command) -> &'static str {
@@ -86,6 +90,8 @@ fn name(command: &Command) -> &'static str {
         Command::Claim(claim::Command::Release(_)) => "claim release",
         Command::Claim(claim::Command::Check(_)) => "claim check",
         Command::StampRemotePass(_) => "stamp-remote-pass",
+        Command::BaseSync(_) => "base-sync",
+        Command::Cleanup(_) => "cleanup",
     }
 }
 
@@ -109,6 +115,8 @@ fn run(command: &Command) -> Res<()> {
         Command::UnitPrepare(args) => unit_prepare::run(&ctx, args),
         Command::Claim(command) => claim::run(&ctx, command),
         Command::StampRemotePass(args) => stamp::run(&ctx, args),
+        Command::BaseSync(args) => base_sync::run(&ctx, args),
+        Command::Cleanup(args) => cleanup::run(&ctx, args),
     }
 }
 

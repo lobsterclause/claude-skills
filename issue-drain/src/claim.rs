@@ -385,6 +385,26 @@ impl Run<'_> {
     }
 }
 
+fn run_for(ctx: &Ctx, unit_number: u64) -> Res<Run<'_>> {
+    let unit = ctx.queue_unit(unit_number)?;
+    let tracker: Published = read_json(&ctx.path("tracker.json")).ok_or_else(|| {
+        Fail::usage("no tracker.json in the run folder: a claim names the tracker issue, so publish it first")
+    })?;
+    Ok(Run {
+        ctx,
+        repo: ctx.repo()?,
+        unit: unit_number,
+        tracker: tracker.number,
+        issues: unit.issues,
+    })
+}
+
+/// `claim release --unit <n>` for another command (`cleanup`): the same
+/// release, the same per-issue report. The caller has checked the mode.
+pub fn release_unit(ctx: &Ctx, unit: u64) -> Res<Vec<Value>> {
+    run_for(ctx, unit)?.release()
+}
+
 pub fn run(ctx: &Ctx, command: &Command) -> Res<()> {
     let (name, args) = match command {
         Command::Take(a) => ("claim take", a),
@@ -392,17 +412,7 @@ pub fn run(ctx: &Ctx, command: &Command) -> Res<()> {
         Command::Check(a) => ("claim check", a),
     };
     ctx.require_driver(name)?;
-    let unit = ctx.queue_unit(args.unit)?;
-    let tracker: Published = read_json(&ctx.path("tracker.json")).ok_or_else(|| {
-        Fail::usage("no tracker.json in the run folder: a claim names the tracker issue, so publish it first")
-    })?;
-    let run = Run {
-        ctx,
-        repo: ctx.repo()?,
-        unit: args.unit,
-        tracker: tracker.number,
-        issues: unit.issues,
-    };
+    let run = run_for(ctx, args.unit)?;
     let report = match command {
         Command::Take(_) => run.take()?,
         Command::Release(_) => run.release()?,

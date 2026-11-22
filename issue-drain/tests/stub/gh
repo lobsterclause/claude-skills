@@ -64,6 +64,9 @@
 #   fail-timeline         the timeline read exits 1
 #   fail-add-label        `gh issue edit ... --add-label` exits 1
 #   fail-merge            `gh pr merge` exits 1
+#   fail-update-branch    `gh pr update-branch` exits 1 (it changes nothing
+#                         otherwise: a test makes the new head itself and
+#                         names it in pr-view-<n>.json)
 #   fail-thread           the thread-reply and thread-resolve mutations exit 1
 # GH_STUB_NEW_PR          the number `gh pr create` reports (default 901)
 # GH_STUB_NEW_ISSUE       the number `gh issue create` reports (default 900)
@@ -138,6 +141,8 @@ case "${1:-} ${2:-}" in
   "pr view")
     if [ -e "$dir/disable-auto-$3" ] && [ -f "$dir/pr-view-$3.after-disable.json" ]; then answer "pr-view-$3.after-disable.json"
     elif [ -e "$dir/merged-$3" ]; then answer "pr-view-$3.after-merge.json"; else answer "pr-view-$3.json"; fi ;;
+  "pr update-branch")
+    if [ -e "$dir/fail-update-branch" ]; then echo "gh stub: update-branch failed" >&2; exit 1; fi ;;
   "pr merge")
     case "$*" in
       *--disable-auto*)

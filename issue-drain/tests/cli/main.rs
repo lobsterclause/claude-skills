@@ -4,7 +4,9 @@
 
 mod common;
 
+mod base_sync;
 mod claim;
+mod cleanup;
 mod close;
 mod deliver_check;
 mod evalscore;

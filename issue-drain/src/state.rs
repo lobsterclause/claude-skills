@@ -442,7 +442,11 @@ pub fn run(ctx: &Ctx, command: &Command) -> Res<()> {
     // its own unit along. So none is open to a unit.
     ctx.require_driver("state")?;
     match command {
-        Command::Init(args) => init(ctx, args),
+        Command::Init(args) => {
+            let queued = init(ctx, args)?;
+            println!("queued {queued} units");
+            Ok(())
+        }
         Command::Event(args) => event(ctx, args),
         Command::Stop(args) => record(ctx, now_event(ctx, None, STOP, Some(args.reason.clone()))),
         Command::Resume => record(ctx, now_event(ctx, None, RESUME, None)),
@@ -533,7 +537,8 @@ fn called_off(parsed: &Value, path: &std::path::Path, dry_run: bool, run: &str) 
     Ok(())
 }
 
-fn init(ctx: &Ctx, args: &InitArgs) -> Res<()> {
+/// Queue the units; the number queued.
+fn init(ctx: &Ctx, args: &InitArgs) -> Res<usize> {
     let replay = replay(ctx)?;
     if replay.events > 0 {
         return Err(Fail::refused(format!(
@@ -597,8 +602,18 @@ fn init(ctx: &Ctx, args: &InitArgs) -> Res<()> {
     }
     append(ctx, &replay.text, &events)?;
     write_snapshot(ctx, &snapshot)?;
-    println!("queued {} units", events.len());
-    Ok(())
+    Ok(events.len())
+}
+
+/// Start the state log with `state init`'s own code when the run has none: no
+/// state event in `events.jsonl` and no `state.json`. A by-hand run that never
+/// ran `state init` gets one this way. `Ok(true)` when it started the log.
+pub fn init_if_missing(ctx: &Ctx) -> Res<bool> {
+    if replay(ctx)?.events > 0 || ctx.path("state.json").exists() {
+        return Ok(false);
+    }
+    init(ctx, &InitArgs { parsed: None })?;
+    Ok(true)
 }
 
 fn event(ctx: &Ctx, args: &EventArgs) -> Res<()> {
