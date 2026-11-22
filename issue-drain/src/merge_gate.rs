@@ -617,11 +617,21 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                 // pass replaced): a pending one is not a pass.
                 if let Some(id) = check.app_id {
                     let source = format!("app:{id}");
+                    // The rollup names no app, but it names the Actions run: an
+                    // entry of a run the pinned app made is that app's run, not
+                    // another source's, and the pin check above has it.
+                    let own_runs: BTreeSet<&str> = groups
+                        .iter()
+                        .flat_map(|group| group.iter())
+                        .map(|r| r.run.as_str())
+                        .filter(|run| !run.is_empty())
+                        .collect();
                     let mut others = latest_apps
                         .iter()
                         .filter(|((name, src), _)| *name == context.as_str() && *src != source)
                         .chain(latest.iter().filter(|((name, _), _)| *name == context.as_str()))
-                        .flat_map(|(_, group)| group.iter().copied());
+                        .flat_map(|(_, group)| group.iter().copied())
+                        .filter(|r| !own_runs.contains(r.run.as_str()));
                     if let Some(bad) = others
                         .find(|r| r.outcome != Outcome::Pass && !superseded(r, &siblings, &f.workflow_runs, &v.head))
                     {
@@ -2151,19 +2161,23 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     ctx.require_driver("merge-gate")?;
     let repo = ctx.repo()?;
     let (unit, pr) = (args.unit, args.pr);
-    // Say so before anything is merged, not after.
-    if let Some(note) = &args.note_file {
+    // A note that cannot be posted is refused before a merge is started, but
+    // not for a PR already merged: that is reported merged, with a warning.
+    let note_problem = args.note_file.as_ref().and_then(|note| {
         if note.as_os_str() == "-" {
-            return Err(Fail::usage("--note-file - is not a file; give a path"));
+            Some("--note-file - is not a file; give a path".to_string())
+        } else if !std::fs::metadata(note).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            Some(format!("--note-file is missing or empty: {}", note.display()))
+        } else {
+            None
         }
-        if !std::fs::metadata(note).is_ok_and(|m| m.is_file() && m.len() > 0) {
-            return Err(Fail::usage(format!(
-                "--note-file is missing or empty: {}",
-                note.display()
-            )));
+    });
+    let view = read_view(&repo, pr);
+    if let Some(problem) = &note_problem {
+        if view.as_ref().map_or(true, |v| v.state != PrState::Merged) {
+            return Err(Fail::usage(problem.clone()));
         }
     }
-    let view = read_view(&repo, pr);
     let unit_entry = ctx
         .queue_unit(unit)
         .map(|u| UnitEntry {
@@ -2200,8 +2214,17 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             report(ctx, unit, pr, &v.head, true, &[]);
             // A merge GitHub queued is merged by now, and its note was never
             // posted: post it once, unless a comment already carries the marker.
-            let note_url = post_note(ctx, unit, pr, &v.head, args.note_file.as_deref(), true);
-            let out = json!({"pr": pr, "unit": unit, "head": v.head, "merged": true, "already": true, "merge_commit": v.merge_commit, "refusals": [], "reviewers": [], "note_url": note_url});
+            let note_url = match &note_problem {
+                Some(problem) => {
+                    eprintln!("issue-drain: warning: PR #{pr} is merged, but the note was not posted: {problem}");
+                    Value::Null
+                }
+                None => post_note(ctx, unit, pr, &v.head, args.note_file.as_deref(), true),
+            };
+            let mut out = json!({"pr": pr, "unit": unit, "head": v.head, "merged": true, "already": true, "merge_commit": v.merge_commit, "refusals": [], "reviewers": [], "note_url": note_url});
+            if let (Some(problem), Some(map)) = (&note_problem, out.as_object_mut()) {
+                map.insert("note_warning".into(), json!(problem));
+            }
             println!("{out}");
             return Ok(());
         }
@@ -3157,6 +3180,23 @@ mod tests {
             from(99, Outcome::Fail, "failure"),
         ]);
         assert_eq!(codes(&f), ["check_failed"]);
+        // The pinned app's own failing run also shows in the rollup (same
+        // Actions run id): one refusal, not a second "from another source".
+        f.app_runs = Ok(vec![Run {
+            run: "100".into(),
+            ..from(15368, Outcome::Fail, "failure")
+        }]);
+        view(&mut f).runs = vec![
+            Run {
+                run: "100".into(),
+                ..run_of("build", Outcome::Fail, "failure", "2026-11-21T01:00:00Z")
+            },
+            pass("lint"),
+        ];
+        let found = judge(&f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].detail.contains("from app 15368"), "{}", found[0].detail);
+        view(&mut f).runs = vec![pass("build"), pass("lint")];
         // The pin is met, but another app's run of the same name is not done.
         // Every same-name run must pass, whatever its source.
         for (outcome, word) in [(Outcome::Pending, "pending"), (Outcome::Other, "cancelled")] {

@@ -1709,3 +1709,22 @@ fn a_dry_run_writes_no_file() {
         .collect();
     assert_eq!(names, ["merge-note.md"]);
 }
+
+#[test]
+fn a_retry_on_a_merged_pr_reports_it_merged_even_when_the_note_file_is_gone() {
+    let env = ready();
+    merged_pr(&env);
+    for bad in ["/no/such/note.md", "-"] {
+        let out = env.run(&["merge-gate", "--unit", "3", "--pr", "12", "--note-file", bad]);
+        assert_eq!(out.code, 0, "{bad}: {}", out.stderr);
+        let r = result(&out);
+        assert_eq!(
+            (r["merged"].as_bool(), r["already"].as_bool()),
+            (Some(true), Some(true))
+        );
+        assert_eq!(r["note_url"], Value::Null);
+        assert!(r["note_warning"].as_str().unwrap().contains(bad), "{r}");
+        assert!(out.stderr.contains("warning"), "{}", out.stderr);
+    }
+    assert!(comment_calls(&env).is_empty());
+}
