@@ -626,12 +626,18 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                         .map(|r| r.run.as_str())
                         .filter(|run| !run.is_empty())
                         .collect();
-                    let mut others = latest_apps
+                    // Only a rollup entry can be the pinned app's own run; every
+                    // REST entry of another app stays another source's.
+                    let rest = latest_apps
                         .iter()
                         .filter(|((name, src), _)| *name == context.as_str() && *src != source)
-                        .chain(latest.iter().filter(|((name, _), _)| *name == context.as_str()))
+                        .flat_map(|(_, group)| group.iter().copied());
+                    let rollup = latest
+                        .iter()
+                        .filter(|((name, _), _)| *name == context.as_str())
                         .flat_map(|(_, group)| group.iter().copied())
                         .filter(|r| !own_runs.contains(r.run.as_str()));
+                    let mut others = rest.chain(rollup);
                     if let Some(bad) = others
                         .find(|r| r.outcome != Outcome::Pass && !superseded(r, &siblings, &f.workflow_runs, &v.head))
                     {
@@ -3197,6 +3203,24 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].detail.contains("from app 15368"), "{}", found[0].detail);
         view(&mut f).runs = vec![pass("build"), pass("lint")];
+        // Another app's REST run of the same name is never the pinned app's,
+        // even when it carries the same Actions run id.
+        for (outcome, word, code) in [
+            (Outcome::Pending, "pending", "required_check"),
+            (Outcome::Fail, "failure", "check_failed"),
+        ] {
+            f.app_runs = Ok(vec![
+                Run {
+                    run: "100".into(),
+                    ..from(15368, Outcome::Pass, "success")
+                },
+                Run {
+                    run: "100".into(),
+                    ..from(99, outcome, word)
+                },
+            ]);
+            assert_eq!(codes(&f), [code], "{word}");
+        }
         // The pin is met, but another app's run of the same name is not done.
         // Every same-name run must pass, whatever its source.
         for (outcome, word) in [(Outcome::Pending, "pending"), (Outcome::Other, "cancelled")] {
