@@ -402,35 +402,34 @@ STUB
   fi
   H1="$(cd "$REPO" && git rev-parse HEAD)"
 
-  # Pass 2: the round above recorded this branch, so the fix check steps down
-  # one notch — still productive work, so not further than `high`.
+  # Pass 2: the round above recorded this branch, so this is a repeat pass, and
+  # the previous pass found a High issue: the ladder escalates to high
+  # (2026-11-22: effort follows the previous pass's findings, not the pass number).
   (cd "$REPO" && echo four >> f.txt && git commit -qam fix3) >/dev/null 2>&1
-  effort_run "$TMP/eff_state1" "$TMP/argv2" --base "$H1"
+  effort_run "$TMP/eff_state1" "$TMP/argv2" --base "$H1" --prev-severity High
   if grep -q 'model_reasoning_effort="high"' "$TMP/argv2" 2>/dev/null; then
-    ok "pass 2 steps codex down to high"
+    ok "pass 2 after a High finding escalates codex to high"
   else
     bad "pass 2 effort"; echo "      argv: $(tr '\n' ' ' < "$TMP/argv2" 2>/dev/null)"
   fi
 
-  # Pass 3: where the measured waste is — 57% of pass 3+ was codex confirming
-  # its own verdict. The ladder must actually REACH this step; a dial stuck at
-  # "repeat" would sit on `high` forever and never save anything here.
+  # Pass 3 after a clean pass: no escalation, codex inherits the config. A dial
+  # stuck on `high` once escalated would spend on every later pass.
   (cd "$REPO" && echo five >> f.txt && git commit -qam fix4) >/dev/null 2>&1
   H2="$(cd "$REPO" && git rev-parse HEAD~1)"
-  effort_run "$TMP/eff_state1" "$TMP/argv5" --base "$H2"
-  if grep -q 'model_reasoning_effort="medium"' "$TMP/argv5" 2>/dev/null; then
-    ok "pass 3 steps codex down to medium"
+  effort_run "$TMP/eff_state1" "$TMP/argv5" --base "$H2" --prev-severity none
+  if [[ -f "$TMP/argv5" ]] && ! grep -q model_reasoning_effort "$TMP/argv5"; then
+    ok "pass 3 after a clean pass inherits the config"
   else
     bad "pass 3 effort"; echo "      argv: $(tr '\n' ' ' < "$TMP/argv5" 2>/dev/null)"
   fi
 
-  # And it stops there: a long round must not walk down to low/minimal, which
-  # nothing measured supports.
+  # Pass 4 after a Critical: escalates again — the pass number never caps it.
   (cd "$REPO" && echo six >> f.txt && git commit -qam fix5) >/dev/null 2>&1
   H3="$(cd "$REPO" && git rev-parse HEAD~1)"
-  effort_run "$TMP/eff_state1" "$TMP/argv6" --base "$H3"
-  if grep -q 'model_reasoning_effort="medium"' "$TMP/argv6" 2>/dev/null; then
-    ok "pass 4 stays at medium — the ladder has a floor"
+  effort_run "$TMP/eff_state1" "$TMP/argv6" --base "$H3" --prev-severity Critical
+  if grep -q 'model_reasoning_effort="high"' "$TMP/argv6" 2>/dev/null; then
+    ok "pass 4 after a Critical escalates to high"
   else
     bad "pass 4 floor"; echo "      argv: $(tr '\n' ' ' < "$TMP/argv6" 2>/dev/null)"
   fi
@@ -461,11 +460,13 @@ STUB
   }
 
   # Two passes WITHOUT --subject-id: no identity, so no state, so pass 2 still
-  # reads as pass 1 and effort is never stepped down. The regression this
+  # reads as pass 1 and the ladder never engages. The regression this
   # whole change exists to end.
   det_run "$TMP/det_s1" "$TMP/dargv1"
   (cd "$DREPO" && echo three >> f.txt && git commit -qam fix2) >/dev/null 2>&1
-  det_run "$TMP/det_s1" "$TMP/dargv2"
+  # --prev-severity High: a real pass 2 would escalate, so no pin proves the
+  # guard still read this as pass 1.
+  det_run "$TMP/det_s1" "$TMP/dargv2" --prev-severity High
   if [[ -f "$TMP/dargv2" ]] && ! grep -q model_reasoning_effort "$TMP/dargv2"; then
     ok "detached without --subject-id: ladder never engages (the bug, pinned)"
   else
@@ -480,9 +481,9 @@ STUB
   det_run "$TMP/det_s2" "$TMP/dargv3" --subject-id pr-777
   DH1="$(cd "$DREPO" && git rev-parse HEAD)"
   (cd "$DREPO" && echo four >> f.txt && git commit -qam fix3) >/dev/null 2>&1
-  det_run "$TMP/det_s2" "$TMP/dargv4" --subject-id pr-777 --base "$DH1"
+  det_run "$TMP/det_s2" "$TMP/dargv4" --subject-id pr-777 --base "$DH1" --prev-severity High
   if grep -q 'model_reasoning_effort="high"' "$TMP/dargv4" 2>/dev/null; then
-    ok "detached with --subject-id: pass 2 steps codex down to high"
+    ok "detached with --subject-id: pass 2 after a High escalates to high"
   else
     bad "detached ladder engagement"; echo "      argv: $(tr '\n' ' ' < "$TMP/dargv4" 2>/dev/null)"
   fi
@@ -491,7 +492,7 @@ STUB
   # pass a flag, and a channel that silently does nothing is worse than none.
   DH2="$(cd "$DREPO" && git rev-parse HEAD)"
   (cd "$DREPO" && echo five >> f.txt && git commit -qam fix4) >/dev/null 2>&1
-  CROSS_REVIEW_SUBJECT_ID=pr-777 det_run "$TMP/det_s2" "$TMP/dargv5" --base "$DH2"
+  CROSS_REVIEW_SUBJECT_ID=pr-777 det_run "$TMP/det_s2" "$TMP/dargv5" --base "$DH2" --prev-severity High
   if grep -q model_reasoning_effort "$TMP/dargv5" 2>/dev/null; then
     ok "CROSS_REVIEW_SUBJECT_ID works as the flag does"
   else
@@ -599,6 +600,50 @@ STUB
 else
   echo "  skip run_reviewers.sh integration (script or git unavailable)"
 fi
+
+echo "── a late writer from an earlier round does not replace the newer record ──"
+# Ordered by dispatch time, not commit ancestry (works across rebase/rollback).
+LW_STATE="$TMP/late_state"
+lw() { bash "$GUARD" --state-dir "$LW_STATE" --project late --branch feat/l --base-sha b0 "$@"; }
+lw --record --head-sha h1 --run-dir /runs/p1 --dispatched-at 1000 >/dev/null 2>&1
+lw --record --head-sha h2 --run-dir /runs/p2 --dispatched-at 2000 >/dev/null 2>&1
+lw --record --head-sha h1 --run-dir /runs/p1 --dispatched-at 1000 >/dev/null 2>&1   # pass 1's trailing seat
+got="$(lw --prev-run-dir 2>/dev/null)"
+if [[ "$got" == "/runs/p2" ]]; then ok "earlier dispatch's late record keeps the newer run_dir"
+else bad "earlier dispatch's late record replaced run_dir (got: '$got')"; fi
+got="$(lw --pass-context --head-sha h3 2>/dev/null)"
+if [[ "$got" == "3" ]]; then ok "earlier dispatch's late record does not bump the pass count (next is 3, not 4)"
+else bad "pass count after late earlier record (got: '$got')"; fi
+# A rollback to an earlier head, dispatched later, is a real new round.
+lw --record --head-sha h1 --run-dir /runs/p3 --dispatched-at 3000 >/dev/null 2>&1
+got="$(lw --prev-run-dir 2>/dev/null)"
+if [[ "$got" == "/runs/p3" ]]; then ok "a later-dispatched round on an earlier head is recorded (rollback)"
+else bad "rollback round not recorded (got: '$got')"; fi
+# A caller that does not pass --dispatched-at is never blocked.
+lw --record --head-sha h4 --run-dir /runs/p4 >/dev/null 2>&1
+got="$(lw --prev-run-dir 2>/dev/null)"
+if [[ "$got" == "/runs/p4" ]]; then ok "a record without --dispatched-at is not blocked"
+else bad "record without --dispatched-at blocked (got: '$got')"; fi
+
+echo "── the record write waits for the record lock ──"
+# A writer that reaches --record while another holds the lock must re-read the
+# record AFTER the lock frees, so a newer record written meanwhile wins.
+LK_STATE="$TMP/lock_state"
+lk() { bash "$GUARD" --state-dir "$LK_STATE" --project lock --branch feat/k --base-sha b0 "$@"; }
+lk --record --head-sha h1 --run-dir /runs/k1 --dispatched-at 1000 >/dev/null 2>&1
+LK_REC="$(ls "$LK_STATE"/*.json | head -1)"
+mkdir "$LK_REC.lock.d" && echo 999999 >"$LK_REC.lock.d/owner"
+( lk --record --head-sha h1 --run-dir /runs/k1 --dispatched-at 1000 >/dev/null 2>&1 ) &
+lk_pid=$!
+sleep 1
+kill -0 "$lk_pid" 2>/dev/null && ok "the second writer is still waiting on the held lock" || bad "the second writer did not wait for the lock"
+lk_rec_tmp="$LK_REC.t"; sed 's/"run_dir":"[^"]*"/"run_dir":"\/runs\/k2"/; s/"dispatched_at":[0-9]*/"dispatched_at":2000/; s/"head_sha":"[^"]*"/"head_sha":"h2"/' "$LK_REC" >"$lk_rec_tmp" && mv "$lk_rec_tmp" "$LK_REC"
+rm -f "$LK_REC.lock.d/owner"; rmdir "$LK_REC.lock.d"
+wait "$lk_pid"
+got="$(lk --prev-run-dir 2>/dev/null)"
+if [[ "$got" == "/runs/k2" ]]; then ok "a writer blocked on the lock re-reads and keeps the newer record"
+else bad "blocked writer overwrote the newer record (got: '$got')"; fi
+[[ ! -d "$LK_REC.lock.d" ]] && ok "the record lock is released" || bad "record lock left behind"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

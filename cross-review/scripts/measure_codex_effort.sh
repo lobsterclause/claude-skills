@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# measure_codex_effort.sh — did stepping codex's reasoning effort down on
-# later passes actually buy anything, and did it cost anything?
+# measure_codex_effort.sh — did changing codex's reasoning effort by pass
+# actually buy anything, and did it cost anything? (2026-09-01 to 2026-11-21 the
+# ladder stepped effort down on later passes; since 2026-11-22 it escalates to
+# high after a pass that found a Critical/High. See REVIEW_DUE below.)
 #
 # WHY THIS EXISTS AS A SCRIPT
 #
@@ -36,8 +38,9 @@
 #   measure_codex_effort.sh [--since <YYYY-MM-DD>] [--runlog <path>] [--if-due]
 #
 #   --since   the cutover — rows on/after it are "after", earlier ones
-#             "before". Defaults to the date the ladder went LIVE, which is not
-#             the date it was written; see LADDER_LIVE below for why.
+#             "before". Defaults to ESCALATION_LIVE (2026-11-22), when the
+#             escalate-on-findings ladder replaced the step-down one. Use
+#             --since 2026-09-01 (LADDER_LIVE) to re-run the step-down review.
 #   --runlog  defaults to ~/.claude/skills/cross-review/runlog.jsonl
 #   --if-due  print nothing before the review date, the banner and the report
 #             on or after it. This is the hook: SKILL.md step 1.5 calls it on
@@ -65,6 +68,10 @@ set -uo pipefail
 # wrong days, which is the failure this whole mechanism exists to avoid.
 LADDER_WRITTEN="2026-08-29"
 LADDER_LIVE="2026-09-01"
+# The escalate-on-findings ladder replaced the step-down one on this date. It is
+# the default cutover now, so the 2026-12-22 review compares the two policies
+# instead of folding step-down runs into the "after" window. --since overrides.
+ESCALATION_LIVE="2026-11-22"
 
 # A week of real rounds after the LIVE date. Written out rather than computed
 # because `date -d` and `date -v` disagree across BSD and GNU, and a date this
@@ -86,9 +93,18 @@ LADDER_LIVE="2026-09-01"
 # codex zero-finding runs fell 78%→54%. CLEAN% rose on every project, but it is
 # the round's verdict, not codex's. Split by project before reading this table
 # again. If the next look agrees, delete the --if-due call in SKILL.md.
-REVIEW_DUE="${CROSS_REVIEW_EFFORT_REVIEW_DUE:-2026-11-18}"
+# Reviewed 2026-11-22 (359 codex runs since 09-01): REPLACED. The owner set the
+# config to medium on 2026-11-14, so the step-down ladder ran medium on every
+# pass and did nothing. Findings/run was 0.75 (pass 1), 0.61 (pass 2), 0.73
+# (pass 3+): late passes still find about as much as the first. The owner chose
+# "escalate on findings": pass 2+ runs at high when the previous pass found a
+# Critical/High that survived scoring, otherwise at the config level, and never
+# steps down (effort_source "escalated_on_findings" in codex.meta.json). Next
+# look: run with --since 2026-11-22 and compare escalated passes with inherited
+# ones -- does `high` find more on a pass that follows a Critical/High?
+REVIEW_DUE="${CROSS_REVIEW_EFFORT_REVIEW_DUE:-2026-12-22}"
 
-since="$LADDER_LIVE"
+since="$ESCALATION_LIVE"
 if_due=0
 runlog="${CROSS_REVIEW_RUNLOG:-$HOME/.claude/skills/cross-review/runlog.jsonl}"
 
@@ -122,10 +138,11 @@ fi
 if [[ "$if_due" == 1 ]]; then
   cat <<BANNER
 ─────────────────────────────────────────────────────────────────────────────
- REVIEW DUE: the codex reasoning-effort ladder was written $LADDER_WRITTEN on a
- projection and went live $LADDER_LIVE (it was inert before that -- see the
- header). It is now past $REVIEW_DUE. The numbers below are the check.
- Decide one of: keep it, move the pass-3+ floor, or revert — then update
+ REVIEW DUE: the codex effort ladder has escalated on findings since
+ $ESCALATION_LIVE. The default windows are $LADDER_LIVE..$ESCALATION_LIVE (the
+ step-down ladder) and $ESCALATION_LIVE..now; the table header shows the actual
+ windows. It is now past $REVIEW_DUE. The numbers below are the check.
+ Decide one of: keep it, change the escalation rule, or revert — then update
  REVIEW_DUE in this script (or delete the --if-due call in SKILL.md step 1.5)
  so this stops asking.
 ─────────────────────────────────────────────────────────────────────────────
@@ -141,10 +158,15 @@ fi
 #
 # ISO-8601 Z timestamps sort lexicographically, so a plain string compare is
 # the whole date filter. Rows without a codex entry are not evidence either way.
+# The "before" window starts at LADDER_LIVE whenever the cutover is later than
+# it: August's pre-ladder xhigh runs are neither policy and would skew the
+# baseline. (codex, cross-review of claude-skills PR #228, pass 2.)
+before_from=""
+[[ "$since" > "$LADDER_LIVE" ]] && before_from="$LADDER_LIVE"
 jq -cR 'select(test("^\\s*$") | not)
         | ((fromjson? // null) as $r
            | if ($r | type) == "object" then $r else {__unparseable: true} end)' "$runlog" |
-jq -rs --arg since "$since" '
+jq -rs --arg since "$since" --arg before_from "$before_from" '
   (map(select(.__unparseable == true)) | length) as $unparseable
   | map(select(.__unparseable != true))
   |
@@ -173,17 +195,20 @@ jq -rs --arg since "$since" '
         }
       end;
 
-  map(select(.reviewers.codex != null and .ts != null)
+  # A seat the round skipped is a runlog placeholder, not a codex run.
+  # (codex, cross-review of claude-skills PR #228, pass 3.)
+  map(select(.reviewers.codex != null and .ts != null
+             and (.reviewers.codex.status // "") != "skipped")
       | {ts, verdict, pass: (.pass // 1), c: .reviewers.codex}
       # A fallback row means the primary lane never ran, so its duration and
       # findings describe OpenRouter, not codex. Kept for the quota count,
       # excluded from the effort proxies below.
       | . + {fell_back: (.c.fallback.used == true)})                as $all
-  | ($all | map(select(.ts < $since)))                              as $before
+  | ($all | map(select(.ts < $since and .ts >= $before_from)))     as $before
   | ($all | map(select(.ts >= $since)))                             as $after
   | {
       since: $since,
-      before: {window: "runlog start .. \($since)", total: ($before | length)},
+      before: {window: "\(if $before_from == "" then "runlog start" else $before_from end) .. \($since)", total: ($before | length)},
       after:  {window: "\($since) .. now",          total: ($after  | length)},
       by_pass: ( ["1","2","3+"] | map(. as $b | {
           key: $b,
@@ -191,12 +216,20 @@ jq -rs --arg since "$since" '
             before: stats($before | map(select(bucket(.pass) == $b))),
             after:  stats($after  | map(select(bucket(.pass) == $b)))
           }
-        }) | from_entries )
+        }) | from_entries ),
+      # Repeat passes in the after window split by WHY they ran at their level,
+      # so escalated passes can be compared with inherited ones directly.
+      by_source: ( $after | map(select(.pass >= 2 and .fell_back != true))
+        | group_by(.c.effort_source // "unrecorded")
+        | map({source: (.[0].c.effort_source // "unrecorded"),
+               n: length,
+               findings_per_run: ((map(.c.findings_total // 0) | add) * 100 / length | floor / 100),
+               clean_pct: ((map(select(.verdict == "CLEAN")) | length) * 100 / length | floor)}) )
     }
   |
   "codex reasoning-effort ladder — before/after \(.since)",
   "",
-  "  before: \(.before.total) codex runs      after: \(.after.total) codex runs",
+  "  before: \(.before.total) codex runs (\(.before.window))      after: \(.after.total) codex runs (\(.after.window))",
   (if $unparseable > 0
    then "  skipped \($unparseable) unparseable runlog row(s) — torn or partial appends,\n  not counted in either window."
    else empty end),
@@ -216,7 +249,12 @@ jq -rs --arg since "$since" '
   "",
   "  effort actually run, after window (codex.meta.json `effort`; \"unrecorded\" = row predates the field):",
   (.by_pass | to_entries[] | "    pass \(.key): \(.value.after.efforts // "—")"),
-  "  Pass 2 or 3+ listed ABOVE pass 1 means the ladder is escalating, not saving.",
+  "  Since 2026-11-22 pass 2+ runs at high only after a Critical/High pass",
+  "  (escalated_on_findings); any other pass above the config level is a bug.",
+  "",
+  "  after window, pass 2+, by effort_source (override = a pinned level):",
+  (if (.by_source | length) == 0 then "    —"
+   else (.by_source[] | "    \(.source): n=\(.n)  findings/run=\(.findings_per_run)  CLEAN=\(.clean_pct)%") end),
   "",
   "  acct_limit   % of codex runs that hit the quota wall and fell through to",
   "               metered OpenRouter. This is the number the ladder targets.",

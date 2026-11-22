@@ -25,7 +25,7 @@ A malformed flag value is a hard error (exit 2), never a silent default — a ty
 
 **The fleet (baselines + rotation):** `codex` (OpenAI), `glm-coding` (GLM 5.3 on the Z.ai Coding Plan) and `kimi` (Kimi K3.1 Pro on the Kimi Code subscription) are **fixed baselines — on every round**, the last two each with an off switch (`CROSS_REVIEW_GLM_BASELINE=0`, `CROSS_REVIEW_KIMI_BASELINE=0`). With `CROSS_REVIEW_OPENROUTER=0` (the default) the rotation draw is the single `agy` Gemini seat, `gemini-pro`; the OpenRouter seats described below light up again when the flag is on. The rest of the roster rotates per round via `select_roster.sh`: a weighted random draw over `gemini-pro` (agy / Gemini 4 Argon or Hydrogen, model and level picked per round by a router) and the OpenRouter pool — `glm` (GLM 5.3, Zhipu), `deepseek` (DeepSeek V4 Pro), `mimo` (Xiaomi MiMo v2.5), `minimax` (MiniMax M3), `qwen` (Qwen3 Coder Next, Alibaba), `devstral` (Devstral 2, Mistral), `laguna` (Poolside Laguna M.1), `kat` (KAT-Coder-Pro V2.5, Kuaishou), `north` (Cohere North Mini Code, free tier), `nemotron` (NVIDIA Nemotron 3.5 Lightning, free tier), `spark` (Meta Muse Spark 1.2), `seed` (ByteDance Seed 2.0 Code, added 2026-08-14), `grok` (xAI Grok 4.6, added 2026-08-14), `longcat` (Meituan LongCat 2.0, added 2026-08-22), `inkling` (Thinking Machines Inkling, added 2026-08-22) — plus two seats on the **direct Moonshot platform API** (NOT an OpenRouter fallback, same billing rail as the kimi baseline): `kimi27` (Kimi k2.7-code, added 2026-07-03) and `kimi3` (Kimi K3, Moonshot's 2.8T-parameter flagship released 2026-07-16, added as a rotation seat 2026-07-18). Both carried a `draw_boost` while they were new; both are back to 1.0 (kimi27 on 2026-07-12, kimi3 on 2026-08-22). Same provider as the kimi baseline — kimi+kimi27+kimi3 agreement is ONE provider vote. Draw weights come from the `leaderboard.sh` score, with an exploration bonus for under-sampled reviewers and an optional per-reviewer `draw_boost` multiplier from `reviewer_profiles.json`. **Every round has at least 3 reviewers.** See "Leaderboard & rotation" below.
 
-**On the Gemini seat:** there is ONE Gemini reviewer, `gemini-pro`, running through Google's `agy` (Antigravity) CLI, which replaced the standalone `gemini` CLI that stopped serving consumer requests on **2026-06-18**. `antigravity` (the Gemini 3.8 Flash lap) was **retired 2026-11-14** — owner: one Gemini seat is enough — so there is no longer a Flash↔Pro "one provider vote" case inside the fleet; gemini-pro is simply one Google vote. `--reviewers antigravity` is refused with a pointer here; its leaderboard/runlog history stays readable. **The seat is a router, not a pinned model:** `references/reviewer_profiles.json` (`gemini-pro.routes` + `.router`) maps pass number and diff size to a `<model>:<level>` route — pass 1 on a diff of 80+ lines → `argon:high` (Gemini 4 Argon (High), Google's flagship reasoning model; tops out at High), pass 1 on a smaller diff → `hydrogen:xhigh`, pass 2 → `hydrogen:high`, pass 3+ → `hydrogen:medium` (the floor — a confirmation pass is never routed to Low, same reasoning as codex's ladder). The pass number is the same one codex's ladder reads. **The table is a starting guess, not a result**: `scripts/measure_gemini_route.sh --if-due` (step 1.5) raises a banner on `router.review_due` and prints per-route timeouts, latency, findings/run and CLEAN%. Pin a route with `--gemini-pro-route <model>:<level>` or `CROSS_REVIEW_GEMINI_PRO_ROUTE` (unknown values are refused and the seat stays on the profile's default model). The level rides in the `--model` display name; **never combine `--model` with agy's `--effort`** — agy rejects the pair. The route, the rule that fired, the pass and the diff size are recorded in `gemini-pro.meta.json` and the runlog. The seat shares one Google "Individual quota" (resets on a ~2-day cadence) — when it's exhausted, agy exits 0 with empty stdout in seconds and only the `.agy.log` says why; the wrapper detects this (`failure_kind: "quota_exhausted"` + an `agy.quota_exhausted` sentinel), which spares retries and the fact-check pass.
+**On the Gemini seat:** there is ONE Gemini reviewer, `gemini-pro`, running through Google's `agy` (Antigravity) CLI, which replaced the standalone `gemini` CLI that stopped serving consumer requests on **2026-06-18**. `antigravity` (the Gemini 3.8 Flash lap) was **retired 2026-11-14** — owner: one Gemini seat is enough — so there is no longer a Flash↔Pro "one provider vote" case inside the fleet; gemini-pro is simply one Google vote. `--reviewers antigravity` is refused with a pointer here; its leaderboard/runlog history stays readable. **The seat is a router, not a pinned model:** `references/reviewer_profiles.json` (`gemini-pro.routes` + `.router`) maps pass number and diff size to a `<model>:<level>` route — pass 1 on a diff of 80+ lines → `argon:high` (Gemini 4 Argon (High), Google's flagship reasoning model; tops out at High), pass 1 on a smaller diff → `hydrogen:xhigh`, pass 2 → `hydrogen:high`, pass 3+ → `hydrogen:medium` (the floor — a confirmation pass is never routed to Low). The pass number is the same one codex's ladder reads. **The table is a starting guess, not a result**: `scripts/measure_gemini_route.sh --if-due` (step 1.5) raises a banner on `router.review_due` and prints per-route timeouts, latency, findings/run and CLEAN%. Pin a route with `--gemini-pro-route <model>:<level>` or `CROSS_REVIEW_GEMINI_PRO_ROUTE` (unknown values are refused and the seat stays on the profile's default model). The level rides in the `--model` display name; **never combine `--model` with agy's `--effort`** — agy rejects the pair. The route, the rule that fired, the pass and the diff size are recorded in `gemini-pro.meta.json` and the runlog. The seat shares one Google "Individual quota" (resets on a ~2-day cadence) — when it's exhausted, agy exits 0 with empty stdout in seconds and only the `.agy.log` says why; the wrapper detects this (`failure_kind: "quota_exhausted"` + an `agy.quota_exhausted` sentinel), which spares retries and the fact-check pass.
 
 **First-party OpenRouter fallback (policy REVISED 2026-08-22, per Gabriel — supersedes the 2026-07-01 no-fallback rule):** a first-party lane that fails on an **account-level wall** may be re-run over OpenRouter against the **same model**, and it warns every time.
 
@@ -134,7 +134,7 @@ bash ~/.claude/skills/cross-review/scripts/measure_gemini_route.sh --if-due
 
 If a warning prints (e.g. *"WARN: gemini-pro timed out 35% of last 10 runs — consider --timeout-gemini-pro 1100"*), surface it to the user and ask whether to apply the suggested override for this run. Do not auto-apply — surface-and-confirm only. If no warning, proceed silently.
 
-`measure_gemini_route.sh --if-due` is the same mechanism for the gemini-pro router (silent until `router.review_due`, then a banner and a per-route table). `measure_codex_effort.sh --if-due` prints nothing until the codex effort ladder's review date, then prints a banner and a before/after table of what stepping effort down on later passes actually did — see the ladder table under step 6. It is there because the ladder shipped on a projection, and "check back in a week" is only a mechanism if something does the checking. When it fires, read it, decide (keep / move the pass-3+ floor / revert), and move `REVIEW_DUE` in the script so it stops asking. Its `findings/run` and `CLEAN%` columns are proxies for review quality, not review quality — the script says so itself, and on pass 3+ a drop is genuinely ambiguous.
+`measure_gemini_route.sh --if-due` is the same mechanism for the gemini-pro router (silent until `router.review_due`, then a banner and a per-route table). `measure_codex_effort.sh --if-due` prints nothing until the codex effort ladder's review date, then prints a banner and a before/after table of what the effort ladder actually did — see the ladder table under step 6 (since 2026-11-22 it escalates to `high` after a pass that found a Critical/High; next review 2026-12-22, run it with `--since 2026-11-22`). It is there because "check back in a month" is only a mechanism if something does the checking. When it fires, read it, decide (keep / change the escalation rule / revert), and move `REVIEW_DUE` in the script so it stops asking. Its `findings/run` and `CLEAN%` columns are proxies for review quality, not review quality — the script says so itself.
 
 - **Ledger hygiene:** `bash ~/.claude/skills/cross-review/scripts/validate_ledgers.sh --json | jq .errors` — a non-zero count is worth surfacing to the user, but never blocks the run.
 
@@ -602,29 +602,51 @@ Use `select_roster.sh --fast` for re-pass rotation picks. A full re-review is ap
 > work, and every one of August's 1,426 review runs inherited it — including
 > pass-3 confirmations on 39-line diffs returning a 15-byte "no findings"
 > verdict. The record now carries a pass counter, and effort follows what the
-> pass is actually doing:
+> pass is actually doing.
 >
-> | pass | effort | why |
-> | ---- | ------ | --- |
-> | 1 | the config level (inherited) | the full diff, first look |
-> | 2 | `min(high, config)` | a narrow fix check — still productive, 51% `FIXES_APPLIED` |
-> | 3+ | `min(medium, config)` | mostly confirming an earlier verdict — 57% `CLEAN` (115/202) |
+> **Escalate on findings (owner decision, 2026-11-22).** The ladder used to step
+> effort *down* on later passes (pass 2 `min(high, config)`, pass 3+
+> `min(medium, config)`). Once the owner set the config to `medium` on
+> 2026-11-14 that ran medium on every pass and did nothing, and the data did not
+> support stepping down anyway: across 359 codex runs since 2026-09-01,
+> findings per run were 0.75 on pass 1, 0.61 on pass 2 and 0.73 on pass 3+. The
+> ladder now points the other way:
 >
-> It stops at `medium`: nothing measured says a confirmation pass at `low` still
-> catches regressions, and a re-pass that quietly stops looking is worse than an
-> expensive one. The ladder is **relative to the config and never escalates above
-> it** (order `minimal < low < medium < high < xhigh`): at `xhigh` it runs
-> xhigh/high/medium, at `medium` medium/medium/medium, at `low` low/low/low. It was
-> written against `xhigh` with a hardcoded pass-2 `high`, so when the owner set the
-> config to `medium` on 2026-11-14 the fix-check pass ran *above* the first review
-> (found from one run's banners: medium/high/medium/medium). If the config cannot
-> be read the original fixed rungs apply. The effort a run actually used, and its
-> pass, are recorded in `codex.meta.json` (`effort`, `effort_source`,
-> `pass_context`) and the runlog; `measure_codex_effort.sh` prints the distribution
-> per pass. The counter restarts when the record goes stale, so a branch
-> revisited days later pays full effort again. Pin the level with
+> | pass | previous pass's worst kept finding | effort | `effort_source` |
+> | ---- | ---------------------------------- | ------ | --------------- |
+> | 1 | — | the config level | `config` |
+> | 2+ | Critical or High | `high` (or the config, if already ≥ high) | `escalated_on_findings` |
+> | 2+ | Medium, Low, none, or unknown | the config level | `config` |
+>
+> It **never steps down**, and it never escalates past `high` on its own. The
+> previous pass's severity comes from `--prev-severity <level>` /
+> `CROSS_REVIEW_PREV_SEVERITY` when the caller knows it (pass it — you just
+> synthesized the findings), otherwise from `scripts/prior_severity.sh` on the
+> run dir the repeat-pass guard recorded for the previous pass. That script
+> reads `findings.verified.json` and `findings.scored.json` (when both exist, a
+> finding must survive both), then
+> `findings.json`, then `findings.md` (struck-through bullets skipped), skipping
+> anything scored or fact-checked as `drop`. A JSON file with no `findings`
+> array is not evidence of a clean pass. Records are ordered by dispatch time:
+> a trailing seat from an earlier dispatch cannot overwrite a later pass's
+> record, and the read-compare-write runs under a per-record lock. When both
+> verified and scored files exist, findings are matched on their findings.json
+> id so each file's vetoes apply. An invalid or empty `--prev-severity` exits 2;
+> an unknown
+> `--codex-effort` is warned about and ignored. `findings.premerged.json`
+> (curl lanes only) counts only as positive evidence. No evidence reads as
+> `unknown`, which does not escalate — a missing file can cost a deeper look,
+> never extra spend. The global config is the owner's (`medium`, set
+> deliberately); never raise it to make a pass deeper. If the config cannot be
+> read, an escalated pass runs at `high` and any other pass sends no effort flag,
+> so codex uses its own default. The effort a run used, its pass, and the severity
+> it acted on are recorded in `codex.meta.json` (`effort`, `effort_source`,
+> `pass_context`, `prior_severity`, `prior_severity_source`) and the runlog;
+> `measure_codex_effort.sh` prints the distribution per pass. The counter
+> restarts when the record goes stale, so a branch revisited days later starts
+> at pass 1 again. Pin the level with
 > `--codex-effort <minimal|low|medium|high|xhigh>` or `CROSS_REVIEW_CODEX_EFFORT`
-> — worth doing when a late pass is really a structural re-review.
+> — an explicit pin always wins over escalation.
 
 Keep iterating until any of:
 

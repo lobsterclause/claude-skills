@@ -73,6 +73,7 @@ project=""; branch=""; base_sha=""; head_sha=""; target_ref=""
 paths_hash=""
 state_dir=""; window_hours="${CROSS_REVIEW_REPEAT_WINDOW_HOURS:-24}"
 record=0; allow="${CROSS_REVIEW_ALLOW_FULL_REREVIEW:-0}"; pass_context=0
+run_dir=""; prev_run_dir=0; dispatched_at=""
 
 need_val() { [[ "$2" -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
@@ -87,6 +88,9 @@ while [[ $# -gt 0 ]]; do
     --window-hours)        need_val "$1" "$#"; window_hours="$2"; shift 2 ;;
     --record)              record=1; shift ;;
     --pass-context)        pass_context=1; shift ;;
+    --run-dir)             need_val "$1" "$#"; run_dir="$2";      shift 2 ;;
+    --dispatched-at)       need_val "$1" "$#"; dispatched_at="$2"; shift 2 ;;
+    --prev-run-dir)        prev_run_dir=1; shift ;;
     --allow-full-rereview) allow=1;  shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -102,7 +106,7 @@ done
 # caller that forgot it has a bug worth reporting. --pass-context is exempt: it
 # is a query about the BRANCH, not about any particular round, so it needs no
 # shas to answer.
-if [[ "$pass_context" != 1 && -z "$base_sha" ]]; then
+if [[ "$pass_context" != 1 && "$prev_run_dir" != 1 && -z "$base_sha" ]]; then
   echo "usage: $0 --project <p> --branch <b> --base-sha <sha> --head-sha <sha> [--record]" >&2
   exit 2
 fi
@@ -129,6 +133,7 @@ if [[ -z "$project" || -z "$branch" || -z "$head_sha" ]]; then
   # exited 2 before reading any record, the caller swallowed it as `|| echo 1`,
   # and every pass got default effort from the first round onward.
   if [[ "$pass_context" == 1 ]]; then echo 1; exit 0; fi
+  [[ "$prev_run_dir" == 1 ]] && exit 0
   echo "check_repeat_pass: no branch identity (detached HEAD?) — guard skipped" >&2
   exit 0
 fi
@@ -190,8 +195,29 @@ if [[ "$pass_context" == 1 ]]; then
   exit 0
 fi
 
+# --prev-run-dir: where the previous pass wrote its output, so the codex effort
+# ladder can read what that pass found (scripts/prior_severity.sh). Prints the
+# path from a FRESH record only — a stale record is not a previous pass — and
+# nothing otherwise. Records written before this field existed print nothing.
+if [[ "$prev_run_dir" == 1 ]]; then
+  [[ -f "$rec" ]] || exit 0
+  _e="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+  record_is_fresh "$_e" || exit 0
+  sed -n 's/.*"run_dir":"\([^"]*\)".*/\1/p' "$rec" 2>/dev/null
+  exit 0
+fi
+
 if [[ "$record" == 1 ]]; then
   mkdir -p "$state_dir" || exit 0   # advisory state: never fail the round
+  # Serialize read-compare-write: the late-writer check below reads the record
+  # and the rename replaces it, and without a lock a trailing seat can pass
+  # the check just before the next pass writes, then rename its older record
+  # over the newer one. Same mkdir lock the ledgers use (no flock on macOS).
+  # Past the wait cap it writes anyway: the record is advisory, and stalling a
+  # round is worse. (codex, cross-review of claude-skills PR #228, pass 3.)
+  if . "$(dirname "$0")/lib_append_lock.sh" 2>/dev/null; then
+    if append_lock_acquire "$rec"; then trap 'append_lock_release "$rec"' EXIT; fi
+  fi
   # The counter is what separates pass 2 (a fix check, still productive: 51%
   # FIXES_APPLIED in August) from pass 5 (mostly codex confirming its own
   # earlier verdict: pass 3+ was 57% CLEAN, 115/202). A stale record starts a
@@ -224,14 +250,38 @@ if [[ "$record" == 1 ]]; then
       fi
     fi
   fi
+  # A LATE WRITER FROM AN EARLIER ROUND. A trailing seat dispatched for pass N
+  # can finish after pass N+1 has recorded. Writing then would bump the count
+  # and point --prev-run-dir back at pass N's findings. Records are ordered by
+  # DISPATCH time (run_reviewers.sh passes --dispatched-at), not by commit
+  # ancestry, which breaks on a rebase and on a deliberate rollback. A record
+  # without the field (older, or a caller that does not pass it) never blocks.
+  # The whole read-compare-write runs under the record lock taken above.
+  # (codex, cross-review of claude-skills PR #228, passes 1 and 2.)
+  case "$dispatched_at" in ''|*[!0-9]*) dispatched_at="" ;; esac
+  if [[ -n "$dispatched_at" && -f "$rec" ]]; then
+    _pe2="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+    _pd2="$(sed -n 's/.*"dispatched_at":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+    if record_is_fresh "$_pe2" && [[ -n "$_pd2" ]] && (( dispatched_at < _pd2 )); then
+      exit 0
+    fi
+  fi
   # Write via temp-and-rename so a reader never sees a half-written record, and
   # so two lanes finishing together produce one whole record rather than an
-  # interleaved one. This does not order the writers -- last rename still wins
-  # -- but with the same-pair case above collapsed, the surviving race is two
-  # DIFFERENT rounds, which the epoch check below already treats as stale.
+  # interleaved one. Ordering between writers comes from the lock and the
+  # dispatch-time check above.
   _tmp="$rec.$$.tmp"
-  if printf '{"project":%s,"branch":%s,"base_sha":%s,"head_sha":%s,"epoch":%s,"passes":%s}\n' \
-    "\"$project\"" "\"$branch\"" "\"$base_sha\"" "\"$head_sha\"" "$now_epoch" "$_rec_passes" \
+  # run_dir is kept only when it needs no JSON escaping; the record is read with
+  # sed, and a path with a quote or backslash is simply not recorded (the next
+  # pass then sees "unknown" and does not escalate).
+  _rd_field=""
+  case "$run_dir" in
+    ''|*'"'*|*'\'*) ;;
+    *) _rd_field=",\"run_dir\":\"$run_dir\"" ;;
+  esac
+  [[ -n "$dispatched_at" ]] && _rd_field="$_rd_field,\"dispatched_at\":$dispatched_at"
+  if printf '{"project":%s,"branch":%s,"base_sha":%s,"head_sha":%s,"epoch":%s,"passes":%s%s}\n' \
+    "\"$project\"" "\"$branch\"" "\"$base_sha\"" "\"$head_sha\"" "$now_epoch" "$_rec_passes" "$_rd_field" \
     > "$_tmp" 2>/dev/null; then
     mv -f "$_tmp" "$rec" 2>/dev/null || rm -f "$_tmp" 2>/dev/null
   else

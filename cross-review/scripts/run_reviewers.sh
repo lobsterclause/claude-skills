@@ -275,6 +275,10 @@ timeout_codex=""
 # Reasoning effort for the codex lane. Empty = derive it (see the resolution
 # block below the repeat-pass guard); an explicit value pins it.
 codex_effort="${CROSS_REVIEW_CODEX_EFFORT:-}"
+# Worst severity the previous pass found (critical|high|medium|low|none). Empty
+# = read it from the previous pass's run dir. Drives the codex effort ladder.
+prev_severity="${CROSS_REVIEW_PREV_SEVERITY:-}"
+codex_prev_severity=""; codex_prev_severity_source=""; prev_severity_flag=0
 # Route for the gemini-pro seat, "<model>:<level>" (e.g. argon:high). Empty =
 # derive it from pass number + diff size via the profile's `router` table.
 gemini_pro_route="${CROSS_REVIEW_GEMINI_PRO_ROUTE:-}"
@@ -348,6 +352,7 @@ while [[ $# -gt 0 ]]; do
     --timeout-codex)      need_val --timeout-codex      "$#"; timeout_codex="$2";      shift 2 ;;
     --gemini-pro-route)   need_val --gemini-pro-route   "$#"; gemini_pro_route="$2";   shift 2 ;;
     --codex-effort)       need_val --codex-effort       "$#"; codex_effort="$2";       shift 2 ;;
+    --prev-severity)      need_val --prev-severity      "$#"; prev_severity="$2"; prev_severity_flag=1; shift 2 ;;
     --subject-id)        need_val --subject-id        "$#"; subject_id="$2";        shift 2 ;;
         --timeout-gemini-pro) need_val --timeout-gemini-pro "$#"; timeout_gemini_pro="$2"; shift 2 ;;
     --timeout-kimi)       need_val --timeout-kimi       "$#"; timeout_kimi="$2";       shift 2 ;;
@@ -368,8 +373,37 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Validate the effort inputs BEFORE the ladder reads them. A malformed
+# --prev-severity is a hard error: read as "unknown" it would silently switch
+# escalation off, the failure a flag like this exists to prevent. An unknown
+# --codex-effort keeps its old warn-and-ignore behaviour, but now before the
+# ladder, so a typo no longer counts as an override that suppresses escalation.
+# (kimi, cross-review of claude-skills PR #228, pass 2.)
+# An explicitly empty flag (`--prev-severity "$unset_var"`) is a caller bug,
+# not "look it up": refuse it like any other bad value.
+if [[ "$prev_severity_flag" == 1 && -z "$prev_severity" ]]; then
+  echo "run_reviewers: --prev-severity was given an empty value" >&2
+  exit 2
+fi
+if [[ -n "$prev_severity" ]]; then
+  prev_severity="$(printf '%s' "$prev_severity" | tr '[:upper:]' '[:lower:]')"
+  case "$prev_severity" in
+    critical|high|medium|low|none) ;;
+    *) echo "run_reviewers: --prev-severity / CROSS_REVIEW_PREV_SEVERITY '$prev_severity' is not one of critical|high|medium|low|none" >&2
+       exit 2 ;;
+  esac
+fi
+case "$codex_effort" in
+  ''|minimal|low|medium|high|xhigh) ;;
+  *) echo "run_reviewers: ignoring unknown --codex-effort '$codex_effort' (want minimal|low|medium|high|xhigh)" >&2
+     codex_effort="" ;;
+esac
+# When this round was dispatched. The guard keeps the record of the LATEST
+# dispatch, so a trailing seat from an earlier round cannot overwrite it.
+_dispatched_at="$(date +%s)"
+
 if [[ -z "$base" || -z "$out" ]]; then
-  echo "usage: $0 --base <ref> --out <dir> [--target-ref refs/remotes/<remote>/<branch>] [--reviewers codex,glm-coding,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff] [--paths <a,b>] [--path <p>]...  [--no-paths] [--allow-empty-paths] [--allow-non-ancestor-base] [--codex-force-base]" >&2
+  echo "usage: $0 --base <ref> --out <dir> [--target-ref refs/remotes/<remote>/<branch>] [--reviewers codex,glm-coding,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff] [--paths <a,b>] [--path <p>]...  [--no-paths] [--allow-empty-paths] [--allow-non-ancestor-base] [--codex-force-base] [--codex-effort <level>] [--prev-severity critical|high|medium|low|none]" >&2
   exit 2
 fi
 case "$context_mode" in
@@ -840,34 +874,31 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # account_limit. The cost of a repeat pass is what took codex out of the
   # fleet for five days on 2026-08-22.
   #
-  # The ladder follows what each pass is actually doing, measured over August,
-  # and is RELATIVE to pass 1's level — it only ever steps DOWN from it:
+  # The ladder ESCALATES ON FINDINGS (owner decision 2026-11-22). It used to
+  # step DOWN by pass number (pass 2 min(high, config), pass 3+ min(medium,
+  # config)) on the projection that later passes only confirm earlier verdicts.
+  # The measurement says otherwise: with every pass at medium, pass 3+ found
+  # 0.73 findings/run against pass 1's 0.75 (359 codex runs since 2026-09-01).
+  # Later passes are still finding real problems, so effort now follows what
+  # the PREVIOUS pass found, not the pass number:
   #
-  #   pass 1   the config level  the full diff, first look (inherited)
-  #   pass 2   min(high, config)    a narrow fix check — still productive,
-  #                                 51% FIXES_APPLIED
-  #   pass 3+  min(medium, config)  mostly codex confirming its own earlier
-  #                                 verdict — 57% CLEAN (115/202)
+  #   pass 1                                   the config level (inherited)
+  #   pass 2+, previous pass found Crit/High   max(high, config)
+  #   pass 2+, anything else                   the config level (inherited)
   #
-  # (order: minimal < low < medium < high < xhigh). With the config at xhigh
-  # that is xhigh/high/medium; at medium, medium/medium/medium; at low,
-  # low/low/low.
+  # (order: minimal < low < medium < high < xhigh). At a medium config that is
+  # medium, then high only after a Critical/High pass. "Anything else" includes
+  # "unknown" — no findings file from the previous pass — which keeps the
+  # owner's level: missing evidence never spends more.
   #
-  # INCIDENT 2026-11-14: the ladder was written against a config of "xhigh" and
-  # hardcoded "high" for pass 2. The owner then deliberately set the config to
-  # "medium", which silently INVERTED the ladder — the narrow fix-check pass
-  # ran at high, above the first full review. Found from the codex banners of
-  # one run (medium/high/medium/medium). Hence the min(): the ladder may never
-  # spend more than the owner's configured level. When the config cannot be
-  # read (no file, no top-level key, unrecognised value) the level is unknown,
-  # nothing can be clamped, and the original fixed rungs (high / medium) apply.
+  # The previous pass's worst severity comes from, in order:
+  #   --prev-severity / CROSS_REVIEW_PREV_SEVERITY   the caller knows it
+  #   scripts/prior_severity.sh on the run dir the guard recorded for that pass
   #
-  # It stops at medium. Nothing measured says a confirmation pass at `low`
-  # still catches regressions, and a re-pass that silently stops looking is
-  # worse than an expensive one — but a config BELOW medium is the owner's own
-  # choice, and the min() honours it. --codex-effort / CROSS_REVIEW_CODEX_EFFORT
-  # pin the level absolutely (no clamping) when the caller knows better — a
-  # late pass that is really a structural re-review wants xhigh back.
+  # INCIDENT 2026-11-14 still binds: nothing here lowers effort BELOW the
+  # owner's config, and only a Critical/High finding raises it. When the config
+  # cannot be read, an escalation passes high and anything else inherits.
+  # --codex-effort / CROSS_REVIEW_CODEX_EFFORT pin the level absolutely.
   # The pass number is computed ONCE and shared with the gemini-pro router
   # below, so both seats agree on which pass this is.
   # Always computed, even when both seats are pinned by an override: the pass
@@ -876,19 +907,26 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   _pc="$(bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --pass-context 2>/dev/null || echo 1)"
   case "$_pc" in ''|*[!0-9]*) _pc=1 ;; esac
   codex_effort_source="config"
+  if (( _pc >= 2 )); then
+    if [[ -n "$prev_severity" ]]; then
+      codex_prev_severity="$(printf '%s' "$prev_severity" | tr '[:upper:]' '[:lower:]')"
+      codex_prev_severity_source="caller"
+    else
+      _prev_dir="$(bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --prev-run-dir 2>/dev/null || true)"
+      codex_prev_severity="$(bash "$(dirname "$_guard")/prior_severity.sh" "$_prev_dir" 2>/dev/null || echo unknown)"
+      codex_prev_severity_source="${_prev_dir:+run_dir}"
+      codex_prev_severity_source="${codex_prev_severity_source:-none}"
+    fi
+    case "$codex_prev_severity" in critical|high|medium|low|none|unknown) ;; *) codex_prev_severity="unknown" ;; esac
+  fi
   if [[ -n "$codex_effort" ]]; then
     codex_effort_source="override"
-  else
-    _cx_target=""
-    if   (( _pc >= 3 )); then _cx_target="medium"
-    elif (( _pc == 2 )); then _cx_target="high"
-    fi
-    if [[ -n "$_cx_target" ]]; then
-      codex_effort="$_cx_target"; codex_effort_source="ladder"
-      _cx_cfg="$(codex_config_effort)"
-      if [[ -n "$_cx_cfg" ]] && (( $(effort_rank "$_cx_cfg") < $(effort_rank "$_cx_target") )); then
-        codex_effort="$_cx_cfg"; codex_effort_source="ladder_clamped_to_config"
-      fi
+  elif (( _pc >= 2 )) && [[ "$codex_prev_severity" == critical || "$codex_prev_severity" == high ]]; then
+    _cx_cfg="$(codex_config_effort)"
+    if [[ -n "$_cx_cfg" ]] && (( $(effort_rank "$_cx_cfg") >= $(effort_rank high) )); then
+      : # the config is already at or above high: inherit it
+    else
+      codex_effort="high"; codex_effort_source="escalated_on_findings"
     fi
   fi
 
@@ -900,15 +938,8 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # NOBODY had reviewed, silently dropping that coverage.
 fi
 
-# Fail closed toward the config default. An unknown level is a typo, and what
-# codex does with one is not something to find out mid-round: at best it is
-# ignored (the dial silently does nothing), at worst it aborts every codex run
-# and reads like a reviewer outage. Empty means "inherit the config".
-case "$codex_effort" in
-  ''|minimal|low|medium|high|xhigh) ;;
-  *) echo "run_reviewers: ignoring unknown --codex-effort '$codex_effort' (want minimal|low|medium|high|xhigh)" >&2
-     codex_effort="" ;;
-esac
+# An unknown --codex-effort was already dropped (with a warning) right after
+# argument parsing, before the ladder could treat it as an override.
 # What the codex lane will actually run at, for the meta/runlog (measure_codex_effort.sh
 # reads `effort`): the pinned/ladder level, else whatever the config gives pass 1.
 if [[ -z "$codex_effort" ]]; then codex_effort_source="config"
@@ -2025,9 +2056,11 @@ run_codex() {
     fk_json='"no_verdict_output"'
     rc=5
   fi
-  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "agent", "context_mode": "tools", "effort": %s, "effort_source": "%s", "pass_context": %s}\n' \
+  printf '{"exit_code": %d, "duration_s": %d, "timed_out": %s, "output_bytes": %s, "attempt": 1, "timeout_budget_s": %d, "failure_kind": %s, "wall_over_budget": %s, "context_access": "agent", "context_mode": "tools", "effort": %s, "effort_source": "%s", "pass_context": %s, "prior_severity": %s, "prior_severity_source": %s}\n' \
     "$rc" "$((end - start))" "$timed_out" "$bytes" "$codex_timeout" "$fk_json" "$(wall_over_budget "$((end - start))" "$codex_timeout")" \
-    "$([[ -n "${codex_effort_used:-}" ]] && printf '"%s"' "$codex_effort_used" || printf null)" "${codex_effort_source:-config}" "${codex_pass:-1}" >"$out/codex.meta.json"
+    "$([[ -n "${codex_effort_used:-}" ]] && printf '"%s"' "$codex_effort_used" || printf null)" "${codex_effort_source:-config}" "${codex_pass:-1}" \
+    "$([[ -n "${codex_prev_severity:-}" ]] && printf '"%s"' "$codex_prev_severity" || printf null)" \
+    "$([[ -n "${codex_prev_severity_source:-}" ]] && printf '"%s"' "$codex_prev_severity_source" || printf null)" >"$out/codex.meta.json"
   # IMPORTANT: return $rc so the caller's `wait "$pid"` sees the real exit code.
   # Previous version ended with `printf` whose success (exit 0) masked every
   # upstream reviewer failure.
@@ -3699,7 +3732,9 @@ fi
 # fixes. It was lost once already, in the rebase that brought these two changes
 # together, and caught only because the detached end-to-end test went red.
 if [[ "$any_ok" -eq 1 && -f "${_guard:-}" && -n "${_base_sha:-}" && -n "${_head_sha:-}" ]]; then
-  bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --record --base-sha "$_base_sha" --head-sha "$_head_sha" || true
+  _out_abs="$(CDPATH="" cd -- "$out" 2>/dev/null && pwd || true)"
+  bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --record --base-sha "$_base_sha" --head-sha "$_head_sha" \
+    ${_out_abs:+--run-dir "$_out_abs"} --dispatched-at "$_dispatched_at" || true
 fi
 
 [[ "$any_ok" -eq 1 ]] || exit 1

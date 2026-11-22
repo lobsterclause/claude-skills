@@ -160,6 +160,33 @@ CROSS_REVIEW_EFFORT_REVIEW_DUE=2026-01-01 bash "$M" --if-due --runlog "$RL" >/de
 [[ $? -eq 0 ]] && ok "--if-due on a torn runlog does not fail the round" \
                || bad "--if-due must never break a round, torn runlog included"
 
+echo "── default windows: pre-ladder rows stay out of the baseline; by effort_source ──"
+WRL="$TMP/windows.jsonl"
+{
+  echo '{"ts":"2026-08-15T00:00:00Z","pass":1,"verdict":"CLEAN","reviewers":{"codex":{"findings_total":0}}}'
+  echo '{"ts":"2026-10-01T00:00:00Z","pass":1,"verdict":"CLEAN","reviewers":{"codex":{"findings_total":0}}}'
+  echo '{"ts":"2026-11-23T00:00:00Z","pass":2,"verdict":"FIXES_APPLIED","reviewers":{"codex":{"findings_total":2,"effort":"high","effort_source":"escalated_on_findings"}}}'
+  echo '{"ts":"2026-11-23T01:00:00Z","pass":2,"verdict":"CLEAN","reviewers":{"codex":{"findings_total":0,"effort":"medium","effort_source":"config"}}}'
+} >"$WRL"
+wout="$(bash "$M" --runlog "$WRL" 2>&1)"
+if grep -q "before: 1 codex runs (2026-09-01 .. 2026-11-22)" <<<"$wout"; then ok "default before window starts at LADDER_LIVE"
+else bad "default before window: $(grep before: <<<"$wout")"; fi
+if grep -q "escalated_on_findings: n=1  findings/run=2" <<<"$wout" && grep -q "config: n=1  findings/run=0" <<<"$wout"
+then ok "after-window pass 2+ split by effort_source"; else bad "by effort_source missing"; fi
+wout="$(bash "$M" --runlog "$WRL" --since 2026-09-01 2>&1)"
+if grep -q "before: 1 codex runs (runlog start .. 2026-09-01)" <<<"$wout"; then ok "--since at LADDER_LIVE keeps an open-ended before window"
+else bad "explicit --since window: $(grep before: <<<"$wout")"; fi
+
+echo "── a skipped codex seat is not a codex run ──"
+SRL="$TMP/skipped.jsonl"
+{
+  echo '{"ts":"2026-11-23T00:00:00Z","pass":2,"verdict":"CLEAN","reviewers":{"codex":{"status":"skipped"}}}'
+  echo '{"ts":"2026-11-23T01:00:00Z","pass":2,"verdict":"FIXES_APPLIED","reviewers":{"codex":{"findings_total":1,"effort":"medium","effort_source":"config"}}}'
+} >"$SRL"
+sout="$(bash "$M" --runlog "$SRL" 2>&1)"
+if grep -q "after: 1 codex runs" <<<"$sout" && ! grep -q "unrecorded: n=" <<<"$sout"; then ok "skipped seat excluded from counts and the effort_source breakdown"
+else bad "skipped seat counted: $(grep -E 'after:|unrecorded' <<<"$sout")"; fi
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]
