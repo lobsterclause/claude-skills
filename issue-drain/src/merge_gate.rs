@@ -89,6 +89,19 @@
 //! which is not a check run: `commits/<head>/statuses` is read too, and a
 //! status counts for the app whose bot posted it (`<slug>[bot]`, the id from
 //! `apps/<slug>`). A status a person posted counts for no app.
+//! The app ids come from the `app.id` and `app.slug` of those check runs first;
+//! `apps/<slug>` is asked only for a slug they did not name (a private app is a
+//! 404 there). Every other run of a pinned check's name, from any source, must
+//! pass as well: a pending or cancelled one refuses.
+//!
+//! A run whose conclusion is `cancelled` does not refuse when a later run of
+//! the same workflow (same workflow id), same event and same head passed, read
+//! from `actions/runs?head_sha=`. A failed run still refuses, and so does a
+//! cancelled run with no later pass or one the read cannot describe.
+//!
+//! `--note-file <path>` posts that file as a PR comment after a successful
+//! merge (`gh-write comment`'s path); its URL is `note_url`. A failed post is a
+//! warning only. A dry run prints the `WOULD` line and posts nothing.
 //!
 //! A unit with no file scope (`scope_checked` not true in `deliver.json`) is
 //! refused (`deliver_check`): a person merges it. The gate may not be run by a
@@ -138,6 +151,9 @@ pub struct Args {
     /// Judge and print, but do not merge: the merge is printed as WOULD.
     #[arg(long)]
     pub dry_run: bool,
+    /// After a successful merge, post this file's contents as a comment on the PR.
+    #[arg(long, value_name = "PATH")]
+    note_file: Option<std::path::PathBuf>,
 }
 
 /// Labels that park a PR for a person, whatever the profile says.
@@ -181,6 +197,10 @@ pub struct Run {
     pub word: String,
     /// Sorts by start time. A run that has not started sorts newest.
     pub started: String,
+    /// Made by GitHub Actions: a rollup check run that names a workflow, or a
+    /// check run of the `github-actions` app. Only such a run has a workflow
+    /// run id that `actions/runs` describes.
+    pub actions: bool,
 }
 
 /// An issue the PR will close, and the repository it is in (`owner/name`).
@@ -325,6 +345,9 @@ pub struct Facts {
     /// The check runs at the head with the app that made each (`source` is
     /// `app:<id>`); read only when a required check is pinned to an app.
     pub app_runs: Read<Vec<Run>>,
+    /// The workflow runs at the head, read only when a check run was cancelled;
+    /// empty when none was or the read failed, so no cancelled run is excused.
+    pub workflow_runs: Vec<WorkflowRun>,
     pub preflight: Read<Preflight>,
     /// The newest cross-review record comment on the PR and who wrote it;
     /// `None` when the PR has none.
@@ -394,6 +417,51 @@ fn newest(runs: &[Run]) -> BTreeMap<(&str, &str), Vec<&Run>> {
         group.retain(|r| latest.get(r.run.as_str()) == Some(&r.started.as_str()));
     }
     by_check
+}
+
+/// One Actions workflow run at the head, from `actions/runs?head_sha=`.
+#[derive(Clone, Debug)]
+pub struct WorkflowRun {
+    pub id: String,
+    pub workflow_id: u64,
+    pub event: String,
+    pub head_sha: String,
+    /// `completed` once the workflow run is over; its `conclusion` is then
+    /// `success` only when every job passed and nothing cancelled it.
+    pub status: String,
+    pub conclusion: String,
+}
+
+/// Whether a cancelled run is replaced by a later run of the same workflow,
+/// the same event and the same head that passed (a concurrency group cancels
+/// the first). A run that is not cancelled, or that the workflow runs do not
+/// describe, is never superseded. Both runs must be GitHub Actions runs of one
+/// source (the same workflow, or the same app for a pinned check): a pass from
+/// another source, or from a third-party check that only links to an Actions
+/// run, excuses nothing and cannot meet an app pin.
+fn superseded(r: &Run, siblings: &[&Run], workflows: &[WorkflowRun], head: &str) -> bool {
+    if r.word != "cancelled" || r.run.is_empty() || !r.actions {
+        return false;
+    }
+    let of = |id: &str| workflows.iter().find(|w| w.id == id);
+    let Some(me) = of(&r.run).filter(|w| w.head_sha == head) else {
+        return false;
+    };
+    let number = |id: &str| id.parse::<u64>().unwrap_or(0);
+    siblings.iter().any(|s| {
+        s.name == r.name
+            && s.source == r.source
+            && s.actions
+            && s.outcome == Outcome::Pass
+            && of(&s.run).is_some_and(|w| {
+                w.workflow_id == me.workflow_id
+                    && w.event == me.event
+                    && w.head_sha == me.head_sha
+                    && number(&w.id) > number(&me.id)
+                    && w.status == "completed"
+                    && w.conclusion == "success"
+            })
+    })
 }
 
 /// The names of the reviewers that produced output, in the proof's order.
@@ -510,6 +578,11 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
             let latest = newest(&v.runs);
             let apps = f.app_runs.as_deref().unwrap_or_default();
             let latest_apps = newest(apps);
+            let siblings: Vec<&Run> = latest
+                .values()
+                .chain(latest_apps.values())
+                .flat_map(|group| group.iter().copied())
+                .collect();
             for check in required {
                 let context = &check.context;
                 // Every source that carries the name must be ok. A check
@@ -539,16 +612,42 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                 // pin asks for, but it is a failed check all the same. The
                 // scan of optional checks below skips required names, so it is
                 // caught here.
+                // A run of the name from any other source, in the rollup or among
+                // the app's runs, must pass too (or be a cancelled run a later
+                // pass replaced): a pending one is not a pass.
                 if let Some(id) = check.app_id {
                     let source = format!("app:{id}");
-                    if let Some(bad) = latest_apps
+                    // The rollup names no app, but it names the Actions run: an
+                    // entry of a run the pinned app made is that app's run, not
+                    // another source's, and the pin check above has it.
+                    let own_runs: BTreeSet<&str> = groups
+                        .iter()
+                        .flat_map(|group| group.iter())
+                        .map(|r| r.run.as_str())
+                        .filter(|run| !run.is_empty())
+                        .collect();
+                    // Only a rollup entry can be the pinned app's own run; every
+                    // REST entry of another app stays another source's.
+                    let rest = latest_apps
                         .iter()
                         .filter(|((name, src), _)| *name == context.as_str() && *src != source)
-                        .flat_map(|(_, group)| group.iter())
-                        .find(|r| r.outcome == Outcome::Fail)
+                        .flat_map(|(_, group)| group.iter().copied());
+                    let rollup = latest
+                        .iter()
+                        .filter(|((name, _), _)| *name == context.as_str())
+                        .flat_map(|(_, group)| group.iter().copied())
+                        .filter(|r| !own_runs.contains(r.run.as_str()));
+                    let mut others = rest.chain(rollup);
+                    if let Some(bad) = others
+                        .find(|r| r.outcome != Outcome::Pass && !superseded(r, &siblings, &f.workflow_runs, &v.head))
                     {
+                        let code = if bad.outcome == Outcome::Fail {
+                            "check_failed"
+                        } else {
+                            "required_check"
+                        };
                         out.push(refusal(
-                            "check_failed",
+                            code,
                             format!("check '{context}' from another source is {}", bad.word),
                         ));
                     }
@@ -566,7 +665,7 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
                 if let Some(bad) = groups
                     .iter()
                     .flat_map(|group| group.iter())
-                    .find(|r| r.outcome != Outcome::Pass)
+                    .find(|r| r.outcome != Outcome::Pass && !superseded(r, &siblings, &f.workflow_runs, &v.head))
                 {
                     out.push(refusal(
                         "required_check",
@@ -1001,6 +1100,11 @@ fn parse_run(entry: &Value) -> Read<Run> {
         .and_then(Value::as_str)
         .map(run_id_of)
         .unwrap_or_default();
+    let actions = is_check_run
+        && entry
+            .get("workflowName")
+            .and_then(Value::as_str)
+            .is_some_and(|w| !w.is_empty());
     Ok(Run {
         name,
         source,
@@ -1008,6 +1112,7 @@ fn parse_run(entry: &Value) -> Read<Run> {
         outcome,
         word,
         started,
+        actions,
     })
 }
 
@@ -1293,6 +1398,40 @@ fn parse_after_merge(raw: &str) -> Read<AfterMerge> {
     })
 }
 
+/// One page of `actions/runs?head_sha=<head>`, or several one after another.
+pub fn parse_workflow_runs(raw: &str) -> Read<Vec<WorkflowRun>> {
+    let mut out = Vec::new();
+    for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
+        let page = page.map_err(|_| "the answer is not JSON".to_string())?;
+        let list = page
+            .get("workflow_runs")
+            .and_then(Value::as_array)
+            .ok_or("a page has no workflow_runs")?;
+        for entry in list {
+            out.push(WorkflowRun {
+                id: entry
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .map(|n| n.to_string())
+                    .ok_or("a workflow run has no id")?,
+                workflow_id: entry
+                    .get("workflow_id")
+                    .and_then(Value::as_u64)
+                    .ok_or("a workflow run has no workflow_id")?,
+                event: text(entry, "event")?,
+                head_sha: text(entry, "head_sha")?,
+                status: entry.get("status").and_then(Value::as_str).unwrap_or_default().into(),
+                conclusion: entry
+                    .get("conclusion")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// One page of `commits/<head>/check-runs`, or several one after another
 /// (`--paginate`): every run with the app that made it (`source` is
 /// `app:<id>`). A run without an app id cannot satisfy a pinned check, so it
@@ -1339,6 +1478,7 @@ pub fn parse_check_runs(raw: &str) -> Read<Vec<Run>> {
                 outcome,
                 word,
                 started,
+                actions: entry.pointer("/app/slug").and_then(Value::as_str) == Some("github-actions"),
             });
         }
     }
@@ -1346,6 +1486,24 @@ pub fn parse_check_runs(raw: &str) -> Read<Vec<Run>> {
         return Err("the answer is empty".into());
     }
     Ok(runs)
+}
+
+/// The id of each app a page of `commits/<head>/check-runs` names, by slug.
+/// A run that names no slug or no id adds nothing.
+pub fn app_ids(raw: &str) -> BTreeMap<String, u64> {
+    let mut ids = BTreeMap::new();
+    for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>().flatten() {
+        let runs = page.get("check_runs").and_then(Value::as_array).into_iter().flatten();
+        for run in runs {
+            if let (Some(slug), Some(id)) = (
+                run.pointer("/app/slug").and_then(Value::as_str),
+                run.pointer("/app/id").and_then(Value::as_u64),
+            ) {
+                ids.insert(slug.to_string(), id);
+            }
+        }
+    }
+    ids
 }
 
 /// One page of `commits/<head>/statuses`, or several one after another
@@ -1420,6 +1578,7 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
                     outcome,
                     word: state.clone(),
                     started: started.to_string(),
+                    actions: false,
                 });
             }
         }
@@ -1723,15 +1882,20 @@ fn gather(
             &format!("repos/{repo}/commits/{head}/check-runs?per_page=100"),
             "--paginate",
         ])
-        .and_then(|raw| parse_check_runs(&raw))
+        .and_then(|raw| parse_check_runs(&raw).map(|runs| (app_ids(&raw), runs)))
         .map_err(|e| format!("the check runs at the head ({e})"))
-        .and_then(|mut runs| {
+        .and_then(|(known, mut runs)| {
             let wanted: Vec<&str> = required
                 .iter()
                 .filter(|c| c.app_id.is_some())
                 .map(|c| c.context.as_str())
                 .collect();
             let mut app_of = |slug: &str| {
+                // The check runs already name each app's id; ask `apps/<slug>`
+                // only for a slug they did not, since a private app is a 404 there.
+                if let Some(id) = known.get(slug) {
+                    return Ok(*id);
+                }
                 let raw = read_gh(&["api", &format!("apps/{slug}")])?;
                 let v: Value = serde_json::from_str(&raw).map_err(|_| "the answer is not JSON".to_string())?;
                 v.get("id")
@@ -1749,6 +1913,25 @@ fn gather(
             Ok(runs)
         }),
         _ => Ok(Vec::new()),
+    };
+    // Only a cancelled check run can be excused by a later pass of its workflow.
+    let cancelled_required = |runs: &[Run]| {
+        required.as_ref().is_ok_and(|req| {
+            runs.iter()
+                .any(|r| r.word == "cancelled" && req.iter().any(|c| c.context == r.name))
+        })
+    };
+    let workflow_runs = match &view {
+        Ok(v) if cancelled_required(&v.runs) || cancelled_required(app_runs.as_deref().unwrap_or_default()) => {
+            read_gh(&[
+                "api",
+                &format!("repos/{repo}/actions/runs?head_sha={}&per_page=100", v.head),
+                "--paginate",
+            ])
+            .and_then(|raw| parse_workflow_runs(&raw))
+            .unwrap_or_default()
+        }
+        _ => Vec::new(),
     };
     let preflight = preflight(ctx, repo, pr);
     let reviewed_ancestry = match (&preflight, &head) {
@@ -1779,6 +1962,7 @@ fn gather(
         unit_branch,
         required,
         app_runs,
+        workflow_runs,
         preflight,
         review_record,
         review_earlier,
@@ -1861,12 +2045,145 @@ fn report(ctx: &Ctx, unit: u64, pr: u64, head: &str, merged: bool, refusals: &[R
     }
 }
 
+/// The line that marks a posted note, so a retry can tell it was posted.
+fn note_marker(head: &str) -> String {
+    format!("<!-- issue-drain:merge-note head={head} -->")
+}
+
+/// Whether one of the PR's comments, written by `me`, opens with the note
+/// marker for this head. A marker further down, or in someone else's comment,
+/// is a quotation and counts for nothing.
+fn note_posted(raw: &str, head: &str, me: &str) -> Read<bool> {
+    let marker = note_marker(head);
+    for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
+        let page = page.map_err(|_| "the answer is not JSON".to_string())?;
+        let list = page.as_array().ok_or("a page is not a list of comments")?;
+        let found = list.iter().any(|c| {
+            c.pointer("/user/login").and_then(Value::as_str) == Some(me)
+                && c.get("body")
+                    .and_then(Value::as_str)
+                    .is_some_and(|body| body.lines().next().is_some_and(|l| l.trim() == marker))
+        });
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The note under its marker, in a new file in the unit's folder that no other
+/// file or run shares (`create_new`); nothing that exists is touched.
+fn stage_note(ctx: &Ctx, unit: u64, head: &str, file: &std::path::Path) -> Read<std::path::PathBuf> {
+    use std::io::Write as _;
+    let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = ctx.path(&format!("units/{unit}/merge-note.{}.{nanos}.md", std::process::id()));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    write!(out, "{}\n\n{text}", note_marker(head)).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Post the note file on the merged PR, through the shared write path, under
+/// a marker line. A failure is a warning: the merge happened and counts.
+/// Returns the comment's URL (`gh` prints it), or null when there is none.
+/// With `check_first`, the PR's comments are read and nothing is posted when
+/// one of ours carries the marker for this head, or when they or our identity
+/// cannot be read. A dry run writes no file: the note file itself is named.
+fn post_note(ctx: &Ctx, unit: u64, pr: u64, head: &str, note: Option<&std::path::Path>, check_first: bool) -> Value {
+    let Some(file) = note else {
+        return Value::Null;
+    };
+    let warn = |why: String| {
+        eprintln!(
+            "issue-drain: warning: PR #{pr} is merged, but the note in {} was not posted: {why}",
+            file.display()
+        );
+        Value::Null
+    };
+    if check_first {
+        let me = match read_gh(&["api", "user", "--jq", ".login"]) {
+            Ok(login) if !login.trim().is_empty() => login.trim().to_string(),
+            _ => return warn("who is posting could not be read".into()),
+        };
+        let seen = ctx.repo().map_err(|e| e.msg).and_then(|repo| {
+            read_gh(&[
+                "api",
+                &format!("repos/{repo}/issues/{pr}/comments?per_page=100"),
+                "--paginate",
+            ])
+            .and_then(|raw| note_posted(&raw, head, &me))
+        });
+        match seen {
+            Ok(false) => {}
+            Ok(true) => return Value::Null,
+            Err(e) => return warn(format!("the comments could not be read ({e})")),
+        }
+    }
+    // A dry run prints the call and writes nothing. Otherwise the marked body
+    // is staged in a file made for this call alone, and removed after.
+    let staged = if ctx.dry_run {
+        None
+    } else {
+        match stage_note(ctx, unit, head, file) {
+            Ok(path) => Some(path),
+            Err(e) => return warn(e),
+        }
+    };
+    let body = staged.as_deref().unwrap_or(file);
+    let posted = gh::write(
+        ctx,
+        &Write::Comment {
+            number: pr,
+            body_file: body,
+        },
+    );
+    if let Some(path) = &staged {
+        let _ = std::fs::remove_file(path);
+    }
+    match posted {
+        Ok(written) => {
+            let url = written.stdout.trim();
+            if written.called && !url.is_empty() {
+                json!(url)
+            } else {
+                Value::Null
+            }
+        }
+        Err(e) => warn(e.msg),
+    }
+}
+
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     // A unit does not merge, and must not get an answer (or a log line) for it.
     ctx.require_driver("merge-gate")?;
     let repo = ctx.repo()?;
     let (unit, pr) = (args.unit, args.pr);
+    // A note that cannot be posted is refused before a merge is started, but
+    // not for a PR already merged: that is reported merged, with a warning.
+    let note_problem = args.note_file.as_ref().and_then(|note| {
+        if note.as_os_str() == "-" {
+            Some("--note-file - is not a file; give a path".to_string())
+        } else if !std::fs::metadata(note).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            Some(format!("--note-file is missing or empty: {}", note.display()))
+        } else {
+            None
+        }
+    });
     let view = read_view(&repo, pr);
+    if let Some(problem) = &note_problem {
+        if view.as_ref().map_or(true, |v| v.state != PrState::Merged) {
+            return Err(Fail::usage(problem.clone()));
+        }
+    }
     let unit_entry = ctx
         .queue_unit(unit)
         .map(|u| UnitEntry {
@@ -1901,7 +2218,19 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                 )));
             }
             report(ctx, unit, pr, &v.head, true, &[]);
-            let out = json!({"pr": pr, "unit": unit, "head": v.head, "merged": true, "already": true, "merge_commit": v.merge_commit, "refusals": [], "reviewers": []});
+            // A merge GitHub queued is merged by now, and its note was never
+            // posted: post it once, unless a comment already carries the marker.
+            let note_url = match &note_problem {
+                Some(problem) => {
+                    eprintln!("issue-drain: warning: PR #{pr} is merged, but the note was not posted: {problem}");
+                    Value::Null
+                }
+                None => post_note(ctx, unit, pr, &v.head, args.note_file.as_deref(), true),
+            };
+            let mut out = json!({"pr": pr, "unit": unit, "head": v.head, "merged": true, "already": true, "merge_commit": v.merge_commit, "refusals": [], "reviewers": [], "note_url": note_url});
+            if let (Some(problem), Some(map)) = (&note_problem, out.as_object_mut()) {
+                map.insert("note_warning".into(), json!(problem));
+            }
             println!("{out}");
             return Ok(());
         }
@@ -1915,7 +2244,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             .iter()
             .map(|r| json!({"code": r.code, "detail": r.detail}))
             .collect();
-        json!({"pr": pr, "unit": unit, "head": head, "merged": merged, "refusals": list, "reviewers": reviewers(&facts)})
+        json!({"pr": pr, "unit": unit, "head": head, "merged": merged, "refusals": list, "reviewers": reviewers(&facts), "note_url": null})
     };
     // `output` plus the fields only a merge call has.
     let output_with = |merged: bool, extra: Value| {
@@ -1954,6 +2283,8 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         Ok(written) if !written.called => {
             // A dry run: nothing was sent.
             report(ctx, unit, pr, &head, false, &[]);
+            // Prints `WOULD: gh issue comment ...` and posts nothing.
+            post_note(ctx, unit, pr, &head, args.note_file.as_deref(), false);
             println!("{}", output(false));
             Ok(())
         }
@@ -1967,7 +2298,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                     ..
                 }) => {
                     report(ctx, unit, pr, &head, true, &[]);
-                    println!("{}", output_with(true, json!({"merge_commit": merge_commit})));
+                    let note_url = post_note(ctx, unit, pr, &head, args.note_file.as_deref(), false);
+                    println!(
+                        "{}",
+                        output_with(true, json!({"merge_commit": merge_commit, "note_url": note_url}))
+                    );
                     Ok(())
                 }
                 Ok(AfterMerge {
@@ -2045,6 +2380,7 @@ mod tests {
             outcome,
             word: word.into(),
             started: started.into(),
+            actions: false,
         }
     }
 
@@ -2088,6 +2424,7 @@ mod tests {
             unit_branch: Ok("fix/tide".into()),
             required: Ok(vec!["build".into()]),
             app_runs: Ok(Vec::new()),
+            workflow_runs: Vec::new(),
             reviewed_ancestry: None,
             preflight: Ok(Preflight {
                 status: "clear".into(),
@@ -2849,11 +3186,206 @@ mod tests {
             from(99, Outcome::Fail, "failure"),
         ]);
         assert_eq!(codes(&f), ["check_failed"]);
+        // The pinned app's own failing run also shows in the rollup (same
+        // Actions run id): one refusal, not a second "from another source".
+        f.app_runs = Ok(vec![Run {
+            run: "100".into(),
+            ..from(15368, Outcome::Fail, "failure")
+        }]);
+        view(&mut f).runs = vec![
+            Run {
+                run: "100".into(),
+                ..run_of("build", Outcome::Fail, "failure", "2026-11-21T01:00:00Z")
+            },
+            pass("lint"),
+        ];
+        let found = judge(&f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].detail.contains("from app 15368"), "{}", found[0].detail);
+        view(&mut f).runs = vec![pass("build"), pass("lint")];
+        // Another app's REST run of the same name is never the pinned app's,
+        // even when it carries the same Actions run id.
+        for (outcome, word, code) in [
+            (Outcome::Pending, "pending", "required_check"),
+            (Outcome::Fail, "failure", "check_failed"),
+        ] {
+            f.app_runs = Ok(vec![
+                Run {
+                    run: "100".into(),
+                    ..from(15368, Outcome::Pass, "success")
+                },
+                Run {
+                    run: "100".into(),
+                    ..from(99, outcome, word)
+                },
+            ]);
+            assert_eq!(codes(&f), [code], "{word}");
+        }
+        // The pin is met, but another app's run of the same name is not done.
+        // Every same-name run must pass, whatever its source.
+        for (outcome, word) in [(Outcome::Pending, "pending"), (Outcome::Other, "cancelled")] {
+            f.app_runs = Ok(vec![from(15368, Outcome::Pass, "success"), from(99, outcome, word)]);
+            assert_eq!(codes(&f), ["required_check"], "{word}");
+        }
         f.app_runs = Err("the check runs at the head (gh exit 1)".into());
         assert_eq!(codes(&f), ["read_error"]);
         // Unpinned: the unreadable runs do not matter.
         f.required = Ok(vec!["build".into()]);
         assert!(codes(&f).is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_run_is_replaced_by_a_later_pass_of_its_workflow() {
+        let attempt = |id: &str, outcome: Outcome, word: &str, at: &str| Run {
+            run: id.into(),
+            actions: true,
+            ..run_of("build", outcome, word, at)
+        };
+        let wf = |id: &str, workflow_id: u64, event: &str, head: &str| WorkflowRun {
+            id: id.into(),
+            workflow_id,
+            event: event.into(),
+            head_sha: head.into(),
+            status: "completed".into(),
+            conclusion: "success".into(),
+        };
+        let mut f = clear();
+        view(&mut f).runs = vec![
+            attempt("10", Outcome::Other, "cancelled", "2026-11-21T01:00:00Z"),
+            attempt("11", Outcome::Pass, "success", "2026-11-21T01:05:00Z"),
+        ];
+        // Without the workflow runs nothing is excused.
+        assert_eq!(codes(&f), ["required_check"]);
+        f.workflow_runs = vec![wf("10", 7, "pull_request", HEAD), wf("11", 7, "pull_request", HEAD)];
+        assert!(codes(&f).is_empty(), "{:?}", judge(&f));
+        // Another workflow, another event or another head does not replace it.
+        for other in [
+            wf("11", 8, "pull_request", HEAD),
+            wf("11", 7, "push", HEAD),
+            wf("11", 7, "pull_request", "fedcba9876543210fedcba9876543210fedcba98"),
+        ] {
+            f.workflow_runs = vec![wf("10", 7, "pull_request", HEAD), other];
+            assert_eq!(codes(&f), ["required_check"]);
+        }
+        // A pass that is earlier than the cancelled run does not replace it.
+        f.workflow_runs = vec![wf("10", 7, "pull_request", HEAD), wf("11", 7, "pull_request", HEAD)];
+        view(&mut f).runs = vec![
+            attempt("12", Outcome::Other, "cancelled", "2026-11-21T01:00:00Z"),
+            attempt("11", Outcome::Pass, "success", "2026-11-21T01:05:00Z"),
+        ];
+        f.workflow_runs.push(wf("12", 7, "pull_request", HEAD));
+        assert_eq!(codes(&f), ["required_check"]);
+        // No later pass at all.
+        view(&mut f).runs = vec![attempt("10", Outcome::Other, "cancelled", "2026-11-21T01:00:00Z")];
+        assert_eq!(codes(&f), ["required_check"]);
+        // A failed run is not excused by a later pass.
+        view(&mut f).runs = vec![
+            attempt("10", Outcome::Fail, "failure", "2026-11-21T01:00:00Z"),
+            attempt("11", Outcome::Pass, "success", "2026-11-21T01:05:00Z"),
+        ];
+        assert_eq!(codes(&f), ["required_check"]);
+        // A pass that is not a GitHub Actions run (a third-party check that
+        // only links to an Actions run), or is from another source, excuses nothing.
+        let wfs = vec![wf("10", 7, "pull_request", HEAD), wf("11", 7, "pull_request", HEAD)];
+        f.workflow_runs = wfs.clone();
+        let cancelled = attempt("10", Outcome::Other, "cancelled", "2026-11-21T01:00:00Z");
+        let passed = attempt("11", Outcome::Pass, "success", "2026-11-21T01:05:00Z");
+        view(&mut f).runs = vec![cancelled.clone(), passed.clone()];
+        assert!(codes(&f).is_empty());
+        view(&mut f).runs = vec![
+            cancelled.clone(),
+            Run {
+                actions: false,
+                ..passed.clone()
+            },
+        ];
+        assert_eq!(codes(&f), ["required_check"]);
+        view(&mut f).runs = vec![
+            cancelled.clone(),
+            Run {
+                source: "check:Other".into(),
+                ..passed.clone()
+            },
+        ];
+        assert_eq!(codes(&f), ["required_check"]);
+        // The replacement's job passed but its workflow run did not finish
+        // green: it was cancelled, failed, or is still going.
+        for (status, conclusion) in [
+            ("completed", "cancelled"),
+            ("completed", "failure"),
+            ("in_progress", ""),
+            ("", ""),
+        ] {
+            view(&mut f).runs = vec![cancelled.clone(), passed.clone()];
+            f.workflow_runs = vec![
+                wf("10", 7, "pull_request", HEAD),
+                WorkflowRun {
+                    status: status.into(),
+                    conclusion: conclusion.into(),
+                    ..wf("11", 7, "pull_request", HEAD)
+                },
+            ];
+            assert_eq!(codes(&f), ["required_check"], "{status} {conclusion}");
+        }
+        f.workflow_runs = wfs;
+        // A cancelled run that is not an Actions run is never excused.
+        view(&mut f).runs = vec![
+            Run {
+                actions: false,
+                ..cancelled.clone()
+            },
+            passed.clone(),
+        ];
+        assert_eq!(codes(&f), ["required_check"]);
+        // A pin to another app is not met by a cancelled run of that app that
+        // an Actions pass elsewhere would excuse.
+        f.required = Ok(vec![Required {
+            context: "build".into(),
+            app_id: Some(99),
+        }]);
+        view(&mut f).runs = vec![passed.clone()];
+        let app = |r: &Run| Run {
+            source: "app:99".into(),
+            ..r.clone()
+        };
+        f.app_runs = Ok(vec![
+            Run {
+                actions: false,
+                ..app(&cancelled)
+            },
+            app(&passed),
+        ]);
+        assert_eq!(codes(&f), ["required_check"]);
+        // The pass is another source's, so the pinned app's run has none after it.
+        f.app_runs = Ok(vec![app(&cancelled)]);
+        assert_eq!(codes(&f), ["required_check"]);
+    }
+
+    #[test]
+    fn app_ids_are_taken_from_the_check_runs_by_slug() {
+        let page = json!({"check_runs": [
+            {"name": "a", "app": {"id": 15368, "slug": "github-actions"}},
+            {"name": "b", "app": {"id": 7}},
+            {"name": "c"}]});
+        let ids = app_ids(&format!("{page}\n{page}"));
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.get("github-actions"), Some(&15368));
+        assert!(app_ids("not json").is_empty());
+    }
+
+    #[test]
+    fn workflow_runs_are_read_from_every_page() {
+        let page = |id: u64| {
+            json!({"total_count": 2, "workflow_runs": [
+                {"id": id, "workflow_id": 7, "event": "push", "head_sha": HEAD}]})
+        };
+        let got = parse_workflow_runs(&format!("{}\n{}", page(10), page(11))).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (got[1].id.as_str(), got[1].workflow_id, got[1].event.as_str()),
+            ("11", 7, "push")
+        );
+        assert!(parse_workflow_runs(r#"{"total_count":0}"#).is_err());
     }
 
     #[test]
