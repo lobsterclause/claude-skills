@@ -49,6 +49,8 @@
 #   workflow-runs.json    answer to `gh api repos/<o>/<r>/actions/runs?head_sha=...`
 #                         (one object, or several one after another); a missing
 #                         file fails the call
+#   user.txt              answer to `gh api user --jq .login` (the gh identity); a
+#                         missing file fails the call
 #   app-<slug>.json       answer to `gh api apps/<slug>`; a missing file fails
 #                         the call
 #   merged-<n> and pr-view-<n>.after-merge.json: see above; `gh pr merge <n>
@@ -156,6 +158,7 @@ case "${1:-} ${2:-}" in
     esac
     if [ -e "$dir/fail-merge" ]; then echo "gh stub: merge failed" >&2; exit 1; fi
     : > "$dir/merged-$3" ;;
+  "api user") answer user.txt ;;
   "api apps/"*) answer "app-${2#apps/}.json" ;;
   "api repos/"*)
     case "$2" in

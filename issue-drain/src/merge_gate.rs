@@ -426,6 +426,10 @@ pub struct WorkflowRun {
     pub workflow_id: u64,
     pub event: String,
     pub head_sha: String,
+    /// `completed` once the workflow run is over; its `conclusion` is then
+    /// `success` only when every job passed and nothing cancelled it.
+    pub status: String,
+    pub conclusion: String,
 }
 
 /// Whether a cancelled run is replaced by a later run of the same workflow,
@@ -454,6 +458,8 @@ fn superseded(r: &Run, siblings: &[&Run], workflows: &[WorkflowRun], head: &str)
                     && w.event == me.event
                     && w.head_sha == me.head_sha
                     && number(&w.id) > number(&me.id)
+                    && w.status == "completed"
+                    && w.conclusion == "success"
             })
     })
 }
@@ -1398,6 +1404,12 @@ pub fn parse_workflow_runs(raw: &str) -> Read<Vec<WorkflowRun>> {
                     .ok_or("a workflow run has no workflow_id")?,
                 event: text(entry, "event")?,
                 head_sha: text(entry, "head_sha")?,
+                status: entry.get("status").and_then(Value::as_str).unwrap_or_default().into(),
+                conclusion: entry
+                    .get("conclusion")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
             });
         }
     }
@@ -2022,16 +2034,20 @@ fn note_marker(head: &str) -> String {
     format!("<!-- issue-drain:merge-note head={head} -->")
 }
 
-/// Whether one of the PR's comments carries the note marker for this head.
-fn note_posted(raw: &str, head: &str) -> Read<bool> {
+/// Whether one of the PR's comments, written by `me`, opens with the note
+/// marker for this head. A marker further down, or in someone else's comment,
+/// is a quotation and counts for nothing.
+fn note_posted(raw: &str, head: &str, me: &str) -> Read<bool> {
     let marker = note_marker(head);
     for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
         let page = page.map_err(|_| "the answer is not JSON".to_string())?;
         let list = page.as_array().ok_or("a page is not a list of comments")?;
-        let found = list
-            .iter()
-            .filter_map(|c| c.get("body").and_then(Value::as_str))
-            .any(|body| body.lines().any(|l| l.trim() == marker));
+        let found = list.iter().any(|c| {
+            c.pointer("/user/login").and_then(Value::as_str) == Some(me)
+                && c.get("body")
+                    .and_then(Value::as_str)
+                    .is_some_and(|body| body.lines().next().is_some_and(|l| l.trim() == marker))
+        });
         if found {
             return Ok(true);
         }
@@ -2039,11 +2055,33 @@ fn note_posted(raw: &str, head: &str) -> Read<bool> {
     Ok(false)
 }
 
+/// The note under its marker, in a new file in the unit's folder that no other
+/// file or run shares (`create_new`); nothing that exists is touched.
+fn stage_note(ctx: &Ctx, unit: u64, head: &str, file: &std::path::Path) -> Read<std::path::PathBuf> {
+    use std::io::Write as _;
+    let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = ctx.path(&format!("units/{unit}/merge-note.{}.{nanos}.md", std::process::id()));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    write!(out, "{}\n\n{text}", note_marker(head)).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 /// Post the note file on the merged PR, through the shared write path, under
 /// a marker line. A failure is a warning: the merge happened and counts.
 /// Returns the comment's URL (`gh` prints it), or null when there is none.
 /// With `check_first`, the PR's comments are read and nothing is posted when
-/// one carries the marker for this head, or when they cannot be read.
+/// one of ours carries the marker for this head, or when they or our identity
+/// cannot be read. A dry run writes no file: the note file itself is named.
 fn post_note(ctx: &Ctx, unit: u64, pr: u64, head: &str, note: Option<&std::path::Path>, check_first: bool) -> Value {
     let Some(file) = note else {
         return Value::Null;
@@ -2056,13 +2094,17 @@ fn post_note(ctx: &Ctx, unit: u64, pr: u64, head: &str, note: Option<&std::path:
         Value::Null
     };
     if check_first {
+        let me = match read_gh(&["api", "user", "--jq", ".login"]) {
+            Ok(login) if !login.trim().is_empty() => login.trim().to_string(),
+            _ => return warn("who is posting could not be read".into()),
+        };
         let seen = ctx.repo().map_err(|e| e.msg).and_then(|repo| {
             read_gh(&[
                 "api",
                 &format!("repos/{repo}/issues/{pr}/comments?per_page=100"),
                 "--paginate",
             ])
-            .and_then(|raw| note_posted(&raw, head))
+            .and_then(|raw| note_posted(&raw, head, &me))
         });
         match seen {
             Ok(false) => {}
@@ -2070,27 +2112,28 @@ fn post_note(ctx: &Ctx, unit: u64, pr: u64, head: &str, note: Option<&std::path:
             Err(e) => return warn(format!("the comments could not be read ({e})")),
         }
     }
-    let body = std::fs::read_to_string(file)
-        .map_err(|e| e.to_string())
-        .and_then(|text| {
-            let out = ctx.path(&format!("units/{unit}/merge-note.md"));
-            if let Some(dir) = out.parent() {
-                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            }
-            std::fs::write(&out, format!("{}\n\n{text}", note_marker(head))).map_err(|e| e.to_string())?;
-            Ok(out)
-        });
-    let body = match body {
-        Ok(path) => path,
-        Err(e) => return warn(e),
+    // A dry run prints the call and writes nothing. Otherwise the marked body
+    // is staged in a file made for this call alone, and removed after.
+    let staged = if ctx.dry_run {
+        None
+    } else {
+        match stage_note(ctx, unit, head, file) {
+            Ok(path) => Some(path),
+            Err(e) => return warn(e),
+        }
     };
-    match gh::write(
+    let body = staged.as_deref().unwrap_or(file);
+    let posted = gh::write(
         ctx,
         &Write::Comment {
             number: pr,
-            body_file: &body,
+            body_file: body,
         },
-    ) {
+    );
+    if let Some(path) = &staged {
+        let _ = std::fs::remove_file(path);
+    }
+    match posted {
         Ok(written) => {
             let url = written.stdout.trim();
             if written.called && !url.is_empty() {
@@ -3139,6 +3182,8 @@ mod tests {
             workflow_id,
             event: event.into(),
             head_sha: head.into(),
+            status: "completed".into(),
+            conclusion: "success".into(),
         };
         let mut f = clear();
         view(&mut f).runs = vec![
@@ -3199,6 +3244,26 @@ mod tests {
             },
         ];
         assert_eq!(codes(&f), ["required_check"]);
+        // The replacement's job passed but its workflow run did not finish
+        // green: it was cancelled, failed, or is still going.
+        for (status, conclusion) in [
+            ("completed", "cancelled"),
+            ("completed", "failure"),
+            ("in_progress", ""),
+            ("", ""),
+        ] {
+            view(&mut f).runs = vec![cancelled.clone(), passed.clone()];
+            f.workflow_runs = vec![
+                wf("10", 7, "pull_request", HEAD),
+                WorkflowRun {
+                    status: status.into(),
+                    conclusion: conclusion.into(),
+                    ..wf("11", 7, "pull_request", HEAD)
+                },
+            ];
+            assert_eq!(codes(&f), ["required_check"], "{status} {conclusion}");
+        }
+        f.workflow_runs = wfs;
         // A cancelled run that is not an Actions run is never excused.
         view(&mut f).runs = vec![
             Run {

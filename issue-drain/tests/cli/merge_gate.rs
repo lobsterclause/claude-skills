@@ -1446,7 +1446,7 @@ fn a_cancelled_required_run_is_excused_by_a_later_pass_of_the_same_workflow() {
         {"__typename": "StatusContext", "context": "lint", "state": "SUCCESS", "startedAt": "2026-11-21T01:00:00Z"}
     ]);
     put(&env, "pr-view-12.json", &view);
-    let workflow = |id: u64, workflow_id: u64| json!({"id": id, "workflow_id": workflow_id, "event": "pull_request", "head_sha": HEAD});
+    let workflow = |id: u64, workflow_id: u64| json!({"id": id, "workflow_id": workflow_id, "event": "pull_request", "head_sha": HEAD, "status": "completed", "conclusion": "success"});
     // Another workflow's later pass does not excuse it.
     put(
         &env,
@@ -1564,6 +1564,7 @@ fn merged_pr(env: &Env) {
 fn a_retry_after_a_queued_merge_posts_the_note_once() {
     let env = ready();
     merged_pr(&env);
+    env.stub_file("user.txt", "someone\n");
     let file = note(&env);
     let args = ["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file];
     comments(&env, &[comment("an unrelated comment", "OWNER")]);
@@ -1618,4 +1619,93 @@ fn a_note_file_named_dash_is_refused_not_read_from_stdin() {
     );
     assert_eq!(out.code, 2, "{}", out.stderr);
     assert!(merged_calls(&env).is_empty());
+}
+
+fn comment_by(login: &str, body: &str) -> Value {
+    json!({"body": body, "author_association": "OWNER", "user": {"login": login}})
+}
+
+#[test]
+fn only_our_own_comment_that_opens_with_the_marker_counts_as_the_posted_note() {
+    let env = ready();
+    merged_pr(&env);
+    env.stub_file("user.txt", "someone\n");
+    let file = note(&env);
+    let args = ["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file];
+    let marked = format!("{MARKER}\n\nMerged by the gate.\n");
+    // Someone else's comment with the marker does not count.
+    comments(&env, &[comment_by("mallory", &marked)]);
+    env.run(&args);
+    assert_eq!(comment_calls(&env).len(), 1);
+    // Nor does our own comment that only quotes it further down.
+    comments(&env, &[comment_by("someone", &format!("quoting\n{marked}"))]);
+    env.run(&args);
+    assert_eq!(comment_calls(&env).len(), 2);
+    // Ours, opening with it, does.
+    comments(&env, &[comment_by("someone", &marked)]);
+    env.run(&args);
+    assert_eq!(comment_calls(&env).len(), 2);
+}
+
+#[test]
+fn a_retry_that_cannot_tell_who_it_is_warns_and_posts_nothing() {
+    let env = ready();
+    merged_pr(&env);
+    comments(&env, &[comment("an unrelated comment", "OWNER")]);
+    let file = note(&env);
+    let out = env.run(&["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stderr.contains("warning"), "{}", out.stderr);
+    assert!(comment_calls(&env).is_empty());
+}
+
+#[test]
+fn posting_a_note_leaves_every_existing_file_in_the_unit_folder_alone() {
+    let env = ready();
+    // A draft where the old code staged its copy, and the note file itself.
+    let draft = env.write("units/3/merge-note.md", "my draft\n");
+    let out = env.run(&[
+        "merge-gate",
+        "--unit",
+        "3",
+        "--pr",
+        "12",
+        "--note-file",
+        &draft.display().to_string(),
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(fs::read_to_string(&draft).unwrap(), "my draft\n");
+    let body = fs::read_to_string(env.stub.join("last-comment-body")).expect("the posted body");
+    assert!(body.starts_with(MARKER) && body.contains("my draft"), "{body}");
+    // The staged copy is gone.
+    let staged: Vec<_> = fs::read_dir(draft.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("merge-note"))
+        .collect();
+    assert_eq!(staged, ["merge-note.md"]);
+}
+
+#[test]
+fn a_dry_run_writes_no_file() {
+    let env = ready();
+    let draft = env.write("units/3/merge-note.md", "my draft\n");
+    let out = env.run(&[
+        "merge-gate",
+        "--unit",
+        "3",
+        "--pr",
+        "12",
+        "--dry-run",
+        "--note-file",
+        &draft.display().to_string(),
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(fs::read_to_string(&draft).unwrap(), "my draft\n");
+    let names: Vec<_> = fs::read_dir(draft.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("merge-note"))
+        .collect();
+    assert_eq!(names, ["merge-note.md"]);
 }
