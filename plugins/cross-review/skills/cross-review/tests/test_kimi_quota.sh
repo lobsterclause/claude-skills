@@ -40,14 +40,26 @@ assert_eq "plain HTTP 429 is a transient throttle, not quota" "$(jq -r '.failure
 [[ -f "$T/o2/kimi.quota_exhausted" ]] && bad "sentinel written for a plain 429" || ok "no sentinel for a plain 429"
 
 # Marker first, then far more diagnostics than a pipe buffer holds.
-printf '#!/bin/sh\ncat >/dev/null 2>&1 || true\necho exceeded_current_quota_error >&2\nyes diagnostic-line-padding | head -n 200000 >&2\nexit 1\n' >"$T/bin/kimi"
+cat >"$T/bin/kimi" <<'SHIM'
+#!/bin/sh
+cat >/dev/null 2>&1 || true
+echo '{"type": "exceeded_current_quota_error"}' >&2
+yes diagnostic-line-padding | head -n 200000 >&2
+exit 1
+SHIM
 chmod +x "$T/bin/kimi"
 run "$T/o5"
 assert_eq "marker before large output -> quota_exhausted" "$(fk "$T/o5")" "quota_exhausted"
 
-kimi_shim 1 'exceeded_current_quota_error' ""
+kimi_shim 1 '{"error": {"type": "exceeded_current_quota_error"}}' ""
 run "$T/o3"
 assert_eq "error type on stdout -> quota_exhausted" "$(fk "$T/o3")" "quota_exhausted"
+
+# A partial review that merely mentions the token, then a transient 429.
+kimi_shim 1 '- [P2] handle exceeded_current_quota_error in the retry loop' 'HTTP 429 Too Many Requests'
+run "$T/o6"
+assert_eq "token quoted in a review is not quota" "$(jq -r '.failure_kind == "quota_exhausted"' "$T/o6/kimi.meta.json")" "false"
+if grep -q "attempt 1 failed" "$T/o6.log"; then ok "transient failure retried"; else bad "transient failure not retried"; fi
 
 kimi_shim 1 "" 'some other crash'
 run "$T/o4"
