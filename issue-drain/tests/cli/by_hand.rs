@@ -143,3 +143,20 @@ fn scope_widen_refuses_a_folder_without_a_slash_but_allows_a_file_not_there_yet(
     assert_eq!(run("src/lib/format.ts").code, 0);
     assert_eq!(run("src/new/file.ts").code, 0);
 }
+
+#[test]
+fn scope_widen_refuses_a_folder_that_exists_only_in_the_worktree() {
+    let env = setup();
+    let tree = private_repo(env.dir.path());
+    std::fs::create_dir_all(tree.join("src/fresh")).expect("an uncommitted folder");
+    std::fs::write(tree.join("src/fresh/a.ts"), "x").expect("a file");
+    std::os::unix::fs::symlink(tree.join("src/timer"), tree.join("src/link")).expect("a symlink");
+    env.write(
+        "units/3/unit.json",
+        &json!({"unit": 3, "worktree": tree.display().to_string(), "files": []}).to_string(),
+    );
+    let run = |file: &str| env.run(&["scope", "widen", "--unit", "3", "--file", file, "--reason", "x"]);
+    assert_eq!(run("src/fresh").code, 3);
+    assert_eq!(run("src/link").code, 3);
+    assert_eq!(run("src/fresh/a.ts").code, 0, "a file in that folder is fine");
+}

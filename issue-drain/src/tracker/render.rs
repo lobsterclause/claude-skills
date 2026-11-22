@@ -620,7 +620,8 @@ fn unit_errors(
         ));
     }
     for file in &u.files {
-        if let Err(why) = repo_path(file) {
+        // A folder is a repo path with one trailing slash, which stays.
+        if let Err(why) = repo_path(file.strip_suffix('/').unwrap_or(file)) {
             push(format!("names a file that {why} ({})", clean(file, 80)));
         } else if input.ctx.profile.is_protected(file) {
             push(format!("names a protected path ({file}); that work needs a person"));

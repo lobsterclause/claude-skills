@@ -81,6 +81,13 @@ pub fn guards_marker(ctx: &Ctx, args: &MarkerArgs) -> Res<()> {
 /// base commit when there is no worktree yet. A path git cannot find is not.
 fn is_folder(ctx: &Ctx, queue: &Value, unit: u64, file: &str) -> Res<bool> {
     let copy: Value = read_json(&ctx.path(&format!("units/{unit}/unit.json"))).unwrap_or(Value::Null);
+    if let Some(worktree) = copy["worktree"].as_str() {
+        // A folder the unit made and has not committed, or a link to one.
+        // `is_dir` follows a symlink, so a link to a folder counts too.
+        if std::path::Path::new(worktree).join(file).is_dir() {
+            return Ok(true);
+        }
+    }
     let (dir, rev) = match copy["worktree"].as_str() {
         Some(worktree) => (std::path::PathBuf::from(worktree), "HEAD".to_string()),
         None => (
@@ -133,12 +140,13 @@ pub fn scope(ctx: &Ctx, command: &ScopeCommand) -> Res<()> {
     }
     // The unit's own copy, when `unit-prepare` has made one.
     let copy_path = ctx.path(&format!("units/{}/unit.json", args.unit));
-    if let Some(mut copy) = read_json::<Value>(&copy_path)
-        && let Some(files) = copy["files"].as_array_mut()
-        && !files.iter().any(|f| f == &args.file)
-    {
-        files.push(json!(args.file));
-        write_json(&copy_path, &copy)?;
+    if let Some(mut copy) = read_json::<Value>(&copy_path) {
+        if let Some(files) = copy["files"].as_array_mut() {
+            if !files.iter().any(|f| f == &args.file) {
+                files.push(json!(args.file));
+                write_json(&copy_path, &copy)?;
+            }
+        }
     }
     ctx.event(
         "scope_widen",

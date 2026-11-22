@@ -99,11 +99,11 @@ fn name(command: &Command) -> &'static str {
 
 fn run(command: &Command) -> Res<()> {
     // Help needs no run folder or profile, so it is answered before they load.
-    if let Command::GhWrite { args } = command
-        && let Some(text) = gh::help(args)
-    {
-        print!("{text}");
-        return Ok(());
+    if let Command::GhWrite { args } = command {
+        if let Some(text) = gh::help(args) {
+            print!("{text}");
+            return Ok(());
+        }
     }
     let mut ctx = Ctx::load()?;
     if matches!(command, Command::MergeGate(args) if args.dry_run) {
