@@ -74,6 +74,5 @@ full_verify_command = "pnpm verify"
 # stamp-remote-pass hands over: the worktree is clean and at the verified commit.
 stamp_command = "bash scripts/verify-stamp.sh write {tree}"
 
-# Shown in the tracker header. Units arrive with the unit-and-gate build;
-# until then triage is the only part that runs.
-unit_permissions = "triage readers: Read, Grep, Glob only. Units: not built yet"
+# Shown in the tracker header. A description only; the code enforces it.
+unit_permissions = "triage readers: Read, Grep, Glob only. Units: edit and run in their own worktree under the guards mod; gh-write comment, add-label (never the claim label), ensure-label, pr-create, thread-reply, thread-resolve; no merge, no closing issues, no protected paths"

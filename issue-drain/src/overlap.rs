@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, write_json};
 use crate::error::{Fail, Res};
 use crate::model::{Group, Overlap, Pair};
+use crate::profile::shared_entry;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -88,7 +89,14 @@ fn dup(a: &Cand, b: &Cand) -> bool {
 }
 
 fn pair(a: &Cand, b: &Cand) -> Option<Pair> {
-    let files: Vec<String> = a.files.intersection(&b.files).cloned().collect();
+    let files: Vec<String> = a
+        .files
+        .iter()
+        .flat_map(|x| b.files.iter().filter_map(move |y| shared_entry(x, y)))
+        .map(str::to_string)
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
     let symbols: Vec<String> = a.symbols.intersection(&b.symbols).cloned().collect();
     let same_pattern = a.mechanical && b.mechanical && !a.pattern.is_empty() && a.pattern == b.pattern;
     let (relation, note) = if dup(a, b) || dup(b, a) {

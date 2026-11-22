@@ -247,6 +247,19 @@ fn a_path_outside_the_unit_files_is_refused() {
 }
 
 #[test]
+fn a_scope_entry_without_a_slash_is_that_path_only() {
+    let c = case_with(json!({"files": ["src/new"]}));
+    c.refuses(&[("src/new/unrelated.ts", "x\n")], "out_of_scope");
+    // Controls: the exact path passes, and so does a folder entry with a slash.
+    let c = case_with(json!({"files": ["src/new"]}));
+    commit(&c.repo, &[("src/new", "x\n")], "a file of that name");
+    assert_eq!(c.check(&[]).code, 0);
+    let c = case_with(json!({"files": ["src/new/"]}));
+    commit(&c.repo, &[("src/new/unrelated.ts", "x\n")], "inside the folder");
+    assert_eq!(c.check(&[]).code, 0);
+}
+
+#[test]
 fn a_test_file_the_implementer_adds_is_in_scope_and_recorded() {
     let c = case_with(json!({"files": ["src/timer/countdown.ts"]}));
     commit(

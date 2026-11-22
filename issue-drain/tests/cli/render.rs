@@ -601,3 +601,27 @@ fn duplicates_of_each_other_are_refused_even_beside_a_live_issue() {
     d["units"][1]["issues"] = json!([105]);
     expect_refused(&env, &d, "never reaches a live issue in this unit");
 }
+
+#[test]
+fn a_folder_that_evidence_check_kept_renders_with_its_slash() {
+    let env = Env::new();
+    env.seed(&["intake.json", "overlap.json", "issues"]);
+    let mut verdicts = json(&eval_fixtures().join("verdicts.good.json"));
+    for v in verdicts.as_array_mut().expect("an array") {
+        if v["number"] == 103 {
+            v["likely_files"] = json!(["src/timer/countdown.ts", "src/timer/"]);
+        }
+    }
+    let input = env.write("in.json", &verdicts.to_string());
+    let out = env.run(&["evidence-check", &input.display().to_string(), "--ref", "develop"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    fs::copy(
+        eval_fixtures().join("decisions.good.json"),
+        env.workdir.join("decisions.json"),
+    )
+    .expect("decisions");
+    let out = render(&env);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let queue = json(&env.workdir.join("queue.json")).to_string();
+    assert!(queue.contains("\"src/timer/\""), "{queue}");
+}

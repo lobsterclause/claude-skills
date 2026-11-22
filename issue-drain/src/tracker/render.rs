@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 use crate::ctx::{Ctx, read_json, write_atomic, write_json};
 use crate::error::{Fail, Res};
 use crate::model::{Checked, Eligible, FixCommit, Intake, Line, Queue};
+use crate::profile::shared_entry;
 use crate::text::{clean, code, count, repo_path, sha7};
 
 #[derive(clap::Args)]
@@ -248,9 +249,11 @@ fn adjacent_order(mut rem: Vec<&Draft>) -> Vec<&Draft> {
     let mut out = Vec::new();
     while !rem.is_empty() {
         let first = rem.remove(0);
-        let (friends, rest): (Vec<&Draft>, Vec<&Draft>) = rem
-            .into_iter()
-            .partition(|d| d.files.iter().any(|f| first.files.contains(f)));
+        let (friends, rest): (Vec<&Draft>, Vec<&Draft>) = rem.into_iter().partition(|d| {
+            d.files
+                .iter()
+                .any(|f| first.files.iter().any(|g| shared_entry(f, g).is_some()))
+        });
         out.push(first);
         out.extend(friends);
         rem = rest;
@@ -620,7 +623,8 @@ fn unit_errors(
         ));
     }
     for file in &u.files {
-        if let Err(why) = repo_path(file) {
+        // A folder is a repo path with one trailing slash, which stays.
+        if let Err(why) = repo_path(file.strip_suffix('/').unwrap_or(file)) {
             push(format!("names a file that {why} ({})", clean(file, 80)));
         } else if input.ctx.profile.is_protected(file) {
             push(format!("names a protected path ({file}); that work needs a person"));
@@ -953,5 +957,12 @@ mod tests {
             .map(|d| d.title.as_str())
             .collect();
         assert_eq!(order, ["a", "a", "b"]);
+        // A folder is pulled together with a file under it.
+        let (f, o, g) = (draft("src/t/"), draft("b"), draft("src/t/x.ts"));
+        let order: Vec<&str> = adjacent_order(vec![&f, &o, &g])
+            .iter()
+            .map(|d| d.title.as_str())
+            .collect();
+        assert_eq!(order, ["src/t/", "src/t/x.ts", "b"]);
     }
 }
