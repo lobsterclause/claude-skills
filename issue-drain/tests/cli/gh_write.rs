@@ -307,3 +307,92 @@ fn a_missing_profile_stops_the_command() {
     );
     assert!(env.gh_calls().is_empty());
 }
+
+#[test]
+fn run_rerun_reaches_gh_with_the_failed_flag_passed_through() {
+    let env = Env::new();
+    let out = env.run(&["gh-write", "run-rerun", "555"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let out = env.run(&["gh-write", "run-rerun", "555", "--failed"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        env.gh_calls(),
+        [
+            format!("run rerun 555 --repo {REPO}"),
+            format!("run rerun 555 --repo {REPO} --failed")
+        ]
+    );
+    let out = env.run(&["gh-write", "run-rerun", "five"]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(env.gh_calls().len(), 2);
+}
+
+#[test]
+fn a_dry_run_of_run_rerun_and_pr_edit_prints_would() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    let body = body(&env);
+    let out = env.run(&["gh-write", "run-rerun", "555", "--failed"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        out.stdout.trim(),
+        format!("WOULD: gh run rerun 555 --repo {REPO} --failed")
+    );
+    let out = env.run(&["gh-write", "pr-edit", "9", "--body-file", &body]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        out.stdout.trim(),
+        format!("WOULD: gh pr edit 9 --repo {REPO} --body-file {body}")
+    );
+    assert!(env.gh_calls().is_empty());
+}
+
+#[test]
+fn pr_edit_replaces_the_body_from_a_file() {
+    let env = Env::new();
+    let body = body(&env);
+    let out = env.run(&["gh-write", "pr-edit", "9", "--body-file", &body]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(env.gh_calls(), [format!("pr edit 9 --repo {REPO} --body-file {body}")]);
+    for args in [
+        &["gh-write", "pr-edit", "9"][..],
+        &["gh-write", "pr-edit", "nine", "--body-file", &body][..],
+    ] {
+        assert_eq!(env.run(args).code, 2, "{args:?}");
+    }
+    assert_eq!(env.gh_calls().len(), 1);
+}
+
+#[test]
+fn a_unit_may_use_neither_run_rerun_nor_pr_edit() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_MODE", "unit");
+    let body = body(&env);
+    for args in [
+        &["gh-write", "run-rerun", "555"][..],
+        &["gh-write", "pr-edit", "9", "--body-file", &body][..],
+    ] {
+        let out = env.run(args);
+        assert_eq!(out.code, 3, "{args:?}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty());
+}
+
+#[test]
+fn help_prints_the_verbs_and_each_verbs_usage_and_calls_nothing() {
+    let env = Env::new();
+    let out = env.run(&["gh-write", "--help"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    for verb in ["issue-create", "run-rerun", "pr-edit", "thread-resolve", "remove-label"] {
+        assert!(out.stdout.contains(verb), "{verb}: {}", out.stdout);
+    }
+    let out = env.run(&["gh-write", "pr-edit", "--help"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("--body-file"), "{}", out.stdout);
+    let out = env.run(&["gh-write", "run-rerun", "-h"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("--failed"), "{}", out.stdout);
+    let out = env.run(&["gh-write", "help"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(env.gh_calls().is_empty());
+}

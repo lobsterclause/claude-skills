@@ -49,6 +49,17 @@ pub enum Write<'a> {
     CloseIssue {
         number: u64,
     },
+    /// Re-run a workflow run, or only its failed jobs. Not a unit's verb.
+    RunRerun {
+        run: u64,
+        failed: bool,
+    },
+    /// Replace a PR's body. Not a unit's verb: a unit process is not told its
+    /// PR number, so it has no PR it could be limited to.
+    PrEdit {
+        number: u64,
+        body_file: &'a Path,
+    },
     /// Squash-merge a PR, only if its head is still `head`. Reached only from
     /// `merge-gate`, which holds every condition a merge needs.
     MergePr {
@@ -198,6 +209,8 @@ impl Write<'_> {
             Write::AddLabel { .. } => "add-label",
             Write::RemoveLabel { .. } => "remove-label",
             Write::CloseIssue { .. } => "close-issue",
+            Write::RunRerun { .. } => "run-rerun",
+            Write::PrEdit { .. } => "pr-edit",
             Write::MergePr { .. } => "merge-pr",
             Write::DisableAutoMerge { .. } => "disable-auto-merge",
             Write::PrCreate { .. } => "pr-create",
@@ -405,6 +418,30 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
                 own("completed"),
             ],
         ),
+        Write::RunRerun { run, failed } => {
+            let mut argv = ["run", "rerun", &run.to_string(), "--repo", &repo]
+                .map(str::to_string)
+                .to_vec();
+            if *failed {
+                argv.push(own("--failed"));
+            }
+            (format!("re-run {run}"), argv)
+        }
+        Write::PrEdit { number, body_file } => {
+            need_body(body_file)?;
+            (
+                format!("replace the body of #{number}"),
+                vec![
+                    own("pr"),
+                    own("edit"),
+                    number.to_string(),
+                    own("--repo"),
+                    repo,
+                    own("--body-file"),
+                    body_file.display().to_string(),
+                ],
+            )
+        }
         Write::MergePr { number, head } => {
             if !head.bytes().all(|b| b.is_ascii_hexdigit()) || head.len() < 40 {
                 return Err(Fail::usage(format!("'{head}' is not a full commit SHA")));
@@ -502,7 +539,73 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
     Ok(Written { called: true, stdout })
 }
 
-const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|pr-create|thread-reply|thread-resolve>";
+const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|pr-create|pr-edit|run-rerun|thread-reply|thread-resolve>";
+
+/// Per verb: its usage line, then who may use it.
+const USAGES: &[(&str, &str)] = &[
+    (
+        "issue-create",
+        "issue-create --title <text> --body-file <file>\n    Create the tracker issue. Not for a unit.",
+    ),
+    (
+        "comment",
+        "comment <issue-or-pr> --body-file <file>\n    Comment on an issue or PR. A unit may.",
+    ),
+    (
+        "ensure-label",
+        "ensure-label <label>\n    Create one of the drain's three labels if it is missing. A unit may.",
+    ),
+    (
+        "add-label",
+        "add-label <issue> <label>\n    Add the claim or blocked label. A unit may not add the claim label.",
+    ),
+    (
+        "remove-label",
+        "remove-label <issue> <label>\n    Remove the claim label. Not for a unit.",
+    ),
+    (
+        "pr-create",
+        "pr-create --head <branch> --base <branch> --title <text> --body-file <file> [--draft] [--label <name>]...\n    Open a PR. A unit may.",
+    ),
+    (
+        "pr-edit",
+        "pr-edit <pr> --body-file <file>\n    Replace a PR's body. Not for a unit: a unit process is not told its PR number.",
+    ),
+    (
+        "run-rerun",
+        "run-rerun <run-id> [--failed]\n    Re-run a workflow run, or only its failed jobs. Not for a unit.",
+    ),
+    (
+        "thread-reply",
+        "thread-reply --thread <id> --body-file <file>\n    Reply on a review thread. A unit may.",
+    ),
+    (
+        "thread-resolve",
+        "thread-resolve --thread <id>\n    Resolve a review thread. A unit may.",
+    ),
+];
+
+fn is_help(arg: &str) -> bool {
+    matches!(arg, "--help" | "-h" | "help")
+}
+
+/// The help for `gh-write`, or for one verb, when that is what was asked.
+fn help(argv: &[String]) -> Option<String> {
+    match argv {
+        [first] if is_help(first) => {
+            let all: Vec<String> = USAGES.iter().map(|(_, text)| format!("  {text}")).collect();
+            Some(format!(
+                "usage: issue-drain gh-write {VERBS} ...\n\nThe one path by which issue-drain writes to GitHub. Bodies come from a file.\nISSUE_DRAIN_DRY_RUN=1 prints WOULD: lines and calls nothing.\n\n{}\n\nRun `gh-write <verb> --help` for one verb.\n",
+                all.join("\n")
+            ))
+        }
+        [verb, rest @ ..] if rest.iter().any(|a| is_help(a)) => USAGES
+            .iter()
+            .find(|(name, _)| name == verb)
+            .map(|(_, text)| format!("usage: issue-drain gh-write {text}\n")),
+        _ => None,
+    }
+}
 
 /// `issue-drain gh-write <verb> ...`. The verb and its options are read by
 /// hand, not by clap, so that a unit process asking for a forbidden verb is
@@ -512,6 +615,10 @@ const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|p
 /// There is no verb that closes an issue. `Write::CloseIssue` is reached only
 /// from `close-verified`, which holds every condition a closure needs.
 pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
+    if let Some(text) = help(argv) {
+        print!("{text}");
+        return Ok(());
+    }
     ctx.repo()?;
     let mode = ctx.mode()?;
     let Some(verb) = argv.first().map(String::as_str).filter(|v| !v.is_empty()) else {
@@ -525,6 +632,7 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     let mut title = String::new();
     let (mut head, mut base, mut thread) = (String::new(), String::new(), String::new());
     let mut draft = false;
+    let mut failed = false;
     let mut labels: Vec<String> = Vec::new();
     let mut args: Vec<&str> = Vec::new();
     let mut rest = argv[1..].iter();
@@ -536,6 +644,7 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             "--base" => base = rest.next().cloned().unwrap_or_default(),
             "--thread" => thread = rest.next().cloned().unwrap_or_default(),
             "--draft" => draft = true,
+            "--failed" => failed = true,
             "--label" => match rest.next() {
                 Some(label) if !label.is_empty() => labels.push(label.clone()),
                 _ => return Err(Fail::usage("--label needs a name")),
@@ -588,6 +697,11 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             draft,
             labels: &labels,
         },
+        "pr-edit" => Write::PrEdit {
+            number: number()?,
+            body_file: body()?,
+        },
+        "run-rerun" => Write::RunRerun { run: number()?, failed },
         "thread-reply" => Write::ThreadReply {
             thread: &thread,
             body_file: body()?,

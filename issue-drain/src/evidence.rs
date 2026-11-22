@@ -225,6 +225,22 @@ fn check_fixing_commit(basis: &Basis, named: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A folder named with a trailing slash that is a folder on the ref, without
+/// the slash. Anything else is returned as it came, and `repo_path` judges it.
+fn folder_without_slash(basis: &Basis, file: String) -> String {
+    match file.strip_suffix('/') {
+        Some(dir) if repo_path(dir).is_ok() => {
+            let spec = format!("{}:{dir}", basis.sha);
+            if git::out(basis.dir, &["cat-file", "-t", &spec]).is_some_and(|t| t.trim() == "tree") {
+                dir.to_string()
+            } else {
+                file
+            }
+        }
+        _ => file,
+    }
+}
+
 fn check_with(basis: &Basis, verdict: &Value, created: Option<i64>, known: &[u64]) -> Res<Checked> {
     let number = number_of(verdict).ok_or_else(|| Fail::usage("a verdict needs an issue number"))?;
     let orig = tostr(verdict.get("status"));
@@ -234,6 +250,7 @@ fn check_with(basis: &Basis, verdict: &Value, created: Option<i64>, known: &[u64
     // queue's file list and from there a unit's scope.
     let (likely_files, bad_files): (Vec<String>, Vec<String>) = strings(verdict.get("likely_files"))
         .into_iter()
+        .map(|f| folder_without_slash(basis, f))
         .partition(|f| repo_path(f).is_ok());
     let bad_file = bad_files.first().and_then(|f| repo_path(f).err());
     let files: BTreeSet<&String> = likely_files

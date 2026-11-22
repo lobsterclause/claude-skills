@@ -4,6 +4,7 @@
 
 mod common;
 
+mod by_hand;
 mod claim;
 mod close;
 mod deliver_check;

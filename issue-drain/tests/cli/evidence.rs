@@ -239,6 +239,21 @@ fn a_likely_file_that_is_no_repo_path_makes_the_verdict_unclear() {
 }
 
 #[test]
+fn a_likely_file_that_is_a_folder_on_the_ref_is_kept_without_its_slash() {
+    for number in [103, 101] {
+        let r = check_one(&with(good(number), "likely_files", json!([COUNTDOWN, "src/timer/"])));
+        assert_ne!(r["status"], "unclear", "#{number} {r}");
+        assert_eq!(r["likely_files"], json!([COUNTDOWN, "src/timer"]));
+    }
+    // Controls: a folder that is not on the ref, and a file with a slash, still fail.
+    for bad in ["src/nowhere/", "src/timer/countdown.ts/"] {
+        let r = check_one(&with(good(103), "likely_files", json!([COUNTDOWN, bad])));
+        assert_eq!(r["status"], "unclear", "{bad}");
+        assert_eq!(r["downgrade_reason"], "a likely file is not a repo-relative path");
+    }
+}
+
+#[test]
 fn an_already_fixed_issue_on_a_protected_path_is_still_already_fixed() {
     // Nothing is written for it, so there is nothing for a person to change.
     let r = check_one(&with(
