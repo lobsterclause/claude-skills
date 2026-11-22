@@ -10,7 +10,8 @@ ok()  { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 assert_eq() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (got: '$2' want: '$3')"; fi; }
 command -v jq >/dev/null 2>&1 || { echo "jq required" >&2; exit 1; }
-mkdir -p "$T/bin" "$T/home"; export HOME="$T/home"
+mkdir -p "$T/bin" "$T/home" "$T/nvm"; export HOME="$T/home"
+export NVM_DIR="$T/nvm"  # an inherited NVM tree would put a real kimi ahead of the shim
 export PATH="$T/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export CROSS_REVIEW_TOOL_MODE=off
 unset OPENROUTER_API_KEY; export XDG_CONFIG_HOME="$T/xdg"
