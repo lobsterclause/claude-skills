@@ -8,6 +8,10 @@
 //!     uncommitted changes is refused unless `--force`. A worktree that holds
 //!     this process's working directory is refused always: that is the by-hand
 //!     case, and removing it would pull the folder from under the caller.
+//!   - the PR must be the unit's (the checks `merge-gate` makes: head repo, head
+//!     branch, base), and the local branch tip must be the PR's head or one of
+//!     its ancestors, or nothing is removed; `--force` does not cover that.
+//!     A PR number from a gate line that refused it as not the unit's is skipped.
 //!   - its local branch is deleted only when the PR is merged. The PR is
 //!     `--pr`, or else the last one the run's log names for the unit. An open or
 //!     closed-unmerged PR, or none known, keeps the branch.
@@ -36,12 +40,13 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::base_sync::{pr_from_log, unit_files, view};
+use crate::base_sync::{owned_view, pr_from_log, unit_files};
 use crate::claim;
 use crate::ctx::Ctx;
 use crate::error::{Fail, Res};
 use crate::exec;
 use crate::git;
+use crate::merge_gate::PrState;
 
 #[derive(clap::Args)]
 #[command(group(clap::ArgGroup::new("target").required(true).args(["unit", "run"])))]
@@ -97,6 +102,23 @@ fn remove_worktree(repo_dir: &Path, wt: &Path, force: bool, log: &Path) -> Res<(
     }
 }
 
+/// Refuse unless `tip` is the PR's head or one of its ancestors. A PR head this
+/// checkout has not seen (the PR's branch is often deleted on merge) is fetched
+/// from GitHub's `refs/pull/<n>/head` first.
+fn unpushed_work_check(repo_dir: &Path, pr: u64, head: &str, tip: &str, branch: &str, log: &Path) -> Res<()> {
+    let have = |sha: &str| git::ok(repo_dir, &["cat-file", "-e", &format!("{sha}^{{commit}}")]);
+    if !have(head) {
+        let spec = format!("refs/pull/{pr}/head");
+        let _ = exec::git(repo_dir, &["fetch", "--quiet", "origin", &spec], GIT_LIMIT, log);
+    }
+    if have(head) && git::ok(repo_dir, &["merge-base", "--is-ancestor", tip, head]) {
+        return Ok(());
+    }
+    Err(Fail::refused(format!(
+        "the local branch {branch} is at {tip}, which is not on the PR's head {head}: it holds commits the PR never had. Push or save them; --force does not cover this"
+    )))
+}
+
 /// One unit's cleanup. `only_finished` is `--run`: a unit whose PR is not known,
 /// or is still open, is skipped, and the skip is the `Ok` answer.
 fn unit(ctx: &Ctx, args: &Args, n: u64, only_finished: bool) -> Res<Value> {
@@ -105,10 +127,18 @@ fn unit(ctx: &Ctx, args: &Args, n: u64, only_finished: bool) -> Res<Value> {
     let repo_dir = ctx.repo_dir()?;
     let run_dir = real(&ctx.workdir);
     let pr = args.pr.or_else(|| pr_from_log(ctx, n));
-    let state = match pr {
-        Some(pr) => Some(view(&repo, pr)?.state),
+    // The PR must be the unit's before its state means anything: a merged PR
+    // of another branch or repo is no reason to delete this unit's work.
+    let view = match pr {
+        Some(pr) => Some(owned_view(ctx, &repo, n, pr, &files.branch)?),
         None => None,
     };
+    let state = view.as_ref().map(|v| match v.state {
+        PrState::Open => "OPEN".to_string(),
+        PrState::Closed => "CLOSED".to_string(),
+        PrState::Merged => "MERGED".to_string(),
+        PrState::Other => "OTHER".to_string(),
+    });
     if only_finished {
         match state.as_deref() {
             None => return Ok(json!({"unit": n, "skipped": "no_pr"})),
@@ -154,6 +184,16 @@ fn unit(ctx: &Ctx, args: &Args, n: u64, only_finished: bool) -> Res<Value> {
         &repo_dir,
         &["rev-parse", "--verify", "-q", &format!("refs/heads/{branch}")],
     );
+    // A clean worktree can still hold commits the PR never had. --force covers
+    // a dirty tree, never those. The comparison is with the PR's head, not with
+    // the squash commit the merge made.
+    if let (Some(view), Some(pr)) = (&view, pr) {
+        let tip = git::commit(&repo_dir, &format!("refs/heads/{branch}"))
+            .or_else(|| present.then(|| git::commit(&wt, "HEAD")).flatten());
+        if let Some(tip) = tip {
+            unpushed_work_check(&repo_dir, pr, &view.head, &tip, &branch, &log)?;
+        }
+    }
     let (worktree_result, branch_result) = if ctx.dry_run {
         if present {
             println!("WOULD: git worktree remove {}", wt.display());
@@ -226,8 +266,25 @@ fn prepared_units(ctx: &Ctx) -> BTreeSet<u64> {
 fn base_clone(ctx: &Ctx, cleaned: &BTreeSet<u64>) -> Res<Option<Value>> {
     let run_dir = real(&ctx.workdir);
     let base = run_dir.join("base");
-    if !base.exists() {
-        return Ok(None);
+    // A link is looked at before it is followed: `git worktree remove --force`
+    // on a link to a worktree elsewhere removes the target.
+    match fs::symlink_metadata(&base) {
+        Err(_) => return Ok(None),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Fail::refused(format!(
+                "{} is a symlink; it is not followed or removed. Remove the link by hand",
+                base.display()
+            )));
+        }
+        Ok(_) => {}
+    }
+    let inside = fs::canonicalize(&base).is_ok_and(|real| real.starts_with(&run_dir) && real != run_dir);
+    if !inside {
+        return Err(Fail::refused(format!(
+            "{} does not resolve to a folder inside the run folder {}; it is not touched",
+            base.display(),
+            run_dir.display()
+        )));
     }
     let left: Vec<String> = fs::read_dir(run_dir.join("worktrees"))
         .into_iter()

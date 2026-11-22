@@ -24,6 +24,27 @@ pub struct Case {
     pub old_head: String,
 }
 
+/// What `gh pr view` answers for PR 7: the unit's branch, in `owner`'s copy of
+/// the tidepool repo, aimed at `base`.
+pub fn pr_json(state: &str, head: &str, owner: &str, base: &str) -> Value {
+    json!({
+        "state": state, "headRefOid": head, "headRefName": BRANCH, "baseRefName": base,
+        "headRepository": {"name": "tidepool"}, "headRepositoryOwner": {"login": owner},
+        "mergeStateStatus": "CLEAN", "reviewDecision": "", "labels": [], "body": "",
+        "closingIssuesReferences": [], "changedFiles": 1, "statusCheckRollup": [], "mergeCommit": null
+    })
+}
+
+/// A stand-in merge_preflight.sh that reads `status` with a CLEAN verdict.
+pub fn preflight(env: &mut Env, status: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = env.dir.path().join("preflight.sh");
+    let out = json!({"status": status, "verdict": "CLEAN", "head": "a".repeat(40), "reviewed": "a".repeat(40)});
+    fs::write(&path, format!("#!/bin/sh\ncat <<'EOF'\n{out}\nEOF\n")).expect("the script");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    env.set("ISSUE_DRAIN_MERGE_PREFLIGHT", &path.display().to_string());
+}
+
 pub fn identity(dir: &Path, args: &[&str]) -> String {
     let mut all = vec!["-c", "user.name=T", "-c", "user.email=t@example.invalid"];
     all.extend_from_slice(args);
@@ -58,6 +79,7 @@ pub fn case() -> Case {
     identity(&wt, &["commit", "-q", "-m", "pad"]);
     git(&wt, &["push", "-q", "origin", BRANCH]);
     let old_head = git(&wt, &["rev-parse", "HEAD"]);
+    preflight(&mut env, "clear");
     Case {
         env,
         bare,
@@ -69,7 +91,7 @@ pub fn case() -> Case {
 
 impl Case {
     /// A new commit on origin's develop.
-    fn advance_base(&self) -> String {
+    pub fn advance_base(&self) -> String {
         fs::write(self.work.join("NEW.md"), "new\n").expect("the file");
         git(&self.work, &["add", "NEW.md"]);
         identity(&self.work, &["commit", "-q", "-m", "new"]);
@@ -79,7 +101,7 @@ impl Case {
 
     /// What GitHub's update-branch does: merge develop into the branch and
     /// push. Returns the new head.
-    fn update_branch(&self, merge: bool) -> String {
+    pub fn update_branch(&self, merge: bool) -> String {
         let other = self.env.dir.path().join("other");
         if !other.exists() {
             git(
@@ -106,14 +128,15 @@ impl Case {
         git(&other, &["rev-parse", "HEAD"])
     }
 
-    fn pr_is_at(&self, head: &str) {
-        self.env.stub_file(
-            &format!("pr-view-{PR}.json"),
-            &json!({"headRefOid": head, "headRefName": BRANCH, "state": "OPEN"}).to_string(),
-        );
+    pub fn pr_is_at(&self, head: &str) {
+        self.pr_with(&pr_json("OPEN", head, "example", "develop"));
     }
 
-    fn proof_for(&self, head: &str) {
+    pub fn pr_with(&self, view: &Value) {
+        self.env.stub_file(&format!("pr-view-{PR}.json"), &view.to_string());
+    }
+
+    pub fn proof_for(&self, head: &str) {
         self.env.write(
             "units/3/review-proof.json",
             &json!({"head": head, "reviewers": []}).to_string(),
@@ -318,4 +341,90 @@ fn the_pr_number_comes_from_the_state_log_when_not_given() {
     assert_eq!(c.env.run(&["state", "event", "3", "pr_open", "--pr", PR]).code, 0);
     let out = c.env.run(&["base-sync", "--unit", "3"]);
     assert_eq!(printed(&out)["pr"], 7);
+}
+
+#[test]
+fn a_fork_pr_or_a_pr_for_another_base_is_never_updated() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    for view in [
+        pr_json("OPEN", &new_head, "someone-else", "develop"),
+        pr_json("OPEN", &new_head, "example", "release"),
+    ] {
+        c.pr_with(&view);
+        let out = c.sync();
+        assert_eq!(out.code, 3, "{}", out.stderr);
+        assert_eq!(c.update_calls(), 0);
+    }
+    assert_eq!(git(&c.wt, &["rev-parse", "HEAD"]), c.old_head);
+}
+
+#[test]
+fn a_review_record_that_is_not_clear_needs_a_round_even_for_a_two_parent_head() {
+    let mut c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    c.proof_for(&c.old_head);
+    // The merge changed the reviewed diff's digest, so the script says stale.
+    preflight(&mut c.env, "stale");
+    assert_eq!(printed(&c.sync())["review_round_needed"], true);
+}
+
+#[test]
+fn an_unreadable_review_record_needs_a_round() {
+    let mut c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    c.proof_for(&c.old_head);
+    c.env
+        .set("ISSUE_DRAIN_MERGE_PREFLIGHT", "/nonexistent/merge_preflight.sh");
+    assert_eq!(printed(&c.sync())["review_round_needed"], true);
+}
+
+fn seed_remote_syncs(c: &Case, count: usize) {
+    // Finished syncs: the remote update, then the local follow-up.
+    let lines: Vec<String> = (0..count)
+        .flat_map(|_| ["base_sync_remote", "base_sync"])
+        .map(|name| json!({"ts": "2026-11-21T03:53:00Z", "event": name, "unit": 3}).to_string())
+        .collect();
+    c.env.write("events.jsonl", &format!("{}\n", lines.join("\n")));
+}
+
+#[test]
+fn the_remote_update_is_logged_before_the_local_steps_and_spends_a_slot() {
+    let c = case();
+    c.advance_base();
+    c.update_branch(true);
+    seed_remote_syncs(&c, 3);
+    // GitHub names a head the branch does not have, so the local follow-up fails.
+    c.pr_is_at(&"f".repeat(40));
+    assert_eq!(c.sync().code, 1);
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 4);
+    assert_eq!(c.env.events_named("base_sync").len(), 3, "no new finished sync");
+    // The PR head is the worktree's again, so this is a new attempt: the 5th.
+    c.pr_is_at(&c.old_head);
+    let out = c.sync();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+}
+
+#[test]
+fn a_retry_after_a_failed_follow_up_resumes_without_another_update_or_slot() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&"f".repeat(40));
+    assert_eq!(c.sync().code, 1);
+    assert_eq!(c.update_calls(), 1);
+
+    c.pr_is_at(&new_head);
+    let out = printed(&c.sync());
+    assert_eq!(out["new_head"], new_head);
+    assert_eq!(out["old_head"], c.old_head);
+    assert_eq!(c.update_calls(), 1, "the PR head had already moved: no second update");
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 1);
+    assert_eq!(c.env.events_named("base_sync").len(), 1);
+    assert_eq!(git(&c.wt, &["rev-parse", "HEAD"]), new_head);
 }

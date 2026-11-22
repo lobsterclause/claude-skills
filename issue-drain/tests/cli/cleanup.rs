@@ -7,16 +7,13 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use crate::base_sync::{BRANCH, Case, PR, case};
+use crate::base_sync::{BRANCH, Case, PR, case, identity, pr_json};
 use crate::common::*;
 
 const LABEL: &str = "agent-in-progress";
 
 fn pr_is(c: &Case, state: &str) {
-    c.env.stub_file(
-        &format!("pr-view-{PR}.json"),
-        &json!({"headRefOid": c.old_head, "headRefName": BRANCH, "state": state}).to_string(),
-    );
+    c.pr_with(&pr_json(state, &c.old_head, "example", "develop"));
 }
 
 fn checkout(c: &Case) -> PathBuf {
@@ -263,4 +260,99 @@ fn a_unit_or_run_is_required_but_not_both() {
     let c = case();
     assert_eq!(c.env.run(&["cleanup"]).code, 2);
     assert_eq!(c.env.run(&["cleanup", "--run", "--unit", "3"]).code, 2);
+}
+
+#[test]
+fn a_pr_that_is_not_the_units_is_refused_whatever_its_state() {
+    let c = case();
+    for view in [
+        pr_json("MERGED", &c.old_head, "someone-else", "develop"),
+        pr_json("MERGED", &c.old_head, "example", "release"),
+    ] {
+        c.pr_with(&view);
+        let out = cleanup(&c, &["--force"]);
+        assert_eq!(out.code, 3, "{}", out.stderr);
+        assert!(c.wt.exists());
+        assert!(branches(&c).contains(BRANCH));
+    }
+    let mut other_branch = pr_json("MERGED", &c.old_head, "example", "develop");
+    other_branch["headRefName"] = json!("fix/9-someone-elses");
+    c.pr_with(&other_branch);
+    assert_eq!(cleanup(&c, &["--force"]).code, 3);
+    assert!(c.wt.exists());
+}
+
+#[test]
+fn a_pr_number_the_gate_refused_is_not_taken_from_the_log() {
+    let c = case();
+    pr_is(&c, "MERGED");
+    let lines = [
+        json!({"ts": "t", "event": "merge_gate", "unit": 3, "pr": 7, "refusals": ["review"]}),
+        json!({"ts": "t", "event": "merge_gate", "unit": 3, "pr": 9, "refusals": ["pr_unit"]}),
+        json!({"ts": "t", "event": "merge_gate", "unit": 3, "pr": 8, "refusals": ["wrong_base"]}),
+    ];
+    let text: Vec<String> = lines.iter().map(Value::to_string).collect();
+    c.env.write("events.jsonl", &format!("{}\n", text.join("\n")));
+    let out = printed(&c.env.run(&["cleanup", "--unit", "3"]));
+    assert_eq!(out["pr"], 7);
+    assert_eq!(out["branch"], "deleted");
+}
+
+#[test]
+fn local_commits_the_pr_never_had_are_not_thrown_away_even_with_force() {
+    let c = case();
+    pr_is(&c, "MERGED");
+    fs::write(c.wt.join("src/timer/countdown.ts"), "export const unpushed = 1;\n").expect("the file");
+    git(&c.wt, &["add", "src/timer/countdown.ts"]);
+    identity(&c.wt, &["commit", "-q", "-m", "never pushed"]);
+    let out = cleanup(&c, &["--force"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("not on the PR"), "{}", out.stderr);
+    assert!(c.wt.exists());
+    assert!(branches(&c).contains(BRANCH));
+}
+
+#[test]
+fn a_branch_behind_the_pr_head_is_fine() {
+    let c = case();
+    // The PR head is a later commit of the same branch than the unit's own tip.
+    let head = c.old_head.clone();
+    fs::write(c.wt.join("src/timer/countdown.ts"), "export const more = 1;\n").expect("the file");
+    git(&c.wt, &["add", "src/timer/countdown.ts"]);
+    identity(&c.wt, &["commit", "-q", "-m", "later"]);
+    let later = git(&c.wt, &["rev-parse", "HEAD"]);
+    git(&c.wt, &["reset", "-q", "--hard", &head]);
+    c.pr_with(&pr_json("MERGED", &later, "example", "develop"));
+    assert_eq!(printed(&cleanup(&c, &[]))["branch"], "deleted");
+}
+
+#[test]
+fn a_base_that_is_a_symlink_is_never_followed() {
+    let c = case();
+    pr_is(&c, "MERGED");
+    c.env.write(
+        "events.jsonl",
+        &format!(
+            "{}\n",
+            json!({"ts": "t", "event": "merge_gate", "unit": 3, "pr": 7, "refusals": []})
+        ),
+    );
+    let elsewhere = c.env.dir.path().join("elsewhere-wt");
+    git(
+        &checkout(&c),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            &elsewhere.display().to_string(),
+            "origin/develop",
+        ],
+    );
+    let base = fs::canonicalize(&c.env.workdir).expect("the run folder").join("base");
+    std::os::unix::fs::symlink(&elsewhere, &base).expect("the link");
+    let out = c.env.run(&["cleanup", "--run"]);
+    assert_eq!(out.code, 3, "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("symlink"), "{}", out.stdout);
+    assert!(elsewhere.exists(), "the link's target survives");
 }

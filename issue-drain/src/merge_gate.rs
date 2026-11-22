@@ -419,7 +419,7 @@ fn same_commit(short: &str, full: &str) -> bool {
 /// branch is the one `unit.json` names and it is in the profile's repository.
 /// Nothing else ties `--pr` to `--unit`, so
 /// the already-merged answer needs it as much as a merge does.
-fn binding(repo: &str, base: &str, unit: u64, pr: u64, view: &PrView, branch: &Read<String>) -> Vec<Refusal> {
+pub fn binding(repo: &str, base: &str, unit: u64, pr: u64, view: &PrView, branch: &Read<String>) -> Vec<Refusal> {
     let mut out = Vec::new();
     if view.base_ref != base {
         out.push(refusal(
@@ -1619,7 +1619,7 @@ fn preflight_path() -> Read<String> {
 /// for a PR nobody reviewed. The script asks local git about the PR's commits,
 /// so it runs in the drained repository's checkout (`ISSUE_DRAIN_REPO_DIR`), and
 /// only when that checkout's origin is the profile's repo.
-fn preflight(ctx: &Ctx, repo: &str, pr: u64) -> Read<Preflight> {
+pub fn preflight(ctx: &Ctx, repo: &str, pr: u64) -> Read<Preflight> {
     let what = "merge_preflight.sh";
     let dir = ctx.repo_dir().map_err(|e| format!("{what}: {}", e.msg))?;
     match git::origin_repo(&dir) {
@@ -1822,7 +1822,7 @@ fn required_checks(repo: &str, base: &str) -> Read<Vec<Required>> {
     Ok(required)
 }
 
-fn read_view(repo: &str, pr: u64) -> Read<PrView> {
+pub fn read_view(repo: &str, pr: u64) -> Read<PrView> {
     let raw = read_gh(&[
         "pr",
         "view",

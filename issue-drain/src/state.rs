@@ -478,11 +478,11 @@ fn unit_number(id: &str) -> Option<u64> {
 /// has no STOP line, and holds nothing the run never offered. A saved parse
 /// that does not say all three is not the output of `tracker parse`. A null
 /// `tracker_state` means the body came from a file, which only a dry run does.
-fn called_off(parsed: &Value, path: &std::path::Path, dry_run: bool, run: &str) -> Res<()> {
+fn called_off(parsed: &Value, path: &str, dry_run: bool, run: &str) -> Res<()> {
     let missing = |key: &str| {
         Fail::usage(format!(
             "{} has no \"{key}\"; it is not what `tracker parse` prints",
-            path.display()
+            path
         ))
     };
     let parsed_run = parsed
@@ -505,7 +505,7 @@ fn called_off(parsed: &Value, path: &std::path::Path, dry_run: bool, run: &str) 
     if parsed_run != run {
         return Err(Fail::refused(format!(
             "{} is the parse of run '{parsed_run}', not of this run '{run}'",
-            path.display()
+            path
         )));
     }
     if stop {
@@ -539,6 +539,24 @@ fn called_off(parsed: &Value, path: &std::path::Path, dry_run: bool, run: &str) 
 
 /// Queue the units; the number queued.
 fn init(ctx: &Ctx, args: &InitArgs) -> Res<usize> {
+    let source = match &args.parsed {
+        None => None,
+        Some(path) => {
+            let parsed: Value = read_json(path).ok_or_else(|| {
+                Fail::usage(format!(
+                    "{} is not the JSON that `tracker parse` prints",
+                    path.display()
+                ))
+            })?;
+            Some((parsed, path.display().to_string()))
+        }
+    };
+    init_from(ctx, source)
+}
+
+/// `init`, with the approved tracker (a `tracker parse` answer and the name to
+/// call it in messages) already read.
+fn init_from(ctx: &Ctx, source: Option<(Value, String)>) -> Res<usize> {
     let replay = replay(ctx)?;
     if replay.events > 0 {
         return Err(Fail::refused(format!(
@@ -560,30 +578,23 @@ fn init(ctx: &Ctx, args: &InitArgs) -> Res<usize> {
             .ok_or_else(|| Fail::usage(format!("queue.json has a unit named '{}', not U<number>", unit.id)))?;
         units.push((number, unit.issues.clone()));
     }
-    if let Some(path) = &args.parsed {
-        let parsed: Value = read_json(path).ok_or_else(|| {
-            Fail::usage(format!(
-                "{} is not the JSON that `tracker parse` prints",
-                path.display()
-            ))
-        })?;
+    if let Some((parsed, path)) = &source {
         let listed = parsed
             .get("units")
             .and_then(Value::as_array)
-            .ok_or_else(|| Fail::usage(format!("{} has no \"units\" list", path.display())))?;
-        called_off(&parsed, path, ctx.dry_run, &queue.run)?;
+            .ok_or_else(|| Fail::usage(format!("{} has no \"units\" list", path)))?;
+        called_off(parsed, path, ctx.dry_run, &queue.run)?;
         let mut ordered = Vec::new();
         for id in listed {
             let id = id.as_str().unwrap_or_default();
             let found = unit_number(id).and_then(|n| units.iter().find(|(m, _)| *m == n));
             let Some(found) = found else {
                 return Err(Fail::usage(format!(
-                    "{} lists {id}, which queue.json does not have",
-                    path.display()
+                    "{path} lists {id}, which queue.json does not have"
                 )));
             };
             if ordered.contains(found) {
-                return Err(Fail::usage(format!("{} lists {id} twice", path.display())));
+                return Err(Fail::usage(format!("{path} lists {id} twice")));
             }
             ordered.push(found.clone());
         }
@@ -612,7 +623,33 @@ pub fn init_if_missing(ctx: &Ctx) -> Res<bool> {
     if replay(ctx)?.events > 0 || ctx.path("state.json").exists() {
         return Ok(false);
     }
-    init(ctx, &InitArgs { parsed: None })?;
+    // The approved tracker, when the run published one: units the person
+    // deleted stay out and the order is theirs. Only a run that never
+    // published one starts from queue.json.
+    let source = if ctx.path("tracker.json").is_file() {
+        let hint = |why: &str| {
+            Fail::refused(format!(
+                "this run has a published tracker, but its approved units could not be read ({why}); \
+                 run `issue-drain tracker parse > parsed.json` and then `issue-drain state init --parsed parsed.json`"
+            ))
+        };
+        let queue: Queue = read_json(&ctx.path("queue.json")).ok_or_else(|| hint("no queue.json"))?;
+        let parsed = crate::tracker::io::fetch_tracker(ctx, &queue).map_err(|e| hint(&e.msg))?;
+        let value = serde_json::to_value(&parsed).map_err(|e| hint(&e.to_string()))?;
+        Some((value, "the published tracker".to_string()))
+    } else {
+        None
+    };
+    init_from(ctx, source).map_err(|e| {
+        if ctx.path("tracker.json").is_file() && e.code != 1 {
+            Fail::refused(format!(
+                "{} (the run's tracker is the source; start the state with `state init --parsed` once that is fixed)",
+                e.msg
+            ))
+        } else {
+            e
+        }
+    })?;
     Ok(true)
 }
 

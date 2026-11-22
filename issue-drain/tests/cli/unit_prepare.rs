@@ -566,3 +566,70 @@ fn a_prepare_leaves_a_started_state_as_it_is() {
     );
     assert_eq!(json(&c.env.workdir.join("state.json"))["units"][0]["state"], "claimed");
 }
+
+fn two_unit_queue() -> Value {
+    let mut queue = queue_with_unit(json!({}));
+    let mut second = queue["units"][0].clone();
+    second["id"] = json!("U4");
+    second["issues"] = json!([104]);
+    queue["units"].as_array_mut().expect("units").insert(0, second);
+    queue
+}
+
+fn publish_tracker(c: &Case, body: &str) {
+    c.env.write("queue.json", &two_unit_queue().to_string());
+    c.env.write(
+        "tracker.json",
+        &json!({"number": 12, "url": "https://example.invalid/12", "run": "run", "published_at": "2026-11-21T00:00:00Z"})
+            .to_string(),
+    );
+    c.env.stub_file(
+        "issue-view-12.json",
+        &json!({"body": body, "state": "OPEN"}).to_string(),
+    );
+}
+
+#[test]
+fn an_auto_started_state_follows_the_approved_tracker_not_the_queue() {
+    let c = case("");
+    // The person deleted U4's line and kept U3's ticked.
+    publish_tracker(
+        &c,
+        "<!-- issue-drain:tracker v1 run=run -->\n- [x] U3 · Zero-pad the countdown\n",
+    );
+    c.prepared();
+    let state = json(&c.env.workdir.join("state.json"));
+    assert_eq!(state["queue"], json!([3]), "U4 stays out: {state}");
+}
+
+#[test]
+fn an_auto_started_state_takes_the_trackers_order() {
+    let c = case("");
+    publish_tracker(
+        &c,
+        "<!-- issue-drain:tracker v1 run=run -->\n- [x] U3 · a\n- [x] U4 · b\n",
+    );
+    c.prepared();
+    assert_eq!(json(&c.env.workdir.join("state.json"))["queue"], json!([3, 4]));
+}
+
+#[test]
+fn an_unreadable_tracker_stops_the_auto_start_and_names_state_init_parsed() {
+    let c = case("");
+    publish_tracker(&c, "<!-- issue-drain:tracker v1 run=run -->\n- [x] U3 · a\n");
+    c.env.stub_file("fail", "");
+    let out = c.prepare();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("state init --parsed"), "{}", out.stderr);
+    assert!(!c.worktree().exists(), "nothing was made");
+    assert!(!c.env.workdir.join("state.json").exists());
+}
+
+#[test]
+fn a_tracker_with_a_stop_line_stops_the_auto_start() {
+    let c = case("");
+    publish_tracker(&c, "<!-- issue-drain:tracker v1 run=run -->\nSTOP\n- [x] U3 · a\n");
+    let out = c.prepare();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("STOP"), "{}", out.stderr);
+}

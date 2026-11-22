@@ -225,6 +225,12 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         }
     }
 
+    // A by-hand run may never have run `state init`. The state is started from
+    // the approved tracker before anything is made, so a refusal leaves nothing behind.
+    if crate::state::init_if_missing(ctx)? {
+        eprintln!("issue-drain unit-prepare: no state in the run folder, so it was started (state init)");
+    }
+
     fs::create_dir_all(&ctx.workdir)
         .map_err(|e| Fail::failed(format!("cannot create {}: {e}", ctx.workdir.display())))?;
     let run_dir = fs::canonicalize(&ctx.workdir)
@@ -359,11 +365,6 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         }),
     )?;
 
-    // A by-hand run may never have run `state init`; the unit's start is then
-    // the first thing in a log of its own.
-    if crate::state::init_if_missing(ctx)? {
-        eprintln!("issue-drain unit-prepare: no state in the run folder, so it was started (state init)");
-    }
     ctx.event(
         "unit_prepared",
         json!({"unit": unit, "branch": branch, "worktree": wt, "base_sha": base_sha,

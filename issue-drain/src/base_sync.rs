@@ -14,10 +14,21 @@
 //! The PR is `--pr`, or else the last PR the run's log names for the unit (the
 //! `state event ... --pr` and `merge-gate` lines carry it).
 //!
-//! A unit takes at most `MAX_BASE_SYNCS` syncs (the plan's cap). They are
-//! counted from this command's own `base_sync` lines in `events.jsonl` and from
-//! the state snapshot's `base_syncs`, whichever is higher, so a driver that also
-//! records the move back to `ci_wait` is not counted twice. The next one is refused.
+//! The PR is held to what `merge-gate` holds it to (head repo, head branch, base)
+//! before anything is called on it.
+//!
+//! `review_round_needed` is false only when the review proof covers the head as
+//! above and the gate's own review read (`merge_preflight.sh`) says `clear`; a
+//! read that fails needs a round.
+//!
+//! A unit takes at most `MAX_BASE_SYNCS` syncs (the plan's cap). A slot is spent
+//! when GitHub is asked to update the branch: a `base_sync_remote` line is
+//! logged right after that call, before any local step. They are counted from
+//! those lines, from the finished `base_sync` lines and from the state snapshot's
+//! `base_syncs`, whichever is highest, so a driver that also records the move back
+//! to `ci_wait` is not counted twice. The next one is refused. A retry that finds
+//! the PR head moved on from the head recorded with the last unfinished remote
+//! update only does the local steps and spends no slot.
 //!
 //! With ISSUE_DRAIN_DRY_RUN=1 it prints what it would call and changes nothing.
 //! A unit process may not run it, as with `merge-gate`.
@@ -41,7 +52,7 @@ use crate::error::{Fail, Res};
 use crate::exec;
 use crate::gh;
 use crate::git;
-use crate::merge_gate::Proof;
+use crate::merge_gate::{PrState, PrView, Proof, binding, preflight, read_view};
 use crate::state::{MAX_BASE_SYNCS, Snapshot};
 
 #[derive(clap::Args)]
@@ -84,55 +95,69 @@ pub fn pr_from_log(ctx: &Ctx, unit: u64) -> Option<u64> {
     text.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|v| v["unit"] == unit)
+        // A PR the gate refused as not the unit's is not the unit's PR.
+        .filter(|v| {
+            v["event"] != "merge_gate"
+                || !v["refusals"]
+                    .as_array()
+                    .is_some_and(|codes| codes.iter().any(|c| c == "pr_unit" || c == "wrong_base"))
+        })
         .filter_map(|v| v["pr"].as_u64())
         .next_back()
 }
 
-/// Base syncs already taken by `unit`.
+/// The unit's lines in the log, oldest first.
+fn unit_events(ctx: &Ctx, unit: u64) -> Vec<Value> {
+    fs::read_to_string(ctx.path("events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["unit"] == unit)
+        .collect()
+}
+
+/// Base syncs already taken by `unit`. A sync is spent when GitHub is asked to
+/// update the branch (`base_sync_remote`), not when the local follow-up is
+/// done (`base_sync`); a finished sync has both, so the higher count is the
+/// number of syncs. The state snapshot's `base_syncs` counts too.
 fn syncs_taken(ctx: &Ctx, unit: u64) -> u32 {
-    let logged = fs::read_to_string(ctx.path("events.jsonl")).map_or(0, |text| {
-        text.lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|v| v["event"] == "base_sync" && v["unit"] == unit)
-            .count() as u32
-    });
+    let events = unit_events(ctx, unit);
+    let count = |name: &str| events.iter().filter(|v| v["event"] == name).count() as u32;
     let snapshot: Option<Snapshot> = read_json(&ctx.path("state.json"));
     let counted = snapshot
         .and_then(|s| s.units.into_iter().find(|u| u.unit == unit))
         .map_or(0, |u| u.base_syncs);
-    logged.max(counted)
+    count("base_sync").max(count("base_sync_remote")).max(counted)
 }
 
-/// The PR's state, head commit and head branch, read now.
-pub struct View {
-    pub state: String,
-    pub head: String,
-    pub branch: String,
-}
-
-pub fn view(repo: &str, pr: u64) -> Res<View> {
-    let raw = gh::read(&[
-        "pr",
-        "view",
-        &pr.to_string(),
-        "--repo",
-        repo,
-        "--json",
-        "headRefOid,headRefName,state",
-    ])
-    .map_err(|rc| Fail::failed(format!("could not read PR #{pr} (gh exit {rc})")))?;
-    let value: Value = serde_json::from_str(&raw)
-        .map_err(|_| Fail::failed(format!("gh answered with something else than JSON for PR #{pr}")))?;
-    let text = |key: &str| value[key].as_str().unwrap_or_default().to_string();
-    let view = View {
-        state: text("state"),
-        head: text("headRefOid"),
-        branch: text("headRefName"),
-    };
-    if view.head.is_empty() {
-        return Err(Fail::failed(format!("gh gave no head commit for PR #{pr}")));
+/// The head the worktree had when the last remote update was asked for, if that
+/// update has no finished local follow-up after it. Empty when the line did
+/// not record one.
+fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<String> {
+    let events = unit_events(ctx, unit);
+    let last = |name: &str| events.iter().rposition(|v| v["event"] == name);
+    let remote = last("base_sync_remote")?;
+    if last("base_sync").is_some_and(|done| done > remote) {
+        return None;
     }
-    Ok(view)
+    Some(events[remote]["local_head"].as_str().unwrap_or_default().to_string())
+}
+
+/// The PR, read now, and held to the same ownership `merge-gate` holds it to:
+/// its head repository is the repo, its head branch is the unit's, and it
+/// targets the profile's base. A read that fails is exit 1; a PR that is not the
+/// unit's is a refusal.
+pub fn owned_view(ctx: &Ctx, repo: &str, unit: u64, pr: u64, branch: &str) -> Res<PrView> {
+    let view = read_view(repo, pr).map_err(|e| Fail::failed(format!("could not read PR #{pr}: {e}")))?;
+    let refusals = binding(repo, &ctx.profile.base_branch, unit, pr, &view, &Ok(branch.to_string()));
+    if refusals.is_empty() {
+        return Ok(view);
+    }
+    let said: Vec<String> = refusals.iter().map(|r| format!("{}: {}", r.code, r.detail)).collect();
+    Err(Fail::refused(format!(
+        "PR #{pr} is not unit {unit}'s: {}",
+        said.join("; ")
+    )))
 }
 
 /// Whether the review proof no longer covers `new_head`. It does when the proof
@@ -191,24 +216,27 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         .or_else(|| pr_from_log(ctx, unit))
         .ok_or_else(|| Fail::usage(format!("no PR is known for unit {unit}; pass --pr")))?;
 
+    // Nothing is called on a PR that is not the unit's: not a fork's PR of the
+    // same branch name, not one aimed at another base.
+    let before = owned_view(ctx, &repo, unit, pr, &branch)?;
+    if before.state != PrState::Open {
+        return Err(Fail::refused(format!("PR #{pr} is not open")));
+    }
+    require_ready(&wt, &branch)?;
+    let local_head = git::commit(&wt, "HEAD").ok_or_else(|| Fail::failed("git finds no HEAD in the worktree"))?;
+
+    // A remote update whose local follow-up failed already spent its slot. If
+    // the PR's head has moved on from the head recorded with that update,
+    // GitHub did its part: the retry only does the local steps.
+    let pending = follow_up_pending(ctx, unit).filter(|recorded| !before.head.eq_ignore_ascii_case(recorded));
+    let resume = pending.is_some();
+    let old_head = pending.filter(|recorded| !recorded.is_empty()).unwrap_or(local_head);
     let taken = syncs_taken(ctx, unit);
-    if taken >= MAX_BASE_SYNCS {
+    if !resume && taken >= MAX_BASE_SYNCS {
         return Err(Fail::refused(format!(
             "unit {unit} has taken {taken} base syncs; the cap is {MAX_BASE_SYNCS}. Park it for a person"
         )));
     }
-    let before = view(&repo, pr)?;
-    if before.state != "OPEN" {
-        return Err(Fail::refused(format!("PR #{pr} is {}, not OPEN", before.state)));
-    }
-    if before.branch != branch {
-        return Err(Fail::refused(format!(
-            "PR #{pr} is on branch {}, not unit {unit}'s branch {branch}",
-            before.branch
-        )));
-    }
-    require_ready(&wt, &branch)?;
-    let old_head = git::commit(&wt, "HEAD").ok_or_else(|| Fail::failed("git finds no HEAD in the worktree"))?;
 
     if ctx.dry_run {
         println!("WOULD: gh pr update-branch {pr} --repo {repo}");
@@ -222,12 +250,21 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
 
     // gh::write has no verb for this one, and the `gh-write` verbs belong to
     // another change; the dry-run and unit-mode rules are applied above.
-    let pr_arg = pr.to_string();
-    let (rc, _) = gh::read_raw(&["pr", "update-branch", &pr_arg, "--repo", &repo]);
-    if rc != 0 {
-        return Err(Fail::failed(format!("gh pr update-branch {pr} failed (exit {rc})")));
-    }
-    let new_head = view(&repo, pr)?.head;
+    let new_head = if resume {
+        before.head.clone()
+    } else {
+        let pr_arg = pr.to_string();
+        let (rc, _) = gh::read_raw(&["pr", "update-branch", &pr_arg, "--repo", &repo]);
+        if rc != 0 {
+            return Err(Fail::failed(format!("gh pr update-branch {pr} failed (exit {rc})")));
+        }
+        // The slot is spent now, before any local step can fail.
+        ctx.event(
+            "base_sync_remote",
+            json!({"unit": unit, "pr": pr, "local_head": old_head}),
+        )?;
+        owned_view(ctx, &repo, unit, pr, &branch)?.head
+    };
 
     let log_dir = ctx.path(&format!("units/{unit}"));
     let log = |step: &str| log_dir.join(format!("base-sync-{step}.log"));
@@ -271,7 +308,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     }
 
     let checked = deliver_check::evaluate(ctx, unit, &wt, None, None)?;
-    let needed = review_round_needed(ctx, unit, &wt, &new_head);
+    // The proof must cover the head, and the gate's own review read must say
+    // `clear` (a merge that changed the reviewed diff's digest does not). A read
+    // that fails needs a round.
+    let clear = preflight(ctx, &repo, pr).is_ok_and(|p| p.status == "clear");
+    let needed = !clear || review_round_needed(ctx, unit, &wt, &new_head);
     let out = json!({
         "unit": unit,
         "pr": pr,
