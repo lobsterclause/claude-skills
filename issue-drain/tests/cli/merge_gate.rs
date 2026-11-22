@@ -1543,3 +1543,79 @@ fn a_note_that_is_not_there_is_refused_before_anything_is_merged() {
     assert_eq!(out.code, 2, "{}", out.stderr);
     assert!(merged_calls(&env).is_empty());
 }
+
+const MARKER: &str = "<!-- issue-drain:merge-note head=0123456789abcdef0123456789abcdef01234567 -->";
+
+fn comment_calls(env: &Env) -> Vec<String> {
+    env.gh_calls()
+        .into_iter()
+        .filter(|c| c.starts_with("issue comment"))
+        .collect()
+}
+
+/// PR 12 already merged and the unit's own, as a driver retrying after exit 4 sees it.
+fn merged_pr(env: &Env) {
+    let mut view = pr_view("MERGED", &[], "");
+    view["mergeCommit"] = json!({"oid": "fedcba9876543210fedcba9876543210fedcba98"});
+    put(env, "pr-view-12.json", &view);
+}
+
+#[test]
+fn a_retry_after_a_queued_merge_posts_the_note_once() {
+    let env = ready();
+    merged_pr(&env);
+    let file = note(&env);
+    let args = ["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file];
+    comments(&env, &[comment("an unrelated comment", "OWNER")]);
+    let out = env.run(&args);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(
+        (r["merged"].as_bool(), r["already"].as_bool()),
+        (Some(true), Some(true))
+    );
+    assert_eq!(
+        r["note_url"],
+        "https://github.com/example/tidepool/pull/12#issuecomment-5001"
+    );
+    assert_eq!(comment_calls(&env).len(), 1);
+    let body = fs::read_to_string(env.stub.join("last-comment-body")).expect("the posted body");
+    assert_eq!(body.lines().next(), Some(MARKER), "{body}");
+    assert!(body.contains("Merged by the gate."), "{body}");
+    // The posted note is now on the PR: a second retry posts nothing.
+    comments(&env, &[comment(&body, "OWNER")]);
+    let out = env.run(&args);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(result(&out)["note_url"], Value::Null);
+    assert_eq!(comment_calls(&env).len(), 1);
+    // A marker for another head does not count.
+    comments(&env, &[comment(&MARKER.replace("0123", "9999"), "OWNER")]);
+    env.run(&args);
+    assert_eq!(comment_calls(&env).len(), 2);
+}
+
+#[test]
+fn a_retry_that_cannot_read_the_comments_warns_and_posts_nothing() {
+    let env = ready();
+    merged_pr(&env);
+    fs::remove_file(env.stub.join("comments.json")).expect("remove");
+    let file = note(&env);
+    let out = env.run(&["merge-gate", "--unit", "3", "--pr", "12", "--note-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stderr.contains("warning"), "{}", out.stderr);
+    assert!(comment_calls(&env).is_empty());
+}
+
+#[test]
+fn a_note_file_named_dash_is_refused_not_read_from_stdin() {
+    let env = ready();
+    let dir = env.dir.path().join("cwd");
+    fs::create_dir_all(&dir).expect("dir");
+    fs::write(dir.join("-"), "text\n").expect("a file named -");
+    let out = env.run_in(
+        Some(&dir),
+        &["merge-gate", "--unit", "3", "--pr", "12", "--note-file", "-"],
+    );
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(merged_calls(&env).is_empty());
+}

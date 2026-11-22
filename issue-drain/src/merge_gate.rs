@@ -197,6 +197,10 @@ pub struct Run {
     pub word: String,
     /// Sorts by start time. A run that has not started sorts newest.
     pub started: String,
+    /// Made by GitHub Actions: a rollup check run that names a workflow, or a
+    /// check run of the `github-actions` app. Only such a run has a workflow
+    /// run id that `actions/runs` describes.
+    pub actions: bool,
 }
 
 /// An issue the PR will close, and the repository it is in (`owner/name`).
@@ -427,9 +431,12 @@ pub struct WorkflowRun {
 /// Whether a cancelled run is replaced by a later run of the same workflow,
 /// the same event and the same head that passed (a concurrency group cancels
 /// the first). A run that is not cancelled, or that the workflow runs do not
-/// describe, is never superseded.
+/// describe, is never superseded. Both runs must be GitHub Actions runs of one
+/// source (the same workflow, or the same app for a pinned check): a pass from
+/// another source, or from a third-party check that only links to an Actions
+/// run, excuses nothing and cannot meet an app pin.
 fn superseded(r: &Run, siblings: &[&Run], workflows: &[WorkflowRun], head: &str) -> bool {
-    if r.word != "cancelled" || r.run.is_empty() {
+    if r.word != "cancelled" || r.run.is_empty() || !r.actions {
         return false;
     }
     let of = |id: &str| workflows.iter().find(|w| w.id == id);
@@ -439,6 +446,8 @@ fn superseded(r: &Run, siblings: &[&Run], workflows: &[WorkflowRun], head: &str)
     let number = |id: &str| id.parse::<u64>().unwrap_or(0);
     siblings.iter().any(|s| {
         s.name == r.name
+            && s.source == r.source
+            && s.actions
             && s.outcome == Outcome::Pass
             && of(&s.run).is_some_and(|w| {
                 w.workflow_id == me.workflow_id
@@ -1069,6 +1078,11 @@ fn parse_run(entry: &Value) -> Read<Run> {
         .and_then(Value::as_str)
         .map(run_id_of)
         .unwrap_or_default();
+    let actions = is_check_run
+        && entry
+            .get("workflowName")
+            .and_then(Value::as_str)
+            .is_some_and(|w| !w.is_empty());
     Ok(Run {
         name,
         source,
@@ -1076,6 +1090,7 @@ fn parse_run(entry: &Value) -> Read<Run> {
         outcome,
         word,
         started,
+        actions,
     })
 }
 
@@ -1435,6 +1450,7 @@ pub fn parse_check_runs(raw: &str) -> Read<Vec<Run>> {
                 outcome,
                 word,
                 started,
+                actions: entry.pointer("/app/slug").and_then(Value::as_str) == Some("github-actions"),
             });
         }
     }
@@ -1534,6 +1550,7 @@ pub fn parse_statuses(raw: &str, wanted: &[&str], app_of: &mut dyn FnMut(&str) -
                     outcome,
                     word: state.clone(),
                     started: started.to_string(),
+                    actions: false,
                 });
             }
         }
@@ -2000,18 +2017,78 @@ fn report(ctx: &Ctx, unit: u64, pr: u64, head: &str, merged: bool, refusals: &[R
     }
 }
 
-/// Post the note file on the merged PR, through the shared write path. A
-/// failure is a warning: the merge happened and counts. Returns the comment's
-/// URL (`gh` prints it), or null when there is none.
-fn post_note(ctx: &Ctx, pr: u64, note: Option<&std::path::Path>) -> Value {
+/// The line that marks a posted note, so a retry can tell it was posted.
+fn note_marker(head: &str) -> String {
+    format!("<!-- issue-drain:merge-note head={head} -->")
+}
+
+/// Whether one of the PR's comments carries the note marker for this head.
+fn note_posted(raw: &str, head: &str) -> Read<bool> {
+    let marker = note_marker(head);
+    for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
+        let page = page.map_err(|_| "the answer is not JSON".to_string())?;
+        let list = page.as_array().ok_or("a page is not a list of comments")?;
+        let found = list
+            .iter()
+            .filter_map(|c| c.get("body").and_then(Value::as_str))
+            .any(|body| body.lines().any(|l| l.trim() == marker));
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Post the note file on the merged PR, through the shared write path, under
+/// a marker line. A failure is a warning: the merge happened and counts.
+/// Returns the comment's URL (`gh` prints it), or null when there is none.
+/// With `check_first`, the PR's comments are read and nothing is posted when
+/// one carries the marker for this head, or when they cannot be read.
+fn post_note(ctx: &Ctx, unit: u64, pr: u64, head: &str, note: Option<&std::path::Path>, check_first: bool) -> Value {
     let Some(file) = note else {
         return Value::Null;
+    };
+    let warn = |why: String| {
+        eprintln!(
+            "issue-drain: warning: PR #{pr} is merged, but the note in {} was not posted: {why}",
+            file.display()
+        );
+        Value::Null
+    };
+    if check_first {
+        let seen = ctx.repo().map_err(|e| e.msg).and_then(|repo| {
+            read_gh(&[
+                "api",
+                &format!("repos/{repo}/issues/{pr}/comments?per_page=100"),
+                "--paginate",
+            ])
+            .and_then(|raw| note_posted(&raw, head))
+        });
+        match seen {
+            Ok(false) => {}
+            Ok(true) => return Value::Null,
+            Err(e) => return warn(format!("the comments could not be read ({e})")),
+        }
+    }
+    let body = std::fs::read_to_string(file)
+        .map_err(|e| e.to_string())
+        .and_then(|text| {
+            let out = ctx.path(&format!("units/{unit}/merge-note.md"));
+            if let Some(dir) = out.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&out, format!("{}\n\n{text}", note_marker(head))).map_err(|e| e.to_string())?;
+            Ok(out)
+        });
+    let body = match body {
+        Ok(path) => path,
+        Err(e) => return warn(e),
     };
     match gh::write(
         ctx,
         &Write::Comment {
             number: pr,
-            body_file: file,
+            body_file: &body,
         },
     ) {
         Ok(written) => {
@@ -2022,14 +2099,7 @@ fn post_note(ctx: &Ctx, pr: u64, note: Option<&std::path::Path>) -> Value {
                 Value::Null
             }
         }
-        Err(e) => {
-            eprintln!(
-                "issue-drain: warning: PR #{pr} is merged, but the note in {} was not posted: {}",
-                file.display(),
-                e.msg
-            );
-            Value::Null
-        }
+        Err(e) => warn(e.msg),
     }
 }
 
@@ -2040,6 +2110,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let (unit, pr) = (args.unit, args.pr);
     // Say so before anything is merged, not after.
     if let Some(note) = &args.note_file {
+        if note.as_os_str() == "-" {
+            return Err(Fail::usage("--note-file - is not a file; give a path"));
+        }
         if !std::fs::metadata(note).is_ok_and(|m| m.is_file() && m.len() > 0) {
             return Err(Fail::usage(format!(
                 "--note-file is missing or empty: {}",
@@ -2082,7 +2155,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                 )));
             }
             report(ctx, unit, pr, &v.head, true, &[]);
-            let out = json!({"pr": pr, "unit": unit, "head": v.head, "merged": true, "already": true, "merge_commit": v.merge_commit, "refusals": [], "reviewers": []});
+            // A merge GitHub queued is merged by now, and its note was never
+            // posted: post it once, unless a comment already carries the marker.
+            let note_url = post_note(ctx, unit, pr, &v.head, args.note_file.as_deref(), true);
+            let out = json!({"pr": pr, "unit": unit, "head": v.head, "merged": true, "already": true, "merge_commit": v.merge_commit, "refusals": [], "reviewers": [], "note_url": note_url});
             println!("{out}");
             return Ok(());
         }
@@ -2136,7 +2212,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             // A dry run: nothing was sent.
             report(ctx, unit, pr, &head, false, &[]);
             // Prints `WOULD: gh issue comment ...` and posts nothing.
-            post_note(ctx, pr, args.note_file.as_deref());
+            post_note(ctx, unit, pr, &head, args.note_file.as_deref(), false);
             println!("{}", output(false));
             Ok(())
         }
@@ -2150,7 +2226,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                     ..
                 }) => {
                     report(ctx, unit, pr, &head, true, &[]);
-                    let note_url = post_note(ctx, pr, args.note_file.as_deref());
+                    let note_url = post_note(ctx, unit, pr, &head, args.note_file.as_deref(), false);
                     println!(
                         "{}",
                         output_with(true, json!({"merge_commit": merge_commit, "note_url": note_url}))
@@ -2232,6 +2308,7 @@ mod tests {
             outcome,
             word: word.into(),
             started: started.into(),
+            actions: false,
         }
     }
 
@@ -3054,6 +3131,7 @@ mod tests {
     fn a_cancelled_run_is_replaced_by_a_later_pass_of_its_workflow() {
         let attempt = |id: &str, outcome: Outcome, word: &str, at: &str| Run {
             run: id.into(),
+            actions: true,
             ..run_of("build", outcome, word, at)
         };
         let wf = |id: &str, workflow_id: u64, event: &str, head: &str| WorkflowRun {
@@ -3096,6 +3174,61 @@ mod tests {
             attempt("10", Outcome::Fail, "failure", "2026-11-21T01:00:00Z"),
             attempt("11", Outcome::Pass, "success", "2026-11-21T01:05:00Z"),
         ];
+        assert_eq!(codes(&f), ["required_check"]);
+        // A pass that is not a GitHub Actions run (a third-party check that
+        // only links to an Actions run), or is from another source, excuses nothing.
+        let wfs = vec![wf("10", 7, "pull_request", HEAD), wf("11", 7, "pull_request", HEAD)];
+        f.workflow_runs = wfs.clone();
+        let cancelled = attempt("10", Outcome::Other, "cancelled", "2026-11-21T01:00:00Z");
+        let passed = attempt("11", Outcome::Pass, "success", "2026-11-21T01:05:00Z");
+        view(&mut f).runs = vec![cancelled.clone(), passed.clone()];
+        assert!(codes(&f).is_empty());
+        view(&mut f).runs = vec![
+            cancelled.clone(),
+            Run {
+                actions: false,
+                ..passed.clone()
+            },
+        ];
+        assert_eq!(codes(&f), ["required_check"]);
+        view(&mut f).runs = vec![
+            cancelled.clone(),
+            Run {
+                source: "check:Other".into(),
+                ..passed.clone()
+            },
+        ];
+        assert_eq!(codes(&f), ["required_check"]);
+        // A cancelled run that is not an Actions run is never excused.
+        view(&mut f).runs = vec![
+            Run {
+                actions: false,
+                ..cancelled.clone()
+            },
+            passed.clone(),
+        ];
+        assert_eq!(codes(&f), ["required_check"]);
+        // A pin to another app is not met by a cancelled run of that app that
+        // an Actions pass elsewhere would excuse.
+        f.required = Ok(vec![Required {
+            context: "build".into(),
+            app_id: Some(99),
+        }]);
+        view(&mut f).runs = vec![passed.clone()];
+        let app = |r: &Run| Run {
+            source: "app:99".into(),
+            ..r.clone()
+        };
+        f.app_runs = Ok(vec![
+            Run {
+                actions: false,
+                ..app(&cancelled)
+            },
+            app(&passed),
+        ]);
+        assert_eq!(codes(&f), ["required_check"]);
+        // The pass is another source's, so the pinned app's run has none after it.
+        f.app_runs = Ok(vec![app(&cancelled)]);
         assert_eq!(codes(&f), ["required_check"]);
     }
 
