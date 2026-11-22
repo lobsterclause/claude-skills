@@ -14,8 +14,9 @@
 # raw findings.json in <dir>.
 #   findings.verified.json — factcheck_findings.sh output (step 4.5) and
 #   findings.scored.json     the scoring pass are siblings: when both exist, a
-#                           finding counts only if it survives both (the lower
-#                           of the two maxima is used).
+#                           finding counts only if it survives both (matched
+#                           on the findings.json id; the lower of the two
+#                           maxima when ids are missing).
 #   findings.scored.json  — score_findings.sh output; findings with
 #                           disposition "drop" or factcheck verdict "drop" do
 #                           not count (they were judged not real).
@@ -84,12 +85,34 @@ first_rank() {
 }
 # The fact-check and the scoring pass both start from findings.json, so each
 # can drop a finding the other kept. When both exist a finding must survive
-# both to count: take the LOWER of their two maxima. That can under-count when
-# each file drops a different High, which is the cheap direction (no escalation
-# is the default). (codex, cross-review of claude-skills PR #228, pass 2.)
+# both to count. Match them on the findings.json id (verified carries it as
+# `local_id`, scored as `id`) and apply both vetoes before taking the maximum.
+# Findings without a matchable id fall back to the lower of the two maxima.
+# (codex, cross-review of claude-skills PR #228, passes 2 and 3.)
+first_file() {
+  local d
+  for d in "$dir" "$parent"; do
+    [[ -f "$d/$1" && -n "$(json_max "$d/$1")" ]] && { echo "$d/$1"; return; }
+  done
+}
 rv="$(first_rank findings.verified.json)"
 rs="$(first_rank findings.scored.json)"
-if [[ -n "$rv" && -n "$rs" ]]; then rank_to_word "$(( rv < rs ? rv : rs ))"; exit 0; fi
+if [[ -n "$rv" && -n "$rs" ]]; then
+  r="$(jq -rs '
+    def rank: (tostring | ascii_downcase) as $s
+      | if $s == "critical" then 4 elif $s == "high" then 3
+        elif $s == "medium" then 2 elif $s == "low" then 1 else 0 end;
+    def dropped: (.disposition // "") == "drop" or (.factcheck.verdict // "") == "drop";
+    (.[0].findings | map(. + {k: (.local_id // .id)})) as $v
+    | (.[1].findings | map(. + {k: .id})) as $s
+    | if ([$v[], $s[]] | any(.k == null)) then empty else
+      ([$v[], $s[]] | map(select(dropped) | .k)) as $drop
+      | [ $v[], $s[] | select((dropped | not) and ((.k as $k | $drop | index($k)) == null))
+          | (.severity // "" | rank) ] | (max // 0) end' \
+    "$(first_file findings.verified.json)" "$(first_file findings.scored.json)" 2>/dev/null)"
+  [[ "$r" =~ ^[0-4]$ ]] || r=$(( rv < rs ? rv : rs ))
+  rank_to_word "$r"; exit 0
+fi
 if [[ -n "$rv$rs" ]]; then rank_to_word "$rv$rs"; exit 0; fi
 rj="$(first_rank findings.json)"
 if [[ -n "$rj" ]]; then rank_to_word "$rj"; exit 0; fi

@@ -73,5 +73,14 @@ case_dir
 printf '{"findings":[{"severity":"Critical"}]}\n' >"$T/c/findings.verified.json"
 assert_eq "verified alone decides when there is no scored file" "$(bash "$S" "$T/c/raw")" "critical"
 
+case_dir  # each pass drops a DIFFERENT High; no High survives both
+printf '{"findings":[{"id":"f-a","local_id":"f1","severity":"High","factcheck":{"verdict":"drop"}},{"id":"f-b","local_id":"f2","severity":"High"},{"id":"f-c","local_id":"f3","severity":"Medium"}]}\n' >"$T/c/findings.verified.json"
+printf '{"findings":[{"id":"f1","severity":"High"},{"id":"f2","severity":"High","disposition":"drop"},{"id":"f3","severity":"Medium"}]}\n' >"$T/c/findings.scored.json"
+assert_eq "matched by id: Highs dropped by different passes both stop counting" "$(bash "$S" "$T/c/raw")" "medium"
+case_dir  # matched, and one High survives both
+printf '{"findings":[{"id":"f-a","local_id":"f1","severity":"High"},{"id":"f-b","local_id":"f2","severity":"Low"}]}\n' >"$T/c/findings.verified.json"
+printf '{"findings":[{"id":"f1","severity":"High"},{"id":"f2","severity":"Low","disposition":"drop"}]}\n' >"$T/c/findings.scored.json"
+assert_eq "matched by id: a High kept by both counts" "$(bash "$S" "$T/c/raw")" "high"
+
 echo; echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

@@ -209,6 +209,15 @@ fi
 
 if [[ "$record" == 1 ]]; then
   mkdir -p "$state_dir" || exit 0   # advisory state: never fail the round
+  # Serialize read-compare-write: the late-writer check below reads the record
+  # and the rename replaces it, and without a lock a trailing seat can pass
+  # the check just before the next pass writes, then rename its older record
+  # over the newer one. Same mkdir lock the ledgers use (no flock on macOS).
+  # Past the wait cap it writes anyway: the record is advisory, and stalling a
+  # round is worse. (codex, cross-review of claude-skills PR #228, pass 3.)
+  if . "$(dirname "$0")/lib_append_lock.sh" 2>/dev/null; then
+    if append_lock_acquire "$rec"; then trap 'append_lock_release "$rec"' EXIT; fi
+  fi
   # The counter is what separates pass 2 (a fix check, still productive: 51%
   # FIXES_APPLIED in August) from pass 5 (mostly codex confirming its own
   # earlier verdict: pass 3+ was 57% CLEAN, 115/202). A stale record starts a
@@ -247,8 +256,7 @@ if [[ "$record" == 1 ]]; then
   # DISPATCH time (run_reviewers.sh passes --dispatched-at), not by commit
   # ancestry, which breaks on a rebase and on a deliberate rollback. A record
   # without the field (older, or a caller that does not pass it) never blocks.
-  # Like the rest of this record it is not locked: two writers racing within
-  # the same second can still both land, and the later rename wins.
+  # The whole read-compare-write runs under the record lock taken above.
   # (codex, cross-review of claude-skills PR #228, passes 1 and 2.)
   case "$dispatched_at" in ''|*[!0-9]*) dispatched_at="" ;; esac
   if [[ -n "$dispatched_at" && -f "$rec" ]]; then
@@ -260,9 +268,8 @@ if [[ "$record" == 1 ]]; then
   fi
   # Write via temp-and-rename so a reader never sees a half-written record, and
   # so two lanes finishing together produce one whole record rather than an
-  # interleaved one. This does not order the writers -- last rename still wins
-  # -- but with the same-pair case above collapsed, the surviving race is two
-  # DIFFERENT rounds, which the epoch check below already treats as stale.
+  # interleaved one. Ordering between writers comes from the lock and the
+  # dispatch-time check above.
   _tmp="$rec.$$.tmp"
   # run_dir is kept only when it needs no JSON escaping; the record is read with
   # sed, and a path with a quote or backslash is simply not recorded (the next

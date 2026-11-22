@@ -177,6 +177,16 @@ wout="$(bash "$M" --runlog "$WRL" --since 2026-09-01 2>&1)"
 if grep -q "before: 1 codex runs (runlog start .. 2026-09-01)" <<<"$wout"; then ok "--since at LADDER_LIVE keeps an open-ended before window"
 else bad "explicit --since window: $(grep before: <<<"$wout")"; fi
 
+echo "── a skipped codex seat is not a codex run ──"
+SRL="$TMP/skipped.jsonl"
+{
+  echo '{"ts":"2026-11-23T00:00:00Z","pass":2,"verdict":"CLEAN","reviewers":{"codex":{"status":"skipped"}}}'
+  echo '{"ts":"2026-11-23T01:00:00Z","pass":2,"verdict":"FIXES_APPLIED","reviewers":{"codex":{"findings_total":1,"effort":"medium","effort_source":"config"}}}'
+} >"$SRL"
+sout="$(bash "$M" --runlog "$SRL" 2>&1)"
+if grep -q "after: 1 codex runs" <<<"$sout" && ! grep -q "unrecorded: n=" <<<"$sout"; then ok "skipped seat excluded from counts and the effort_source breakdown"
+else bad "skipped seat counted: $(grep -E 'after:|unrecorded' <<<"$sout")"; fi
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

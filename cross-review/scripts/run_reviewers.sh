@@ -278,7 +278,7 @@ codex_effort="${CROSS_REVIEW_CODEX_EFFORT:-}"
 # Worst severity the previous pass found (critical|high|medium|low|none). Empty
 # = read it from the previous pass's run dir. Drives the codex effort ladder.
 prev_severity="${CROSS_REVIEW_PREV_SEVERITY:-}"
-codex_prev_severity=""; codex_prev_severity_source=""
+codex_prev_severity=""; codex_prev_severity_source=""; prev_severity_flag=0
 # Route for the gemini-pro seat, "<model>:<level>" (e.g. argon:high). Empty =
 # derive it from pass number + diff size via the profile's `router` table.
 gemini_pro_route="${CROSS_REVIEW_GEMINI_PRO_ROUTE:-}"
@@ -352,7 +352,7 @@ while [[ $# -gt 0 ]]; do
     --timeout-codex)      need_val --timeout-codex      "$#"; timeout_codex="$2";      shift 2 ;;
     --gemini-pro-route)   need_val --gemini-pro-route   "$#"; gemini_pro_route="$2";   shift 2 ;;
     --codex-effort)       need_val --codex-effort       "$#"; codex_effort="$2";       shift 2 ;;
-    --prev-severity)      need_val --prev-severity      "$#"; prev_severity="$2";      shift 2 ;;
+    --prev-severity)      need_val --prev-severity      "$#"; prev_severity="$2"; prev_severity_flag=1; shift 2 ;;
     --subject-id)        need_val --subject-id        "$#"; subject_id="$2";        shift 2 ;;
         --timeout-gemini-pro) need_val --timeout-gemini-pro "$#"; timeout_gemini_pro="$2"; shift 2 ;;
     --timeout-kimi)       need_val --timeout-kimi       "$#"; timeout_kimi="$2";       shift 2 ;;
@@ -379,6 +379,12 @@ done
 # --codex-effort keeps its old warn-and-ignore behaviour, but now before the
 # ladder, so a typo no longer counts as an override that suppresses escalation.
 # (kimi, cross-review of claude-skills PR #228, pass 2.)
+# An explicitly empty flag (`--prev-severity "$unset_var"`) is a caller bug,
+# not "look it up": refuse it like any other bad value.
+if [[ "$prev_severity_flag" == 1 && -z "$prev_severity" ]]; then
+  echo "run_reviewers: --prev-severity was given an empty value" >&2
+  exit 2
+fi
 if [[ -n "$prev_severity" ]]; then
   prev_severity="$(printf '%s' "$prev_severity" | tr '[:upper:]' '[:lower:]')"
   case "$prev_severity" in
@@ -3709,7 +3715,7 @@ fi
 # fixes. It was lost once already, in the rebase that brought these two changes
 # together, and caught only because the detached end-to-end test went red.
 if [[ "$any_ok" -eq 1 && -f "${_guard:-}" && -n "${_base_sha:-}" && -n "${_head_sha:-}" ]]; then
-  _out_abs="$(cd "$out" 2>/dev/null && pwd || true)"
+  _out_abs="$(CDPATH="" cd -- "$out" 2>/dev/null && pwd || true)"
   bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --record --base-sha "$_base_sha" --head-sha "$_head_sha" \
     ${_out_abs:+--run-dir "$_out_abs"} --dispatched-at "$_dispatched_at" || true
 fi

@@ -625,6 +625,26 @@ got="$(lw --prev-run-dir 2>/dev/null)"
 if [[ "$got" == "/runs/p4" ]]; then ok "a record without --dispatched-at is not blocked"
 else bad "record without --dispatched-at blocked (got: '$got')"; fi
 
+echo "── the record write waits for the record lock ──"
+# A writer that reaches --record while another holds the lock must re-read the
+# record AFTER the lock frees, so a newer record written meanwhile wins.
+LK_STATE="$TMP/lock_state"
+lk() { bash "$GUARD" --state-dir "$LK_STATE" --project lock --branch feat/k --base-sha b0 "$@"; }
+lk --record --head-sha h1 --run-dir /runs/k1 --dispatched-at 1000 >/dev/null 2>&1
+LK_REC="$(ls "$LK_STATE"/*.json | head -1)"
+mkdir "$LK_REC.lock.d" && echo 999999 >"$LK_REC.lock.d/owner"
+( lk --record --head-sha h1 --run-dir /runs/k1 --dispatched-at 1000 >/dev/null 2>&1 ) &
+lk_pid=$!
+sleep 1
+kill -0 "$lk_pid" 2>/dev/null && ok "the second writer is still waiting on the held lock" || bad "the second writer did not wait for the lock"
+lk_rec_tmp="$LK_REC.t"; sed 's/"run_dir":"[^"]*"/"run_dir":"\/runs\/k2"/; s/"dispatched_at":[0-9]*/"dispatched_at":2000/; s/"head_sha":"[^"]*"/"head_sha":"h2"/' "$LK_REC" >"$lk_rec_tmp" && mv "$lk_rec_tmp" "$LK_REC"
+rm -f "$LK_REC.lock.d/owner"; rmdir "$LK_REC.lock.d"
+wait "$lk_pid"
+got="$(lk --prev-run-dir 2>/dev/null)"
+if [[ "$got" == "/runs/k2" ]]; then ok "a writer blocked on the lock re-reads and keeps the newer record"
+else bad "blocked writer overwrote the newer record (got: '$got')"; fi
+[[ ! -d "$LK_REC.lock.d" ]] && ok "the record lock is released" || bad "record lock left behind"
+
 echo
 echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

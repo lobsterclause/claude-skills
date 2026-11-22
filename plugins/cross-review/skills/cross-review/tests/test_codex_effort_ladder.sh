@@ -118,6 +118,10 @@ PRIOR=High run badeff 2 --codex-effort turbo
 grep -qi "turbo" "$T/log-badeff" && ok "unknown --codex-effort is warned about" || bad "no warning for turbo"
 assert_eq "…and ignored, so the ladder still escalates" "$EFF" "high"
 
+rc=0; ( cd "$REPO" && bash "$S/run_reviewers.sh" --base master --out "$T/out-emptysev" --reviewers codex \
+    --subject-id pr-emptysev --allow-full-rereview --prev-severity "" >"$T/log-emptysev" 2>&1 ) || rc=$?
+assert_eq "an explicitly empty --prev-severity exits 2" "$rc" "2"
+
 echo "── override wins absolutely, no clamping ──"
 cfg medium
 PRIOR=- run ov 2 --codex-effort xhigh
@@ -163,6 +167,14 @@ rm -rf "$T/state-chain"; CODEX_ARGV="$T/argv-chain"; export CODEX_ARGV
     --out "$T/chain/raw" --reviewers codex --subject-id pr-chain >/dev/null 2>&1 )
 got="$(cd "$REPO" && bash "$S/check_repeat_pass.sh" --state-dir "$T/state-chain/last_base" --branch pr-chain --prev-run-dir)"
 assert_eq "guard returns the previous --out" "$got" "$(cd "$T/chain/raw" && pwd)"
+
+echo "── a relative --out is recorded right even with CDPATH set ──"
+rm -rf "$T/state-cdp" "$REPO/rel" "$T/decoy"; mkdir -p "$T/decoy/rel/raw"; CODEX_ARGV="$T/argv-cdp"; export CODEX_ARGV
+( cd "$REPO" && CDPATH="$T/decoy" CROSS_REVIEW_STATE_DIR="$T/state-cdp" bash "$S/run_reviewers.sh" --base master \
+    --out rel/raw --reviewers codex --subject-id pr-cdp >/dev/null 2>&1 )
+got="$(cd "$REPO" && bash "$S/check_repeat_pass.sh" --state-dir "$T/state-cdp/last_base" --branch pr-cdp --prev-run-dir)"
+assert_eq "CDPATH does not redirect the recorded run dir" "$got" "$(cd "$REPO/rel/raw" && pwd)"
+rm -rf "$REPO/rel"
 
 echo "── the measurement script reads the new field ──"
 RL="$T/rl.jsonl"

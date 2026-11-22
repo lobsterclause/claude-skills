@@ -195,7 +195,10 @@ jq -rs --arg since "$since" --arg before_from "$before_from" '
         }
       end;
 
-  map(select(.reviewers.codex != null and .ts != null)
+  # A seat the round skipped is a runlog placeholder, not a codex run.
+  # (codex, cross-review of claude-skills PR #228, pass 3.)
+  map(select(.reviewers.codex != null and .ts != null
+             and (.reviewers.codex.status // "") != "skipped")
       | {ts, verdict, pass: (.pass // 1), c: .reviewers.codex}
       # A fallback row means the primary lane never ran, so its duration and
       # findings describe OpenRouter, not codex. Kept for the quota count,
