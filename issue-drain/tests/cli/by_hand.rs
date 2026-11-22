@@ -8,7 +8,50 @@ use crate::common::*;
 fn setup() -> Env {
     let env = Env::new();
     env.write("queue.json", &queue_with_unit(json!({})).to_string());
+    published(&env);
     env
+}
+
+/// What `tracker publish` leaves behind.
+fn published(env: &Env) {
+    env.write(
+        "tracker.json",
+        &json!({"number": 12, "url": "https://example.invalid/12", "run": "run", "published_at": "2026-11-21T00:00:00Z"})
+            .to_string(),
+    );
+}
+
+#[test]
+fn scope_widen_waits_for_the_tracker_to_be_published() {
+    let env = Env::new();
+    env.write("queue.json", &queue_with_unit(json!({})).to_string());
+    let args = ["scope", "widen", "--unit", "3", "--file", "src/a.ts", "--reason", "x"];
+    let out = env.run(&args);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("publish"), "{}", out.stderr);
+    published(&env);
+    assert_eq!(env.run(&args).code, 0);
+}
+
+#[test]
+fn scope_widen_does_not_bring_a_risk_path_into_an_ordinary_unit() {
+    let env = setup();
+    let run = |file: &str| env.run(&["scope", "widen", "--unit", "3", "--file", file, "--reason", "x"]);
+    let out = run("src/crisis/keywords.ts");
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("risk path"), "{}", out.stderr);
+    // A unit with a named reviewer and one issue may take it.
+    env.write(
+        "queue.json",
+        &queue_with_unit(json!({"issues": [103], "risk": true, "waits": true, "waits_for": "gate"})).to_string(),
+    );
+    assert_eq!(run("src/crisis/keywords.ts").code, 0);
+    // But not when it carries more than one issue.
+    env.write(
+        "queue.json",
+        &queue_with_unit(json!({"risk": true, "waits": true, "waits_for": "gate"})).to_string(),
+    );
+    assert_eq!(run("src/crisis/other.ts").code, 3);
 }
 
 #[test]
@@ -117,6 +160,7 @@ fn scope_widen_refuses_a_protected_path_and_a_bad_path() {
 #[test]
 fn scope_widen_changes_only_the_files_of_its_unit() {
     let env = Env::new();
+    published(&env);
     let mut queue = queue_with_unit(json!({"acceptance_tests": ["src/timer/a.test.ts"]}));
     let mut second = queue["units"][0].clone();
     second["id"] = json!("U4");
@@ -134,6 +178,7 @@ fn scope_widen_changes_only_the_files_of_its_unit() {
 #[test]
 fn scope_widen_refuses_a_folder_without_a_slash_but_allows_a_file_not_there_yet() {
     let env = Env::new();
+    published(&env);
     let sha = git(fixture_repo(), &["rev-parse", "develop"]);
     let mut queue = queue_with_unit(json!({}));
     queue["base_sha"] = json!(sha);

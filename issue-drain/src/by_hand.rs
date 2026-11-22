@@ -112,6 +112,13 @@ pub fn scope(ctx: &Ctx, command: &ScopeCommand) -> Res<()> {
             args.file
         )));
     }
+    // tracker.json is what `tracker publish` leaves. Before it, the tracker the
+    // person approves has not been shown yet, and a render makes the scope.
+    if !ctx.path("tracker.json").is_file() {
+        return Err(Fail::refused(
+            "the tracker is not published (no tracker.json); change the decisions and render again instead",
+        ));
+    }
     let queue_path = ctx.path("queue.json");
     let mut queue: Value = read_json(&queue_path).ok_or_else(|| {
         Fail::usage(format!(
@@ -125,6 +132,26 @@ pub fn scope(ctx: &Ctx, command: &ScopeCommand) -> Res<()> {
             "{} is a folder; name a file, or a new path",
             args.file
         )));
+    }
+    // A risk-path file changes who must approve the unit's PR, and only a unit
+    // already queued as a risk unit with one issue and a named reviewer has that.
+    if ctx.profile.is_risk(&args.file) {
+        let unit = queue["units"]
+            .as_array()
+            .and_then(|units| units.iter().find(|u| u["id"] == id));
+        let reviewer = unit.is_some_and(|u| u["waits_for"].as_str().is_some_and(|w| !w.trim().is_empty()));
+        let issues = unit.and_then(|u| u["issues"].as_array()).map_or(0, Vec::len);
+        if !reviewer || issues > 1 {
+            return Err(Fail::refused(format!(
+                "{} is a risk path; only a unit with one issue and a waits_for reviewer may take it, and {id} {}",
+                args.file,
+                if reviewer {
+                    "has several issues"
+                } else {
+                    "has no waits_for"
+                }
+            )));
+        }
     }
     // Only the target unit's `files` changes; every other key is left as it is.
     let files = queue["units"]
