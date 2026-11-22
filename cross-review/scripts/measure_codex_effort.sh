@@ -139,8 +139,9 @@ if [[ "$if_due" == 1 ]]; then
   cat <<BANNER
 ─────────────────────────────────────────────────────────────────────────────
  REVIEW DUE: the codex effort ladder has escalated on findings since
- $ESCALATION_LIVE ("after" below; "before" is the step-down ladder). It is now
- past $REVIEW_DUE. The numbers below are the check.
+ $ESCALATION_LIVE. The default windows are $LADDER_LIVE..$ESCALATION_LIVE (the
+ step-down ladder) and $ESCALATION_LIVE..now; the table header shows the actual
+ windows. It is now past $REVIEW_DUE. The numbers below are the check.
  Decide one of: keep it, change the escalation rule, or revert — then update
  REVIEW_DUE in this script (or delete the --if-due call in SKILL.md step 1.5)
  so this stops asking.
@@ -157,10 +158,15 @@ fi
 #
 # ISO-8601 Z timestamps sort lexicographically, so a plain string compare is
 # the whole date filter. Rows without a codex entry are not evidence either way.
+# The "before" window starts at LADDER_LIVE whenever the cutover is later than
+# it: August's pre-ladder xhigh runs are neither policy and would skew the
+# baseline. (codex, cross-review of claude-skills PR #228, pass 2.)
+before_from=""
+[[ "$since" > "$LADDER_LIVE" ]] && before_from="$LADDER_LIVE"
 jq -cR 'select(test("^\\s*$") | not)
         | ((fromjson? // null) as $r
            | if ($r | type) == "object" then $r else {__unparseable: true} end)' "$runlog" |
-jq -rs --arg since "$since" '
+jq -rs --arg since "$since" --arg before_from "$before_from" '
   (map(select(.__unparseable == true)) | length) as $unparseable
   | map(select(.__unparseable != true))
   |
@@ -195,11 +201,11 @@ jq -rs --arg since "$since" '
       # findings describe OpenRouter, not codex. Kept for the quota count,
       # excluded from the effort proxies below.
       | . + {fell_back: (.c.fallback.used == true)})                as $all
-  | ($all | map(select(.ts < $since)))                              as $before
+  | ($all | map(select(.ts < $since and .ts >= $before_from)))     as $before
   | ($all | map(select(.ts >= $since)))                             as $after
   | {
       since: $since,
-      before: {window: "runlog start .. \($since)", total: ($before | length)},
+      before: {window: "\(if $before_from == "" then "runlog start" else $before_from end) .. \($since)", total: ($before | length)},
       after:  {window: "\($since) .. now",          total: ($after  | length)},
       by_pass: ( ["1","2","3+"] | map(. as $b | {
           key: $b,
@@ -207,12 +213,20 @@ jq -rs --arg since "$since" '
             before: stats($before | map(select(bucket(.pass) == $b))),
             after:  stats($after  | map(select(bucket(.pass) == $b)))
           }
-        }) | from_entries )
+        }) | from_entries ),
+      # Repeat passes in the after window split by WHY they ran at their level,
+      # so escalated passes can be compared with inherited ones directly.
+      by_source: ( $after | map(select(.pass >= 2 and .fell_back != true))
+        | group_by(.c.effort_source // "unrecorded")
+        | map({source: (.[0].c.effort_source // "unrecorded"),
+               n: length,
+               findings_per_run: ((map(.c.findings_total // 0) | add) * 100 / length | floor / 100),
+               clean_pct: ((map(select(.verdict == "CLEAN")) | length) * 100 / length | floor)}) )
     }
   |
   "codex reasoning-effort ladder — before/after \(.since)",
   "",
-  "  before: \(.before.total) codex runs      after: \(.after.total) codex runs",
+  "  before: \(.before.total) codex runs (\(.before.window))      after: \(.after.total) codex runs (\(.after.window))",
   (if $unparseable > 0
    then "  skipped \($unparseable) unparseable runlog row(s) — torn or partial appends,\n  not counted in either window."
    else empty end),
@@ -234,6 +248,10 @@ jq -rs --arg since "$since" '
   (.by_pass | to_entries[] | "    pass \(.key): \(.value.after.efforts // "—")"),
   "  Since 2026-11-22 pass 2+ runs at high only after a Critical/High pass",
   "  (escalated_on_findings); any other pass above the config level is a bug.",
+  "",
+  "  after window, pass 2+, by effort_source (override = a pinned level):",
+  (if (.by_source | length) == 0 then "    —"
+   else (.by_source[] | "    \(.source): n=\(.n)  findings/run=\(.findings_per_run)  CLEAN=\(.clean_pct)%") end),
   "",
   "  acct_limit   % of codex runs that hit the quota wall and fell through to",
   "               metered OpenRouter. This is the number the ladder targets.",

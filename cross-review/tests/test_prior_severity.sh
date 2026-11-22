@@ -65,5 +65,13 @@ assert_eq "no findings array and nothing else -> unknown" "$(bash "$S" "$T/c/raw
 case_dir; printf '# x\n\n## High\n- ~~**[a.ts:1]** vetoed~~ (fact-check: drop)\n\n## Low\n- small\n' >"$T/c/findings.md"
 assert_eq "md: struck-through High does not count" "$(bash "$S" "$T/c/raw")" "low"
 
+case_dir
+printf '{"findings":[{"severity":"High"},{"severity":"Low"}]}\n' >"$T/c/findings.verified.json"
+printf '{"findings":[{"severity":"High","disposition":"drop"},{"severity":"Low"}]}\n' >"$T/c/findings.scored.json"
+assert_eq "a High dropped by scoring does not count even if fact-check kept it" "$(bash "$S" "$T/c/raw")" "low"
+case_dir
+printf '{"findings":[{"severity":"Critical"}]}\n' >"$T/c/findings.verified.json"
+assert_eq "verified alone decides when there is no scored file" "$(bash "$S" "$T/c/raw")" "critical"
+
 echo; echo "══ $PASS passed, $FAIL failed ══"
 [[ "$FAIL" -eq 0 ]]

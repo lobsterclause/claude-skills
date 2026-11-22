@@ -12,8 +12,10 @@
 # Sources, most trusted first; the first one that exists (in either directory)
 # decides. Source rank beats directory: a scored file in the parent wins over a
 # raw findings.json in <dir>.
-#   findings.verified.json — factcheck_findings.sh output (step 4.5); same drop
-#                           rules as the scored file.
+#   findings.verified.json — factcheck_findings.sh output (step 4.5) and
+#   findings.scored.json     the scoring pass are siblings: when both exist, a
+#                           finding counts only if it survives both (the lower
+#                           of the two maxima is used).
 #   findings.scored.json  — score_findings.sh output; findings with
 #                           disposition "drop" or factcheck verdict "drop" do
 #                           not count (they were judged not real).
@@ -71,14 +73,26 @@ md_max() {
 }
 
 parent="$(dirname "$dir")"
-for f in findings.verified.json findings.scored.json findings.json; do
+# First parseable copy of a JSON source across both directories, as a rank.
+first_rank() {
+  local d r
   for d in "$dir" "$parent"; do
-    if [[ -f "$d/$f" ]]; then
-      r="$(json_max "$d/$f")"
-      if [[ "$r" =~ ^[0-4]$ ]]; then rank_to_word "$r"; exit 0; fi
-    fi
+    [[ -f "$d/$1" ]] || continue
+    r="$(json_max "$d/$1")"
+    [[ "$r" =~ ^[0-4]$ ]] && { echo "$r"; return; }
   done
-done
+}
+# The fact-check and the scoring pass both start from findings.json, so each
+# can drop a finding the other kept. When both exist a finding must survive
+# both to count: take the LOWER of their two maxima. That can under-count when
+# each file drops a different High, which is the cheap direction (no escalation
+# is the default). (codex, cross-review of claude-skills PR #228, pass 2.)
+rv="$(first_rank findings.verified.json)"
+rs="$(first_rank findings.scored.json)"
+if [[ -n "$rv" && -n "$rs" ]]; then rank_to_word "$(( rv < rs ? rv : rs ))"; exit 0; fi
+if [[ -n "$rv$rs" ]]; then rank_to_word "$rv$rs"; exit 0; fi
+rj="$(first_rank findings.json)"
+if [[ -n "$rj" ]]; then rank_to_word "$rj"; exit 0; fi
 for d in "$dir" "$parent"; do
   if [[ -f "$d/findings.md" ]]; then
     rank_to_word "$(md_max "$d/findings.md")"; exit 0

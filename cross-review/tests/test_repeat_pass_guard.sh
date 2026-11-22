@@ -601,22 +601,29 @@ else
   echo "  skip run_reviewers.sh integration (script or git unavailable)"
 fi
 
-echo "── a late writer from an older pass does not replace the newer record ──"
-LW="$TMP/late_repo"; LW_STATE="$TMP/late_state"; mkdir -p "$LW"
-(cd "$LW" && git init -q . && git config user.email t@t && git config user.name t \
-  && echo a >f && git add f && git commit -qm base && echo b >>f && git commit -qam p1 \
-  && echo c >>f && git commit -qam p2)
-LW_BASE="$(git -C "$LW" rev-parse HEAD~2)"; LW_P1="$(git -C "$LW" rev-parse HEAD~1)"; LW_P2="$(git -C "$LW" rev-parse HEAD)"
-lw() { (cd "$LW" && bash "$GUARD" --state-dir "$LW_STATE" --project late --branch feat/l "$@"); }
-lw --record --base-sha "$LW_BASE" --head-sha "$LW_P1" --run-dir /runs/p1 >/dev/null 2>&1
-lw --record --base-sha "$LW_BASE" --head-sha "$LW_P2" --run-dir /runs/p2 >/dev/null 2>&1
-lw --record --base-sha "$LW_BASE" --head-sha "$LW_P1" --run-dir /runs/p1 >/dev/null 2>&1   # pass 1's trailing seat
+echo "── a late writer from an earlier round does not replace the newer record ──"
+# Ordered by dispatch time, not commit ancestry (works across rebase/rollback).
+LW_STATE="$TMP/late_state"
+lw() { bash "$GUARD" --state-dir "$LW_STATE" --project late --branch feat/l --base-sha b0 "$@"; }
+lw --record --head-sha h1 --run-dir /runs/p1 --dispatched-at 1000 >/dev/null 2>&1
+lw --record --head-sha h2 --run-dir /runs/p2 --dispatched-at 2000 >/dev/null 2>&1
+lw --record --head-sha h1 --run-dir /runs/p1 --dispatched-at 1000 >/dev/null 2>&1   # pass 1's trailing seat
 got="$(lw --prev-run-dir 2>/dev/null)"
-if [[ "$got" == "/runs/p2" ]]; then ok "older head's late record keeps the newer run_dir"
-else bad "older head's late record replaced run_dir (got: '$got')"; fi
-got="$(lw --pass-context --base-sha "$LW_BASE" --head-sha "$LW_P2" 2>/dev/null)"
-if [[ "$got" == "3" ]]; then ok "older head's late record does not bump the pass count (next is 3, not 4)"
-else bad "pass count after late older record (got: '$got')"; fi
+if [[ "$got" == "/runs/p2" ]]; then ok "earlier dispatch's late record keeps the newer run_dir"
+else bad "earlier dispatch's late record replaced run_dir (got: '$got')"; fi
+got="$(lw --pass-context --head-sha h3 2>/dev/null)"
+if [[ "$got" == "3" ]]; then ok "earlier dispatch's late record does not bump the pass count (next is 3, not 4)"
+else bad "pass count after late earlier record (got: '$got')"; fi
+# A rollback to an earlier head, dispatched later, is a real new round.
+lw --record --head-sha h1 --run-dir /runs/p3 --dispatched-at 3000 >/dev/null 2>&1
+got="$(lw --prev-run-dir 2>/dev/null)"
+if [[ "$got" == "/runs/p3" ]]; then ok "a later-dispatched round on an earlier head is recorded (rollback)"
+else bad "rollback round not recorded (got: '$got')"; fi
+# A caller that does not pass --dispatched-at is never blocked.
+lw --record --head-sha h4 --run-dir /runs/p4 >/dev/null 2>&1
+got="$(lw --prev-run-dir 2>/dev/null)"
+if [[ "$got" == "/runs/p4" ]]; then ok "a record without --dispatched-at is not blocked"
+else bad "record without --dispatched-at blocked (got: '$got')"; fi
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

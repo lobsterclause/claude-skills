@@ -73,7 +73,7 @@ project=""; branch=""; base_sha=""; head_sha=""; target_ref=""
 paths_hash=""
 state_dir=""; window_hours="${CROSS_REVIEW_REPEAT_WINDOW_HOURS:-24}"
 record=0; allow="${CROSS_REVIEW_ALLOW_FULL_REREVIEW:-0}"; pass_context=0
-run_dir=""; prev_run_dir=0
+run_dir=""; prev_run_dir=0; dispatched_at=""
 
 need_val() { [[ "$2" -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
@@ -89,6 +89,7 @@ while [[ $# -gt 0 ]]; do
     --record)              record=1; shift ;;
     --pass-context)        pass_context=1; shift ;;
     --run-dir)             need_val "$1" "$#"; run_dir="$2";      shift 2 ;;
+    --dispatched-at)       need_val "$1" "$#"; dispatched_at="$2"; shift 2 ;;
     --prev-run-dir)        prev_run_dir=1; shift ;;
     --allow-full-rereview) allow=1;  shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -240,16 +241,20 @@ if [[ "$record" == 1 ]]; then
       fi
     fi
   fi
-  # A LATE WRITER FROM AN OLDER PASS. A trailing seat dispatched for pass N can
-  # finish after pass N+1 has recorded. Its head is then an ancestor of the
-  # head on disk, and writing would both bump the count and point --prev-run-dir
-  # back at pass N's findings, so the escalation would read the wrong pass. Keep
-  # the newer record. (Found by codex on claude-skills PR #228.)
-  if [[ -f "$rec" ]]; then
+  # A LATE WRITER FROM AN EARLIER ROUND. A trailing seat dispatched for pass N
+  # can finish after pass N+1 has recorded. Writing then would bump the count
+  # and point --prev-run-dir back at pass N's findings. Records are ordered by
+  # DISPATCH time (run_reviewers.sh passes --dispatched-at), not by commit
+  # ancestry, which breaks on a rebase and on a deliberate rollback. A record
+  # without the field (older, or a caller that does not pass it) never blocks.
+  # Like the rest of this record it is not locked: two writers racing within
+  # the same second can still both land, and the later rename wins.
+  # (codex, cross-review of claude-skills PR #228, passes 1 and 2.)
+  case "$dispatched_at" in ''|*[!0-9]*) dispatched_at="" ;; esac
+  if [[ -n "$dispatched_at" && -f "$rec" ]]; then
     _pe2="$(sed -n 's/.*"epoch":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
-    _ph2="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$rec" 2>/dev/null)"
-    if record_is_fresh "$_pe2" && [[ -n "$_ph2" && "$_ph2" != "$head_sha" ]] \
-       && git merge-base --is-ancestor "$head_sha" "$_ph2" 2>/dev/null; then
+    _pd2="$(sed -n 's/.*"dispatched_at":\([0-9]*\).*/\1/p' "$rec" 2>/dev/null)"
+    if record_is_fresh "$_pe2" && [[ -n "$_pd2" ]] && (( dispatched_at < _pd2 )); then
       exit 0
     fi
   fi
@@ -267,6 +272,7 @@ if [[ "$record" == 1 ]]; then
     ''|*'"'*|*'\'*) ;;
     *) _rd_field=",\"run_dir\":\"$run_dir\"" ;;
   esac
+  [[ -n "$dispatched_at" ]] && _rd_field="$_rd_field,\"dispatched_at\":$dispatched_at"
   if printf '{"project":%s,"branch":%s,"base_sha":%s,"head_sha":%s,"epoch":%s,"passes":%s%s}\n' \
     "\"$project\"" "\"$branch\"" "\"$base_sha\"" "\"$head_sha\"" "$now_epoch" "$_rec_passes" "$_rd_field" \
     > "$_tmp" 2>/dev/null; then

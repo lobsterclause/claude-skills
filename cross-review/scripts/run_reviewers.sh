@@ -373,6 +373,29 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Validate the effort inputs BEFORE the ladder reads them. A malformed
+# --prev-severity is a hard error: read as "unknown" it would silently switch
+# escalation off, the failure a flag like this exists to prevent. An unknown
+# --codex-effort keeps its old warn-and-ignore behaviour, but now before the
+# ladder, so a typo no longer counts as an override that suppresses escalation.
+# (kimi, cross-review of claude-skills PR #228, pass 2.)
+if [[ -n "$prev_severity" ]]; then
+  prev_severity="$(printf '%s' "$prev_severity" | tr '[:upper:]' '[:lower:]')"
+  case "$prev_severity" in
+    critical|high|medium|low|none) ;;
+    *) echo "run_reviewers: --prev-severity / CROSS_REVIEW_PREV_SEVERITY '$prev_severity' is not one of critical|high|medium|low|none" >&2
+       exit 2 ;;
+  esac
+fi
+case "$codex_effort" in
+  ''|minimal|low|medium|high|xhigh) ;;
+  *) echo "run_reviewers: ignoring unknown --codex-effort '$codex_effort' (want minimal|low|medium|high|xhigh)" >&2
+     codex_effort="" ;;
+esac
+# When this round was dispatched. The guard keeps the record of the LATEST
+# dispatch, so a trailing seat from an earlier round cannot overwrite it.
+_dispatched_at="$(date +%s)"
+
 if [[ -z "$base" || -z "$out" ]]; then
   echo "usage: $0 --base <ref> --out <dir> [--target-ref refs/remotes/<remote>/<branch>] [--reviewers codex,glm-coding,gemini-pro,kimi,glm,deepseek,mimo,minimax,qwen,devstral,laguna,kat,north,nemotron,spark,seed,grok,longcat,inkling] [--timeout <sec>] [--timeout-codex <sec>] [--timeout-gemini-pro <sec>] [--timeout-kimi <sec>] [--timeout-glm <sec>] [--timeout-glm-coding <sec>] [--snapshot-dir <dir>] [--context-mode files|diff] [--paths <a,b>] [--path <p>]...  [--no-paths] [--allow-empty-paths] [--allow-non-ancestor-base] [--codex-force-base] [--codex-effort <level>] [--prev-severity critical|high|medium|low|none]" >&2
   exit 2
@@ -909,15 +932,8 @@ if [[ -f "$_guard" && -n "$_base_sha" && -n "$_head_sha" ]]; then
   # NOBODY had reviewed, silently dropping that coverage.
 fi
 
-# Fail closed toward the config default. An unknown level is a typo, and what
-# codex does with one is not something to find out mid-round: at best it is
-# ignored (the dial silently does nothing), at worst it aborts every codex run
-# and reads like a reviewer outage. Empty means "inherit the config".
-case "$codex_effort" in
-  ''|minimal|low|medium|high|xhigh) ;;
-  *) echo "run_reviewers: ignoring unknown --codex-effort '$codex_effort' (want minimal|low|medium|high|xhigh)" >&2
-     codex_effort="" ;;
-esac
+# An unknown --codex-effort was already dropped (with a warning) right after
+# argument parsing, before the ladder could treat it as an override.
 # What the codex lane will actually run at, for the meta/runlog (measure_codex_effort.sh
 # reads `effort`): the pinned/ladder level, else whatever the config gives pass 1.
 if [[ -z "$codex_effort" ]]; then codex_effort_source="config"
@@ -3695,7 +3711,7 @@ fi
 if [[ "$any_ok" -eq 1 && -f "${_guard:-}" && -n "${_base_sha:-}" && -n "${_head_sha:-}" ]]; then
   _out_abs="$(cd "$out" 2>/dev/null && pwd || true)"
   bash "$_guard" ${_guard_id_args[@]+"${_guard_id_args[@]}"} --record --base-sha "$_base_sha" --head-sha "$_head_sha" \
-    ${_out_abs:+--run-dir "$_out_abs"} || true
+    ${_out_abs:+--run-dir "$_out_abs"} --dispatched-at "$_dispatched_at" || true
 fi
 
 [[ "$any_ok" -eq 1 ]] || exit 1

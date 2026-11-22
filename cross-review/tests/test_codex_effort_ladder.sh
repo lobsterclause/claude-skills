@@ -109,6 +109,15 @@ assert_eq "…source=caller" "$(jq -r .prior_severity_source "$META")" "caller"
 PRIOR=High CROSS_REVIEW_PREV_SEVERITY=none run cse 2
 assert_eq "env none beats a High file" "$EFF" ""
 
+echo "── input validation runs before the ladder ──"
+cfg medium
+rc=0; ( cd "$REPO" && bash "$S/run_reviewers.sh" --base master --out "$T/out-badsev" --reviewers codex \
+    --subject-id pr-badsev --allow-full-rereview --prev-severity bogus >"$T/log-badsev" 2>&1 ) || rc=$?
+assert_eq "--prev-severity bogus exits 2" "$rc" "2"
+PRIOR=High run badeff 2 --codex-effort turbo
+grep -qi "turbo" "$T/log-badeff" && ok "unknown --codex-effort is warned about" || bad "no warning for turbo"
+assert_eq "…and ignored, so the ladder still escalates" "$EFF" "high"
+
 echo "── override wins absolutely, no clamping ──"
 cfg medium
 PRIOR=- run ov 2 --codex-effort xhigh

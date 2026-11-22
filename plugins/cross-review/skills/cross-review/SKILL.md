@@ -623,11 +623,15 @@ Use `select_roster.sh --fast` for re-pass rotation picks. A full re-review is ap
 > `CROSS_REVIEW_PREV_SEVERITY` when the caller knows it (pass it — you just
 > synthesized the findings), otherwise from `scripts/prior_severity.sh` on the
 > run dir the repeat-pass guard recorded for the previous pass. That script
-> reads `findings.verified.json`, then `findings.scored.json`, then
+> reads `findings.verified.json` and `findings.scored.json` (when both exist, a
+> finding must survive both, so the lower of their two maxima counts), then
 > `findings.json`, then `findings.md` (struck-through bullets skipped), skipping
 > anything scored or fact-checked as `drop`. A JSON file with no `findings`
-> array is not evidence of a clean pass. A trailing seat from an older pass
-> cannot overwrite the newer pass's record. `findings.premerged.json`
+> array is not evidence of a clean pass. Records are ordered by dispatch time:
+> a trailing seat from an earlier dispatch cannot overwrite a later pass's
+> record (the write is not locked, so two dispatches in the same second can
+> still race). An invalid `--prev-severity` exits 2; an unknown
+> `--codex-effort` is warned about and ignored. `findings.premerged.json`
 > (curl lanes only) counts only as positive evidence. No evidence reads as
 > `unknown`, which does not escalate — a missing file can cost a deeper look,
 > never extra spend. The global config is the owner's (`medium`, set
