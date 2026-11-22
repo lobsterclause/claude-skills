@@ -60,6 +60,18 @@ fn a_shared_file_alone_is_only_adjacent() {
 }
 
 #[test]
+fn a_folder_covers_the_files_under_it() {
+    let o = overlap_of(vec![
+        v(1, "live", &["src/timer/"], &["f"], "S"),
+        v(2, "live", &["src/timer/countdown.ts"], &["f"], "S"),
+        v(3, "live", &["src/timer2/x.ts"], &["g"], "S"),
+    ]);
+    assert_eq!(o["pairs"][0]["shared_files"], json!(["src/timer/countdown.ts"]));
+    assert_eq!(o["pairs"].as_array().expect("pairs").len(), 1);
+    assert_eq!(o["groups"][0]["issues"], json!([1, 2]));
+}
+
+#[test]
 fn only_live_and_duplicate_issues_take_part() {
     let o = overlap_of(vec![
         v(1, "live", &["a.ts"], &["f"], "S"),

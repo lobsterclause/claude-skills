@@ -7,8 +7,8 @@
 //! rule is reported, not the first. A git call that fails is an error (exit 1),
 //! never an `ok: true`.
 //!
-//! Scope is the queue's `files`: a path equal to one, or under one that is a
-//! folder. A test file the implementer adds is not in that list, so a path also
+//! Scope is the queue's `files`: a path equal to one, or under one that ends
+//! in `/` (a bare entry is that exact path only). A test file the implementer adds is not in that list, so a path also
 //! counts as in scope when it is a test file beside a scoped file or under a
 //! `__tests__`, `tests` or `test` folder that sits in a scoped file's folder or
 //! at the repo root (`is_test_path`). Protected and frozen paths still apply to
@@ -45,7 +45,7 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, read_json, write_json};
 use crate::error::{Fail, Res};
 use crate::git;
-use crate::profile::path_within;
+use crate::profile::scope_covers;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -172,7 +172,7 @@ pub fn judge(
     if let Some(scope) = &input.scope {
         let (mut outside, mut tests) = (Vec::new(), Vec::new());
         for p in paths.iter().copied() {
-            if scope.iter().chain(acceptance).any(|entry| path_within(p, entry)) {
+            if scope.iter().chain(acceptance).any(|entry| scope_covers(entry, p)) {
                 continue;
             }
             if is_test_path(p, scope) {
@@ -612,6 +612,10 @@ mod tests {
         ] {
             assert!(!is_test_path(no, &scope), "{no}");
         }
+        // A folder entry keeps its slash: its tests are inside it, not beside it.
+        let folder = ["src/timer/".to_string()];
+        assert!(is_test_path("src/timer/a.test.ts", &folder));
+        assert!(!is_test_path("src/badge.test.ts", &folder));
     }
 
     #[test]

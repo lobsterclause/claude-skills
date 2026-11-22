@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use issue_drain::ctx::Ctx;
 use issue_drain::error::Res;
 use issue_drain::{
-    base_sync, claim, cleanup, close, deliver_check, evalscore, evidence, gh, intake, merge_gate, overlap,
+    base_sync, by_hand, claim, cleanup, close, deliver_check, evalscore, evidence, gh, intake, merge_gate, overlap,
     review_proof, stamp, state, tracker, unit_prepare,
 };
 
@@ -35,7 +35,8 @@ enum Command {
     Tracker(tracker::Command),
     /// Close the already-fixed issues ticked on the tracker.
     CloseVerified(close::Args),
-    /// The one path by which issue-drain writes to GitHub.
+    /// The one path by which issue-drain writes to GitHub (`gh-write --help` lists the verbs).
+    #[command(disable_help_flag = true)]
     GhWrite {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -62,6 +63,11 @@ enum Command {
     BaseSync(base_sync::Args),
     /// Remove a finished unit's worktree, its merged branch and its claim; or the whole run's.
     Cleanup(cleanup::Args),
+    /// Write a unit's guards marker by hand, with the reason on record.
+    GuardsMarker(by_hand::MarkerArgs),
+    /// Change a unit's scope by hand.
+    #[command(subcommand)]
+    Scope(by_hand::ScopeCommand),
 }
 
 fn name(command: &Command) -> &'static str {
@@ -92,10 +98,19 @@ fn name(command: &Command) -> &'static str {
         Command::StampRemotePass(_) => "stamp-remote-pass",
         Command::BaseSync(_) => "base-sync",
         Command::Cleanup(_) => "cleanup",
+        Command::GuardsMarker(_) => "guards-marker",
+        Command::Scope(_) => "scope widen",
     }
 }
 
 fn run(command: &Command) -> Res<()> {
+    // Help needs no run folder or profile, so it is answered before they load.
+    if let Command::GhWrite { args } = command {
+        if let Some(text) = gh::help(args) {
+            print!("{text}");
+            return Ok(());
+        }
+    }
     let mut ctx = Ctx::load()?;
     if matches!(command, Command::MergeGate(args) if args.dry_run) {
         ctx.dry_run = true;
@@ -117,6 +132,8 @@ fn run(command: &Command) -> Res<()> {
         Command::StampRemotePass(args) => stamp::run(&ctx, args),
         Command::BaseSync(args) => base_sync::run(&ctx, args),
         Command::Cleanup(args) => cleanup::run(&ctx, args),
+        Command::GuardsMarker(args) => by_hand::guards_marker(&ctx, args),
+        Command::Scope(command) => by_hand::scope(&ctx, command),
     }
 }
 

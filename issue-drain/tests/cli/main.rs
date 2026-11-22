@@ -5,6 +5,7 @@
 mod common;
 
 mod base_sync;
+mod by_hand;
 mod claim;
 mod cleanup;
 mod close;

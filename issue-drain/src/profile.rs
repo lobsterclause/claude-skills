@@ -102,6 +102,23 @@ pub fn path_within(path: &str, entry: &str) -> bool {
     !entry.is_empty() && (path == entry || path.strip_prefix(entry).is_some_and(|rest| rest.starts_with('/')))
 }
 
+/// Whether a scope entry covers `path`: an entry ending in `/` is a folder and
+/// covers what is under it; any other entry covers only that exact path.
+pub fn scope_covers(entry: &str, path: &str) -> bool {
+    path == entry || (entry.ends_with('/') && path.starts_with(entry))
+}
+
+/// The more specific of two file entries when one covers the other, else `None`.
+pub fn shared_entry<'a>(a: &'a str, b: &'a str) -> Option<&'a str> {
+    if scope_covers(a, b) {
+        Some(b)
+    } else if scope_covers(b, a) {
+        Some(a)
+    } else {
+        None
+    }
+}
+
 /// GitHub treats label names as case-insensitive, so `Blocked` is the hold
 /// label `blocked`.
 pub fn same_label(a: &str, b: &str) -> bool {

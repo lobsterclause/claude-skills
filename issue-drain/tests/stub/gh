@@ -179,6 +179,8 @@ case "${1:-} ${2:-}" in
     case "$*" in
       *--add-label*) if [ -e "$dir/fail-add-label" ]; then echo "gh stub: add-label failed" >&2; exit 1; fi ;;
     esac ;;
+  "run rerun") ;;
+  "pr edit") ;;
   "label create") ;;
   "label list")
     if [ -f "$dir/labels.txt" ]; then cat "$dir/labels.txt"; fi ;;

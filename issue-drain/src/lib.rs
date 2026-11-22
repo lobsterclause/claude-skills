@@ -3,6 +3,7 @@
 //! `profile` and `text` are shared by all of them.
 
 pub mod base_sync;
+pub mod by_hand;
 pub mod claim;
 pub mod cleanup;
 pub mod close;
