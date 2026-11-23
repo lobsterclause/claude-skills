@@ -239,6 +239,8 @@ pub struct Written {
     /// False in a dry run, and when `ensure-label` found the label in place.
     pub called: bool,
     pub stdout: String,
+    /// `issue-edit` only: the issue as read just before the write (None in a dry run).
+    pub preflight: Option<serde_json::Value>,
 }
 
 /// gh, with the host pinned. A repo is named `owner/repo`, and the checkout's
@@ -311,7 +313,7 @@ fn same_text(a: &str, b: &str) -> bool {
 fn issue_edit(ctx: &Ctx, number: u64, title: &str, body_file: &str) -> Res<()> {
     let title = Some(title).filter(|t| !t.is_empty());
     let file = Some(body_file).filter(|f| !f.is_empty()).map(Path::new);
-    write(
+    let written = write(
         ctx,
         &Write::IssueEdit {
             number,
@@ -324,12 +326,14 @@ fn issue_edit(ctx: &Ctx, number: u64, title: &str, body_file: &str) -> Res<()> {
         return Ok(());
     }
     let now = read_issue(&ctx.repo()?, number)?;
-    let title_changed = title.is_some_and(|t| now["title"].as_str() == Some(t));
+    let before = written.preflight.unwrap_or_default();
+    let title_changed = title.is_some_and(|t| before["title"].as_str() != Some(t) && now["title"].as_str() == Some(t));
     let body_changed = match file {
         Some(f) => {
             let want =
                 std::fs::read_to_string(f).map_err(|e| Fail::failed(format!("could not read {}: {e}", f.display())))?;
-            now["body"].as_str().is_some_and(|b| same_text(b, &want))
+            let was_same = before["body"].as_str().is_some_and(|b| same_text(b, &want));
+            !was_same && now["body"].as_str().is_some_and(|b| same_text(b, &want))
         }
         None => false,
     };
@@ -351,13 +355,8 @@ fn unblock(ctx: &Ctx, number: u64, labels: &[String], reason: &str) -> Res<()> {
     }
     // Every label is checked before the first write.
     for label in labels {
-        if label.contains(',') {
-            return Err(refuse(
-                ctx,
-                "unblock",
-                mode,
-                format!("'{label}' contains a comma; gh would split it"),
-            ));
+        if let Some(why) = csv_hazard(label) {
+            return Err(refuse(ctx, "unblock", mode, why));
         }
         if same_label(label, &ctx.profile.claim_label) {
             return Err(refuse(
@@ -413,7 +412,7 @@ fn unblock(ctx: &Ctx, number: u64, labels: &[String], reason: &str) -> Res<()> {
         return Ok(());
     }
     let now = label_names(&read_issue(&repo, number)?);
-    if let Some(left) = removing.iter().find(|r| now.iter().any(|l| same_label(l, r))) {
+    if let Some(left) = labels.iter().find(|r| now.iter().any(|l| same_label(l, r))) {
         return Err(Fail::failed(format!(
             "'{left}' is still on #{number} after the write (labels now: {})",
             now.join(", ")
@@ -426,7 +425,25 @@ fn unblock(ctx: &Ctx, number: u64, labels: &[String], reason: &str) -> Res<()> {
     Ok(())
 }
 
+/// gh parses `--remove-label` as CSV: a comma splits it, a quote or a line break is reinterpreted.
+fn csv_hazard(label: &str) -> Option<String> {
+    if label.contains(',') {
+        Some(format!("'{label}' contains a comma; gh would split it"))
+    } else if label.contains(['"', '\n', '\r']) {
+        Some(format!(
+            "'{label}' contains a quote or line break; gh would reinterpret it"
+        ))
+    } else {
+        None
+    }
+}
+
 fn need_body(file: &Path) -> Res<()> {
+    if file == Path::new("-") {
+        return Err(Fail::usage(
+            "body file '-' means stdin to gh, which this wrapper does not supply; use ./- for a file named -",
+        ));
+    }
     match std::fs::metadata(file) {
         Ok(meta) if meta.is_file() && meta.len() > 0 => Ok(()),
         _ => Err(Fail::usage(format!(
@@ -446,6 +463,7 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
     }
 
     let own = |s: &str| s.to_string();
+    let mut preflight = None;
     let (what, argv): (String, Vec<String>) = match w {
         Write::IssueCreate { title, body_file } => {
             need_body(body_file)?;
@@ -507,6 +525,7 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
                     return Ok(Written {
                         called: false,
                         stdout: String::new(),
+                        preflight: None,
                     });
                 }
             }
@@ -631,6 +650,7 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
             // A dry run calls nothing, so it cannot tell an issue from a PR.
             if !ctx.dry_run {
                 let issue = read_issue(&repo, *number)?;
+                preflight = Some(issue.clone());
                 if issue.get("pull_request").is_some() {
                     return Err(refuse(
                         ctx,
@@ -662,13 +682,8 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
             (format!("edit #{number}"), argv)
         }
         Write::RemoveHold { number, label } => {
-            if label.contains(',') {
-                return Err(refuse(
-                    ctx,
-                    verb,
-                    mode,
-                    format!("'{label}' contains a comma; gh would split it"),
-                ));
+            if let Some(why) = csv_hazard(label) {
+                return Err(refuse(ctx, verb, mode, why));
             }
             if same_label(label, &p.claim_label) {
                 return Err(refuse(
@@ -766,6 +781,7 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
         return Ok(Written {
             called: false,
             stdout: String::new(),
+            preflight,
         });
     }
 
@@ -793,7 +809,11 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
     if rc != 0 {
         return Err(Fail::failed(format!("gh failed (exit {rc}): {what}")));
     }
-    Ok(Written { called: true, stdout })
+    Ok(Written {
+        called: true,
+        stdout,
+        preflight,
+    })
 }
 
 const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|pr-create|pr-edit|issue-edit|unblock|run-rerun|thread-reply|thread-resolve>";
@@ -874,7 +894,7 @@ pub fn help(argv: &[String]) -> Option<String> {
 /// An option's value, refused when missing or empty.
 fn need_value(next: Option<&String>, opt: &str) -> Res<String> {
     match next {
-        Some(v) if !v.is_empty() => Ok(v.clone()),
+        Some(v) if !v.is_empty() && !v.starts_with("--") => Ok(v.clone()),
         _ => Err(Fail::usage(format!("{opt} needs a value"))),
     }
 }
