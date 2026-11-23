@@ -871,13 +871,7 @@ pub fn help(argv: &[String]) -> Option<String> {
     }
 }
 
-/// `issue-drain gh-write <verb> ...`. The verb and its options are read by
-/// hand, not by clap, so that a unit process asking for a forbidden verb is
-/// refused, and the refusal logged, before anything else about the call is
-/// looked at.
-///
-/// There is no verb that closes an issue. `Write::CloseIssue` is reached only
-/// from `close-verified`, which holds every condition a closure needs.
+/// An option's value, refused when missing or empty.
 fn need_value(next: Option<&String>, opt: &str) -> Res<String> {
     match next {
         Some(v) if !v.is_empty() => Ok(v.clone()),
@@ -885,6 +879,13 @@ fn need_value(next: Option<&String>, opt: &str) -> Res<String> {
     }
 }
 
+/// `issue-drain gh-write <verb> ...`. The verb and its options are read by
+/// hand, not by clap, so that a unit process asking for a forbidden verb is
+/// refused, and the refusal logged, before anything else about the call is
+/// looked at.
+///
+/// There is no verb that closes an issue. `Write::CloseIssue` is reached only
+/// from `close-verified`, which holds every condition a closure needs.
 pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     ctx.repo()?;
     let mode = ctx.mode()?;
