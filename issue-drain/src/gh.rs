@@ -304,6 +304,18 @@ fn label_names(issue: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Like `label_names`, but a missing or non-array `labels` is a failed read,
+/// not an empty list.
+fn label_names_strict(issue: &serde_json::Value, number: u64) -> Res<Vec<String>> {
+    if issue["labels"].is_array() {
+        Ok(label_names(issue))
+    } else {
+        Err(Fail::failed(format!(
+            "could not read the labels of #{number}: no labels array"
+        )))
+    }
+}
+
 /// Line endings and trailing newlines are not what GitHub keeps verbatim.
 fn same_text(a: &str, b: &str) -> bool {
     a.replace("\r\n", "\n").trim_end() == b.replace("\r\n", "\n").trim_end()
@@ -313,16 +325,36 @@ fn same_text(a: &str, b: &str) -> bool {
 fn issue_edit(ctx: &Ctx, number: u64, title: &str, body_file: &str) -> Res<()> {
     let title = Some(title).filter(|t| !t.is_empty());
     let file = Some(body_file).filter(|f| !f.is_empty()).map(Path::new);
-    // The file is read once, before the write; after it, only GitHub is read.
-    let want = file.and_then(|f| std::fs::read_to_string(f).ok());
-    let written = write(
+    // The file is checked, then read once; gh gets a private copy of that text,
+    // so a file saved mid-request cannot change what is sent. After the write
+    // only GitHub is read.
+    let mut want = None;
+    let mut staged = None;
+    if let Some(f) = file {
+        need_body(f)?;
+        let text = std::fs::read_to_string(f)
+            .map_err(|e| Fail::usage(format!("body file is not readable UTF-8 text: {}: {e}", f.display())))?;
+        let copy = ctx
+            .workdir
+            .join(format!("issue-edit-{number}-{}-body.md", std::process::id()));
+        std::fs::create_dir_all(&ctx.workdir)
+            .and_then(|()| std::fs::write(&copy, &text))
+            .map_err(|e| Fail::failed(format!("could not write {}: {e}", copy.display())))?;
+        want = Some(text);
+        staged = Some(copy);
+    }
+    let result = write(
         ctx,
         &Write::IssueEdit {
             number,
             title,
-            body_file: file,
+            body_file: staged.as_deref(),
         },
-    )?;
+    );
+    if let Some(copy) = &staged {
+        let _ = std::fs::remove_file(copy);
+    }
+    let written = result?;
     // gh's own output (a URL) is not part of the verb's one JSON line.
     if ctx.dry_run {
         return Ok(());
@@ -381,7 +413,7 @@ fn unblock(ctx: &Ctx, number: u64, labels: &[String], reason: &str) -> Res<()> {
     if ctx.dry_run {
         removing = labels.to_vec();
     } else {
-        let on = label_names(&read_issue(&repo, number)?);
+        let on = label_names_strict(&read_issue(&repo, number)?, number)?;
         for label in labels {
             match on.iter().find(|l| same_label(l, label)) {
                 Some(actual) => removing.push(actual.clone()),
@@ -411,7 +443,7 @@ fn unblock(ctx: &Ctx, number: u64, labels: &[String], reason: &str) -> Res<()> {
     if ctx.dry_run {
         return Ok(());
     }
-    let now = label_names(&read_issue(&repo, number)?);
+    let now = label_names_strict(&read_issue(&repo, number)?, number)?;
     if let Some(left) = labels.iter().find(|r| now.iter().any(|l| same_label(l, r))) {
         return Err(Fail::failed(format!(
             "'{left}' is still on #{number} after the write (labels now: {})",
@@ -659,7 +691,10 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
                         format!("#{number} is a pull request; use pr-edit"),
                     ));
                 }
-                if label_names(&issue).iter().any(|l| same_label(l, &p.tracker_label)) {
+                if label_names_strict(&issue, *number)?
+                    .iter()
+                    .any(|l| same_label(l, &p.tracker_label))
+                {
                     return Err(refuse(
                         ctx,
                         verb,
@@ -925,6 +960,7 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     let mut reason = String::new();
     let mut reason_given = false;
     let mut args: Vec<&str> = Vec::new();
+    let mut given: Vec<&str> = Vec::new();
     let mut rest = argv[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -939,13 +975,21 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             }
             "--draft" => draft = true,
             "--failed" => failed = true,
-            "--label" => match rest.next() {
-                Some(label) if !label.is_empty() => labels.push(label.clone()),
-                _ => return Err(Fail::usage("--label needs a name")),
-            },
+            "--label" => labels.push(need_value(rest.next(), "--label")?),
             option if option.starts_with("--") => return Err(Fail::usage(format!("unknown option {option}"))),
             other => args.push(other),
         }
+        if arg.starts_with("--") {
+            given.push(arg.as_str());
+        }
+    }
+    let used: Option<&[&str]> = match verb {
+        "issue-edit" => Some(&["--title", "--body-file"]),
+        "unblock" => Some(&["--label", "--reason"]),
+        _ => None,
+    };
+    if let Some(bad) = used.and_then(|used| given.iter().find(|o| !used.contains(o))) {
+        return Err(Fail::usage(format!("{verb} does not take {bad}")));
     }
     if reason_given && verb != "unblock" {
         return Err(Fail::usage(format!("{verb} does not take --reason")));

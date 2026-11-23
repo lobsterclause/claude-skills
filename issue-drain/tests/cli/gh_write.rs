@@ -484,21 +484,23 @@ fn issue_edit_read_failure_is_exit_1() {
 fn issue_edit_changes_title_and_body_and_reports_what_github_says() {
     let env = Env::new();
     let body = env.write("new-body.md", "New body\n").display().to_string();
-    api_issue(&env, 7, r#"{"number":7,"title":"Old","body":"Old body"}"#);
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"Old","body":"Old body"}"#);
     env.stub_file(
         "issue-api-7.after-edit.json",
         r#"{"number":7,"title":"New","body":"New body"}"#,
     );
     let out = env.run(&["gh-write", "issue-edit", "7", "--title", "New", "--body-file", &body]);
     assert_eq!(out.code, 0, "{}", out.stderr);
-    assert_eq!(
-        env.gh_calls(),
-        [
-            format!("api repos/{REPO}/issues/7"),
-            format!("issue edit 7 --repo {REPO} --title New --body-file {body}"),
-            format!("api repos/{REPO}/issues/7"),
-        ]
+    let calls = env.gh_calls();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert_eq!(calls[0], format!("api repos/{REPO}/issues/7"));
+    assert!(
+        calls[1].starts_with(&format!("issue edit 7 --repo {REPO} --title New --body-file "))
+            && calls[1].ends_with("-body.md")
+            && !calls[1].contains(&body),
+        "{calls:?}"
     );
+    assert_eq!(calls[2], format!("api repos/{REPO}/issues/7"));
     let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
     assert_eq!(line["issue"], 7);
     assert_eq!(line["title_changed"], true);
@@ -508,7 +510,7 @@ fn issue_edit_changes_title_and_body_and_reports_what_github_says() {
 #[test]
 fn issue_edit_reports_a_change_github_did_not_take() {
     let env = Env::new();
-    api_issue(&env, 7, r#"{"number":7,"title":"Old","body":"b"}"#);
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"Old","body":"b"}"#);
     // No after-edit file: the read-back still shows the old title.
     let out = env.run(&["gh-write", "issue-edit", "7", "--title", "New"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
@@ -524,10 +526,14 @@ fn issue_edit_dry_run_prints_would_and_calls_nothing() {
     let body = body(&env);
     let out = env.run(&["gh-write", "issue-edit", "7", "--title", "New", "--body-file", &body]);
     assert_eq!(out.code, 0, "{}", out.stderr);
-    assert_eq!(
-        out.stdout.trim(),
-        format!("WOULD: gh issue edit 7 --repo {REPO} --title New --body-file {body}")
+    let line = out.stdout.trim();
+    assert!(
+        line.starts_with(&format!(
+            "WOULD: gh issue edit 7 --repo {REPO} --title New --body-file "
+        )) && line.ends_with("-body.md"),
+        "{line}"
     );
+    assert!(!line.contains(&body), "{line}");
     assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
 }
 
@@ -839,7 +845,7 @@ fn unblock_fails_when_a_skipped_label_shows_up_by_the_read_back() {
 #[test]
 fn issue_edit_does_not_call_an_unchanged_title_changed() {
     let env = Env::new();
-    api_issue(&env, 7, r#"{"number":7,"title":"Same","body":"b"}"#);
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"Same","body":"b"}"#);
     let out = env.run(&["gh-write", "issue-edit", "7", "--title", "Same"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
@@ -877,7 +883,7 @@ fn issue_edit_reads_the_body_file_once_before_the_write() {
     let env = Env::new();
     let path = env.write("b.md", "New body\n");
     let file = path.display().to_string();
-    api_issue(&env, 7, r#"{"number":7,"title":"t","body":"Old"}"#);
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"t","body":"Old"}"#);
     env.stub_file(
         "issue-api-7.after-edit.json",
         r#"{"number":7,"title":"t","body":"New body"}"#,
@@ -886,4 +892,62 @@ fn issue_edit_reads_the_body_file_once_before_the_write() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
     assert_eq!(line["body_changed"], true);
+}
+
+#[test]
+fn issue_edit_and_unblock_refuse_options_they_do_not_use() {
+    let env = Env::new();
+    let cases: [&[&str]; 3] = [
+        &["gh-write", "issue-edit", "7", "--title", "X", "--label", "blocked"],
+        &[
+            "gh-write",
+            "unblock",
+            "7",
+            "--label",
+            "needs-human",
+            "--reason",
+            "r",
+            "--title",
+            "X",
+        ],
+        &["gh-write", "unblock", "7", "--label", "--reason", "r"],
+    ];
+    for args in cases {
+        let out = env.run(args);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn a_read_with_no_labels_array_is_a_failed_read_for_unblock() {
+    let env = Env::new();
+    api_issue(&env, 7, r#"{"number":7,"title":"t"}"#);
+    let out = env.run(&unblock(&["--label", "needs-human", "--reason", "r"]));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(writes(&env).is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn issue_edit_sends_a_private_copy_of_the_body_and_dry_run_never_hangs_on_a_fifo() {
+    let mut env = Env::new();
+    let file = env.write("b.md", "Body\n").display().to_string();
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"t","body":"Old"}"#);
+    let out = env.run(&["gh-write", "issue-edit", "7", "--body-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let sent = writes(&env).join("\n");
+    assert!(sent.contains("-body.md") && !sent.contains(&file), "{sent}");
+
+    let fifo = env.dir.path().join("fifo.md");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success());
+    env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    let out = env.run(&[
+        "gh-write",
+        "issue-edit",
+        "7",
+        "--body-file",
+        &fifo.display().to_string(),
+    ]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
 }
