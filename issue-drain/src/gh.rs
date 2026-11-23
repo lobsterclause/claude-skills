@@ -313,6 +313,8 @@ fn same_text(a: &str, b: &str) -> bool {
 fn issue_edit(ctx: &Ctx, number: u64, title: &str, body_file: &str) -> Res<()> {
     let title = Some(title).filter(|t| !t.is_empty());
     let file = Some(body_file).filter(|f| !f.is_empty()).map(Path::new);
+    // The file is read once, before the write; after it, only GitHub is read.
+    let want = file.and_then(|f| std::fs::read_to_string(f).ok());
     let written = write(
         ctx,
         &Write::IssueEdit {
@@ -328,12 +330,10 @@ fn issue_edit(ctx: &Ctx, number: u64, title: &str, body_file: &str) -> Res<()> {
     let now = read_issue(&ctx.repo()?, number)?;
     let before = written.preflight.unwrap_or_default();
     let title_changed = title.is_some_and(|t| before["title"].as_str() != Some(t) && now["title"].as_str() == Some(t));
-    let body_changed = match file {
-        Some(f) => {
-            let want =
-                std::fs::read_to_string(f).map_err(|e| Fail::failed(format!("could not read {}: {e}", f.display())))?;
-            let was_same = before["body"].as_str().is_some_and(|b| same_text(b, &want));
-            !was_same && now["body"].as_str().is_some_and(|b| same_text(b, &want))
+    let body_changed = match &want {
+        Some(want) => {
+            let was_same = before["body"].as_str().is_some_and(|b| same_text(b, want));
+            !was_same && now["body"].as_str().is_some_and(|b| same_text(b, want))
         }
         None => false,
     };
@@ -395,7 +395,7 @@ fn unblock(ctx: &Ctx, number: u64, labels: &[String], reason: &str) -> Res<()> {
             .workdir
             .join(format!("unblock-{number}-{}-comment.md", std::process::id()));
         std::fs::create_dir_all(&ctx.workdir)
-            .and_then(|()| std::fs::write(&file, format!("Removed {}: {}\n", names.join(", "), reason.trim())))
+            .and_then(|()| std::fs::write(&file, format!("Removing {}: {}\n", names.join(", "), reason.trim())))
             .map_err(|e| Fail::failed(format!("could not write {}: {e}", file.display())))?;
         write(
             ctx,
@@ -854,7 +854,7 @@ const USAGES: &[(&str, &str)] = &[
     ),
     (
         "unblock",
-        "unblock <number> --label <hold-label> [--label <hold-label>]... --reason <text>\n    Remove hold labels from an issue or PR: posts \"Removed `<labels>`: <reason>\", removes each label that is on the item,\n    reads back, and prints {number, removed, skipped, labels_now}. The claim label is refused (use claim release). Not for a unit.",
+        "unblock <number> --label <hold-label> [--label <hold-label>]... --reason <text>\n    Remove hold labels from an issue or PR: posts \"Removing `<labels>`: <reason>\", removes each label that is on the item,\n    reads back, and prints {number, removed, skipped, labels_now}. The claim label is refused (use claim release). Not for a unit.",
     ),
     (
         "run-rerun",
@@ -923,6 +923,7 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     let mut failed = false;
     let mut labels: Vec<String> = Vec::new();
     let mut reason = String::new();
+    let mut reason_given = false;
     let mut args: Vec<&str> = Vec::new();
     let mut rest = argv[1..].iter();
     while let Some(arg) = rest.next() {
@@ -932,7 +933,10 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             "--head" => head = need_value(rest.next(), "--head")?,
             "--base" => base = need_value(rest.next(), "--base")?,
             "--thread" => thread = need_value(rest.next(), "--thread")?,
-            "--reason" => reason = need_value(rest.next(), "--reason")?,
+            "--reason" => {
+                reason = need_value(rest.next(), "--reason")?;
+                reason_given = true;
+            }
             "--draft" => draft = true,
             "--failed" => failed = true,
             "--label" => match rest.next() {
@@ -942,6 +946,21 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             option if option.starts_with("--") => return Err(Fail::usage(format!("unknown option {option}"))),
             other => args.push(other),
         }
+    }
+    if reason_given && verb != "unblock" {
+        return Err(Fail::usage(format!("{verb} does not take --reason")));
+    }
+    let wanted = match verb {
+        "issue-create" | "pr-create" | "thread-reply" | "thread-resolve" => Some(0),
+        "issue-edit" | "unblock" | "comment" | "ensure-label" | "pr-edit" | "run-rerun" => Some(1),
+        "add-label" | "remove-label" => Some(2),
+        _ => None,
+    };
+    if let Some(n) = wanted.filter(|n| args.len() != *n && (*n == 0 || verb == "issue-edit" || verb == "unblock")) {
+        return Err(Fail::usage(format!(
+            "{verb} takes {n} positional argument(s), got {}",
+            args.len()
+        )));
     }
     let arg = |i: usize| args.get(i).copied().unwrap_or_default();
     let number = || {

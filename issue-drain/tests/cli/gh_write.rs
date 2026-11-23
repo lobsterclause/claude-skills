@@ -649,7 +649,7 @@ fn unblock_comments_first_then_removes_then_reads_back() {
     assert_eq!(calls[3], format!("issue edit 7 --repo {REPO} --remove-label Blocked"));
     assert_eq!(calls[4], format!("api repos/{REPO}/issues/7"));
     let posted = std::fs::read_to_string(env.stub.join("last-comment-body")).expect("the comment body");
-    assert_eq!(posted.trim_end(), "Removed `needs-human`, `Blocked`: owner answered");
+    assert_eq!(posted.trim_end(), "Removing `needs-human`, `Blocked`: owner answered");
     let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
     assert_eq!(line["number"], 7);
     assert_eq!(line["removed"], serde_json::json!(["needs-human", "Blocked"]));
@@ -844,4 +844,46 @@ fn issue_edit_does_not_call_an_unchanged_title_changed() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
     assert_eq!(line["title_changed"], false);
+}
+
+#[test]
+fn extra_positionals_and_a_stray_reason_are_usage_errors_before_gh() {
+    let env = Env::new();
+    let cases: [&[&str]; 5] = [
+        &["gh-write", "issue-edit", "7", "8", "--title", "New"],
+        &[
+            "gh-write",
+            "unblock",
+            "7",
+            "8",
+            "--label",
+            "needs-human",
+            "--reason",
+            "r",
+        ],
+        &["gh-write", "issue-edit"],
+        &["gh-write", "remove-label", "7", "agent-in-progress", "--reason", "why"],
+        &["gh-write", "issue-create", "extra", "--title", "T"],
+    ];
+    for args in cases {
+        let out = env.run(args);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn issue_edit_reads_the_body_file_once_before_the_write() {
+    let env = Env::new();
+    let path = env.write("b.md", "New body\n");
+    let file = path.display().to_string();
+    api_issue(&env, 7, r#"{"number":7,"title":"t","body":"Old"}"#);
+    env.stub_file(
+        "issue-api-7.after-edit.json",
+        r#"{"number":7,"title":"t","body":"New body"}"#,
+    );
+    let out = env.run(&["gh-write", "issue-edit", "7", "--body-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
+    assert_eq!(line["body_changed"], true);
 }
