@@ -38,5 +38,7 @@ To add a repo, copy an existing profile, then check each label against `gh label
 | `codegraph_timeout_secs` | 300 | The same limit for `codegraph sync` and for `codegraph init`, each |
 | `full_verify_command` | none | The command a homelab verify must have run for `stamp-remote-pass` to stamp (`pnpm verify`). Empty means nothing is ever stamped |
 | `stamp_command` | none | Run in the unit worktree to record the repo's verify stamp (a relative path with a `/` is relative to the worktree, as for `bootstrap_command`). `{tree}` is `HEAD^{tree}` and `{head}` is HEAD. Empty means `stamp-remote-pass` records `stamped: false` and does nothing else |
+| `unit_timeout_secs` | 5400 | `unit-run` kills a unit's `claude -p` process, with what it started, after this long. The attempt is recorded as `timed_out` |
+| `unit_allowed_tools` | `Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `Agent`, `ToolSearch`, `mcp__codegraph__codegraph_explore` | The tools a unit process may use without asking (`--allowedTools`, one argument each). A unit runs with `--permission-prompts none`, so a tool not listed here is refused |
 
 Both path patterns are regular expressions matched against repo-relative paths, ignoring case. Labels are compared ignoring case, as GitHub does. The base branch and the three single labels are checked for shape, because they become `git` and `gh` arguments.

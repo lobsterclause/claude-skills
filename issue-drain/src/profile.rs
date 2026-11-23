@@ -45,6 +45,8 @@ pub struct Profile {
     pub codegraph_timeout_secs: u64,
     pub full_verify_command: String,
     pub stamp_command: String,
+    pub unit_timeout_secs: u64,
+    pub unit_allowed_tools: Vec<String>,
     #[serde(skip)]
     protected: Option<Regex>,
     #[serde(skip)]
@@ -88,6 +90,10 @@ impl Default for Profile {
             codegraph_timeout_secs: 300,
             full_verify_command: String::new(),
             stamp_command: String::new(),
+            unit_timeout_secs: 5400,
+            unit_allowed_tools: words(
+                "Bash Read Edit Write Grep Glob Agent ToolSearch mcp__codegraph__codegraph_explore",
+            ),
             protected: None,
             risk: None,
             file: PathBuf::new(),
@@ -199,6 +205,14 @@ impl Profile {
         if self.bootstrap_timeout_secs == 0 || self.codegraph_timeout_secs == 0 {
             return Err(Fail::usage(
                 "profile keys bootstrap_timeout_secs and codegraph_timeout_secs must be above 0",
+            ));
+        }
+        if self.unit_timeout_secs == 0 {
+            return Err(Fail::usage("profile key unit_timeout_secs must be above 0"));
+        }
+        if self.unit_allowed_tools.iter().any(|t| t.trim().is_empty()) {
+            return Err(Fail::usage(
+                "profile key unit_allowed_tools must hold tool names, none empty",
             ));
         }
         // A required path is joined onto the main checkout: it stays inside it.
@@ -328,6 +342,24 @@ mod tests {
         assert!(load("bootstrap_requires = [\"node_modules\", \"a/b\"]\n").is_ok());
         assert_eq!(load("bootstrap_timeout_secs = 0\n").unwrap_err().code, 2);
         assert_eq!(load("codegraph_timeout_secs = 0\n").unwrap_err().code, 2);
+    }
+
+    #[test]
+    fn the_unit_process_keys_have_defaults_and_a_zero_timeout_is_rejected() {
+        let p = load("").unwrap();
+        assert_eq!(p.unit_timeout_secs, 5400);
+        assert_eq!(p.unit_allowed_tools.len(), 9);
+        assert!(
+            p.unit_allowed_tools
+                .contains(&"mcp__codegraph__codegraph_explore".to_string())
+        );
+        let p = load("unit_timeout_secs = 60\nunit_allowed_tools = [\"Read\"]\n").unwrap();
+        assert_eq!(
+            (p.unit_timeout_secs, p.unit_allowed_tools),
+            (60, vec!["Read".to_string()])
+        );
+        assert_eq!(load("unit_timeout_secs = 0\n").unwrap_err().code, 2);
+        assert_eq!(load("unit_allowed_tools = [\"\"]\n").unwrap_err().code, 2);
     }
 
     #[test]

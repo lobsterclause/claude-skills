@@ -65,8 +65,43 @@ pub fn run(program: &str, args: &[String], dir: &Path, limit: Duration, log: &Pa
         Ok((out, err))
     };
     let (out, err) = open().map_err(|e| Fail::failed(format!("cannot write {}: {e}", log.display())))?;
+    supervise(program, args, dir, limit, (out, err), &[], log)
+}
+
+/// `run`, with extra environment variables for the child and stdout and stderr
+/// in separate files (`tail` is the end of stderr). The child inherits the rest
+/// of the environment.
+pub fn run_env(
+    program: &str,
+    args: &[String],
+    dir: &Path,
+    limit: Duration,
+    logs: (&Path, &Path),
+    env: &[(&str, &str)],
+) -> Res<Ran> {
+    let open = |path: &Path| -> Res<File> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))?;
+        }
+        File::create(path).map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))
+    };
+    let files = (open(logs.0)?, open(logs.1)?);
+    supervise(program, args, dir, limit, files, env, logs.1)
+}
+
+fn supervise(
+    program: &str,
+    args: &[String],
+    dir: &Path,
+    limit: Duration,
+    (out, err): (File, File),
+    env: &[(&str, &str)],
+    tail_log: &Path,
+) -> Res<Ran> {
     let mut child = Command::new(program)
         .args(args)
+        .envs(env.iter().copied())
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(out)
@@ -94,7 +129,7 @@ pub fn run(program: &str, args: &[String], dir: &Path, limit: Duration, log: &Pa
     Ok(Ran {
         code,
         timed_out,
-        tail: tail_of(log),
+        tail: tail_of(tail_log),
     })
 }
 
