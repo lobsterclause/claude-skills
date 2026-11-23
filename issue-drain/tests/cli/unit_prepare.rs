@@ -645,3 +645,58 @@ fn a_unit_the_approved_tracker_dropped_gets_no_branch_and_no_worktree() {
     assert!(!c.worktree().exists());
     assert_eq!(git(&c.checkout, &["branch", "--list", BRANCH]), "");
 }
+
+/// Puts an index in the main checkout for a unit to copy.
+fn seed_main_index(c: &Case) {
+    let dir = c.checkout.join(".codegraph");
+    fs::create_dir_all(&dir).expect("the folder");
+    fs::write(dir.join("codegraph.db"), "db").expect("the index");
+    fs::write(dir.join("codegraph.db-wal"), "wal").expect("the log");
+}
+
+#[test]
+fn a_main_checkout_index_is_copied_into_the_worktree_and_synced() {
+    let mut c = case("codegraph_init = true\n");
+    seed_main_index(&c);
+    let seen = c.env.dir.path().join("codegraph.seen");
+    let bin = c.fake_codegraph(&format!("echo \"$@\" >> {0}\npwd >> {0}", seen.display()));
+    let path = c.path_with(&[&bin]);
+    c.env.set("PATH", &path);
+    c.prepared();
+    assert_eq!(c.unit_json()["codegraph"], "ready");
+    let text = fs::read_to_string(&seen).expect("codegraph ran");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "one call: {text}");
+    assert_eq!(lines[0], "sync .");
+    assert_eq!(fs::canonicalize(lines[1]).expect("a folder"), c.worktree());
+    let copy = c.worktree().join(".codegraph");
+    assert_eq!(fs::read_to_string(copy.join("codegraph.db")).expect("copied"), "db");
+    assert_eq!(
+        fs::read_to_string(copy.join("codegraph.db-wal")).expect("copied"),
+        "wal"
+    );
+    assert!(!copy.join("codegraph.db-shm").exists());
+    assert_eq!(
+        fs::read_to_string(c.checkout.join(".codegraph/codegraph.db")).expect("left alone"),
+        "db"
+    );
+}
+
+#[test]
+fn a_copied_index_that_will_not_sync_is_removed_and_built_fresh() {
+    let mut c = case("codegraph_init = true\n");
+    seed_main_index(&c);
+    let seen = c.env.dir.path().join("codegraph.seen");
+    let body = format!(
+        "echo \"$@\" >> {0}\nif [ \"$1\" = sync ]; then exit 1; fi\nls .codegraph >> {0} 2>/dev/null || echo none >> {0}",
+        seen.display()
+    );
+    let bin = c.fake_codegraph(&body);
+    let path = c.path_with(&[&bin]);
+    c.env.set("PATH", &path);
+    c.prepared();
+    assert_eq!(c.unit_json()["codegraph"], "ready");
+    let text = fs::read_to_string(&seen).expect("codegraph ran");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, ["sync .", "init -i", "none"], "{text}");
+}

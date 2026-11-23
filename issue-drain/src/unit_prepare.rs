@@ -87,12 +87,58 @@ fn on_path(program: &str) -> bool {
     })
 }
 
+/// The index files a seed copy takes. The `-wal` and `-shm` files go with the
+/// database so a copy made while the main checkout's daemon writes stays whole.
+const CODEGRAPH_SEED: [&str; 3] = ["codegraph.db", "codegraph.db-wal", "codegraph.db-shm"];
+
+/// Copies the main checkout's index into the worktree (a clone on APFS, so
+/// it costs no space), for `codegraph sync` to bring up to the unit's commit.
+/// The main checkout's index is never synced or written: it follows that
+/// checkout's own files, and its daemon may hold it. False when there is no
+/// index to copy or the copy failed, and then nothing is left behind.
+fn seed_codegraph(main: &Path, worktree: &Path) -> bool {
+    let from = main.join(".codegraph");
+    if main == worktree || !from.join(CODEGRAPH_SEED[0]).is_file() {
+        return false;
+    }
+    let to = worktree.join(".codegraph");
+    let copied = fs::create_dir_all(&to).is_ok()
+        && CODEGRAPH_SEED.iter().all(|name| {
+            let src = from.join(name);
+            // `cp -c` clones on APFS and copies elsewhere; fs::copy if cp is not there.
+            !src.exists()
+                || std::process::Command::new("cp")
+                    .arg("-c")
+                    .arg(&src)
+                    .arg(to.join(name))
+                    .status()
+                    .is_ok_and(|s| s.success())
+                || fs::copy(&src, to.join(name)).is_ok()
+        });
+    if !copied {
+        let _ = fs::remove_dir_all(&to);
+    }
+    copied
+}
+
 /// `["codegraph"...]` result for unit.json: ready, absent or failed.
-fn init_codegraph(ctx: &Ctx, worktree: &Path, log: &Path) -> &'static str {
+fn init_codegraph(ctx: &Ctx, main: &Path, worktree: &Path, log: &Path) -> &'static str {
     if !ctx.profile.codegraph_init || !on_path("codegraph") {
         return "absent";
     }
     let limit = Duration::from_secs(ctx.profile.codegraph_timeout_secs);
+    if seed_codegraph(main, worktree) {
+        let args = ["sync".to_string(), ".".to_string()];
+        match exec::run("codegraph", &args, worktree, limit, log) {
+            Ok(ran) if ran.ok() => return "ready",
+            Ok(ran) => eprintln!(
+                "issue-drain unit-prepare: codegraph sync of the copied index {}; building a fresh one",
+                ran.failure(limit)
+            ),
+            Err(e) => eprintln!("issue-drain unit-prepare: {}; building a fresh index", e.msg),
+        }
+        let _ = fs::remove_dir_all(worktree.join(".codegraph"));
+    }
     let args = ["init".to_string(), "-i".to_string()];
     match exec::run("codegraph", &args, worktree, limit, log) {
         Ok(ran) if ran.ok() => "ready",
@@ -316,7 +362,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let codegraph = if done("codegraph", "ready") {
         "ready"
     } else {
-        init_codegraph(ctx, &worktree, &log("codegraph"))
+        init_codegraph(ctx, &main, &worktree, &log("codegraph"))
     };
 
     let state = state_dir.display().to_string();

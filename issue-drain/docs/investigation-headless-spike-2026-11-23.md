@@ -21,7 +21,7 @@ The run took 10 minutes and exited 0. The reported API-equivalent cost was $0.39
 | 4. `--resume` with a different `--model` | Settled. `--resume <id> --model haiku --effort low` kept the session id, ran as `claude-haiku-5-5` and edited the result file | Repair rounds resume the unit session and step the model up or down as planned |
 | 5. Guards from `--plugin-dir` in a headless run | Settled. The marker was written at session start. An Agent call without model and effort was refused, and so was `gh pr merge 999999` | As designed. A unit with no marker is not merged |
 | 6. A separate unit token | Not tested | Waits for the owner's choice of identity before the first unattended run |
-| 7. CodeGraph in a fresh worktree | Settled: it does not answer. The tool loaded and returned "isn't indexed (no .codegraph/ directory)" | The implementer brief names Grep and LSP for finding callers and reusable code, and says not to ask about indexing |
+| 7. CodeGraph in a fresh worktree | Settled: it does not answer. The tool loaded and returned "isn't indexed (no .codegraph/ directory)" | `unit-prepare` now copies the main checkout's index into the worktree (an APFS clone, 0 s) and runs `codegraph sync .` (7 s on kma, queries answered correctly). With no index to copy it runs `init -i`; when neither works the brief names Grep and LSP and says not to ask |
 
 ## Other things seen
 

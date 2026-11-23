@@ -34,8 +34,8 @@ To add a repo, copy an existing profile, then check each label against `gh label
 | `bootstrap_command` | none | Run in the new worktree by `unit-prepare`. `{worktree}` is its path; a relative program path is relative to the worktree. No shell runs it. It must be safe to run twice. A nonzero exit fails the step |
 | `bootstrap_requires` | none | Paths that must exist in the main checkout before the worktree is made (for example `node_modules`). A missing one refuses with exit 3. Relative, no `..` |
 | `bootstrap_timeout_secs` | 900 | The bootstrap is killed, with what it started, after this long |
-| `codegraph_init` | `false` | When true and a `codegraph` program is on PATH, `unit-prepare` runs `codegraph init -i` in the worktree. A failure or a missing program is recorded in `unit.json`, never an error |
-| `codegraph_timeout_secs` | 300 | The same limit for `codegraph init` |
+| `codegraph_init` | `false` | When true and a `codegraph` program is on PATH, `unit-prepare` gives the worktree an index. If the main checkout has one (`.codegraph/codegraph.db`), it copies that file and its `-wal` and `-shm` files (an APFS clone, so no disk cost) and runs `codegraph sync .` in the worktree; the main checkout's index is never written. With no index to copy, or when the sync fails (the copy is then removed), it runs `codegraph init -i`. A failure or a missing program is recorded in `unit.json`, never an error |
+| `codegraph_timeout_secs` | 300 | The same limit for `codegraph sync` and for `codegraph init`, each |
 | `full_verify_command` | none | The command a homelab verify must have run for `stamp-remote-pass` to stamp (`pnpm verify`). Empty means nothing is ever stamped |
 | `stamp_command` | none | Run in the unit worktree to record the repo's verify stamp (a relative path with a `/` is relative to the worktree, as for `bootstrap_command`). `{tree}` is `HEAD^{tree}` and `{head}` is HEAD. Empty means `stamp-remote-pass` records `stamped: false` and does nothing else |
 

@@ -63,7 +63,9 @@ guard_protected_paths = [".github/workflows", ".github/actions", ".husky", ".cla
 bootstrap_command = ".claude/scripts/worktree-bootstrap.sh {worktree}"
 bootstrap_requires = ["node_modules"]
 
-# `codegraph init -i` in the worktree; a unit falls back to Grep and LSP if it is absent or fails.
+# Copy the main checkout's index into the worktree and `codegraph sync` it (about 7 s for kma's
+# 362 MB index, 2026-11-23), or `codegraph init -i` when there is none. A unit falls back to
+# Grep and LSP if it is absent or fails.
 codegraph_init = true
 
 # What the homelab verify runs (pr-drain/scripts/remote-verify.sh: ${RV_CMD:-pnpm verify};

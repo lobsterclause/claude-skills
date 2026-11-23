@@ -46,12 +46,12 @@ Targeted test command: <test command, wrapped in a hard timeout>
 How to work:
 1. For each issue, write its acceptance check first and run it to see it fail. Then make it pass. If a check cannot be written first, say why and stop.
 2. Follow the rules below under "Ponytail". Where they differ from this brief, this brief wins: the check comes before the code; never trim validation at a trust boundary, data-loss handling, security, accessibility, or <the profile's named fail-safes>; never add a dependency. If the right fix is a library this repo does not have, say so and stop.
-3. To find code and callers use Grep and the LSP tool. If CodeGraph says it is not initialised, do not initialise it and do not ask.
+3. To find code and callers use CodeGraph (`codegraph_explore`) when the worktree has an index, otherwise Grep and the LSP tool. If CodeGraph says it is not initialised, do not initialise it and do not ask.
 4. Do not edit <protected paths> or <frozen paths>. If the fix needs one, say so and stop.
 5. Run only the targeted tests here. The full verify runs elsewhere.
 6. Commit early and small, staging files by name, never `git add -A`.
 7. If an issue in this unit turns out to be a different change from the rest, leave it and say so.
-8. Give any background command an explicit timeout.
+8. Give any background command an explicit timeout (up to 7200000 ms); the default kills it at 600 s.
 
 End your report with: the commits you made; for each issue, the check and whether you saw it fail and then pass; anything handed back; and a last section "Skipped or not checked".
 
