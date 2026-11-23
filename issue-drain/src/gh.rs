@@ -60,6 +60,19 @@ pub enum Write<'a> {
         number: u64,
         body_file: &'a Path,
     },
+    /// Edit an issue's title and/or body. Issues only: a PR is refused (use
+    /// `pr-edit`). Not a unit's verb.
+    IssueEdit {
+        number: u64,
+        title: Option<&'a str>,
+        body_file: Option<&'a Path>,
+    },
+    /// Remove one hold label from an issue or PR. Reached from `unblock`.
+    /// Not a unit's verb.
+    RemoveHold {
+        number: u64,
+        label: &'a str,
+    },
     /// Squash-merge a PR, only if its head is still `head`. Reached only from
     /// `merge-gate`, which holds every condition a merge needs.
     MergePr {
@@ -211,6 +224,8 @@ impl Write<'_> {
             Write::CloseIssue { .. } => "close-issue",
             Write::RunRerun { .. } => "run-rerun",
             Write::PrEdit { .. } => "pr-edit",
+            Write::IssueEdit { .. } => "issue-edit",
+            Write::RemoveHold { .. } => "unblock",
             Write::MergePr { .. } => "merge-pr",
             Write::DisableAutoMerge { .. } => "disable-auto-merge",
             Write::PrCreate { .. } => "pr-create",
@@ -264,6 +279,141 @@ fn refuse(ctx: &Ctx, verb: &str, mode: Mode, why: String) -> Fail {
         Ok(()) => Fail::refused(format!("refused: {why}")),
         Err(e) => e,
     }
+}
+
+/// `gh api repos/<repo>/issues/<n>`: an issue or a PR, by number. A read that
+/// fails, or does not parse, is exit 1.
+fn read_issue(repo: &str, number: u64) -> Res<serde_json::Value> {
+    let path = format!("repos/{repo}/issues/{number}");
+    let text = read(&["api", &path]).map_err(|rc| Fail::failed(format!("could not read #{number} (gh exit {rc})")))?;
+    serde_json::from_str(&text).map_err(|_| Fail::failed(format!("could not read #{number}: gh did not return JSON")))
+}
+
+fn label_names(issue: &serde_json::Value) -> Vec<String> {
+    issue["labels"]
+        .as_array()
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|l| l["name"].as_str().or_else(|| l.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Line endings and trailing newlines are not what GitHub keeps verbatim.
+fn same_text(a: &str, b: &str) -> bool {
+    a.replace("\r\n", "\n").trim_end() == b.replace("\r\n", "\n").trim_end()
+}
+
+/// `issue-edit`: the write, then one JSON line from a read-back.
+fn issue_edit(ctx: &Ctx, number: u64, title: &str, body_file: &str) -> Res<()> {
+    let title = Some(title).filter(|t| !t.is_empty());
+    let file = Some(body_file).filter(|f| !f.is_empty()).map(Path::new);
+    write(
+        ctx,
+        &Write::IssueEdit {
+            number,
+            title,
+            body_file: file,
+        },
+    )?;
+    // gh's own output (a URL) is not part of the verb's one JSON line.
+    if ctx.dry_run {
+        return Ok(());
+    }
+    let now = read_issue(&ctx.repo()?, number)?;
+    let title_changed = title.is_some_and(|t| now["title"].as_str() == Some(t));
+    let body_changed = match file {
+        Some(f) => {
+            let want =
+                std::fs::read_to_string(f).map_err(|e| Fail::failed(format!("could not read {}: {e}", f.display())))?;
+            now["body"].as_str().is_some_and(|b| same_text(b, &want))
+        }
+        None => false,
+    };
+    println!(
+        "{}",
+        json!({"issue": number, "title_changed": title_changed, "body_changed": body_changed})
+    );
+    Ok(())
+}
+
+/// `unblock`: comment, remove each hold label that is on the item, read back.
+fn unblock(ctx: &Ctx, number: u64, labels: &[String], reason: &str) -> Res<()> {
+    let mode = ctx.mode()?;
+    if reason.trim().is_empty() {
+        return Err(Fail::usage("unblock needs --reason <text>"));
+    }
+    if labels.is_empty() {
+        return Err(Fail::usage("unblock needs at least one --label <label>"));
+    }
+    // Every label is checked before the first write.
+    for label in labels {
+        if same_label(label, &ctx.profile.claim_label) {
+            return Err(refuse(
+                ctx,
+                "unblock",
+                mode,
+                format!("'{label}' is the claim label; use claim release"),
+            ));
+        }
+        if !ctx.profile.hold_labels.iter().any(|hold| same_label(hold, label)) {
+            return Err(refuse(
+                ctx,
+                "unblock",
+                mode,
+                format!("'{label}' is not a hold label ({})", ctx.profile.hold_labels.join(", ")),
+            ));
+        }
+    }
+    let repo = ctx.repo()?;
+    // A dry run calls nothing, so it cannot read the labels: it assumes all are on.
+    let (mut removing, mut skipped) = (Vec::new(), Vec::new());
+    if ctx.dry_run {
+        removing = labels.to_vec();
+    } else {
+        let on = label_names(&read_issue(&repo, number)?);
+        for label in labels {
+            match on.iter().find(|l| same_label(l, label)) {
+                Some(actual) => removing.push(actual.clone()),
+                None => skipped.push(label.clone()),
+            }
+        }
+    }
+    if !removing.is_empty() {
+        let names: Vec<String> = removing.iter().map(|l| format!("`{l}`")).collect();
+        let file = ctx.workdir.join(format!("unblock-{number}-comment.md"));
+        std::fs::create_dir_all(&ctx.workdir)
+            .and_then(|()| std::fs::write(&file, format!("Removed {}: {}\n", names.join(", "), reason.trim())))
+            .map_err(|e| Fail::failed(format!("could not write {}: {e}", file.display())))?;
+        write(
+            ctx,
+            &Write::Comment {
+                number,
+                body_file: &file,
+            },
+        )?;
+        for label in &removing {
+            write(ctx, &Write::RemoveHold { number, label })?;
+        }
+    }
+    if ctx.dry_run {
+        return Ok(());
+    }
+    let now = label_names(&read_issue(&repo, number)?);
+    if let Some(left) = removing.iter().find(|r| now.iter().any(|l| same_label(l, r))) {
+        return Err(Fail::failed(format!(
+            "'{left}' is still on #{number} after the write (labels now: {})",
+            now.join(", ")
+        )));
+    }
+    println!(
+        "{}",
+        json!({"number": number, "removed": removing, "skipped": skipped, "labels_now": now})
+    );
+    Ok(())
 }
 
 fn need_body(file: &Path) -> Res<()> {
@@ -442,6 +592,69 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
                 ],
             )
         }
+        Write::IssueEdit {
+            number,
+            title,
+            body_file,
+        } => {
+            if title.is_none() && body_file.is_none() {
+                return Err(Fail::usage("issue-edit needs --title or --body-file"));
+            }
+            if let Some(file) = body_file {
+                need_body(file)?;
+            }
+            // A dry run calls nothing, so it cannot tell an issue from a PR.
+            if !ctx.dry_run && read_issue(&repo, *number)?.get("pull_request").is_some() {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!("#{number} is a pull request; use pr-edit"),
+                ));
+            }
+            let mut argv = ["issue", "edit", &number.to_string(), "--repo", &repo]
+                .map(str::to_string)
+                .to_vec();
+            if let Some(title) = title {
+                argv.push(own("--title"));
+                argv.push(own(title));
+            }
+            if let Some(file) = body_file {
+                argv.push(own("--body-file"));
+                argv.push(file.display().to_string());
+            }
+            (format!("edit #{number}"), argv)
+        }
+        Write::RemoveHold { number, label } => {
+            if same_label(label, &p.claim_label) {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!("'{label}' is the claim label; use claim release"),
+                ));
+            }
+            if !p.hold_labels.iter().any(|hold| same_label(hold, label)) {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!("'{label}' is not a hold label ({})", p.hold_labels.join(", ")),
+                ));
+            }
+            (
+                format!("remove {label} from #{number}"),
+                vec![
+                    own("issue"),
+                    own("edit"),
+                    number.to_string(),
+                    own("--repo"),
+                    repo,
+                    own("--remove-label"),
+                    own(label),
+                ],
+            )
+        }
         Write::MergePr { number, head } => {
             if !head.bytes().all(|b| b.is_ascii_hexdigit()) || head.len() < 40 {
                 return Err(Fail::usage(format!("'{head}' is not a full commit SHA")));
@@ -539,7 +752,7 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
     Ok(Written { called: true, stdout })
 }
 
-const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|pr-create|pr-edit|run-rerun|thread-reply|thread-resolve>";
+const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|pr-create|pr-edit|issue-edit|unblock|run-rerun|thread-reply|thread-resolve>";
 
 /// Per verb: its usage line, then who may use it.
 const USAGES: &[(&str, &str)] = &[
@@ -570,6 +783,14 @@ const USAGES: &[(&str, &str)] = &[
     (
         "pr-edit",
         "pr-edit <pr> --body-file <file>\n    Replace a PR's body. Not for a unit: a unit process is not told its PR number.",
+    ),
+    (
+        "issue-edit",
+        "issue-edit <issue> [--title <text>] [--body-file <file>]\n    Replace an issue's title and/or body (one of them is required). Issues only: a PR is refused, use pr-edit.\n    Prints {issue, title_changed, body_changed} from a read-back. Not for a unit.",
+    ),
+    (
+        "unblock",
+        "unblock <number> --label <hold-label> [--label <hold-label>]... --reason <text>\n    Remove hold labels from an issue or PR: posts \"Removed `<labels>`: <reason>\", removes each label that is on the item,\n    reads back, and prints {number, removed, skipped, labels_now}. The claim label is refused (use claim release). Not for a unit.",
     ),
     (
         "run-rerun",
@@ -629,6 +850,7 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     let mut draft = false;
     let mut failed = false;
     let mut labels: Vec<String> = Vec::new();
+    let mut reason = String::new();
     let mut args: Vec<&str> = Vec::new();
     let mut rest = argv[1..].iter();
     while let Some(arg) = rest.next() {
@@ -638,6 +860,7 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             "--head" => head = rest.next().cloned().unwrap_or_default(),
             "--base" => base = rest.next().cloned().unwrap_or_default(),
             "--thread" => thread = rest.next().cloned().unwrap_or_default(),
+            "--reason" => reason = rest.next().cloned().unwrap_or_default(),
             "--draft" => draft = true,
             "--failed" => failed = true,
             "--label" => match rest.next() {
@@ -660,6 +883,12 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
             Ok(Path::new(&body_file))
         }
     };
+
+    match verb {
+        "issue-edit" => return issue_edit(ctx, number()?, &title, &body_file),
+        "unblock" => return unblock(ctx, number()?, &labels, &reason),
+        _ => {}
+    }
 
     let w = match verb {
         "issue-create" => Write::IssueCreate {
@@ -787,6 +1016,8 @@ mod tests {
         let refused = [
             "issue-create",
             "remove-label",
+            "issue-edit",
+            "unblock",
             "close-issue",
             "merge-pr",
             "merge",

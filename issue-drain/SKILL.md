@@ -92,7 +92,7 @@ Lead with the tracker link. Then, briefly: how many issues were taken in and how
 3. For each claim the user ticked for release, check the issue again (`references/triage.md`, "After the user says go"), then `gh-write remove-label <number> <claim label>`.
 4. Tell the user what the queue holds and that the units wait for the unit runner.
 
-`gh-write` also has `pr-edit <pr> --body-file <file>` and `run-rerun <run-id> [--failed]`, both refused in a unit process, and `--help` for the verbs. The driver can write a guards marker by hand with `guards-marker --unit <n> --by-hand --reason <text>` and add a file to a unit's scope with `scope widen --unit <n> --file <path> --reason <text>`; both refuse a unit process (see `references/unit.md`).
+`gh-write` also has `pr-edit <pr> --body-file <file>`, `issue-edit <issue> [--title <text>] [--body-file <file>]`, `unblock <number> --label <hold-label>... --reason <text>` and `run-rerun <run-id> [--failed]`, all refused in a unit process, and `--help` for the verbs. The driver can write a guards marker by hand with `guards-marker --unit <n> --by-hand --reason <text>` and add a file to a unit's scope with `scope widen --unit <n> --file <path> --reason <text>`; both refuse a unit process (see `references/unit.md`).
 
 `gh-write` has no verb that closes an issue. `close-verified` is the only way this skill closes one.
 

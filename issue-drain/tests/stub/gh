@@ -74,6 +74,9 @@
 #                         otherwise: a test makes the new head itself and
 #                         names it in pr-view-<n>.json)
 #   fail-thread           the thread-reply and thread-resolve mutations exit 1
+#   issue-api-<n>.json    answer to `gh api repos/<o>/<r>/issues/<n>` (title, body,
+#                         labels, and a pull_request key for a PR)
+#   issue-api-<n>.after-edit.json  the answer once `gh issue edit <n>` has run
 # GH_STUB_NEW_PR          the number `gh pr create` reports (default 901)
 # GH_STUB_NEW_ISSUE       the number `gh issue create` reports (default 900)
 # GH_STUB_CLOSE_NOOP=1    `gh issue close` exits 0 but closes nothing
@@ -187,12 +190,17 @@ case "${1:-} ${2:-}" in
         if [ -e "$dir/fail-timeline" ]; then echo "gh stub: timeline failed" >&2; exit 1; fi
         t="${2#*/issues/}"
         if [ -f "$dir/timeline-${t%%/*}.json" ]; then cat "$dir/timeline-${t%%/*}.json"; else echo "[]"; fi ;;
+      */issues/[0-9]*)
+        i="${2##*/}"
+        if [ -e "$dir/edited-$i" ] && [ -f "$dir/issue-api-$i.after-edit.json" ]; then answer "issue-api-$i.after-edit.json"
+        else answer "issue-api-$i.json"; fi ;;
       *) echo "gh stub: unexpected call: $*" >&2; exit 9 ;;
     esac ;;
   "issue edit")
     case "$*" in
       *--add-label*) if [ -e "$dir/fail-add-label" ]; then echo "gh stub: add-label failed" >&2; exit 1; fi ;;
-    esac ;;
+    esac
+    : > "$dir/edited-$3" ;;
   "run rerun") ;;
   "pr edit") ;;
   "label create") ;;
