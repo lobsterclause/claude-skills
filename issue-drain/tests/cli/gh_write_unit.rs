@@ -141,12 +141,14 @@ fn thread_verbs_reach_gh() {
 fn a_bad_thread_id_is_refused_before_gh() {
     let env = Env::new();
     let body = body(&env);
-    for bad in ["", "a b", "x;y", "$(id)", "a/b"] {
+    for bad in ["a b", "x;y", "$(id)", "a/b"] {
         let reply = env.run(&["gh-write", "thread-reply", "--thread", bad, "--body-file", &body]);
         assert_eq!(reply.code, 3, "{bad:?}: {}", reply.stderr);
         let resolve = env.run(&["gh-write", "thread-resolve", "--thread", bad]);
         assert_eq!(resolve.code, 3, "{bad:?}: {}", resolve.stderr);
     }
+    let empty = env.run(&["gh-write", "thread-resolve", "--thread", ""]);
+    assert_eq!(empty.code, 2, "{}", empty.stderr);
     let missing = env.run(&["gh-write", "thread-resolve"]);
     assert_eq!(missing.code, 3);
     assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());

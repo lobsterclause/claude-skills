@@ -422,3 +422,532 @@ fn help_needs_no_run_folder_or_profile() {
     let out = env.run(&["gh-write", "pr-edit", "--help"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
 }
+
+// ---- issue-edit ----
+
+fn api_issue(env: &Env, n: u64, json: &str) {
+    env.stub_file(&format!("issue-api-{n}.json"), json);
+}
+
+fn writes(env: &Env) -> Vec<String> {
+    env.gh_calls().into_iter().filter(|c| c.starts_with("issue ")).collect()
+}
+
+#[test]
+fn issue_edit_needs_a_flag_and_a_real_body_file() {
+    let env = Env::new();
+    let empty = env.write("empty.md", "").display().to_string();
+    let cases: [&[&str]; 5] = [
+        &["gh-write", "issue-edit", "7"],
+        &["gh-write", "issue-edit", "seven", "--title", "T"],
+        &["gh-write", "issue-edit", "7", "--body-file", &empty],
+        &["gh-write", "issue-edit", "7", "--body-file", "-"],
+        &["gh-write", "issue-edit", "7", "--body-file", "/nonexistent/b.md"],
+    ];
+    for args in cases {
+        let out = env.run(args);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn issue_edit_refuses_a_pull_request_and_a_unit() {
+    let mut env = Env::new();
+    api_issue(
+        &env,
+        8,
+        r#"{"number":8,"title":"t","body":"b","pull_request":{"url":"x"}}"#,
+    );
+    let out = env.run(&["gh-write", "issue-edit", "8", "--title", "New"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("is a pull request; use pr-edit"), "{}", out.stderr);
+    assert!(writes(&env).is_empty(), "{:?}", env.gh_calls());
+
+    env.set("ISSUE_DRAIN_MODE", "unit");
+    let before = env.gh_calls().len();
+    let out = env.run(&["gh-write", "issue-edit", "7", "--title", "New"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("is the driver's job in a unit"), "{}", out.stderr);
+    assert_eq!(env.gh_calls().len(), before);
+}
+
+#[test]
+fn issue_edit_read_failure_is_exit_1() {
+    let env = Env::new();
+    let out = env.run(&["gh-write", "issue-edit", "7", "--title", "New"]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(writes(&env).is_empty());
+}
+
+#[test]
+fn issue_edit_changes_title_and_body_and_reports_what_github_says() {
+    let env = Env::new();
+    let body = env.write("new-body.md", "New body\n").display().to_string();
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"Old","body":"Old body"}"#);
+    env.stub_file(
+        "issue-api-7.after-edit.json",
+        r#"{"number":7,"title":"New","body":"New body"}"#,
+    );
+    let out = env.run(&["gh-write", "issue-edit", "7", "--title", "New", "--body-file", &body]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let calls = env.gh_calls();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert_eq!(calls[0], format!("api repos/{REPO}/issues/7"));
+    assert!(
+        calls[1].starts_with(&format!("issue edit 7 --repo {REPO} --title New --body-file "))
+            && calls[1].ends_with("-body.md")
+            && !calls[1].contains(&body),
+        "{calls:?}"
+    );
+    assert_eq!(calls[2], format!("api repos/{REPO}/issues/7"));
+    let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
+    assert_eq!(line["issue"], 7);
+    assert_eq!(line["title_changed"], true);
+    assert_eq!(line["body_changed"], true);
+}
+
+#[test]
+fn issue_edit_reports_a_change_github_did_not_take() {
+    let env = Env::new();
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"Old","body":"b"}"#);
+    // No after-edit file: the read-back still shows the old title.
+    let out = env.run(&["gh-write", "issue-edit", "7", "--title", "New"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
+    assert_eq!(line["title_changed"], false);
+    assert_eq!(line["body_changed"], false);
+}
+
+#[test]
+fn issue_edit_dry_run_prints_would_and_calls_nothing() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    let body = body(&env);
+    let out = env.run(&["gh-write", "issue-edit", "7", "--title", "New", "--body-file", &body]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let line = out.stdout.trim();
+    assert!(
+        line.starts_with(&format!(
+            "WOULD: gh issue edit 7 --repo {REPO} --title New --body-file "
+        )) && line.ends_with("-body.md"),
+        "{line}"
+    );
+    assert!(!line.contains(&body), "{line}");
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+// ---- unblock ----
+
+const UNBLOCK: &[&str] = &["gh-write", "unblock", "7"];
+
+fn unblock<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args: Vec<&str> = UNBLOCK.to_vec();
+    args.extend_from_slice(extra);
+    args
+}
+
+#[test]
+fn unblock_refuses_non_hold_labels_and_the_claim_label() {
+    let env = Env::new();
+    let out = env.run(&unblock(&["--label", "bug", "--reason", "r"]));
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let out = env.run(&unblock(&["--label", "agent-in-progress", "--reason", "r"]));
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("use claim release"), "{}", out.stderr);
+    // One bad label refuses the whole call before any write.
+    let out = env.run(&unblock(&["--label", "needs-human", "--label", "bug", "--reason", "r"]));
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn unblock_needs_a_reason_a_label_and_a_number() {
+    let env = Env::new();
+    let cases: [&[&str]; 4] = [
+        &["gh-write", "unblock", "7", "--label", "needs-human"],
+        &["gh-write", "unblock", "7", "--label", "needs-human", "--reason", ""],
+        &["gh-write", "unblock", "7", "--reason", "r"],
+        &[
+            "gh-write",
+            "unblock",
+            "seven",
+            "--label",
+            "needs-human",
+            "--reason",
+            "r",
+        ],
+    ];
+    for args in cases {
+        let out = env.run(args);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty());
+}
+
+#[test]
+fn unblock_is_refused_in_a_unit() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_MODE", "unit");
+    let out = env.run(&unblock(&["--label", "needs-human", "--reason", "r"]));
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(env.gh_calls().is_empty());
+}
+
+#[test]
+fn unblock_skips_a_label_that_is_not_on_the_item() {
+    let env = Env::new();
+    api_issue(&env, 7, r#"{"number":7,"labels":[{"name":"bug"}]}"#);
+    let out = env.run(&unblock(&["--label", "needs-human", "--reason", "r"]));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
+    assert_eq!(line["removed"], serde_json::json!([]));
+    assert_eq!(line["skipped"], serde_json::json!(["needs-human"]));
+    assert_eq!(line["labels_now"], serde_json::json!(["bug"]));
+    assert!(writes(&env).is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn unblock_comments_first_then_removes_then_reads_back() {
+    let env = Env::new();
+    api_issue(
+        &env,
+        7,
+        r#"{"number":7,"labels":[{"name":"needs-human"},{"name":"Blocked"},{"name":"bug"}]}"#,
+    );
+    env.stub_file(
+        "issue-api-7.after-edit.json",
+        r#"{"number":7,"labels":[{"name":"bug"}]}"#,
+    );
+    let out = env.run(&unblock(&[
+        "--label",
+        "needs-human",
+        "--label",
+        "blocked",
+        "--label",
+        "bug-not-hold-skip",
+        "--reason",
+        "owner answered",
+    ]));
+    // bug-not-hold-skip is not a hold label: the whole call is refused.
+    assert_eq!(out.code, 3, "{}", out.stderr);
+
+    let out = env.run(&unblock(&[
+        "--label",
+        "needs-human",
+        "--label",
+        "blocked",
+        "--reason",
+        "owner answered",
+    ]));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let calls = env.gh_calls();
+    assert_eq!(calls.len(), 5, "{calls:?}");
+    assert_eq!(calls[0], format!("api repos/{REPO}/issues/7"));
+    assert!(
+        calls[1].starts_with(&format!("issue comment 7 --repo {REPO} --body-file ")),
+        "{calls:?}"
+    );
+    assert_eq!(
+        calls[2],
+        format!("issue edit 7 --repo {REPO} --remove-label needs-human")
+    );
+    assert_eq!(calls[3], format!("issue edit 7 --repo {REPO} --remove-label Blocked"));
+    assert_eq!(calls[4], format!("api repos/{REPO}/issues/7"));
+    let posted = std::fs::read_to_string(env.stub.join("last-comment-body")).expect("the comment body");
+    assert_eq!(posted.trim_end(), "Removing `needs-human`, `Blocked`: owner answered");
+    let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
+    assert_eq!(line["number"], 7);
+    assert_eq!(line["removed"], serde_json::json!(["needs-human", "Blocked"]));
+    assert_eq!(line["skipped"], serde_json::json!([]));
+    assert_eq!(line["labels_now"], serde_json::json!(["bug"]));
+}
+
+#[test]
+fn unblock_fails_when_the_label_is_still_there_after_the_write() {
+    let env = Env::new();
+    // No after-edit file: the read-back still shows needs-human.
+    api_issue(&env, 7, r#"{"number":7,"labels":[{"name":"needs-human"}]}"#);
+    let out = env.run(&unblock(&["--label", "needs-human", "--reason", "r"]));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("still"), "{}", out.stderr);
+}
+
+#[test]
+fn unblock_dry_run_prints_would_lines_and_writes_nothing() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    let out = env.run(&unblock(&["--label", "needs-human", "--reason", "r"]));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", out.stdout);
+    assert!(
+        lines[0].starts_with(&format!("WOULD: gh issue comment 7 --repo {REPO} --body-file ")),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(
+        lines[1],
+        format!("WOULD: gh issue edit 7 --repo {REPO} --remove-label needs-human")
+    );
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+// ---- review fixes ----
+
+#[test]
+fn issue_edit_refuses_the_tracker_issue_by_label_and_by_tracker_json() {
+    let env = Env::new();
+    api_issue(
+        &env,
+        9,
+        r#"{"number":9,"title":"t","body":"b","labels":[{"name":"issue-drain"}]}"#,
+    );
+    let out = env.run(&["gh-write", "issue-edit", "9", "--title", "New"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("tracker label"), "{}", out.stderr);
+    assert!(writes(&env).is_empty(), "{:?}", env.gh_calls());
+
+    std::fs::create_dir_all(&env.workdir).unwrap();
+    std::fs::write(env.workdir.join("tracker.json"), r#"{"number":10}"#).unwrap();
+    let before = env.gh_calls().len();
+    let out = env.run(&["gh-write", "issue-edit", "10", "--title", "New"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("tracker issue"), "{}", out.stderr);
+    let mut env = env;
+    env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    let out = env.run(&["gh-write", "issue-edit", "10", "--title", "New"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(env.gh_calls().len(), before, "{:?}", env.gh_calls());
+}
+
+#[test]
+fn unblock_refuses_a_label_with_a_comma_before_any_write() {
+    let env = Env::new();
+    let out = env.run(&unblock(&["--label", "needs-human,blocked", "--reason", "r"]));
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("contains a comma"), "{}", out.stderr);
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn issue_edit_refuses_a_body_file_that_is_not_utf8() {
+    let env = Env::new();
+    let path = env.dir.path().join("bad.md");
+    std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+    let out = env.run(&[
+        "gh-write",
+        "issue-edit",
+        "7",
+        "--body-file",
+        &path.display().to_string(),
+    ]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn an_option_without_its_value_is_a_usage_error() {
+    let env = Env::new();
+    for opt in ["--body-file", "--title", "--head", "--base", "--thread", "--reason"] {
+        let out = env.run(&["gh-write", "issue-edit", "7", "--title", "x", opt]);
+        assert_eq!(out.code, 2, "{opt}: {}", out.stderr);
+        assert!(out.stderr.contains("needs a value"), "{opt}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn unblock_stages_its_comment_in_a_per_process_file() {
+    let env = Env::new();
+    api_issue(&env, 7, r#"{"number":7,"labels":[{"name":"needs-human"}]}"#);
+    env.stub_file("issue-api-7.after-edit.json", r#"{"number":7,"labels":[]}"#);
+    let out = env.run(&unblock(&["--label", "needs-human", "--reason", "r"]));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let staged: Vec<String> = std::fs::read_dir(&env.workdir)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("unblock-7-") && n.ends_with("-comment.md"))
+        .collect();
+    assert_eq!(staged.len(), 1, "{staged:?}");
+    assert_ne!(staged[0], "unblock-7-comment.md");
+}
+
+#[test]
+fn an_option_is_not_a_value_for_the_option_before_it() {
+    let env = Env::new();
+    let body = env.write("notes.md", "n\n").display().to_string();
+    let cases: [&[&str]; 2] = [
+        &["gh-write", "issue-edit", "7", "--title", "--body-file", &body],
+        &[
+            "gh-write",
+            "unblock",
+            "7",
+            "--label",
+            "needs-human",
+            "--reason",
+            "--something",
+        ],
+    ];
+    for args in cases {
+        let out = env.run(args);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+        assert!(out.stderr.contains("needs a value"), "{}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn unblock_refuses_a_label_gh_would_reinterpret_as_csv() {
+    let env = Env::new();
+    let out = env.run(&unblock(&["--label", "needs\"human", "--reason", "r"]));
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("would reinterpret"), "{}", out.stderr);
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn a_body_file_of_dash_is_refused_even_when_such_a_file_exists() {
+    let env = Env::new();
+    env.write("-", "x\n");
+    for args in [
+        &["gh-write", "issue-edit", "7", "--body-file", "-"][..],
+        &["gh-write", "comment", "7", "--body-file", "-"][..],
+        &["gh-write", "pr-edit", "7", "--body-file", "-"][..],
+    ] {
+        let out = env.run(args);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+        assert!(out.stderr.contains("./-"), "{}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn unblock_fails_when_a_skipped_label_shows_up_by_the_read_back() {
+    let env = Env::new();
+    api_issue(&env, 7, r#"{"number":7,"labels":[{"name":"needs-human"}]}"#);
+    env.stub_file(
+        "issue-api-7.after-edit.json",
+        r#"{"number":7,"labels":[{"name":"blocked"}]}"#,
+    );
+    let out = env.run(&unblock(&[
+        "--label",
+        "needs-human",
+        "--label",
+        "blocked",
+        "--reason",
+        "r",
+    ]));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("'blocked' is still on"), "{}", out.stderr);
+}
+
+#[test]
+fn issue_edit_does_not_call_an_unchanged_title_changed() {
+    let env = Env::new();
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"Same","body":"b"}"#);
+    let out = env.run(&["gh-write", "issue-edit", "7", "--title", "Same"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
+    assert_eq!(line["title_changed"], false);
+}
+
+#[test]
+fn extra_positionals_and_a_stray_reason_are_usage_errors_before_gh() {
+    let env = Env::new();
+    let cases: [&[&str]; 5] = [
+        &["gh-write", "issue-edit", "7", "8", "--title", "New"],
+        &[
+            "gh-write",
+            "unblock",
+            "7",
+            "8",
+            "--label",
+            "needs-human",
+            "--reason",
+            "r",
+        ],
+        &["gh-write", "issue-edit"],
+        &["gh-write", "remove-label", "7", "agent-in-progress", "--reason", "why"],
+        &["gh-write", "issue-create", "extra", "--title", "T"],
+    ];
+    for args in cases {
+        let out = env.run(args);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn issue_edit_reads_the_body_file_once_before_the_write() {
+    let env = Env::new();
+    let path = env.write("b.md", "New body\n");
+    let file = path.display().to_string();
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"t","body":"Old"}"#);
+    env.stub_file(
+        "issue-api-7.after-edit.json",
+        r#"{"number":7,"title":"t","body":"New body"}"#,
+    );
+    let out = env.run(&["gh-write", "issue-edit", "7", "--body-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let line: serde_json::Value = serde_json::from_str(out.stdout.trim()).expect("one JSON line");
+    assert_eq!(line["body_changed"], true);
+}
+
+#[test]
+fn issue_edit_and_unblock_refuse_options_they_do_not_use() {
+    let env = Env::new();
+    let cases: [&[&str]; 3] = [
+        &["gh-write", "issue-edit", "7", "--title", "X", "--label", "blocked"],
+        &[
+            "gh-write",
+            "unblock",
+            "7",
+            "--label",
+            "needs-human",
+            "--reason",
+            "r",
+            "--title",
+            "X",
+        ],
+        &["gh-write", "unblock", "7", "--label", "--reason", "r"],
+    ];
+    for args in cases {
+        let out = env.run(args);
+        assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn a_read_with_no_labels_array_is_a_failed_read_for_unblock() {
+    let env = Env::new();
+    api_issue(&env, 7, r#"{"number":7,"title":"t"}"#);
+    let out = env.run(&unblock(&["--label", "needs-human", "--reason", "r"]));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(writes(&env).is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn issue_edit_sends_a_private_copy_of_the_body_and_dry_run_never_hangs_on_a_fifo() {
+    let mut env = Env::new();
+    let file = env.write("b.md", "Body\n").display().to_string();
+    api_issue(&env, 7, r#"{"number":7,"labels":[],"title":"t","body":"Old"}"#);
+    let out = env.run(&["gh-write", "issue-edit", "7", "--body-file", &file]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let sent = writes(&env).join("\n");
+    assert!(sent.contains("-body.md") && !sent.contains(&file), "{sent}");
+
+    let fifo = env.dir.path().join("fifo.md");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success());
+    env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    let out = env.run(&[
+        "gh-write",
+        "issue-edit",
+        "7",
+        "--body-file",
+        &fifo.display().to_string(),
+    ]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+}
