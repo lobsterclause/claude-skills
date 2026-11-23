@@ -952,11 +952,10 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     }
     let wanted = match verb {
         "issue-create" | "pr-create" | "thread-reply" | "thread-resolve" => Some(0),
-        "issue-edit" | "unblock" | "comment" | "ensure-label" | "pr-edit" | "run-rerun" => Some(1),
-        "add-label" | "remove-label" => Some(2),
+        "issue-edit" | "unblock" => Some(1),
         _ => None,
     };
-    if let Some(n) = wanted.filter(|n| args.len() != *n && (*n == 0 || verb == "issue-edit" || verb == "unblock")) {
+    if let Some(n) = wanted.filter(|n| args.len() != *n) {
         return Err(Fail::usage(format!(
             "{verb} takes {n} positional argument(s), got {}",
             args.len()
