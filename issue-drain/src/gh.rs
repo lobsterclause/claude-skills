@@ -351,6 +351,14 @@ fn unblock(ctx: &Ctx, number: u64, labels: &[String], reason: &str) -> Res<()> {
     }
     // Every label is checked before the first write.
     for label in labels {
+        if label.contains(',') {
+            return Err(refuse(
+                ctx,
+                "unblock",
+                mode,
+                format!("'{label}' contains a comma; gh would split it"),
+            ));
+        }
         if same_label(label, &ctx.profile.claim_label) {
             return Err(refuse(
                 ctx,
@@ -384,7 +392,9 @@ fn unblock(ctx: &Ctx, number: u64, labels: &[String], reason: &str) -> Res<()> {
     }
     if !removing.is_empty() {
         let names: Vec<String> = removing.iter().map(|l| format!("`{l}`")).collect();
-        let file = ctx.workdir.join(format!("unblock-{number}-comment.md"));
+        let file = ctx
+            .workdir
+            .join(format!("unblock-{number}-{}-comment.md", std::process::id()));
         std::fs::create_dir_all(&ctx.workdir)
             .and_then(|()| std::fs::write(&file, format!("Removed {}: {}\n", names.join(", "), reason.trim())))
             .map_err(|e| Fail::failed(format!("could not write {}: {e}", file.display())))?;
@@ -602,15 +612,41 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
             }
             if let Some(file) = body_file {
                 need_body(file)?;
+                std::fs::read_to_string(file).map_err(|e| {
+                    Fail::usage(format!("body file is not readable UTF-8 text: {}: {e}", file.display()))
+                })?;
             }
-            // A dry run calls nothing, so it cannot tell an issue from a PR.
-            if !ctx.dry_run && read_issue(&repo, *number)?.get("pull_request").is_some() {
+            let tracked = std::fs::read_to_string(ctx.workdir.join("tracker.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .is_some_and(|t| t["number"].as_u64() == Some(*number));
+            if tracked {
                 return Err(refuse(
                     ctx,
                     verb,
                     mode,
-                    format!("#{number} is a pull request; use pr-edit"),
+                    format!("#{number} is this run's tracker issue; its body is the approval record"),
                 ));
+            }
+            // A dry run calls nothing, so it cannot tell an issue from a PR.
+            if !ctx.dry_run {
+                let issue = read_issue(&repo, *number)?;
+                if issue.get("pull_request").is_some() {
+                    return Err(refuse(
+                        ctx,
+                        verb,
+                        mode,
+                        format!("#{number} is a pull request; use pr-edit"),
+                    ));
+                }
+                if label_names(&issue).iter().any(|l| same_label(l, &p.tracker_label)) {
+                    return Err(refuse(
+                        ctx,
+                        verb,
+                        mode,
+                        format!("#{number} carries the tracker label '{}'", p.tracker_label),
+                    ));
+                }
             }
             let mut argv = ["issue", "edit", &number.to_string(), "--repo", &repo]
                 .map(str::to_string)
@@ -626,6 +662,14 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
             (format!("edit #{number}"), argv)
         }
         Write::RemoveHold { number, label } => {
+            if label.contains(',') {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!("'{label}' contains a comma; gh would split it"),
+                ));
+            }
             if same_label(label, &p.claim_label) {
                 return Err(refuse(
                     ctx,
@@ -834,6 +878,13 @@ pub fn help(argv: &[String]) -> Option<String> {
 ///
 /// There is no verb that closes an issue. `Write::CloseIssue` is reached only
 /// from `close-verified`, which holds every condition a closure needs.
+fn need_value(next: Option<&String>, opt: &str) -> Res<String> {
+    match next {
+        Some(v) if !v.is_empty() => Ok(v.clone()),
+        _ => Err(Fail::usage(format!("{opt} needs a value"))),
+    }
+}
+
 pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     ctx.repo()?;
     let mode = ctx.mode()?;
@@ -855,12 +906,12 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     let mut rest = argv[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "--body-file" => body_file = rest.next().cloned().unwrap_or_default(),
-            "--title" => title = rest.next().cloned().unwrap_or_default(),
-            "--head" => head = rest.next().cloned().unwrap_or_default(),
-            "--base" => base = rest.next().cloned().unwrap_or_default(),
-            "--thread" => thread = rest.next().cloned().unwrap_or_default(),
-            "--reason" => reason = rest.next().cloned().unwrap_or_default(),
+            "--body-file" => body_file = need_value(rest.next(), "--body-file")?,
+            "--title" => title = need_value(rest.next(), "--title")?,
+            "--head" => head = need_value(rest.next(), "--head")?,
+            "--base" => base = need_value(rest.next(), "--base")?,
+            "--thread" => thread = need_value(rest.next(), "--thread")?,
+            "--reason" => reason = need_value(rest.next(), "--reason")?,
             "--draft" => draft = true,
             "--failed" => failed = true,
             "--label" => match rest.next() {

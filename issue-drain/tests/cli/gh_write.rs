@@ -686,3 +686,83 @@ fn unblock_dry_run_prints_would_lines_and_writes_nothing() {
     );
     assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
 }
+
+// ---- review fixes ----
+
+#[test]
+fn issue_edit_refuses_the_tracker_issue_by_label_and_by_tracker_json() {
+    let env = Env::new();
+    api_issue(
+        &env,
+        9,
+        r#"{"number":9,"title":"t","body":"b","labels":[{"name":"issue-drain"}]}"#,
+    );
+    let out = env.run(&["gh-write", "issue-edit", "9", "--title", "New"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("tracker label"), "{}", out.stderr);
+    assert!(writes(&env).is_empty(), "{:?}", env.gh_calls());
+
+    std::fs::create_dir_all(&env.workdir).unwrap();
+    std::fs::write(env.workdir.join("tracker.json"), r#"{"number":10}"#).unwrap();
+    let before = env.gh_calls().len();
+    let out = env.run(&["gh-write", "issue-edit", "10", "--title", "New"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("tracker issue"), "{}", out.stderr);
+    let mut env = env;
+    env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    let out = env.run(&["gh-write", "issue-edit", "10", "--title", "New"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(env.gh_calls().len(), before, "{:?}", env.gh_calls());
+}
+
+#[test]
+fn unblock_refuses_a_label_with_a_comma_before_any_write() {
+    let env = Env::new();
+    let out = env.run(&unblock(&["--label", "needs-human,blocked", "--reason", "r"]));
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("contains a comma"), "{}", out.stderr);
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn issue_edit_refuses_a_body_file_that_is_not_utf8() {
+    let env = Env::new();
+    let path = env.dir.path().join("bad.md");
+    std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+    let out = env.run(&[
+        "gh-write",
+        "issue-edit",
+        "7",
+        "--body-file",
+        &path.display().to_string(),
+    ]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn an_option_without_its_value_is_a_usage_error() {
+    let env = Env::new();
+    for opt in ["--body-file", "--title", "--head", "--base", "--thread", "--reason"] {
+        let out = env.run(&["gh-write", "issue-edit", "7", "--title", "x", opt]);
+        assert_eq!(out.code, 2, "{opt}: {}", out.stderr);
+        assert!(out.stderr.contains("needs a value"), "{opt}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn unblock_stages_its_comment_in_a_per_process_file() {
+    let env = Env::new();
+    api_issue(&env, 7, r#"{"number":7,"labels":[{"name":"needs-human"}]}"#);
+    env.stub_file("issue-api-7.after-edit.json", r#"{"number":7,"labels":[]}"#);
+    let out = env.run(&unblock(&["--label", "needs-human", "--reason", "r"]));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let staged: Vec<String> = std::fs::read_dir(&env.workdir)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("unblock-7-") && n.ends_with("-comment.md"))
+        .collect();
+    assert_eq!(staged.len(), 1, "{staged:?}");
+    assert_ne!(staged[0], "unblock-7-comment.md");
+}
