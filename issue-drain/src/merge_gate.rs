@@ -1750,7 +1750,7 @@ fn review_records(repo: &str, pr: u64) -> Read<Vec<ReviewRecord>> {
 }
 
 /// Whether the PR is in the merge queue.
-fn in_merge_queue(repo: &str, pr: u64) -> Read<bool> {
+pub fn in_merge_queue(repo: &str, pr: u64) -> Read<bool> {
     let (owner, name) = repo.split_once('/').ok_or("the repo is not owner/name")?;
     let (query, number) = (format!("query={QUEUE_QUERY}"), format!("number={pr}"));
     let (owner_arg, name_arg) = (format!("owner={owner}"), format!("name={name}"));

@@ -173,7 +173,7 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, env_str, read_json, write_atomic};
 use crate::error::{Fail, Res};
 use crate::exec;
-use crate::merge_gate::{PrState, binding, is_sha, read_view};
+use crate::merge_gate::{PrState, binding, in_merge_queue, is_sha, read_view};
 use crate::state::{self, MAX_BASE_SYNCS, MAX_REPAIRS, Snapshot, State, UnitState};
 use crate::tracker::io::Published;
 
@@ -192,9 +192,22 @@ const MAX_REVIEW_PASSES: u32 = 4;
 const BASE_SYNC_TRIES: u32 = 3;
 const CHILD_PID: &str = "drive-child.pid";
 const TREE_MISMATCH: &str = "drive-tree-mismatch";
+/// Written when the gate queued the PR or sent a merge call whose outcome is
+/// unknown, and removed once the PR is read back merged, or open and out of
+/// the merge queue. While it exists no refusal parks the unit: a park releases
+/// the claim on a PR that may still merge.
+const MERGE_ASKED: &str = "drive-merge-asked";
 const INFRA: &str = "infrastructure failure: ";
 const CLAIM_REFUSED: &str = "claim refused: ";
 const REMOVED: &str = "removed from the tracker";
+
+/// What became of a merge the gate asked for.
+enum Outcome {
+    Merged(String),
+    /// Open and out of the merge queue, or closed: nothing can merge it now.
+    NotMerging,
+    Unsure(String),
+}
 
 /// What a child printed and how it ended.
 struct Reply {
@@ -1295,6 +1308,7 @@ impl<'a> Driver<'a> {
                             .ok_or_else(|| Fail::failed(format!("PR #{pr} merged, but no merge commit was named")))?,
                     };
                     self.mv(u.unit, "merged", None, None, Some(&commit))?;
+                    self.merge_settled(u.unit)?;
                     return self.merged(u.unit, pr);
                 }
                 4 => {
@@ -1303,6 +1317,7 @@ impl<'a> Driver<'a> {
                     if self.dry {
                         return Ok(None);
                     }
+                    self.merge_asked(u.unit)?;
                     if start.elapsed() >= self.ci_max {
                         return Ok(Some(format!(
                             "PR #{pr} of unit {} is still in the merge queue after {} seconds; once it merges, run `state resume` and drive again",
@@ -1313,6 +1328,28 @@ impl<'a> Driver<'a> {
                     self.nap();
                 }
                 3 => {
+                    if !self.dry && self.unit_dir(u.unit).join(MERGE_ASKED).exists() {
+                        match self.merge_outcome(pr) {
+                            Outcome::Merged(commit) => {
+                                self.mv(u.unit, "merged", None, None, Some(&commit))?;
+                                self.merge_settled(u.unit)?;
+                                return self.merged(u.unit, pr);
+                            }
+                            Outcome::NotMerging => self.merge_settled(u.unit)?,
+                            Outcome::Unsure(why) => {
+                                // The refusals cannot be acted on yet: a park
+                                // would release the claim on a PR that may merge.
+                                if start.elapsed() >= self.ci_max {
+                                    return Ok(Some(format!(
+                                        "a merge of PR #{pr} of unit {} was asked for and is not settled ({why}): check the PR, then `state resume` and drive again",
+                                        u.unit
+                                    )));
+                                }
+                                self.nap();
+                                continue;
+                            }
+                        }
+                    }
                     if !self.at_gate(u, &refusals_of(&r), start, &mut errors)? {
                         return Ok(None);
                     }
@@ -1332,6 +1369,9 @@ impl<'a> Driver<'a> {
                     // PR may have merged. Parking would release the claim and
                     // skip the post-merge checks, so ask once more, then stop
                     // with the unit at the gate.
+                    if !self.dry {
+                        self.merge_asked(u.unit)?;
+                    }
                     errors += 1;
                     if errors >= 2 || self.dry {
                         return Ok(Some(format!(
@@ -1350,6 +1390,40 @@ impl<'a> Driver<'a> {
                     self.nap();
                 }
             }
+        }
+    }
+
+    fn merge_asked(&self, unit: u64) -> Res<()> {
+        write_atomic(&self.unit_dir(unit).join(MERGE_ASKED), b"a merge was asked for\n")
+    }
+
+    fn merge_settled(&self, unit: u64) -> Res<()> {
+        match fs::remove_file(self.unit_dir(unit).join(MERGE_ASKED)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Fail::failed(format!(
+                "cannot remove the merge record of unit {unit}: {e}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// What became of a merge the gate asked for, read from GitHub.
+    fn merge_outcome(&self, pr: u64) -> Outcome {
+        let view = match read_view(&self.repo, pr) {
+            Ok(v) => v,
+            Err(e) => return Outcome::Unsure(format!("PR #{pr} could not be read: {e}")),
+        };
+        match view.state {
+            PrState::Merged => match view.merge_commit.filter(|c| is_sha(c)) {
+                Some(commit) => Outcome::Merged(commit),
+                None => Outcome::Unsure(format!("PR #{pr} is merged, but no merge commit was named")),
+            },
+            PrState::Closed => Outcome::NotMerging,
+            PrState::Open => match in_merge_queue(&self.repo, pr) {
+                Ok(false) => Outcome::NotMerging,
+                Ok(true) => Outcome::Unsure(format!("PR #{pr} is still in the merge queue")),
+                Err(e) => Outcome::Unsure(format!("could not read {e}")),
+            },
+            PrState::Other => Outcome::Unsure(format!("PR #{pr} is in a state the driver does not know")),
         }
     }
 

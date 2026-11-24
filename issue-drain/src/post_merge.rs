@@ -73,7 +73,6 @@ static CLOSING_KEYWORD: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static HTML_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("a fixed pattern"));
-static INLINE_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`\n]*`").expect("a fixed pattern"));
 
 /// `body` without the text GitHub does not read for closing keywords: fenced
 /// code blocks, indented code, HTML comments and inline code. A PR body that
@@ -106,7 +105,48 @@ fn prose(body: &str) -> String {
         }
     }
     let kept = HTML_COMMENT.replace_all(&kept, " ");
-    INLINE_CODE.replace_all(&kept, " ").into_owned()
+    without_code_spans(&kept)
+}
+
+/// `text` with each inline code span replaced by a space. A span opens with a
+/// run of backticks and closes at the next run of the same length, so
+/// ``` ``Fixes #1`` ``` is code too. A run with no closer is literal text.
+fn without_code_spans(text: &str) -> String {
+    let b = text.as_bytes();
+    let run_at = |i: usize| b[i..].iter().take_while(|&&c| c == b'`').count();
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut copied) = (0, 0);
+    while i < b.len() {
+        if b[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let n = run_at(i);
+        let mut j = i + n;
+        let close = loop {
+            match b[j..].iter().position(|&c| c == b'`') {
+                None => break None,
+                Some(k) => {
+                    let m = run_at(j + k);
+                    if m == n {
+                        break Some(j + k + m);
+                    }
+                    j += k + m;
+                }
+            }
+        };
+        match close {
+            Some(end) => {
+                out.push_str(&text[copied..i]);
+                out.push(' ');
+                copied = end;
+                i = end;
+            }
+            None => i += n,
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// The issues in `repo` that `body` says it closes.
@@ -445,6 +485,15 @@ mod tests {
     fn indented_code_closes_nothing() {
         let body = "Fixes #1\n\nFor example:\n\n    Fixes #2\n\tCloses #3\n";
         assert_eq!(body_closes(body, "a/b"), vec![1]);
+    }
+
+    #[test]
+    fn a_code_span_of_any_backtick_run_closes_nothing() {
+        let body = "Fixes #1, ``Fixes #2``, ```fixes #3 `x` ```.";
+        assert_eq!(body_closes(body, "a/b"), vec![1]);
+        // A run with no closer of its own length is literal, as GitHub reads it.
+        assert_eq!(body_closes("``close #4` and fixes #5", "a/b"), vec![4, 5]);
+        assert_eq!(body_closes("A lone ` then Fixes #6", "a/b"), vec![6]);
     }
 
     #[test]

@@ -912,3 +912,104 @@ fn an_unknown_merge_outcome_stops_the_drain_with_the_claim_kept() {
     assert_eq!(c.state_of(1), "gate", "the unit is not parked");
     assert_eq!(c.count("claim release"), 0);
 }
+
+/// PR 4701 as GitHub shows it: `state`, its merge commit, and whether it sits
+/// in the merge queue.
+fn pr_now(c: &Case, state: &str, merge_commit: Option<&str>, queued: bool) {
+    c.pr_view(1, 4701);
+    let path = c.env.stub.join("pr-view-4701.json");
+    let mut view: Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({}));
+    view["state"] = json!(state);
+    view["mergeCommit"] = merge_commit.map_or(Value::Null, |c| json!({"oid": c}));
+    c.env.stub_file("pr-view-4701.json", &view.to_string());
+    let answer = json!({"data": {"repository": {"pullRequest": {"isInMergeQueue": queued}}}});
+    c.env.stub_file("merge-queue.json", &answer.to_string());
+}
+
+#[test]
+fn a_refusal_after_an_unknown_merge_outcome_keeps_the_claim_while_the_pr_is_queued() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(1, &GATE_PATH, Some(4701));
+    pr_now(&c, "OPEN", None, true);
+    let unknown = json!({"merged": false, "state_unknown": true}).to_string();
+    c.canned_n("merge-gate", 1, 1, &unknown);
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("read_error", "checks could not be read")]),
+    );
+    // The first drive stops on the unknown outcome; the next one sees a refusal.
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let stopped = report["stopped"].as_str().unwrap_or_default();
+    assert!(stopped.contains("is not settled"), "{report}");
+    assert!(stopped.contains("still in the merge queue"), "{report}");
+    assert_eq!(c.state_of(1), "gate", "the unit is not parked");
+    assert_eq!(c.count("claim release"), 0);
+}
+
+#[test]
+fn a_hold_label_on_a_queued_pr_does_not_park_the_unit() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/drive-merge-asked", "a merge was asked for\n");
+    pr_now(&c, "OPEN", None, true);
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("needs_a_person", "label needs-human is on the PR")]),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "gate");
+    assert_eq!(c.count("claim release"), 0);
+    assert!(
+        c.env.workdir.join("units/1/drive-merge-asked").exists(),
+        "the record stays"
+    );
+}
+
+#[test]
+fn a_refusal_on_a_pr_that_merged_meanwhile_takes_the_merged_path() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/drive-merge-asked", "a merge was asked for\n");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("read_error", "checks could not be read")]),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "done");
+}
+
+#[test]
+fn a_refusal_once_the_pr_left_the_queue_is_acted_on() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/drive-merge-asked", "a merge was asked for\n");
+    pr_now(&c, "OPEN", None, false);
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("needs_a_person", "label needs-human is on the PR")]),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "parked");
+    assert_eq!(c.count("claim release"), 1);
+    assert!(
+        !c.env.workdir.join("units/1/drive-merge-asked").exists(),
+        "the record is gone"
+    );
+}
