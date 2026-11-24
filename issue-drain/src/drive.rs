@@ -158,7 +158,7 @@ pub struct Args {
     pub once: bool,
 }
 
-const LADDER: [&str; 3] = ["haiku", "sonnet", "opus"];
+pub(crate) const LADDER: [&str; 3] = ["haiku", "sonnet", "opus"];
 const MAX_STEPS: u32 = 200;
 const INFRA: &str = "infrastructure failure: ";
 const CLAIM_REFUSED: &str = "claim refused: ";

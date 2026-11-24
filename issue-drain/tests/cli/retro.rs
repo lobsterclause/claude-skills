@@ -328,3 +328,25 @@ fn publish_needs_a_tracker_and_a_unit_process_is_refused() {
     assert_eq!(out.code, 3, "{}", out.stderr);
     assert!(!env.workdir.join("retro.md").exists());
 }
+
+#[test]
+fn a_tier_up_is_a_step_up_the_ladder_between_attempts() {
+    let env = seeded();
+    // haiku, then sonnet (up), then a sonnet resume, then haiku (down), then opus (up).
+    let attempt = |n: u32, model: &str, resumed: bool| json!({"attempt": n, "resumed": resumed, "model": model, "effort": "low", "cost_usd": 0.1});
+    env.write(
+        "units/1/session.json",
+        &json!({"attempts": [
+            attempt(1, "haiku", false),
+            attempt(2, "sonnet", false),
+            attempt(3, "sonnet", true),
+            attempt(4, "haiku", true),
+            attempt(5, "opus", true),
+        ]})
+        .to_string(),
+    );
+    assert_eq!(env.run(&["retro"]).code, 0);
+    let doc = json(&env.workdir.join("retro.json"));
+    assert_eq!(doc["units"][0]["escalations"]["tier_ups"], 2, "{doc}");
+    assert_eq!(doc["units"][0]["escalations"]["resumes"], 3, "{doc}");
+}

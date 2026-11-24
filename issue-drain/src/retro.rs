@@ -167,10 +167,16 @@ fn unit_retro(ctx: &Ctx, replayed: &Replayed, queue: &Option<Value>, unit: u64) 
     let model_of = |a: &Value| a["model"].as_str().map(str::to_string);
     let first_model = attempts.and_then(|a| a.first()).and_then(model_of);
     let last_model = attempts.and_then(|a| a.iter().rev().find_map(model_of));
+    // A step up the ladder from one attempt to the next. A step back down, or
+    // a resume on the same model, is not a tier-up.
+    let rank = |a: &Value| {
+        a["model"]
+            .as_str()
+            .and_then(|m| crate::drive::LADDER.iter().position(|l| *l == m))
+    };
     let tier_ups = attempts.map_or(0, |list| {
-        list.iter()
-            .filter(|a| model_of(a).is_some() && model_of(a) != first_model)
-            .count()
+        let ranks: Vec<usize> = list.iter().filter_map(rank).collect();
+        ranks.windows(2).filter(|w| w[1] > w[0]).count()
     });
     let resumes = attempts.map_or(0, |list| list.iter().filter(|a| a["resumed"] == true).count());
     let costs: Vec<f64> = attempts
