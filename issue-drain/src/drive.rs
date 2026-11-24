@@ -205,7 +205,7 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, env_str, read_json, write_atomic};
 use crate::error::{Fail, Res};
 use crate::exec;
-use crate::merge_gate::{PrState, binding, in_merge_queue, is_sha, read_view};
+use crate::merge_gate::{PrState, PrView, binding, in_merge_queue, is_sha, read_view};
 use crate::state::{self, MAX_BASE_SYNCS, MAX_REPAIRS, Snapshot, State, UnitState};
 use crate::tracker::io::Published;
 
@@ -1378,17 +1378,23 @@ impl<'a> Driver<'a> {
         if view.state != PrState::Open {
             return Ok(Some(format!("PR #{pr} is not open")));
         }
+        Ok(self.not_the_units(unit, pr, &view))
+    }
+
+    /// Why the PR is not the unit's (wrong base, branch or repository), or
+    /// `None` when it is.
+    fn not_the_units(&self, unit: u64, pr: u64, view: &PrView) -> Option<String> {
         let unit_file: Value = read_json(&self.unit_dir(unit).join("unit.json")).unwrap_or(Value::Null);
         let branch = unit_file["branch"]
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| format!("unit {unit} has no branch in unit.json"));
-        let refusals = binding(&self.repo, &self.ctx.profile.base_branch, unit, pr, &view, &branch);
+        let refusals = binding(&self.repo, &self.ctx.profile.base_branch, unit, pr, view, &branch);
         if refusals.is_empty() {
-            Ok(None)
+            None
         } else {
             let text: Vec<String> = refusals.iter().map(|r| format!("{}: {}", r.code, r.detail)).collect();
-            Ok(Some(text.join("; ")))
+            Some(text.join("; "))
         }
     }
 
@@ -1570,7 +1576,28 @@ impl<'a> Driver<'a> {
         // A base sync a dead driver left half done: finish it before the gate
         // is read, or the gate would see a moved head and spend another sync
         // or a repair round, or merge a head the delivery check never saw.
-        if !self.dry && self.unit_dir(u.unit).join(crate::base_sync::PENDING_MARKER).exists() {
+        let marker = self.unit_dir(u.unit).join(crate::base_sync::PENDING_MARKER);
+        if !self.dry && marker.exists() {
+            // A PR that merged while the driver was down needs no sync, and
+            // base-sync would refuse it as not open: settle it as merged.
+            if let Ok(view) = read_view(&self.repo, pr)
+                && view.state == PrState::Merged
+            {
+                if let Some(why) = self.not_the_units(u.unit, pr, &view) {
+                    return self
+                        .park(u, &format!("PR #{pr} merged, but {why}"), false)
+                        .map(|()| None);
+                }
+                let Some(commit) = view.merge_commit.clone().filter(|c| is_sha(c)) else {
+                    return self
+                        .park(u, &format!("PR #{pr} is merged, but no merge commit was named"), false)
+                        .map(|()| None);
+                };
+                let _ = fs::remove_file(&marker);
+                self.mv(u.unit, "merged", None, None, Some(&commit))?;
+                self.merge_settled(u.unit)?;
+                return self.merged(u.unit, pr);
+            }
             self.base_sync(u)?;
             return Ok(None);
         }

@@ -14,7 +14,11 @@ n=1
 while [ -e "$FAKE_REC/argv.$n" ]; do n=$((n+1)); done
 printf '%s\n' "$@" > "$FAKE_REC/argv.$n"
 cat > "$FAKE_REC/stdin.$n"
-cat "$(dirname "$ISSUE_DRAIN_UNIT_FILE")/unit-run-child.pid" > "$FAKE_REC/childpid.$n" 2>/dev/null
+# unit-run writes the pid file just after it starts this process: wait for it.
+pidfile="$(dirname "$ISSUE_DRAIN_UNIT_FILE")/unit-run-child.pid"
+i=0
+while [ ! -s "$pidfile" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+cat "$pidfile" > "$FAKE_REC/childpid.$n" 2>/dev/null
 echo $$ > "$FAKE_REC/mypid.$n"
 pwd -P > "$FAKE_REC/cwd.$n"
 printf '%s\n%s\n%s\n%s\n' "$VERIFY_GATE_SKIP" "$CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" "$ISSUE_DRAIN_MODE" "$ISSUE_DRAIN_UNIT_FILE" > "$FAKE_REC/env.$n"

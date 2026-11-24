@@ -167,6 +167,9 @@ struct Pending {
     local_head: Option<String>,
     /// The base commit the request aimed at; old lines lack it.
     base_head: Option<String>,
+    /// The line was written from the marker after a process died around the
+    /// call, and no request has been sent since: GitHub may never have had it.
+    unsent: bool,
 }
 
 fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<Pending> {
@@ -178,11 +181,13 @@ fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<Pending> {
     }
     let line = &events[remote];
     let text = |key: &str| line[key].as_str().map(str::to_string);
+    let resent = last("base_sync_reissued").is_some_and(|sent| sent > remote);
     Some(Pending {
         pr: line["pr"].as_u64(),
         pr_head: text("pr_head"),
         local_head: text("local_head"),
         base_head: text("base_head"),
+        unsent: line["recovered"] == true && !resent,
     })
 }
 
@@ -304,7 +309,6 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let base_ref = format!("refs/remotes/origin/{base}");
     let marker = log_dir.join(PENDING_MARKER);
     let mut resume = false;
-    let mut recovered = false;
     let mut reissue = false;
     let mut old_head = local_head;
     let mut pending = follow_up_pending(ctx, unit).filter(|p| p.pr == Some(pr));
@@ -320,9 +324,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         }
         ctx.event("base_sync_remote", line)?;
         pending = follow_up_pending(ctx, unit).filter(|p| p.pr == Some(pr));
-        recovered = true;
     }
     if let Some(p) = pending {
+        // Read from the log, so a run that failed after the recovery (a fetch,
+        // or the request sent again) still knows on the next try.
+        let recovered = p.unsent;
         resume = match &p.base_head {
             Some(aimed) if !ctx.dry_run => {
                 fetch(&wt, &branch, &base, &log("fetch"))?;
@@ -384,11 +390,25 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             )?;
         }
         let (rc, _) = gh::read_raw(&["pr", "update-branch", &pr_arg, "--repo", &repo]);
+        if rc == gh::READ_TIMED_OUT {
+            // GitHub may have taken the request and gh never heard back. The
+            // marker stays, so the next run checks whether it landed before it
+            // asks again.
+            return Err(Fail::failed(format!(
+                "gh pr update-branch {pr} timed out; whether GitHub took it is unknown. Run base-sync again"
+            )));
+        }
         if rc != 0 {
             if !reissue {
                 let _ = fs::remove_file(&marker);
             }
             return Err(Fail::failed(format!("gh pr update-branch {pr} failed (exit {rc})")));
+        }
+        if reissue {
+            ctx.event(
+                "base_sync_reissued",
+                json!({"unit": unit, "pr": pr, "base_head": aimed}),
+            )?;
         }
         // The slot is spent now, before any local step can fail. A recovered
         // request's slot was logged when the marker was found.

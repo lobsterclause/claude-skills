@@ -1219,3 +1219,50 @@ fn a_failed_cleanup_is_retried_on_the_next_drive_without_a_second_comment() {
     assert!(!unit.join("drive-cleanup-pending").exists());
     assert_eq!(comments(), posted, "the unit's comment is not posted again");
 }
+
+#[test]
+fn a_pr_that_merged_while_a_sync_was_in_flight_is_settled_as_merged_not_synced() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "done", "{}", c.last_comment());
+    assert_eq!(c.count("base-sync --unit 1"), 0, "a merged PR needs no sync");
+    assert!(!c.env.workdir.join("units/1/base-sync-pending.json").exists());
+}
+
+#[test]
+fn a_merged_pr_that_is_not_the_units_is_parked_when_a_sync_was_in_flight() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    let path = c.env.stub.join("pr-view-4701.json");
+    let mut view: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    view["headRefName"] = json!("someone-else");
+    c.env.stub_file("pr-view-4701.json", &view.to_string());
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_ne!(c.state_of(1), "done");
+    assert_eq!(c.count("base-sync --unit 1"), 0);
+    assert!(c.last_comment().contains("not unit 1's branch"), "{}", c.last_comment());
+}
+
+#[test]
+fn a_pr_read_whose_output_a_leftover_process_holds_open_is_cut_off() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS", "1");
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    c.pr_view(1, 4701);
+    c.env.stub_file("linger-pr-view", "");
+    let started = std::time::Instant::now();
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the read waited for the leftover process"
+    );
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+}

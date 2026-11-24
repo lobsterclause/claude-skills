@@ -29,6 +29,10 @@
 #   labels.txt            answer to `gh label list`, one name per line
 #   pr-view-<n>.json      answer to `gh pr view <n>`
 #   hang-pr-view          `gh pr view` sleeps 30 s before it answers
+#   linger-pr-view        `gh pr view` leaves a process holding stdout open
+#                         for 30 s, then answers and exits at once
+#   hang-update-branch    `gh pr update-branch` sleeps 30 s (the caller's
+#                         time limit cuts it off)
 #   pr-view-<n>.after-merge.json  the answer to `gh pr view <n>` once `gh pr
 #                         merge <n>` has exited 0 (a merge queue leaves the PR
 #                         OPEN); without the file that view fails
@@ -158,9 +162,11 @@ case "${1:-} ${2:-}" in
     echo "https://github.com/example/tidepool/pull/${GH_STUB_NEW_PR:-901}" ;;
   "pr view")
     if [ -e "$dir/hang-pr-view" ]; then sleep 30; fi
+    if [ -e "$dir/linger-pr-view" ]; then sleep 30 & fi
     if [ -e "$dir/disable-auto-$3" ] && [ -f "$dir/pr-view-$3.after-disable.json" ]; then answer "pr-view-$3.after-disable.json"
     elif [ -e "$dir/merged-$3" ]; then answer "pr-view-$3.after-merge.json"; else answer "pr-view-$3.json"; fi ;;
   "pr update-branch")
+    if [ -e "$dir/hang-update-branch" ]; then sleep 30; fi
     if [ -e "$dir/fail-update-branch" ]; then echo "gh stub: update-branch failed" >&2; exit 1; fi
     if [ -e "$dir/die-after-update-branch" ]; then kill -9 "$PPID"; sleep 1; exit 1; fi ;;
   "pr merge")

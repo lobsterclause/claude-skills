@@ -299,12 +299,13 @@ pub fn read_raw(args: &[&str]) -> (i32, String) {
         return (127, String::new());
     };
     let mut pipe = child.stdout.take();
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(pipe) = pipe.as_mut() {
             let _ = pipe.read_to_end(&mut bytes);
         }
-        bytes
+        let _ = tx.send(bytes);
     });
     let limit = std::env::var("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS")
         .ok()
@@ -329,10 +330,18 @@ pub fn read_raw(args: &[&str]) -> (i32, String) {
             Err(_) => break 1,
         }
     };
-    let bytes = reader.join().unwrap_or_default();
     if code == READ_TIMED_OUT {
         return (code, String::new());
     }
+    // gh has exited, but a process it left behind outside its group can still
+    // hold stdout open: wait for the end of the output only until the deadline,
+    // plus a moment for a pipe that is already draining.
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(200));
+    let Ok(bytes) = rx.recv_timeout(wait) else {
+        return (READ_TIMED_OUT, String::new());
+    };
     (code, String::from_utf8_lossy(&bytes).into_owned())
 }
 

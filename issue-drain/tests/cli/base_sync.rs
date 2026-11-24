@@ -591,3 +591,55 @@ fn a_failed_update_call_leaves_no_pending_marker() {
     assert_eq!(c.sync().code, 1);
     assert!(!c.env.workdir.join("units/3/base-sync-pending.json").exists());
 }
+
+#[test]
+fn a_recovered_request_whose_resend_failed_is_sent_again_next_time() {
+    let c = case();
+    let base = c.advance_base();
+    c.pr_is_at(&c.old_head);
+    let marker = json!({"pr": 7, "pr_head": c.old_head, "local_head": c.old_head, "base_head": base});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    c.env.stub_file("fail-update-branch", "");
+    assert_eq!(c.sync().code, 1);
+    assert_eq!(c.update_calls(), 1);
+    assert_eq!(c.sync().code, 1);
+    assert_eq!(
+        c.update_calls(),
+        2,
+        "the request never reached GitHub: ask again, do not wait"
+    );
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 1, "for the same slot");
+}
+
+#[test]
+fn a_resent_request_is_waited_for_not_sent_a_third_time() {
+    let c = case();
+    let base = c.advance_base();
+    c.pr_is_at(&c.old_head);
+    let marker = json!({"pr": 7, "pr_head": c.old_head, "local_head": c.old_head, "base_head": base});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    assert_eq!(c.sync().code, 1);
+    assert_eq!(c.update_calls(), 1);
+    assert_eq!(c.env.events_named("base_sync_reissued").len(), 1);
+    let out = c.sync();
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("still pending"), "{}", out.stderr);
+    assert_eq!(c.update_calls(), 1);
+}
+
+#[test]
+fn an_update_call_that_timed_out_keeps_the_pending_marker() {
+    let mut c = case();
+    c.env.set("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS", "1");
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    c.env.stub_file("hang-update-branch", "");
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("timed out"), "{}", out.stderr);
+    assert!(
+        c.env.workdir.join("units/3/base-sync-pending.json").is_file(),
+        "whether GitHub took it is unknown"
+    );
+}
