@@ -72,10 +72,44 @@ static CLOSING_KEYWORD: LazyLock<Regex> = LazyLock::new(|| {
         .expect("a fixed pattern")
 });
 
+static HTML_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("a fixed pattern"));
+static INLINE_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`\n]*`").expect("a fixed pattern"));
+
+/// `body` without the text GitHub does not read for closing keywords: fenced
+/// code blocks, HTML comments and inline code. A PR body that quotes
+/// "Fixes #12" as an example does not close #12.
+fn prose(body: &str) -> String {
+    let mut kept = String::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        let run = |c: char| trimmed.chars().take_while(|&x| x == c).count();
+        match fence {
+            Some((c, n)) => {
+                if run(c) >= n && trimmed.trim_start_matches(c).trim().is_empty() {
+                    fence = None;
+                }
+            }
+            None => {
+                let opener = ['`', '~'].into_iter().map(|c| (c, run(c))).find(|&(_, n)| n >= 3);
+                match opener {
+                    Some(open) => fence = Some(open),
+                    None => {
+                        kept.push_str(line);
+                        kept.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    let kept = HTML_COMMENT.replace_all(&kept, " ");
+    INLINE_CODE.replace_all(&kept, " ").into_owned()
+}
+
 /// The issues in `repo` that `body` says it closes.
 fn body_closes(body: &str, repo: &str) -> Vec<u64> {
     CLOSING_KEYWORD
-        .captures_iter(body)
+        .captures_iter(&prose(body))
         .filter(|c| c.get(1).is_none_or(|r| r.as_str().eq_ignore_ascii_case(repo)))
         .filter_map(|c| c[2].parse().ok())
         .collect()
@@ -380,4 +414,32 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         return Err(Fail::refused(format!("left open for a person: {}", list.join(", "))));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_keywords_in_code_and_comments_close_nothing() {
+        let body = "Fixes #101\n\
+                    \n\
+                    ```text\n\
+                    Fixes #102\n\
+                    ```\n\
+                    ~~~~\n\
+                    closes #103\n\
+                    ```\n\
+                    ~~~~\n\
+                    <!-- Resolves #104\n\
+                    still a comment -->\n\
+                    An example: `Fixes #105`.\n\
+                    Closes example/tidepool#106 and closes other/repo#107\n";
+        assert_eq!(body_closes(body, "example/tidepool"), vec![101, 106]);
+    }
+
+    #[test]
+    fn an_unclosed_fence_hides_the_rest_of_the_body() {
+        assert_eq!(body_closes("Fixes #1\n```\nFixes #2\n", "a/b"), vec![1]);
+    }
 }

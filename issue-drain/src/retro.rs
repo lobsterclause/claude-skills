@@ -60,7 +60,7 @@ struct Replayed {
 /// Fold the log. Lines the state rules refuse are skipped here: `state
 /// rebuild` is where a bad log is reported, and a retro is read-only.
 fn replay(ctx: &Ctx) -> Replayed {
-    let text = fs::read_to_string(ctx.path("events.jsonl")).unwrap_or_default();
+    let text = crate::state::log_text(ctx).unwrap_or_default();
     let mut out = Replayed {
         snapshot: Snapshot::default(),
         logs: BTreeMap::new(),

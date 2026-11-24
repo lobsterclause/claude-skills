@@ -10,6 +10,11 @@
 //! The log is shared with the other commands (`Ctx::event`). Their lines carry
 //! an `event` key; a state event never does, and replay skips theirs.
 //! Nothing here touches GitHub or git.
+//!
+//! A dry run keeps its state apart, in `events.dry.jsonl` and `state.dry.json`,
+//! so a dry `drive` that walks a unit to `claimed` leaves the run's own record
+//! where it was. The dry log starts as a copy of the live one at its first
+//! write, and `reset_dry` throws it away.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -300,8 +305,45 @@ struct Replay {
     text: String,
 }
 
-fn log_path(ctx: &Ctx) -> PathBuf {
-    ctx.path("events.jsonl")
+/// The log the state events are read from and written to: `events.jsonl`, or
+/// `events.dry.jsonl` in a dry run.
+pub fn log_path(ctx: &Ctx) -> PathBuf {
+    ctx.path(if ctx.dry_run {
+        "events.dry.jsonl"
+    } else {
+        "events.jsonl"
+    })
+}
+
+fn snapshot_path(ctx: &Ctx) -> PathBuf {
+    ctx.path(if ctx.dry_run { "state.dry.json" } else { "state.json" })
+}
+
+/// The text of the state log. A dry run with no dry log yet reads the live
+/// one, so it starts where the run is.
+pub fn log_text(ctx: &Ctx) -> Res<String> {
+    let mut path = log_path(ctx);
+    if ctx.dry_run && !path.exists() {
+        path = ctx.path("events.jsonl");
+    }
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(Fail::failed(format!("cannot read {}: {e}", path.display()))),
+    }
+}
+
+/// Throw away a dry run's state, so the next dry run starts from the live log.
+pub fn reset_dry(ctx: &Ctx) -> Res<()> {
+    for name in ["events.dry.jsonl", "state.dry.json"] {
+        let path = ctx.path(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Fail::failed(format!("cannot remove {}: {e}", path.display()))),
+        }
+    }
+    Ok(())
 }
 
 /// Replay the log. A line that does not parse as a state event, or that the
@@ -309,11 +351,7 @@ fn log_path(ctx: &Ctx) -> PathBuf {
 /// (those with an `event` key) are skipped.
 fn replay(ctx: &Ctx) -> Res<Replay> {
     let path = log_path(ctx);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(Fail::failed(format!("cannot read {}: {e}", path.display()))),
-    };
+    let text = log_text(ctx)?;
     let mut snapshot = Snapshot::default();
     let mut events = 0;
     for (index, line) in text.lines().enumerate() {
@@ -351,6 +389,10 @@ fn started(ctx: &Ctx) -> Res<Replay> {
 fn append(ctx: &Ctx, before: &str, events: &[Event]) -> Res<()> {
     let path = log_path(ctx);
     let mut out = String::new();
+    // A dry log's first write starts it as a copy of the live log it replayed.
+    if ctx.dry_run && !path.exists() {
+        out.push_str(before);
+    }
     if !before.is_empty() && !before.ends_with('\n') {
         out.push('\n');
     }
@@ -370,7 +412,7 @@ fn append(ctx: &Ctx, before: &str, events: &[Event]) -> Res<()> {
 }
 
 fn write_snapshot(ctx: &Ctx, snapshot: &Snapshot) -> Res<()> {
-    write_json(&ctx.path("state.json"), snapshot)
+    write_json(&snapshot_path(ctx), snapshot)
 }
 
 /// Apply one new event to a started drain, then record it.
@@ -631,7 +673,7 @@ pub fn require_queued(ctx: &Ctx, unit: u64) -> Res<()> {
 /// state event in `events.jsonl` and no `state.json`. A by-hand run that never
 /// ran `state init` gets one this way. `Ok(true)` when it started the log.
 pub fn init_if_missing(ctx: &Ctx) -> Res<bool> {
-    if replay(ctx)?.events > 0 || ctx.path("state.json").exists() {
+    if replay(ctx)?.events > 0 || snapshot_path(ctx).exists() {
         return Ok(false);
     }
     // The approved tracker, when the run published one: units the person

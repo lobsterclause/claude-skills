@@ -174,7 +174,7 @@ use crate::ctx::{Ctx, env_str, read_json, write_atomic};
 use crate::error::{Fail, Res};
 use crate::exec;
 use crate::merge_gate::{PrState, binding, is_sha, read_view};
-use crate::state::{MAX_BASE_SYNCS, MAX_REPAIRS, Snapshot, State, UnitState};
+use crate::state::{self, MAX_BASE_SYNCS, MAX_REPAIRS, Snapshot, State, UnitState};
 use crate::tracker::io::Published;
 
 #[derive(clap::Args)]
@@ -396,9 +396,12 @@ fn unknown_lines(j: &Value) -> Option<String> {
     (!list.is_empty()).then(|| list.join("; "))
 }
 
-/// Whether the gate's dry read could not be taken at all.
+/// Whether the gate's dry read could not be taken at all. Exit 4 with
+/// `queued: true` is a read: the PR is already in the merge queue.
 fn unreadable(r: &Reply, refusals: &[Refusal]) -> bool {
-    (!r.ok() && (r.timed_out || r.code != 3)) || (!refusals.is_empty() && decide(refusals) == Action::ReadError)
+    let queued = r.code == 4 && !r.timed_out && r.json().is_some_and(|j| j["queued"] == true);
+    (!r.ok() && !queued && (r.timed_out || r.code != 3))
+        || (!refusals.is_empty() && decide(refusals) == Action::ReadError)
 }
 
 /// Why the driver stops, and the exit code that goes with it.
@@ -435,7 +438,9 @@ impl Lock {
         } else {
             ctx.workdir.parent().map_or_else(|| ctx.workdir.clone(), PathBuf::from)
         };
-        let dir = base.join(repo.replace('/', "__"));
+        // Lowercased: GitHub does not tell `Owner/Repo` from `owner/repo`, so
+        // neither may the lock, or two spellings would run two drivers.
+        let dir = base.join(repo.to_ascii_lowercase().replace('/', "__"));
         let path = dir.join("drive.lock");
         fs::create_dir_all(&dir).map_err(|e| Fail::failed(format!("cannot make {}: {e}", dir.display())))?;
         let mut f = OpenOptions::new()
@@ -547,6 +552,16 @@ impl<'a> Driver<'a> {
             seq: Cell::new(logged / 2),
             child_pid: lock.dir.join(CHILD_PID),
         })
+    }
+
+    /// A driver marker's file name. A dry run's markers carry a `dry-` prefix,
+    /// so a later live run neither reads nor ends anything a dry run touched.
+    fn mark(&self, name: &str) -> String {
+        if self.dry {
+            format!("dry-{name}")
+        } else {
+            name.to_string()
+        }
     }
 
     fn log(&self, unit: Option<u64>, what: &str, detail: Value) -> Res<()> {
@@ -810,7 +825,10 @@ impl<'a> Driver<'a> {
             };
             if let Some((stop, top)) = self.streak_stop() {
                 let stopped = self.stop(stop)?;
-                write_atomic(&self.ctx.path("drive-streak-floor"), format!("{top}\n").as_bytes())?;
+                write_atomic(
+                    &self.ctx.path(&self.mark("drive-streak-floor")),
+                    format!("{top}\n").as_bytes(),
+                )?;
                 return Ok(stopped);
             }
             visited.push(unit);
@@ -878,7 +896,7 @@ impl<'a> Driver<'a> {
     fn touch(&self, unit: u64) -> Res<()> {
         let dir = self.unit_dir(unit);
         fs::create_dir_all(&dir).map_err(|e| Fail::failed(format!("cannot make {}: {e}", dir.display())))?;
-        write_atomic(&dir.join("drive-owned"), b"1\n")
+        write_atomic(&dir.join(self.mark("drive-owned")), b"1\n")
     }
 
     /// The first `units/<n>/drive-tree-mismatch` marker, if any unit left one.
@@ -1279,6 +1297,16 @@ impl<'a> Driver<'a> {
                         return Ok(None);
                     }
                 }
+                _ if r.json().is_some_and(|j| j["auto_merge_armed"] == true) => {
+                    // The gate asked for a merge and could not take auto-merge
+                    // off again: GitHub may still merge the PR. Parking would
+                    // release the claim on a PR that can land, so the drain
+                    // stops with the unit at the gate.
+                    return Ok(Some(format!(
+                        "auto-merge is still armed on PR #{pr} of unit {}: run `gh pr merge {pr} --disable-auto`, then `state resume` and drive again",
+                        u.unit
+                    )));
+                }
                 _ => {
                     errors += 1;
                     if errors >= 2 || self.dry {
@@ -1438,7 +1466,7 @@ impl<'a> Driver<'a> {
 
     /// The note of the unit's last move into `state`.
     fn last_note(&self, unit: u64, state: State) -> Option<String> {
-        let text = fs::read_to_string(self.ctx.path("events.jsonl")).ok()?;
+        let text = state::log_text(self.ctx).ok()?;
         text.lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .rfind(|v| v.get("event").is_none() && v["unit"] == unit && v["to"] == state.as_str())
@@ -1449,7 +1477,7 @@ impl<'a> Driver<'a> {
         let snap = self.snapshot()?;
         for u in snap.units.iter().filter(|u| u.state.is_terminal()) {
             let dir = self.unit_dir(u.unit);
-            if dir.join("drive-owned").exists() && !dir.join("drive-ended.json").exists() {
+            if dir.join(self.mark("drive-owned")).exists() && !dir.join(self.mark("drive-ended.json")).exists() {
                 self.end_unit(u)?;
             }
         }
@@ -1515,7 +1543,7 @@ impl<'a> Driver<'a> {
         let seq = self.ended().len() as u64 + 1;
         let marker = json!({"unit": u.unit, "seq": seq, "state": u.state.as_str(), "infra": infra});
         write_atomic(
-            &self.unit_dir(u.unit).join("drive-ended.json"),
+            &self.unit_dir(u.unit).join(self.mark("drive-ended.json")),
             format!("{marker}\n").as_bytes(),
         )
     }
@@ -1526,7 +1554,7 @@ impl<'a> Driver<'a> {
             .into_iter()
             .flatten()
             .flatten()
-            .filter_map(|e| read_json::<Value>(&e.path().join("drive-ended.json")))
+            .filter_map(|e| read_json::<Value>(&e.path().join(self.mark("drive-ended.json"))))
             .map(|m| {
                 (
                     m["seq"].as_u64().unwrap_or(0),
@@ -1542,7 +1570,7 @@ impl<'a> Driver<'a> {
     /// A streak that stops the drain, and the newest ended unit's seq: the
     /// floor the caller writes once the stop is recorded.
     fn streak_stop(&self) -> Option<(Stop, u64)> {
-        let floor: u64 = fs::read_to_string(self.ctx.path("drive-streak-floor"))
+        let floor: u64 = fs::read_to_string(self.ctx.path(&self.mark("drive-streak-floor")))
             .ok()
             .and_then(|t| t.trim().parse().ok())
             .unwrap_or(0);
@@ -1567,6 +1595,28 @@ impl<'a> Driver<'a> {
     }
 }
 
+/// Remove the markers an earlier dry run left: the `dry-` files in the run
+/// folder and in each unit's folder.
+fn reset_dry_markers(ctx: &Ctx) -> Res<()> {
+    let mut dirs = vec![ctx.workdir.clone()];
+    dirs.extend(
+        fs::read_dir(ctx.path("units"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path()),
+    );
+    for dir in dirs {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_file() && entry.file_name().to_string_lossy().starts_with("dry-drive-") {
+                fs::remove_file(&path).map_err(|e| Fail::failed(format!("cannot remove {}: {e}", path.display())))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     ctx.require_driver("drive")?;
     if !args.once && env_str("ISSUE_DRAIN_UNATTENDED_OK") != "1" {
@@ -1576,6 +1626,11 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         ));
     }
     let lock = Lock::take(ctx)?;
+    if ctx.dry_run {
+        // Each dry run starts from the run as it is now.
+        state::reset_dry(ctx)?;
+        reset_dry_markers(ctx)?;
+    }
     let driver = Driver::new(ctx, &lock)?;
     let _awake = Caffeinate::start();
     driver.ensure_state()?;

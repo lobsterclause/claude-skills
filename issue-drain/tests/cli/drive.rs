@@ -805,3 +805,79 @@ fn a_relative_profile_reaches_the_children_as_an_absolute_path() {
     let seen = fs::read_to_string(c.fake.join("profile.seen")).expect("the child ran");
     assert_eq!(PathBuf::from(seen), eval_fixtures().join("tidepool.toml"));
 }
+
+#[test]
+fn a_dry_run_keeps_its_state_apart_and_starts_again_from_the_live_log() {
+    let mut c = case(&[1]);
+    let init = c.env.run(&[
+        "state",
+        "init",
+        "--parsed",
+        &c.env.workdir.join("parsed.json").display().to_string(),
+    ]);
+    assert_eq!(init.code, 0, "{}", init.stderr);
+    c.env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    for round in 1..=2 {
+        let (out, report) = c.drive(&["--once"]);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(
+            report["processed"],
+            json!([{"unit": 1, "state": "claimed"}]),
+            "{report}"
+        );
+        // Each dry run starts from the live log, so it claims again.
+        assert_eq!(c.count("claim take --unit 1"), round);
+    }
+    let dry = fs::read_to_string(c.env.workdir.join("events.dry.jsonl")).expect("the dry log");
+    assert!(dry.contains("\"to\":\"claimed\""), "{dry}");
+    assert!(c.env.workdir.join("units/1/dry-drive-owned").exists());
+    assert!(!c.env.workdir.join("units/1/drive-owned").exists());
+
+    c.env.set("ISSUE_DRAIN_DRY_RUN", "0");
+    assert_eq!(c.state_of(1), "queued", "the live state did not move");
+    let live = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("the live log");
+    assert!(!live.contains("\"to\":\"claimed\""), "{live}");
+}
+
+#[test]
+fn auto_merge_left_armed_stops_the_drain_with_the_unit_at_the_gate() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n("merge-gate", 2, 1, &json!({"auto_merge_armed": true}).to_string());
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let stopped = report["stopped"].as_str().unwrap_or_default();
+    assert!(stopped.contains("--disable-auto"), "{report}");
+    assert_eq!(c.state_of(1), "gate", "the unit is not parked");
+    assert_eq!(c.count("claim release"), 0);
+}
+
+#[test]
+fn a_pr_already_in_the_merge_queue_reads_as_ready_at_ci_wait() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(1, &GATE_PATH[..6], Some(4701));
+    let queued = json!({"merged": false, "queued": true, "refusals": []}).to_string();
+    c.canned_n("merge-gate", 1, 4, &queued);
+    c.canned("merge-gate", 0, &Case::merged());
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "done");
+}
+
+#[test]
+fn the_lock_is_one_per_repo_whatever_the_case_of_its_name() {
+    let mut c = case(&[1]);
+    let lock_dir = c.env.dir.path().join("home/.issue-drain/example__tidepool");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock = lock_dir.join("drive.lock");
+    fs::write(&lock, "4242\n").unwrap();
+    let held = fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    held.try_lock().unwrap();
+    c.env.set("ISSUE_DRAIN_REPO", "Example/Tidepool");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("4242"), "{}", out.stderr);
+}
