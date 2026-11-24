@@ -42,7 +42,6 @@
 //! is not clean and on the branch); 2 no queue, unit files or PR number; 1 gh or
 //! git failed.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -93,7 +92,7 @@ pub fn unit_files(ctx: &Ctx, unit: u64) -> Res<UnitFiles> {
 /// The last PR number the log names for `unit`: a `state event --pr` line or a
 /// line another command logged (`merge-gate`).
 pub fn pr_from_log(ctx: &Ctx, unit: u64) -> Option<u64> {
-    let text = fs::read_to_string(ctx.path("events.jsonl")).ok()?;
+    let text = crate::state::log_text(ctx).ok()?;
     text.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|v| v["unit"] == unit)
@@ -110,7 +109,7 @@ pub fn pr_from_log(ctx: &Ctx, unit: u64) -> Option<u64> {
 
 /// The unit's lines in the log, oldest first.
 fn unit_events(ctx: &Ctx, unit: u64) -> Vec<Value> {
-    fs::read_to_string(ctx.path("events.jsonl"))
+    crate::state::log_text(ctx)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -305,10 +304,8 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                 .as_deref()
                 .is_some_and(|head| !before.head.eq_ignore_ascii_case(head)),
         };
-        if resume {
-            if let Some(recorded) = p.local_head {
-                old_head = recorded;
-            }
+        if resume && let Some(recorded) = p.local_head {
+            old_head = recorded;
         }
     }
     let taken = syncs_taken(ctx, unit);

@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use issue_drain::ctx::Ctx;
 use issue_drain::error::Res;
 use issue_drain::{
-    base_sync, by_hand, claim, cleanup, close, deliver_check, evalscore, evidence, gh, intake, merge_gate, overlap,
-    review_proof, stamp, state, tracker, unit_prepare,
+    base_sync, by_hand, claim, cleanup, close, deliver_check, drive, evalscore, evidence, gh, intake, merge_gate,
+    overlap, post_merge, retro, review_proof, stamp, state, tracker, unit_prepare, unit_run,
 };
 
 /// Triage a set of GitHub issues and carry each one through to a merged PR.
@@ -68,6 +68,14 @@ enum Command {
     /// Change a unit's scope by hand.
     #[command(subcommand)]
     Scope(by_hand::ScopeCommand),
+    /// Start or resume a unit's headless Claude process.
+    UnitRun(unit_run::Args),
+    /// Check a merged unit: tree, closed issues, claim, status.
+    PostMerge(post_merge::Args),
+    /// Write the run's retrospective from its event log.
+    Retro(retro::Args),
+    /// Run the queue: one unit at a time from claim to merge.
+    Drive(drive::Args),
 }
 
 fn name(command: &Command) -> &'static str {
@@ -100,16 +108,20 @@ fn name(command: &Command) -> &'static str {
         Command::Cleanup(_) => "cleanup",
         Command::GuardsMarker(_) => "guards-marker",
         Command::Scope(_) => "scope widen",
+        Command::UnitRun(_) => "unit-run",
+        Command::PostMerge(_) => "post-merge",
+        Command::Retro(_) => "retro",
+        Command::Drive(_) => "drive",
     }
 }
 
 fn run(command: &Command) -> Res<()> {
     // Help needs no run folder or profile, so it is answered before they load.
-    if let Command::GhWrite { args } = command {
-        if let Some(text) = gh::help(args) {
-            print!("{text}");
-            return Ok(());
-        }
+    if let Command::GhWrite { args } = command
+        && let Some(text) = gh::help(args)
+    {
+        print!("{text}");
+        return Ok(());
     }
     let mut ctx = Ctx::load()?;
     if matches!(command, Command::MergeGate(args) if args.dry_run) {
@@ -134,6 +146,10 @@ fn run(command: &Command) -> Res<()> {
         Command::Cleanup(args) => cleanup::run(&ctx, args),
         Command::GuardsMarker(args) => by_hand::guards_marker(&ctx, args),
         Command::Scope(command) => by_hand::scope(&ctx, command),
+        Command::UnitRun(args) => unit_run::run(&ctx, args),
+        Command::PostMerge(args) => post_merge::run(&ctx, args),
+        Command::Retro(args) => retro::run(&ctx, args),
+        Command::Drive(args) => drive::run(&ctx, args),
     }
 }
 

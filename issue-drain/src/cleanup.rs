@@ -215,25 +215,26 @@ fn unit(ctx: &Ctx, args: &Args, n: u64, only_finished: bool) -> Res<Value> {
     }
     // With no PR the branch is kept, but a detached HEAD is not on it: a commit
     // no kept ref reaches would be lost with the worktree.
-    if view.is_none() && present {
-        if let Some(head) = git::commit(&wt, "HEAD") {
-            let kept = git::out(
-                &repo_dir,
-                &[
-                    "for-each-ref",
-                    "--contains",
-                    &head,
-                    "refs/heads",
-                    "refs/remotes",
-                    "refs/tags",
-                ],
-            );
-            if kept.is_none_or(|refs| refs.trim().is_empty()) {
-                return Err(Fail::refused(format!(
-                    "the worktree {} is at {head}, which is not reachable from any branch, remote ref or tag; it would be lost. Push or save it first; --force does not cover this",
-                    wt.display()
-                )));
-            }
+    if view.is_none()
+        && present
+        && let Some(head) = git::commit(&wt, "HEAD")
+    {
+        let kept = git::out(
+            &repo_dir,
+            &[
+                "for-each-ref",
+                "--contains",
+                &head,
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ],
+        );
+        if kept.is_none_or(|refs| refs.trim().is_empty()) {
+            return Err(Fail::refused(format!(
+                "the worktree {} is at {head}, which is not reachable from any branch, remote ref or tag; it would be lost. Push or save it first; --force does not cover this",
+                wt.display()
+            )));
         }
     }
     let (worktree_result, branch_result) = if ctx.dry_run {

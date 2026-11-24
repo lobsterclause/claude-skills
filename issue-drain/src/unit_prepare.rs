@@ -87,30 +87,104 @@ fn on_path(program: &str) -> bool {
     })
 }
 
+/// The index files a seed copy takes. The `-wal` and `-shm` files go with the
+/// database so a copy made while the main checkout's daemon writes stays whole.
+const CODEGRAPH_SEED: [&str; 3] = ["codegraph.db", "codegraph.db-wal", "codegraph.db-shm"];
+
+/// Copies the main checkout's index into the worktree (a clone on APFS, so
+/// it costs no space), for `codegraph sync` to bring up to the unit's commit.
+/// The main checkout's index is never synced or written: it follows that
+/// checkout's own files, and its daemon may hold it. The worktree's
+/// `.codegraph` must not exist yet: it is made here, so a seed never lands on
+/// an index this attempt did not make. False when there is no index to copy
+/// or the copy failed, and then nothing is left behind.
+///
+/// The three files are copied one after another, so a copy taken while the
+/// daemon writes can be torn. `sync` is what finds that out: when it fails the
+/// copy is removed and a fresh index is built.
+fn seed_codegraph(main: &Path, worktree: &Path) -> bool {
+    let from = main.join(".codegraph");
+    if main == worktree || !from.join(CODEGRAPH_SEED[0]).is_file() {
+        return false;
+    }
+    let to = worktree.join(".codegraph");
+    if fs::create_dir(&to).is_err() {
+        return false;
+    }
+    let copied = CODEGRAPH_SEED.iter().all(|name| {
+        let src = from.join(name);
+        // `cp -c` clones on APFS and copies elsewhere; fs::copy if cp is not there.
+        !src.exists()
+            || std::process::Command::new("cp")
+                .arg("-c")
+                .arg(&src)
+                .arg(to.join(name))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            || fs::copy(&src, to.join(name)).is_ok()
+    });
+    if !copied {
+        let _ = fs::remove_dir_all(&to);
+    }
+    copied
+}
+
 /// `["codegraph"...]` result for unit.json: ready, absent or failed.
-fn init_codegraph(ctx: &Ctx, worktree: &Path, log: &Path) -> &'static str {
+///
+/// A reused worktree that already has an index (an earlier attempt's) gets a
+/// `sync` and nothing else: it is never seeded over or removed. Otherwise the
+/// main checkout's index is copied and synced, and failing that a fresh one is
+/// built with `init -i`; an index this attempt made that did not come up is
+/// removed, so the unit never starts on a half-built one.
+fn init_codegraph(ctx: &Ctx, main: &Path, worktree: &Path, log: &Path) -> &'static str {
     if !ctx.profile.codegraph_init || !on_path("codegraph") {
         return "absent";
     }
     let limit = Duration::from_secs(ctx.profile.codegraph_timeout_secs);
-    let args = ["init".to_string(), "-i".to_string()];
-    match exec::run("codegraph", &args, worktree, limit, log) {
-        Ok(ran) if ran.ok() => "ready",
-        Ok(ran) => {
-            eprintln!(
-                "issue-drain unit-prepare: codegraph init {}; the unit falls back to Grep and LSP",
-                ran.failure(limit)
-            );
-            "failed"
-        }
-        Err(e) => {
-            eprintln!(
-                "issue-drain unit-prepare: {}; the unit falls back to Grep and LSP",
-                e.msg
-            );
-            "failed"
-        }
+    let index = worktree.join(".codegraph");
+    let sync = ["sync".to_string(), ".".to_string()];
+    if fs::symlink_metadata(&index).is_ok() {
+        return match exec::run("codegraph", &sync, worktree, limit, log) {
+            Ok(ran) if ran.ok() => "ready",
+            Ok(ran) => {
+                eprintln!(
+                    "issue-drain unit-prepare: codegraph sync of the worktree's index {}; the unit falls back to Grep and LSP",
+                    ran.failure(limit)
+                );
+                "failed"
+            }
+            Err(e) => {
+                eprintln!(
+                    "issue-drain unit-prepare: {}; the unit falls back to Grep and LSP",
+                    e.msg
+                );
+                "failed"
+            }
+        };
     }
+    if seed_codegraph(main, worktree) {
+        match exec::run("codegraph", &sync, worktree, limit, log) {
+            Ok(ran) if ran.ok() => return "ready",
+            Ok(ran) => eprintln!(
+                "issue-drain unit-prepare: codegraph sync of the copied index {}; building a fresh one",
+                ran.failure(limit)
+            ),
+            Err(e) => eprintln!("issue-drain unit-prepare: {}; building a fresh index", e.msg),
+        }
+        let _ = fs::remove_dir_all(&index);
+    }
+    let args = ["init".to_string(), "-i".to_string()];
+    let failure = match exec::run("codegraph", &args, worktree, limit, log) {
+        Ok(ran) if ran.ok() => return "ready",
+        Ok(ran) => format!("codegraph init {}", ran.failure(limit)),
+        Err(e) => e.msg,
+    };
+    let _ = fs::remove_dir_all(&index);
+    eprintln!("issue-drain unit-prepare: {failure}; the unit falls back to Grep and LSP");
+    "failed"
 }
 
 fn bootstrap(ctx: &Ctx, worktree: &Path, log: &Path) -> Res<()> {
@@ -316,7 +390,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let codegraph = if done("codegraph", "ready") {
         "ready"
     } else {
-        init_codegraph(ctx, &worktree, &log("codegraph"))
+        init_codegraph(ctx, &main, &worktree, &log("codegraph"))
     };
 
     let state = state_dir.display().to_string();

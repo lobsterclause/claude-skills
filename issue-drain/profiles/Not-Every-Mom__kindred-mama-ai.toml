@@ -63,7 +63,9 @@ guard_protected_paths = [".github/workflows", ".github/actions", ".husky", ".cla
 bootstrap_command = ".claude/scripts/worktree-bootstrap.sh {worktree}"
 bootstrap_requires = ["node_modules"]
 
-# `codegraph init -i` in the worktree; a unit falls back to Grep and LSP if it is absent or fails.
+# Copy the main checkout's index into the worktree and `codegraph sync` it (about 7 s for kma's
+# 362 MB index, 2026-11-23), or `codegraph init -i` when there is none. A unit falls back to
+# Grep and LSP if it is absent or fails.
 codegraph_init = true
 
 # What the homelab verify runs (pr-drain/scripts/remote-verify.sh: ${RV_CMD:-pnpm verify};
@@ -73,6 +75,10 @@ full_verify_command = "pnpm verify"
 # .husky/pre-push looks for the stamp of `git rev-parse <pushed sha>^{tree}`, which is the tree
 # stamp-remote-pass hands over: the worktree is clean and at the verified commit.
 stamp_command = "bash scripts/verify-stamp.sh write {tree}"
+
+# unit-run: the wall-clock limit per `claude -p` process, and the tools it may use unasked.
+unit_timeout_secs = 5400
+unit_allowed_tools = ["Bash", "Read", "Edit", "Write", "Grep", "Glob", "Agent", "ToolSearch", "mcp__codegraph__codegraph_explore"]
 
 # Shown in the tracker header. A description only; the code enforces it.
 unit_permissions = "triage readers: Read, Grep, Glob only. Units: edit and run in their own worktree under the guards mod; gh-write comment, add-label (never the claim label), ensure-label, pr-create, thread-reply, thread-resolve; no merge, no closing issues, no protected paths"

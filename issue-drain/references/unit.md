@@ -19,7 +19,7 @@ Read the task statement, not the issue body, unless `unit.json` marks the issue'
 3. **Push only this unit's branch**, never with force. A branch that fell behind is synced by the driver with a merge of the base, not a rebase.
 4. **The author is not the auditor.** A subagent writes the change; you read it against the acceptance checks.
 5. **Set the model and the effort on every Agent call.** The guards deny a call that leaves either out.
-6. **Give every background command an explicit timeout** as long as the wait needs (a homelab verify or a reviewer round can pass ten minutes). A background command with the default limit is killed and the wait is lost. Do not poll and do not sleep; wait for the completion notice.
+6. **Give every background command an explicit timeout** as long as the wait needs (a homelab verify or a reviewer round can pass ten minutes), up to the Bash tool's maximum of 7200000 ms. A background command with the default limit is killed at 600 s and the wait is lost. Do not poll and do not sleep; wait for the completion notice.
 7. **Full verify runs on the homelab, never here.** On this machine run only the targeted tests for the change.
 8. **Protected paths park the unit.** If the fix needs a file under a protected path, a frozen app path, or a new dependency, do not make that edit: open the PR as far as the rest goes, label it `needs-human`, and end as `parked`.
 
@@ -29,7 +29,7 @@ Read the task statement, not the issue body, unless `unit.json` marks the issue'
 
 Re-read the code the task names. If the base already fixes it, write `result.json` with `outcome: "skipped"` and the lines that show it, and stop. Do not close the issue.
 
-Finding code: a fresh worktree may have no CodeGraph index. If the tool says it is not initialised, use Grep and the LSP tool (references, definitions, call chains). Do not run `codegraph init` and do not ask.
+Finding code: `unit.json`'s `codegraph` says whether the worktree has a CodeGraph index. When it is `ready`, use `codegraph_explore` first. Otherwise, or if the tool says it is not initialised, use Grep and the LSP tool (references, definitions, call chains). Do not run `codegraph init` and do not ask.
 
 ### 2. Brief one implementer
 
