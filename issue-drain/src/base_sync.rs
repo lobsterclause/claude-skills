@@ -312,9 +312,16 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let mut reissue = false;
     let mut old_head = local_head;
     let mut pending = follow_up_pending(ctx, unit).filter(|p| p.pr == Some(pr));
-    if pending.is_none()
-        && !ctx.dry_run
-        && let Some(m) = read_json::<Value>(&marker).filter(|m| m["pr"].as_u64() == Some(pr))
+    // The marker names the newest request; a pending line for an older one
+    // (a sync that was then started again on a moved base) is not its line.
+    let unlogged = |m: &Value| match &pending {
+        None => true,
+        Some(p) => m["base_head"]
+            .as_str()
+            .is_some_and(|b| p.base_head.as_deref() != Some(b)),
+    };
+    if !ctx.dry_run
+        && let Some(m) = read_json::<Value>(&marker).filter(|m| m["pr"].as_u64() == Some(pr) && unlogged(m))
     {
         // The marker was written, but the request's line was not: the process
         // died around the call. That request spent the slot; log it now.

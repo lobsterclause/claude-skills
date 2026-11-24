@@ -274,8 +274,7 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
     let transcript = state_dir.join(format!("transcript-{attempt}.jsonl"));
     let stderr_log = state_dir.join(format!("transcript-{attempt}.stderr"));
     let prompt_file = state_dir.join(format!("prompt-{attempt}.txt"));
-    fs::write(&prompt_file, &prompt)
-        .map_err(|e| Fail::failed(format!("cannot write {}: {e}", prompt_file.display())))?;
+    let prompt_input = write_prompt(&prompt_file, &prompt)?;
     let guards_file_text = guards_file.display().to_string();
     let env = [
         ("VERIFY_GATE_SKIP", "1"),
@@ -292,7 +291,7 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
         (&transcript, &stderr_log),
         &env,
         Some(&child_pid),
-        Some(&prompt_file),
+        Some(prompt_input),
     )?;
     let ended = ctx.now();
 
@@ -410,9 +409,48 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     Ok(())
 }
 
+/// Write the prompt to a new file at `path` and return it open at its start.
+/// A file already there (a retry's, or a link someone planted) is removed
+/// first, and `create_new` refuses to follow a link put back in between, so
+/// the child reads exactly the text written here.
+fn write_prompt(path: &std::path::Path, prompt: &str) -> Res<fs::File> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    let fail = |e: std::io::Error| Fail::failed(format!("cannot write {}: {e}", path.display()));
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(fail(e)),
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(fail)?;
+    file.write_all(prompt.as_bytes()).map_err(fail)?;
+    file.seek(SeekFrom::Start(0)).map_err(fail)?;
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_is_never_written_through_a_link_planted_at_its_path() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.txt");
+        fs::write(&target, "keep me").unwrap();
+        let path = dir.path().join("prompt-1.txt");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let mut file = write_prompt(&path, "the prompt").unwrap();
+        let mut read = String::new();
+        file.read_to_string(&mut read).unwrap();
+        assert_eq!(read, "the prompt", "the child reads from the start");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    }
 
     #[test]
     fn a_transcript_gives_the_session_and_the_last_result_and_skips_noise() {

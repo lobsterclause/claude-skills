@@ -84,8 +84,9 @@ pub fn run_env(
     run_env_stdin(program, args, dir, limit, logs, env, pidfile, None)
 }
 
-/// `run_env`, with the child's standard input read from the file `stdin`. The
-/// child gets the file open from the start, so the text never goes through
+/// `run_env`, with the child's standard input read from the open file `stdin`,
+/// positioned where the child should start reading. The child gets the file
+/// open from the start, so the text never goes through
 /// argv, which has a size limit and is visible to `ps`. Without it the child's
 /// stdin is empty.
 #[allow(clippy::too_many_arguments)] // `run_env` plus one
@@ -97,7 +98,7 @@ pub fn run_env_stdin(
     logs: (&Path, &Path),
     env: &[(&str, &str)],
     pidfile: Option<&Path>,
-    stdin: Option<&Path>,
+    stdin: Option<File>,
 ) -> Res<Ran> {
     let files = open_logs(logs)?;
     supervise(program, args, dir, limit, files, env, logs.1, pidfile, stdin)
@@ -154,14 +155,9 @@ fn supervise(
     env: &[(&str, &str)],
     tail_log: &Path,
     pidfile: Option<&Path>,
-    stdin: Option<&Path>,
+    stdin: Option<File>,
 ) -> Res<Ran> {
-    let input = match stdin {
-        Some(path) => {
-            Stdio::from(File::open(path).map_err(|e| Fail::failed(format!("cannot read {}: {e}", path.display())))?)
-        }
-        None => Stdio::null(),
-    };
+    let input = stdin.map_or_else(Stdio::null, Stdio::from);
     let mut child = Command::new(program)
         .args(args)
         .envs(env.iter().copied())

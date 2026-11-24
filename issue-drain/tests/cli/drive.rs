@@ -1174,7 +1174,8 @@ fn a_unit_with_a_sync_in_flight_finishes_it_before_the_gate_is_read() {
         &json!({"unit": 1, "deliver_ok": true, "review_round_needed": false}).to_string(),
     );
     c.canned("merge-gate", 0, &Case::clean());
-    c.canned_n("merge-gate", 2, 0, &Case::merged());
+    // Call 1 is the hold check, call 2 the read in ci_wait, call 3 the merge.
+    c.canned_n("merge-gate", 3, 0, &Case::merged());
     let (out, report) = c.drive(&[]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(
@@ -1184,7 +1185,60 @@ fn a_unit_with_a_sync_in_flight_finishes_it_before_the_gate_is_read() {
         c.last_comment()
     );
     assert_eq!(c.count("base-sync --unit 1 --pr 4701"), 1);
-    assert!(c.at("base-sync --unit 1") < c.at("merge-gate --unit 1 --pr 4701"));
+    let calls = c.calls();
+    assert_eq!(
+        calls[c.at("merge-gate --unit 1")],
+        "merge-gate --unit 1 --pr 4701 --dry-run"
+    );
+    assert!(c.at("merge-gate --unit 1") < c.at("base-sync --unit 1"));
+    let merge = calls
+        .iter()
+        .position(|l| l == "merge-gate --unit 1 --pr 4701")
+        .expect("the merge call");
+    assert!(c.at("base-sync --unit 1") < merge);
+}
+
+#[test]
+fn a_held_pr_with_a_sync_in_flight_is_parked_not_synced() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    pr_now(&c, "OPEN", None, false);
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("hold_label", "PR #4701 carries 'needs-human'")]),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+    assert_eq!(c.count("base-sync"), 0, "a held PR is not pushed to");
+    assert!(c.last_comment().contains("hold_label"), "{}", c.last_comment());
+}
+
+#[test]
+fn a_sync_recovery_that_fails_because_the_pr_merged_settles_it_as_merged() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    let merged = fs::read_to_string(c.env.stub.join("pr-view-4701.json")).unwrap();
+    c.env.stub_file("merged-view.json", &merged);
+    pr_now(&c, "OPEN", None, false);
+    c.canned("merge-gate", 0, &Case::clean());
+    // The PR merges while the sync runs, and base-sync refuses it as not open.
+    let stub = c.env.stub.display().to_string();
+    fs::write(
+        c.fake.join("base-sync.sh"),
+        format!("cp \"{stub}/merged-view.json\" \"{stub}/pr-view-4701.json\"\n"),
+    )
+    .unwrap();
+    c.canned("base-sync", 3, "{\"error\": \"PR #4701 is not open\"}");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "done", "{}", c.last_comment());
+    assert_eq!(c.count("base-sync --unit 1"), 1);
+    assert!(!c.env.workdir.join("units/1/base-sync-pending.json").exists());
 }
 
 #[test]

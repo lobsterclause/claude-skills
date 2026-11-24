@@ -643,3 +643,25 @@ fn an_update_call_that_timed_out_keeps_the_pending_marker() {
         "whether GitHub took it is unknown"
     );
 }
+
+#[test]
+fn a_newer_request_than_the_pending_line_is_counted_from_its_marker() {
+    let c = case();
+    let first = c.advance_base();
+    let h1 = c.update_branch(true);
+    let second = c.advance_base();
+    // The second request landed, but the process died before logging it.
+    let h2 = c.update_branch(true);
+    c.pr_is_at(&h2);
+    let line = json!({"ts": "t", "event": "base_sync_remote", "unit": 3, "pr": 7,
+        "pr_head": c.old_head, "local_head": c.old_head, "base_head": first});
+    c.env.write("events.jsonl", &format!("{line}\n"));
+    let marker = json!({"pr": 7, "pr_head": h1, "local_head": c.old_head, "base_head": second});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    let out = printed(&c.sync());
+    assert_eq!(out["new_head"], h2);
+    assert_eq!(c.update_calls(), 0, "it landed: nothing is sent again");
+    let remote = c.env.events_named("base_sync_remote");
+    assert_eq!(remote.len(), 2, "the second request spent its own slot");
+    assert_eq!(remote[1]["base_head"], second);
+}

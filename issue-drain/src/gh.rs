@@ -282,20 +282,14 @@ fn gh() -> Command {
 /// stderr is dropped: every caller turns a failure into its own message.
 ///
 /// A read has a time limit (`READ_TIMEOUT_SECS`, or ISSUE_DRAIN_GH_READ_TIMEOUT_SECS):
-/// a `gh` that hangs is killed, with the process group it started, and the
-/// exit code is `READ_TIMED_OUT`.
+/// a `gh` that hangs is killed and the exit code is `READ_TIMED_OUT`. gh stays
+/// in the caller's process group, so a supervisor that kills the caller's group
+/// (the driver's time limit on a subcommand) reaches gh and whatever it started.
 pub fn read_raw(args: &[&str]) -> (i32, String) {
     use std::io::Read as _;
-    use std::os::unix::process::CommandExt as _;
     use std::time::{Duration, Instant};
 
-    let Ok(mut child) = gh()
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-    else {
+    let Ok(mut child) = gh().args(args).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
         return (127, String::new());
     };
     let mut pipe = child.stdout.take();
@@ -317,11 +311,6 @@ pub fn read_raw(args: &[&str]) -> (i32, String) {
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(1),
             Ok(None) if Instant::now() >= deadline => {
-                // A negative pid is the whole group; this crate forbids unsafe
-                // code, so `kill` does it.
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{}", child.id())])
-                    .status();
                 let _ = child.kill();
                 let _ = child.wait();
                 break READ_TIMED_OUT;
@@ -333,9 +322,11 @@ pub fn read_raw(args: &[&str]) -> (i32, String) {
     if code == READ_TIMED_OUT {
         return (code, String::new());
     }
-    // gh has exited, but a process it left behind outside its group can still
-    // hold stdout open: wait for the end of the output only until the deadline,
-    // plus a moment for a pipe that is already draining.
+    // gh has exited, but a process it left behind can still hold stdout open:
+    // wait for the end of the output only until the deadline, plus a moment for
+    // a pipe that is already draining. A blocking read cannot be cancelled, so
+    // the reader thread ends when that process closes the pipe or is killed
+    // with the caller's group.
     let wait = deadline
         .saturating_duration_since(Instant::now())
         .max(Duration::from_millis(200));

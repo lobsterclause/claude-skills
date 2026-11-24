@@ -1570,6 +1570,29 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// The PR as GitHub has it, when it is merged.
+    fn merged_view(&self, pr: u64) -> Option<PrView> {
+        read_view(&self.repo, pr).ok().filter(|v| v.state == PrState::Merged)
+    }
+
+    /// Settle a unit whose PR merged while a base sync was in flight.
+    fn settle_merged(&self, u: &UnitState, pr: u64, view: &PrView, marker: &Path) -> Res<Option<String>> {
+        if let Some(why) = self.not_the_units(u.unit, pr, view) {
+            return self
+                .park(u, &format!("PR #{pr} merged, but {why}"), false)
+                .map(|()| None);
+        }
+        let Some(commit) = view.merge_commit.clone().filter(|c| is_sha(c)) else {
+            return self
+                .park(u, &format!("PR #{pr} is merged, but no merge commit was named"), false)
+                .map(|()| None);
+        };
+        let _ = fs::remove_file(marker);
+        self.mv(u.unit, "merged", None, None, Some(&commit))?;
+        self.merge_settled(u.unit)?;
+        self.merged(u.unit, pr)
+    }
+
     fn gate(&self, u: &UnitState) -> Res<Option<String>> {
         let pr = self.pr_of(u)?;
         let (n, p) = (u.unit.to_string(), pr.to_string());
@@ -1580,25 +1603,29 @@ impl<'a> Driver<'a> {
         if !self.dry && marker.exists() {
             // A PR that merged while the driver was down needs no sync, and
             // base-sync would refuse it as not open: settle it as merged.
-            if let Ok(view) = read_view(&self.repo, pr)
-                && view.state == PrState::Merged
-            {
-                if let Some(why) = self.not_the_units(u.unit, pr, &view) {
-                    return self
-                        .park(u, &format!("PR #{pr} merged, but {why}"), false)
-                        .map(|()| None);
-                }
-                let Some(commit) = view.merge_commit.clone().filter(|c| is_sha(c)) else {
-                    return self
-                        .park(u, &format!("PR #{pr} is merged, but no merge commit was named"), false)
-                        .map(|()| None);
-                };
-                let _ = fs::remove_file(&marker);
-                self.mv(u.unit, "merged", None, None, Some(&commit))?;
-                self.merge_settled(u.unit)?;
-                return self.merged(u.unit, pr);
+            if let Some(view) = self.merged_view(pr) {
+                return self.settle_merged(u, pr, &view, &marker);
             }
-            self.base_sync(u)?;
+            // A hold put on while the driver was down still stops the unit:
+            // the sync would push to the PR a person asked to be left alone.
+            let (_, refusals) = self.gate_dry(u)?;
+            let person: Vec<Refusal> = refusals.iter().filter(|x| needs_a_person(x)).cloned().collect();
+            if !person.is_empty() {
+                return self
+                    .park(u, &format!("needs a person: {}", listed(&person)), false)
+                    .map(|()| None);
+            }
+            if u.base_syncs >= MAX_BASE_SYNCS {
+                return self.base_sync(u).map(|()| None);
+            }
+            let r = self.sync_call(u)?;
+            // The sync may have failed because the PR merged in the meantime.
+            if !r.ok()
+                && let Some(view) = self.merged_view(pr)
+            {
+                return self.settle_merged(u, pr, &view, &marker);
+            }
+            self.after_sync(u, &r)?;
             return Ok(None);
         }
         let start = Instant::now();
@@ -1789,19 +1816,29 @@ impl<'a> Driver<'a> {
                 false,
             );
         }
+        let r = self.sync_call(u)?;
+        self.after_sync(u, &r)
+    }
+
+    /// Call `base-sync`, retrying an exit 1.
+    fn sync_call(&self, u: &UnitState) -> Res<Reply> {
         let (n, p) = (u.unit.to_string(), self.pr_of(u)?.to_string());
         // Exit 1 is often GitHub not having applied the update yet; a retry
         // spends no sync slot.
         let mut tries = 0;
-        let r = loop {
+        loop {
             let r = self.call(&["base-sync", "--unit", &n, "--pr", &p])?;
             tries += 1;
             if r.code == 1 && !r.timed_out && tries < BASE_SYNC_TRIES && !self.dry {
                 self.nap(u);
                 continue;
             }
-            break r;
-        };
+            return Ok(r);
+        }
+    }
+
+    /// Move the unit on from what `base-sync` answered.
+    fn after_sync(&self, u: &UnitState, r: &Reply) -> Res<()> {
         if !r.ok() {
             return self.park(u, &format!("base-sync failed: {}", r.why()), r.infra());
         }
