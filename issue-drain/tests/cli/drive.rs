@@ -1,1 +1,519 @@
 //! CLI tests for `drive`.
+//!
+//! The driver runs its subcommands as children. These tests give it a wrapper
+//! program (`ISSUE_DRAIN_DRIVE_EXE`, honoured only with
+//! `ISSUE_DRAIN_DRIVE_TESTING=1`) that logs each call and answers some of them
+//! from canned files, passing the rest to the real binary. Real here: `state`,
+//! `unit-run` (with a fake `claude`) and `gh-write` (with the stub gh). Canned:
+//! `claim`, `unit-prepare`, `merge-gate`, `base-sync`, `post-merge`, `cleanup`,
+//! `retro` and `tracker parse`. The real `claude` and GitHub are never touched.
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+
+use serde_json::{Value, json};
+
+use crate::common::*;
+
+const WRAPPER: &str = r#"#!/bin/sh
+case "$1" in tracker|state|claim) sub="$1-$2";; *) sub="$1";; esac
+printf '%s\n' "$*" >> "$FAKE_DIR/calls.log"
+n=$(cat "$FAKE_DIR/count.$sub" 2>/dev/null || echo 0)
+n=$((n+1))
+echo "$n" > "$FAKE_DIR/count.$sub"
+pick() { for f in "$FAKE_DIR/$sub.$n.$1" "$FAKE_DIR/$sub.$1"; do if [ -e "$f" ]; then echo "$f"; return; fi; done; }
+out=$(pick out); code=$(pick code); hook=$(pick sh)
+if [ -z "$out$code$hook" ]; then exec "$REAL_BIN" "$@"; fi
+if [ -n "$hook" ]; then . "$hook"; fi
+if [ -n "$out" ]; then cat "$out"; fi
+if [ -n "$code" ]; then exit "$(cat "$code")"; fi
+exit 0
+"#;
+
+const CLAUDE: &str = r#"#!/bin/sh
+d=$(dirname "$ISSUE_DRAIN_UNIT_FILE")
+u=$(basename "$d")
+k=1
+while [ -e "$FAKE_REC/argv.$u.$k" ]; do k=$((k+1)); done
+printf '%s\n' "$@" > "$FAKE_REC/argv.$u.$k"
+echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
+echo '{"type":"result","subtype":"success","session_id":"sess-1","total_cost_usd":0.1,"is_error":false,"num_turns":2}'
+if [ -e "$FAKE_REC/result.$u" ]; then cp "$FAKE_REC/result.$u" "$d/result.json"; fi
+exit 0
+"#;
+
+const MERGE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+struct Case {
+    env: Env,
+    fake: PathBuf,
+    rec: PathBuf,
+}
+
+fn script(path: &PathBuf, text: &str) {
+    fs::write(path, text).expect("the script");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("the mode");
+}
+
+fn case(units: &[u64]) -> Case {
+    let mut env = Env::new();
+    let dir = env.dir.path().to_path_buf();
+    let (fake, rec, bin, home, wt) = (
+        dir.join("fake"),
+        dir.join("rec"),
+        dir.join("fakebin"),
+        dir.join("home"),
+        dir.join("wt"),
+    );
+    for d in [&fake, &rec, &bin, &home, &wt] {
+        fs::create_dir_all(d).expect("the folder");
+    }
+    script(&bin.join("claude"), CLAUDE);
+    let wrapper = dir.join("wrapper.sh");
+    script(&wrapper, WRAPPER);
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        bin.display(),
+        manifest_dir().join("tests/stub").display()
+    );
+    let text = |p: &PathBuf| p.display().to_string();
+    env.set("PATH", &path)
+        .set("HOME", &text(&home))
+        .set("FAKE_DIR", &text(&fake))
+        .set("FAKE_REC", &text(&rec))
+        .set("REAL_BIN", env!("CARGO_BIN_EXE_issue-drain"))
+        .set("ISSUE_DRAIN_DRIVE_TESTING", "1")
+        .set("ISSUE_DRAIN_DRIVE_EXE", &text(&wrapper))
+        .set("ISSUE_DRAIN_DRIVE_POLL_SECS", "0")
+        .set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "5");
+
+    // The queue: one unit per number, issues 100+n.
+    let mut queue = queue_with_unit(json!({}));
+    let template = queue["units"][0].clone();
+    let entries: Vec<Value> = units
+        .iter()
+        .map(|n| {
+            let mut e = template.clone();
+            let issue = 100 + n;
+            e["id"] = json!(format!("U{n}"));
+            e["issues"] = json!([issue]);
+            e["live"] = json!([issue]);
+            e["acceptance"] = json!({ issue.to_string(): "it works" });
+            e
+        })
+        .collect();
+    queue["units"] = json!(entries);
+    env.write("queue.json", &queue.to_string());
+    env.write(
+        "tracker.json",
+        &json!({"number": 50, "url": "https://github.com/example/tidepool/issues/50", "run": "run",
+                "published_at": "2026-11-21T00:00:00Z"})
+        .to_string(),
+    );
+    for n in units {
+        env.write(
+            &format!("units/{n}/unit.json"),
+            &json!({"unit": n, "worktree": wt, "model": "haiku", "effort": "low", "branch": format!("fix/{n}")})
+                .to_string(),
+        );
+    }
+    let c = Case { env, fake, rec };
+    let ids: Vec<String> = units.iter().map(|n| format!("U{n}")).collect();
+    let parsed = json!({"run": "run", "stop": false, "units": ids, "approved_closures": [],
+                        "release_claims": [], "tracker_state": "OPEN", "unknown": []});
+    c.canned("tracker-parse", 0, &parsed.to_string());
+    c.env.write("parsed.json", &parsed.to_string());
+    c.canned("claim-take", 0, "[]");
+    c.canned("claim-release", 0, "[]");
+    c.canned("unit-prepare", 0, "");
+    c.canned("cleanup", 0, "{}");
+    c.canned("retro", 0, "");
+    c.canned("post-merge", 0, &json!({"tree_match": true}).to_string());
+    c
+}
+
+impl Case {
+    /// Answer every call of `sub` (or call number `n`, with `canned_n`) from a file.
+    fn canned(&self, sub: &str, code: i32, out: &str) {
+        fs::write(self.fake.join(format!("{sub}.code")), code.to_string()).expect("code");
+        if !out.is_empty() {
+            fs::write(self.fake.join(format!("{sub}.out")), out).expect("out");
+        }
+    }
+
+    fn canned_n(&self, sub: &str, n: u32, code: i32, out: &str) {
+        fs::write(self.fake.join(format!("{sub}.{n}.code")), code.to_string()).expect("code");
+        fs::write(self.fake.join(format!("{sub}.{n}.out")), out).expect("out");
+    }
+
+    fn clean() -> String {
+        json!({"merged": false, "refusals": []}).to_string()
+    }
+
+    fn merged() -> String {
+        json!({"merged": true, "merge_commit": MERGE_SHA, "refusals": []}).to_string()
+    }
+
+    fn refused(codes: &[(&str, &str)]) -> String {
+        let list: Vec<Value> = codes.iter().map(|(c, d)| json!({"code": c, "detail": d})).collect();
+        json!({"merged": false, "refusals": list}).to_string()
+    }
+
+    fn result(&self, unit: u64, result: Value) {
+        fs::write(self.rec.join(format!("result.{unit}")), result.to_string()).expect("result");
+    }
+
+    fn pr_view(&self, unit: u64, pr: u64) {
+        let view = json!({
+            "state": "OPEN", "headRefOid": "b".repeat(40), "headRefName": format!("fix/{unit}"),
+            "baseRefName": "develop", "headRepository": {"name": "tidepool"},
+            "headRepositoryOwner": {"login": "example"}, "mergeStateStatus": "CLEAN", "reviewDecision": "",
+            "labels": [], "body": "", "closingIssuesReferences": [], "changedFiles": 1,
+            "statusCheckRollup": [], "mergeCommit": null
+        });
+        self.env.stub_file(&format!("pr-view-{pr}.json"), &view.to_string());
+    }
+
+    fn drive(&self, extra: &[&str]) -> (Out, Value) {
+        let mut args = vec!["drive"];
+        args.extend_from_slice(extra);
+        let out = self.env.run(&args);
+        let last = out.stdout.lines().last().unwrap_or_default();
+        let report = serde_json::from_str(last).unwrap_or(Value::Null);
+        (out, report)
+    }
+
+    fn calls(&self) -> Vec<String> {
+        fs::read_to_string(self.fake.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn count(&self, prefix: &str) -> usize {
+        self.calls().iter().filter(|c| c.starts_with(prefix)).count()
+    }
+
+    fn at(&self, prefix: &str) -> usize {
+        self.calls()
+            .iter()
+            .position(|c| c.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no call starting '{prefix}' in {:?}", self.calls()))
+    }
+
+    fn snapshot(&self) -> Value {
+        let out = self.env.run(&["state", "show", "--json"]);
+        serde_json::from_str(&out.stdout).unwrap_or_else(|e| panic!("no snapshot ({e}): {}", out.stderr))
+    }
+
+    fn state_of(&self, unit: u64) -> String {
+        let snap = self.snapshot();
+        let found = snap["units"]
+            .as_array()
+            .and_then(|u| u.iter().find(|x| x["unit"] == unit));
+        found.map_or("none".into(), |u| u["state"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Start the state log and walk a unit to `to`, as an earlier driver would have.
+    fn seed(&self, unit: u64, to: &[&str], pr: Option<u64>) {
+        let init = self.env.run(&[
+            "state",
+            "init",
+            "--parsed",
+            &self.env.workdir.join("parsed.json").display().to_string(),
+        ]);
+        assert_eq!(init.code, 0, "{}", init.stderr);
+        let n = unit.to_string();
+        for state in to {
+            let mut args = vec!["state", "event", &n, state];
+            let p = pr.map(|p| p.to_string());
+            if *state == "pr_open" {
+                args.extend(["--pr", p.as_deref().expect("a PR for pr_open")]);
+            }
+            let out = self.env.run(&args);
+            assert_eq!(out.code, 0, "{state}: {}", out.stderr);
+        }
+        self.env.write(&format!("units/{unit}/drive-owned"), "1\n");
+    }
+
+    fn last_comment(&self) -> String {
+        fs::read_to_string(self.env.stub.join("last-comment-body")).unwrap_or_default()
+    }
+
+    fn claude_runs(&self, unit: u64) -> usize {
+        fs::read_dir(&self.rec)
+            .expect("rec")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("argv.{unit}.")))
+            .count()
+    }
+}
+
+const GATE_PATH: [&str; 7] = [
+    "claimed",
+    "prepared",
+    "implementing",
+    "pr_open",
+    "reviewing",
+    "ci_wait",
+    "gate",
+];
+
+#[test]
+fn one_unit_goes_from_queued_to_done_with_post_merge_and_cleanup() {
+    let c = case(&[1]);
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    c.pr_view(1, 4701);
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n("merge-gate", 3, 0, &Case::merged());
+
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        report,
+        json!({"processed": [{"unit": 1, "state": "done"}], "stopped": null})
+    );
+    assert_eq!(c.state_of(1), "done");
+    assert_eq!(c.claude_runs(1), 1);
+    assert!(c.at("claim take --unit 1") < c.at("unit-prepare --unit 1"));
+    assert!(c.at("merge-gate --unit 1 --pr 4701 --dry-run") < c.at("post-merge --unit 1 --pr 4701"));
+    assert!(c.at("post-merge --unit 1 --pr 4701") < c.at("cleanup --unit 1 --pr 4701"));
+    assert_eq!(c.count("retro --publish"), 1);
+    assert!(c.env.gh_calls().iter().any(|l| l.starts_with("issue comment 50 ")));
+    let comment = c.last_comment();
+    assert!(comment.contains("unit U1 (#101) is done and merged"), "{comment}");
+    assert!(comment.contains("pull/4701"), "{comment}");
+    assert!(!comment.contains('\u{2014}'));
+    // The merge commit went into the state log.
+    assert_eq!(c.snapshot()["units"][0]["head"], MERGE_SHA);
+}
+
+#[test]
+fn a_blocked_result_ends_the_unit_with_a_comment_and_a_claim_release() {
+    let c = case(&[1]);
+    c.result(
+        1,
+        json!({"unit": 1, "outcome": "blocked", "notes": ["the tests would not run"]}),
+    );
+
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    assert_eq!(c.state_of(1), "blocked");
+    assert!(c.count("claim release --unit 1") == 1);
+    assert_eq!(c.count("merge-gate"), 0);
+    assert_eq!(c.count("cleanup"), 0, "a blocked unit keeps its worktree");
+    let comment = c.last_comment();
+    assert!(comment.contains("is blocked"), "{comment}");
+    assert!(comment.contains("the tests would not run"), "{comment}");
+}
+
+#[test]
+fn three_blocked_units_in_a_row_stop_the_drain_with_exit_3() {
+    let c = case(&[1, 2, 3, 4]);
+    for n in 1..=4 {
+        c.result(n, json!({"unit": n, "outcome": "blocked", "notes": ["no"]}));
+    }
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(
+        report["stopped"].as_str().unwrap().contains("three units in a row"),
+        "{report}"
+    );
+    assert_eq!(report["processed"].as_array().unwrap().len(), 3);
+    assert_eq!(c.count("claim take"), 3);
+    assert_eq!(c.state_of(4), "queued");
+    assert_eq!(c.count("retro"), 0);
+    let snap = c.snapshot();
+    assert!(
+        snap["stopped"]["reason"].as_str().unwrap().contains("three units"),
+        "{snap}"
+    );
+    assert!(c.last_comment().contains("has stopped"));
+}
+
+#[test]
+fn a_stop_file_stops_the_drain_before_the_next_claim() {
+    let c = case(&[1]);
+    c.env.write("STOP", "");
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(report["stopped"].as_str().unwrap().contains("STOP file"), "{report}");
+    assert_eq!(c.count("claim take"), 0);
+    assert_eq!(c.state_of(1), "queued");
+    assert!(c.snapshot()["stopped"].is_object());
+    assert!(c.last_comment().contains("has stopped"));
+}
+
+#[test]
+fn a_unit_left_in_implementing_with_a_result_carries_on_without_claude() {
+    let c = case(&[1]);
+    c.seed(1, &["claimed", "prepared", "implementing"], None);
+    c.env.write(
+        "units/1/result.json",
+        &json!({"unit": 1, "outcome": "skipped", "notes": ["already fixed on develop"]}).to_string(),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "skipped"}]));
+    assert_eq!(c.claude_runs(1), 0);
+    assert_eq!(c.count("unit-run"), 0);
+    assert_eq!(c.count("claim take"), 0, "a restart does not claim again");
+    assert!(c.last_comment().contains("already fixed on develop"));
+}
+
+#[test]
+fn a_unit_left_in_implementing_with_no_result_is_retried_one_tier_up_then_blocked() {
+    let c = case(&[1]);
+    c.seed(1, &["claimed", "prepared", "implementing"], None);
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    // First run on haiku, one retry on sonnet, then the unit is blocked.
+    assert_eq!(c.claude_runs(1), 2);
+    let second = fs::read_to_string(c.rec.join("argv.1.2")).expect("the retry");
+    assert!(second.contains("sonnet"), "{second}");
+    assert!(second.contains("--resume"), "{second}");
+    assert!(c.last_comment().contains("ended twice without writing result.json"));
+}
+
+#[test]
+fn behind_base_calls_base_sync_and_returns_to_ci_wait() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n(
+        "merge-gate",
+        1,
+        3,
+        &Case::refused(&[("behind_base", "the PR branch is 3 commits behind develop")]),
+    );
+    c.canned_n("merge-gate", 3, 0, &Case::merged());
+    c.canned(
+        "base-sync",
+        0,
+        &json!({"unit": 1, "deliver_ok": true, "review_round_needed": false}).to_string(),
+    );
+
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "done"}]));
+    assert!(c.at("base-sync --unit 1 --pr 4701") < c.at("merge-gate --unit 1 --pr 4701 --dry-run"));
+    assert_eq!(c.snapshot()["units"][0]["base_syncs"], 1);
+}
+
+#[test]
+fn a_failed_check_repairs_the_unit_and_names_the_check() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write(
+        "units/1/session.json",
+        &json!({"session_id": "sess-1", "attempts": [{"attempt": 1, "model": "haiku"}]}).to_string(),
+    );
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n(
+        "merge-gate",
+        1,
+        3,
+        &Case::refused(&[("check_failed", "check 'lint' is failure")]),
+    );
+    c.canned_n("merge-gate", 3, 0, &Case::merged());
+
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "done"}]));
+    let argv = fs::read_to_string(c.rec.join("argv.1.1")).expect("the resume");
+    assert!(argv.contains("--resume") && argv.contains("sess-1"), "{argv}");
+    let prompt = fs::read_to_string(c.env.workdir.join("units/1/drive-prompt-1.md")).expect("the prompt");
+    assert!(prompt.contains("lint"), "{prompt}");
+    assert_eq!(c.snapshot()["units"][0]["repairs"], 1);
+}
+
+#[test]
+fn a_held_pr_is_parked_and_keeps_its_worktree() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("hold_label", "PR #4701 carries 'needs-human'")]),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+    assert_eq!(c.count("base-sync"), 0);
+    assert_eq!(c.count("cleanup"), 0);
+    assert_eq!(c.count("claim release --unit 1"), 1);
+    assert!(c.last_comment().contains("hold_label"));
+}
+
+#[test]
+fn checks_that_never_finish_block_the_unit_as_an_infrastructure_failure() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing", "ci_wait"],
+        Some(4701),
+    );
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("required_check", "required check 'ci' is pending at the head")]),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    assert!(
+        c.last_comment().contains("an infrastructure failure"),
+        "{}",
+        c.last_comment()
+    );
+}
+
+#[test]
+fn once_carries_one_unit_and_runs_no_retro() {
+    let c = case(&[1, 2]);
+    c.result(1, json!({"unit": 1, "outcome": "skipped", "notes": ["done elsewhere"]}));
+    c.result(2, json!({"unit": 2, "outcome": "skipped", "notes": ["done elsewhere"]}));
+    let (out, report) = c.drive(&["--once"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "skipped"}]));
+    assert_eq!(c.state_of(2), "queued");
+    assert_eq!(c.count("claim take"), 1);
+    assert_eq!(c.count("retro"), 0);
+}
+
+#[test]
+fn a_unit_process_may_not_drive() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_MODE", "unit");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3);
+    assert!(out.stderr.contains("driver's job"), "{}", out.stderr);
+    assert!(c.calls().is_empty());
+}
+
+#[test]
+fn a_live_lock_refuses_and_a_dead_one_is_taken_over_and_removed() {
+    let c = case(&[1]);
+    let lock_dir = c.env.dir.path().join("home/.issue-drain/example__tidepool");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let lock = lock_dir.join("drive.lock");
+    fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("another driver"), "{}", out.stderr);
+    assert!(lock.exists(), "a refused driver leaves the other's lock alone");
+
+    let mut dead = std::process::Command::new("true").spawn().unwrap();
+    let pid = dead.id();
+    dead.wait().unwrap();
+    fs::write(&lock, format!("{pid}\n")).unwrap();
+    c.env.write("STOP", "");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(!lock.exists(), "the lock is removed on exit");
+}
