@@ -67,6 +67,17 @@
 //! NEEDS_DECISION one was written by an untrusted author. A person must then
 //! merge the PR or remove that comment.
 //! No record, or comments that cannot be read, refuse too.
+//!
+//! `--accept-cap <sha>` is the driver's cap default (see `drive`): a review
+//! that stopped at the pass cap stands for a CLEAN one, at that commit only.
+//! It applies when the script's status is pending or stale, its verdict is
+//! FIXES_APPLIED or NEEDS_DECISION, its `reviewed` is the named commit, its
+//! `head` is the live head, and `reviewed` is the head or (by GitHub's compare
+//! answer) an ancestor of it; the comment's stamp must then name that verdict.
+//! Commits pushed after `reviewed` are not reviewed, the same as for the
+//! ancestor path above. Without the flag, or when any of that fails, the
+//! review refusal stands and says why the waiver did not apply. The output's
+//! `cap_waiver` names the commit a waiver let stand, or is null.
 //! GitHub's association is what the gate can read; a login is not compared.
 //!
 //! Within one check name and source, the newest entry is kept per workflow run,
@@ -154,6 +165,11 @@ pub struct Args {
     /// After a successful merge, post this file's contents as a comment on the PR.
     #[arg(long, value_name = "PATH")]
     note_file: Option<std::path::PathBuf>,
+    /// Accept a review that stopped at the pass cap: the record at this commit
+    /// may say FIXES_APPLIED or NEEDS_DECISION instead of CLEAN. The driver
+    /// passes it only after its cap default held (see `drive`).
+    #[arg(long, value_name = "SHA")]
+    pub accept_cap: Option<String>,
 }
 
 /// Labels that park a PR for a person, whatever the profile says.
@@ -301,6 +317,13 @@ pub struct Reviewer {
     pub has_output: bool,
     #[serde(default)]
     pub failure_kind: Option<String>,
+    /// The finding lines of the reviewer's last review block (`- [Pn] ...`);
+    /// `None` when its output was not parsed or had no block to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<Vec<String>>,
+    /// How many of `findings` are P0 or P1; `None` when `findings` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -376,6 +399,8 @@ pub struct Facts {
     pub merge_base: Read<String>,
     /// The unit's queue entry.
     pub unit_entry: Read<UnitEntry>,
+    /// The commit `--accept-cap` names, if it was given.
+    pub accept_cap: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -522,6 +547,49 @@ pub fn binding(repo: &str, base: &str, unit: u64, pr: u64, view: &PrView, branch
 
 /// Every condition that stops the merge. No I/O. An empty list is the only
 /// way to a merge.
+/// Whether `--accept-cap` lets a review that stopped at the pass cap stand
+/// for a CLEAN one. `Ok(None)` when the flag was not given, `Ok(Some(sha))`
+/// when it applies, and `Err(why)` when it was given and does not.
+///
+/// It applies only to a record the review script read as not clear because
+/// its verdict is FIXES_APPLIED or NEEDS_DECISION (BLOCKED never), stamped at
+/// the commit the flag names, which is the head or an ancestor of it. What it
+/// does not cover: commits pushed after that commit are unreviewed, and only
+/// codex's findings were weighed by the driver that passed the flag.
+pub fn cap_waiver(f: &Facts, head: Option<&str>) -> Result<Option<String>, String> {
+    let Some(sha) = f.accept_cap.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(p) = &f.preflight else {
+        return Err("the review record could not be read".into());
+    };
+    if !matches!(p.status.as_str(), "pending" | "stale") {
+        return Err(format!(
+            "it covers a record the script reads as pending or stale, not '{}'",
+            p.status
+        ));
+    }
+    if !matches!(p.verdict.as_str(), "FIXES_APPLIED" | "NEEDS_DECISION") {
+        return Err(format!(
+            "it covers a FIXES_APPLIED or NEEDS_DECISION verdict, not '{}'",
+            p.verdict
+        ));
+    }
+    if p.reviewed.is_empty() || !(same_commit(&p.reviewed, sha) || same_commit(sha, &p.reviewed)) {
+        return Err(format!("the record is stamped at '{}', not at '{sha}'", p.reviewed));
+    }
+    let Some(h) = head else {
+        return Err("the PR head could not be read".into());
+    };
+    if p.head != h {
+        return Err(format!("the review script read head {}, not the PR head", p.head));
+    }
+    if !same_commit(&p.reviewed, h) && !matches!(f.reviewed_ancestry, Some(Ok(true))) {
+        return Err(format!("{} is not shown to be an ancestor of the head", p.reviewed));
+    }
+    Ok(Some(p.reviewed.clone()))
+}
+
 pub fn judge(f: &Facts) -> Vec<Refusal> {
     let mut out = Vec::new();
     let n = f.pr;
@@ -683,14 +751,22 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
         (Ok(_), None) => {}
     }
 
-    // 4. the review record
+    // 4. the review record. A review that stopped at the pass cap is not
+    // CLEAN; `--accept-cap` lets its record stand for one (see `cap_waiver`).
+    let waiver = cap_waiver(f, head);
     match &f.preflight {
         Err(what) => out.push(refusal("read_error", format!("could not read {what}"))),
         Ok(p) => {
-            if p.status != "clear" || p.verdict != "CLEAN" {
+            if !matches!(waiver, Ok(Some(_))) && (p.status != "clear" || p.verdict != "CLEAN") {
                 out.push(refusal(
                     "review",
-                    format!("the review record says status '{}', verdict '{}'", p.status, p.verdict),
+                    match &waiver {
+                        Err(why) => format!(
+                            "the review record says status '{}', verdict '{}', and the cap waiver does not apply: {why}",
+                            p.status, p.verdict
+                        ),
+                        _ => format!("the review record says status '{}', verdict '{}'", p.status, p.verdict),
+                    },
                 ));
             } else if p.head.is_empty() {
                 out.push(refusal("review", "the review record names no head commit"));
@@ -755,12 +831,19 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
             } else if let Some(p) = f.preflight.as_ref().ok().filter(|p| !p.reviewed.is_empty()) {
                 // An empty `reviewed` is refused under 4 already.
                 let same = same_commit(&rec.sha, &p.reviewed) || same_commit(&p.reviewed, &rec.sha);
-                if !same || rec.verdict != "CLEAN" {
+                // Under the cap waiver the record says what the script read
+                // (FIXES_APPLIED or NEEDS_DECISION), not CLEAN.
+                let want = if matches!(waiver, Ok(Some(_))) {
+                    p.verdict.as_str()
+                } else {
+                    "CLEAN"
+                };
+                if !same || rec.verdict != want {
                     out.push(refusal(
                         "review_author",
                         format!(
                             "the newest cross-review record on PR #{n} is stamped at '{}' with verdict '{}', \
-                             not at '{}' with CLEAN as the review script reported",
+                             not at '{}' with {want} as the review script reported",
                             rec.sha, rec.verdict, p.reviewed
                         ),
                     ));
@@ -801,8 +884,7 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
     // only once that commit is shown to be an ancestor of the head.
     let ancestor = match (&f.preflight, head) {
         (Ok(p), Some(h))
-            if p.status == "clear"
-                && p.verdict == "CLEAN"
+            if ((p.status == "clear" && p.verdict == "CLEAN") || matches!(waiver, Ok(Some(_))))
                 && !p.reviewed.is_empty()
                 && !same_commit(&p.reviewed, h)
                 && matches!(f.reviewed_ancestry, Some(Ok(true))) =>
@@ -2035,6 +2117,7 @@ fn gather(
         behind_by,
         merge_base,
         unit_entry,
+        accept_cap: None,
     }
 }
 
@@ -2299,15 +2382,21 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         return Ok(());
     }
 
-    let facts = gather(ctx, &repo, unit, pr, view, unit_entry, unit_branch);
+    let mut facts = gather(ctx, &repo, unit, pr, view, unit_entry, unit_branch);
+    facts.accept_cap = args.accept_cap.clone();
     let refusals = judge(&facts);
     let head = facts.view.as_ref().map(|v| v.head.clone()).unwrap_or_default();
+    // The commit a cap waiver let stand for a CLEAN review, so the record of
+    // the merge says the review stopped at the cap.
+    let waived = cap_waiver(&facts, facts.view.as_ref().ok().map(|v| v.head.as_str()))
+        .ok()
+        .flatten();
     let output = |merged: bool| {
         let list: Vec<Value> = refusals
             .iter()
             .map(|r| json!({"code": r.code, "detail": r.detail}))
             .collect();
-        json!({"pr": pr, "unit": unit, "head": head, "merged": merged, "refusals": list, "reviewers": reviewers(&facts), "note_url": null})
+        json!({"pr": pr, "unit": unit, "head": head, "merged": merged, "refusals": list, "reviewers": reviewers(&facts), "note_url": null, "cap_waiver": waived})
     };
     // `output` plus the fields only a merge call has.
     let output_with = |merged: bool, extra: Value| {
@@ -2480,6 +2569,8 @@ mod tests {
             name: name.into(),
             has_output,
             failure_kind: None,
+            findings: None,
+            blocking: None,
         }
     }
 
@@ -2513,6 +2604,7 @@ mod tests {
             app_runs: Ok(Vec::new()),
             workflow_runs: Vec::new(),
             reviewed_ancestry: None,
+            accept_cap: None,
             preflight: Ok(Preflight {
                 status: "clear".into(),
                 verdict: "CLEAN".into(),
@@ -3243,6 +3335,74 @@ mod tests {
         f.review_record.as_mut().unwrap().as_mut().unwrap().sha = HEAD.into();
         f.reviewed_ancestry = None;
         assert!(codes(&f).is_empty());
+    }
+
+    #[test]
+    fn a_review_stopped_at_the_cap_stands_only_under_a_matching_waiver() {
+        let capped = |verdict: &str| {
+            let mut f = clear();
+            let p = f.preflight.as_mut().unwrap();
+            p.status = "pending".into();
+            p.verdict = verdict.into();
+            f.review_record.as_mut().unwrap().as_mut().unwrap().verdict = verdict.into();
+            f
+        };
+        let mut f = capped("NEEDS_DECISION");
+        assert_eq!(codes(&f), ["review", "review_author"], "no waiver, no merge");
+        f.accept_cap = Some(HEAD.into());
+        assert!(codes(&f).is_empty(), "{:?}", judge(&f));
+        assert_eq!(cap_waiver(&f, Some(HEAD)), Ok(Some(HEAD.into())));
+        f.accept_cap = Some(HEAD[..9].into());
+        assert!(codes(&f).is_empty(), "an abbreviated commit names it too");
+
+        let mut f = capped("FIXES_APPLIED");
+        f.accept_cap = Some(HEAD.into());
+        assert!(codes(&f).is_empty(), "{:?}", judge(&f));
+
+        // BLOCKED is never waived, and a record that says CLEAN needs no waiver.
+        let mut f = capped("BLOCKED");
+        f.accept_cap = Some(HEAD.into());
+        let found = judge(&f);
+        assert!(found[0].detail.contains("does not apply"), "{}", found[0].detail);
+        let mut f = clear();
+        f.accept_cap = Some(HEAD.into());
+        assert!(codes(&f).is_empty());
+        assert!(cap_waiver(&f, Some(HEAD)).is_err());
+
+        // Another commit than the record's.
+        let mut f = capped("NEEDS_DECISION");
+        f.accept_cap = Some(BASE_TIP.into());
+        assert_eq!(codes(&f), ["review", "review_author"]);
+
+        // The record says CLEAN where the script read NEEDS_DECISION.
+        let mut f = capped("NEEDS_DECISION");
+        f.accept_cap = Some(HEAD.into());
+        f.review_record.as_mut().unwrap().as_mut().unwrap().verdict = "CLEAN".into();
+        assert_eq!(codes(&f), ["review_author"]);
+    }
+
+    #[test]
+    fn a_waived_review_at_an_ancestor_needs_the_ancestry_and_a_proof_for_it() {
+        let mut f = clear();
+        let p = f.preflight.as_mut().unwrap();
+        p.status = "stale".into();
+        p.verdict = "NEEDS_DECISION".into();
+        p.reviewed = BASE_TIP.into();
+        let rec = f.review_record.as_mut().unwrap().as_mut().unwrap();
+        rec.verdict = "NEEDS_DECISION".into();
+        rec.sha = BASE_TIP.into();
+        f.proof.as_mut().unwrap().head = BASE_TIP.into();
+        f.accept_cap = Some(BASE_TIP.into());
+        f.reviewed_ancestry = Some(Ok(true));
+        assert!(codes(&f).is_empty(), "{:?}", judge(&f));
+        f.reviewed_ancestry = Some(Ok(false));
+        let found = codes(&f);
+        assert!(
+            found.contains(&"review") && found.contains(&"review_proof"),
+            "{found:?}"
+        );
+        f.reviewed_ancestry = None;
+        assert!(codes(&f).contains(&"review"));
     }
 
     #[test]

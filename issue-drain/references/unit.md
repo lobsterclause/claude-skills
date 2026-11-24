@@ -70,7 +70,7 @@ Push the branch with the remote and the branch named: `git push -u origin <branc
 
 Run the `cross-review` skill on the PR. Reviewers that are out of quota are expected; do not retry them. Adjudicate each finding by checking the claim against the code first (pr-drain's false-finding patterns apply), keep the claims ledger, and send real fixes back to the same implementer. After a fix: targeted tests, `deliver-check`, homelab verify, push, next pass.
 
-- At most 4 passes. Where the skill says to stop and ask the user, do not ask: go to step 6 with `cap_reached`.
+- At most 4 passes. Where the skill says to stop and ask the user, do not ask: go to step 6 with `cap_reached`. Run `review-proof` (below) after every pass, not only the last: it appends the pass to `units/<n>/review-history.jsonl`, which is what the driver reads at the cap. Put every finding the cap left unfixed in `review.open_findings` of `result.json`, one line each; the driver files them as one follow-up issue when it sends a capped review on to the gate (a review with no P0 or P1 from codex in pass 3 on), and parks the unit otherwise.
 - The same finding coming back after a fix counts as the cap.
 - A finding you leave for later, or work the review cap cut off, goes in a follow-up issue: `issue-drain gh-write followup-create --title <text> --body-file <file> [--label <name>]...`. It makes an ordinary issue without the tracker label and prints its URL; name the URL in `notes` of `result.json`. Do not use `issue-create`, which is for the tracker and is refused in a unit.
 - Post the record with `post_comment.sh --verdict …` at the final head. Only `CLEAN` lets the gate merge. Say "codex-only" when codex alone produced output.
