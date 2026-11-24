@@ -165,8 +165,13 @@ struct Pending {
     pr: Option<u64>,
     pr_head: Option<String>,
     local_head: Option<String>,
-    /// The base commit the request aimed at; old lines lack it.
+    /// The base commit the request aimed at; old lines lack it. The marker is
+    /// matched against this one, as a resend does not rewrite the marker.
     base_head: Option<String>,
+    /// The base the newest request aimed at: a resend's when there was one,
+    /// since a base rewritten before it may leave the first target out of the
+    /// head the resend produced. Whether the update landed is checked on this.
+    target: Option<String>,
     /// The line was written from the marker after a process died around the
     /// call, and no request has been sent since: GitHub may never have had it.
     unsent: bool,
@@ -181,12 +186,17 @@ fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<Pending> {
     }
     let line = &events[remote];
     let text = |key: &str| line[key].as_str().map(str::to_string);
-    let resent = last("base_sync_reissued").is_some_and(|sent| sent > remote);
+    let resend = last("base_sync_reissued").filter(|&sent| sent > remote);
+    let resent = resend.is_some();
+    let target = resend
+        .and_then(|i| events[i]["base_head"].as_str().map(str::to_string))
+        .or_else(|| text("base_head"));
     Some(Pending {
         pr: line["pr"].as_u64(),
         pr_head: text("pr_head"),
         local_head: text("local_head"),
         base_head: text("base_head"),
+        target,
         unsent: line["recovered"] == true && !resent,
     })
 }
@@ -336,7 +346,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         // Read from the log, so a run that failed after the recovery (a fetch,
         // or the request sent again) still knows on the next try.
         let recovered = p.unsent;
-        resume = match &p.base_head {
+        resume = match &p.target {
             Some(aimed) if !ctx.dry_run => {
                 fetch(&wt, &branch, &base, &log("fetch"))?;
                 let landed = git::ok(&wt, &["merge-base", "--is-ancestor", aimed, &before.head]);

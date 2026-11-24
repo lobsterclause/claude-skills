@@ -285,22 +285,26 @@ fn gh() -> Command {
 /// a `gh` that hangs is killed and the exit code is `READ_TIMED_OUT`. gh stays
 /// in the caller's process group, so a supervisor that kills the caller's group
 /// (the driver's time limit on a subcommand) reaches gh and whatever it started.
+///
+/// stdout goes to an unnamed temporary file, not a pipe, so the read ends when
+/// gh exits: a process gh left behind that still holds stdout cannot hold the
+/// answer back.
 pub fn read_raw(args: &[&str]) -> (i32, String) {
-    use std::io::Read as _;
+    use std::io::{Read as _, Seek as _};
     use std::time::{Duration, Instant};
 
-    let Ok(mut child) = gh().args(args).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
+    // stdout goes to an unnamed file, not a pipe: nothing has to wait on a
+    // pipe a process gh left behind may hold open, so a read that times out
+    // leaves no reader blocked behind it.
+    let Ok(mut out) = tempfile::tempfile() else {
+        return (1, String::new());
+    };
+    let Ok(sink) = out.try_clone() else {
+        return (1, String::new());
+    };
+    let Ok(mut child) = gh().args(args).stdout(sink).stderr(Stdio::null()).spawn() else {
         return (127, String::new());
     };
-    let mut pipe = child.stdout.take();
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(pipe) = pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut bytes);
-        }
-        let _ = tx.send(bytes);
-    });
     let limit = std::env::var("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -322,17 +326,11 @@ pub fn read_raw(args: &[&str]) -> (i32, String) {
     if code == READ_TIMED_OUT {
         return (code, String::new());
     }
-    // gh has exited, but a process it left behind can still hold stdout open:
-    // wait for the end of the output only until the deadline, plus a moment for
-    // a pipe that is already draining. A blocking read cannot be cancelled, so
-    // the reader thread ends when that process closes the pipe or is killed
-    // with the caller's group.
-    let wait = deadline
-        .saturating_duration_since(Instant::now())
-        .max(Duration::from_millis(200));
-    let Ok(bytes) = rx.recv_timeout(wait) else {
-        return (READ_TIMED_OUT, String::new());
-    };
+    // gh has exited, so what it wrote is in the file.
+    let mut bytes = Vec::new();
+    if out.rewind().is_err() || out.read_to_end(&mut bytes).is_err() {
+        return (1, String::new());
+    }
     (code, String::from_utf8_lossy(&bytes).into_owned())
 }
 

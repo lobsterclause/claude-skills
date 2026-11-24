@@ -1217,6 +1217,26 @@ fn a_held_pr_with_a_sync_in_flight_is_parked_not_synced() {
 }
 
 #[test]
+fn a_sync_in_flight_is_not_resumed_when_the_holds_cannot_be_read() {
+    for (code, answer) in [
+        (3, Case::refused(&[("read_error", "could not read issue #5's labels")])),
+        (1, "{\"error\": \"gh timed out\"}".to_string()),
+    ] {
+        let c = case(&[1]);
+        c.seed(1, &GATE_PATH, Some(4701));
+        c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+        pr_now(&c, "OPEN", None, false);
+        c.canned("merge-gate", code, &answer);
+        let (_, report) = c.drive(&[]);
+        assert_eq!(c.count("base-sync"), 0, "an unread hold is not taken as no hold");
+        assert_eq!(c.count("merge-gate"), 2, "the gate is read once more before blocking");
+        // From the gate a unit can only be parked; the note marks it as infra.
+        assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+        assert!(c.last_comment().contains("could not be read"), "{}", c.last_comment());
+    }
+}
+
+#[test]
 fn a_sync_recovery_that_fails_because_the_pr_merged_settles_it_as_merged() {
     let c = case(&[1]);
     c.seed(1, &GATE_PATH, Some(4701));
@@ -1305,18 +1325,26 @@ fn a_merged_pr_that_is_not_the_units_is_parked_when_a_sync_was_in_flight() {
 }
 
 #[test]
-fn a_pr_read_whose_output_a_leftover_process_holds_open_is_cut_off() {
-    let mut c = case(&[1]);
-    c.env.set("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS", "1");
-    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
-    c.pr_view(1, 4701);
-    c.env.stub_file("linger-pr-view", "");
-    let started = std::time::Instant::now();
-    let (out, report) = c.drive(&[]);
-    assert_eq!(out.code, 0, "{}", out.stderr);
+fn a_pr_read_whose_output_a_leftover_process_holds_open_is_still_answered() {
+    let drive = |linger: bool| {
+        let mut c = case(&[1]);
+        c.env.set("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS", "1");
+        c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+        c.pr_view(1, 4701);
+        if linger {
+            c.env.stub_file("linger-pr-view", "");
+        }
+        let started = std::time::Instant::now();
+        let (out, report) = c.drive(&[]);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        (started.elapsed(), report["processed"].clone(), c.last_comment())
+    };
+    let (took, lingered, note) = drive(true);
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
+        took < std::time::Duration::from_secs(20),
         "the read waited for the leftover process"
     );
-    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    // gh exited with its answer; the process it left behind changes nothing.
+    assert_eq!(lingered, drive(false).1, "{note}");
+    assert!(!note.contains("timed out"), "{note}");
 }

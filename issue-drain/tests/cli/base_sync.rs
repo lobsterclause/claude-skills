@@ -628,6 +628,32 @@ fn a_resent_request_is_waited_for_not_sent_a_third_time() {
 }
 
 #[test]
+fn a_resend_to_a_rewritten_base_is_counted_landed_once_its_own_base_is_in() {
+    let c = case();
+    // The first request aimed at `lost`; the base was then rewritten without it.
+    let lost = c.advance_base();
+    git(&c.work, &["reset", "-q", "--hard", "HEAD~1"]);
+    fs::write(c.work.join("OTHER.md"), "rewritten\n").expect("the file");
+    git(&c.work, &["add", "OTHER.md"]);
+    identity(&c.work, &["commit", "-q", "-m", "rewritten"]);
+    git(&c.work, &["push", "-q", "-f", &c.bare.display().to_string(), "develop"]);
+    c.pr_is_at(&c.old_head);
+    let marker = json!({"pr": 7, "pr_head": c.old_head, "local_head": c.old_head, "base_head": lost});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    assert_eq!(c.sync().code, 1, "the resend is not in the head yet");
+    assert_eq!(c.update_calls(), 1);
+    assert_eq!(c.env.events_named("base_sync_reissued").len(), 1);
+    // GitHub applies the resend: the head now holds the rewritten base, never `lost`.
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    let out = c.sync();
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(printed(&out)["new_head"], new_head);
+    assert_eq!(c.update_calls(), 1, "nothing is sent a third time");
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 1, "one slot");
+}
+
+#[test]
 fn an_update_call_that_timed_out_keeps_the_pending_marker() {
     let mut c = case();
     c.env.set("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS", "1");

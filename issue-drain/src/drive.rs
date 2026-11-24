@@ -1608,12 +1608,35 @@ impl<'a> Driver<'a> {
             }
             // A hold put on while the driver was down still stops the unit:
             // the sync would push to the PR a person asked to be left alone.
-            let (_, refusals) = self.gate_dry(u)?;
-            let person: Vec<Refusal> = refusals.iter().filter(|x| needs_a_person(x)).cloned().collect();
-            if !person.is_empty() {
-                return self
-                    .park(u, &format!("needs a person: {}", listed(&person)), false)
-                    .map(|()| None);
+            // base-sync does not read holds, so a gate that could not read
+            // them is no answer: read again once, then block.
+            let mut reads = 0;
+            loop {
+                let (r, refusals) = self.gate_dry(u)?;
+                let person: Vec<Refusal> = refusals.iter().filter(|x| needs_a_person(x)).cloned().collect();
+                if !person.is_empty() {
+                    return self
+                        .park(u, &format!("needs a person: {}", listed(&person)), false)
+                        .map(|()| None);
+                }
+                if !unreadable(&r, &refusals) && !refusals.iter().any(|x| x.code == "read_error") {
+                    break;
+                }
+                reads += 1;
+                if reads >= 2 {
+                    let why = refusals
+                        .iter()
+                        .find(|x| x.code == "read_error")
+                        .map_or_else(|| r.why(), |x| x.detail.clone());
+                    return self
+                        .block(
+                            u,
+                            &format!("a base sync is in flight, but whether the PR is held could not be read: {why}"),
+                            true,
+                        )
+                        .map(|()| None);
+                }
+                self.nap(u);
             }
             if u.base_syncs >= MAX_BASE_SYNCS {
                 return self.base_sync(u).map(|()| None);
