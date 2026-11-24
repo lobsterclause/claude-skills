@@ -28,6 +28,8 @@ function files(units: object[], extra: Partial<RunFiles> = {}): RunFiles {
     tracker: null,
     eventsTail: null,
     eventsCut: false,
+    eventsStart: null,
+    eventsEnd: null,
     eventsMtimeMs: null,
     sessions: {},
     stopRequested: false,
@@ -126,23 +128,38 @@ test('summaryText marks cost as an estimate and shows the park note', () => {
   expect(text).toContain('  review cap reached')
 })
 
-test('a unit whose lines left the tail keeps its note and refusals from the last view', () => {
+test('a unit whose lines left the tail keeps its note and refusals, only with no gap', () => {
   const first = buildView(
     files([unit(1, 'parked'), unit(2, 'ci_wait')], {
       eventsTail: [
         moved(1, 'parked', 'review cap reached'),
         line({ event: 'merge_gate', unit: 2, merged: false, refusals: ['ci red'] }),
       ].join('\n'),
+      eventsStart: 0,
+      eventsEnd: 100_000,
     }),
   )
-  const later = buildView(
-    files([unit(1, 'parked'), unit(2, 'ci_wait')], { eventsTail: call(['unit-run', '--unit', '3']), eventsCut: true }),
-    first,
-  )
+  const quiet = files([unit(1, 'parked'), unit(2, 'ci_wait')], {
+    eventsTail: call(['unit-run', '--unit', '3']),
+    eventsCut: true,
+  })
+
+  // This tail starts before the last read ended: nothing went unread.
+  const later = buildView({ ...quiet, eventsStart: 99_000, eventsEnd: 160_000 }, first)
   expect(later.units[0]?.note).toBe('review cap reached')
   expect(later.units[1]?.refusals).toEqual(['ci red'])
-  const elsewhere = buildView(files([unit(1, 'parked')]), { ...first, runDir: '/elsewhere' })
-  expect(elsewhere.units[0]?.note).toBe(null)
+  expect(later.eventsEnd).toBe(160_000)
+
+  // A gap: events between 100,000 and 200,000 were never read.
+  const gap = buildView({ ...quiet, eventsStart: 200_000, eventsEnd: 265_536 }, first)
+  expect(gap.units[0]?.note).toBe(null)
+  expect(gap.units[1]?.refusals).toEqual([])
+
+  // A shorter file was rewritten; another run, or a view stored before offsets, is no baseline.
+  expect(buildView({ ...quiet, eventsStart: 0, eventsEnd: 50 }, first).units[0]?.note).toBe(null)
+  const elsewhere = { ...quiet, runDir: '/elsewhere', eventsStart: 99_000, eventsEnd: 160_000 }
+  expect(buildView(elsewhere, { ...first, runDir: '/elsewhere', eventsEnd: undefined }).units[0]?.note).toBe(null)
+  expect(buildView({ ...quiet, eventsStart: 99_000, eventsEnd: 160_000 }, { ...first, runDir: '/x' }).units[0]?.note).toBe(null)
 })
 
 test('the summarise prompt carries no note or stop reason', () => {

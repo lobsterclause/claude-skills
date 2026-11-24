@@ -48,9 +48,10 @@ const errText = (err: unknown): string =>
 /** `~` and `~/x` against HOME; anything else as given. */
 const expand = (path: string, home: string | undefined): string => {
   const p = path.trim().replace(/\/+$/, '')
-  const h = home?.replace(/\/+$/, '') ?? ''
-  if (h !== '' && (p === '~' || p.startsWith('~/'))) {
-    return `${h}${p.slice(1)}`
+  if (home !== undefined && home !== '' && (p === '~' || p.startsWith('~/'))) {
+    // Trailing slashes off, so `~/x` under `/home/t/` is `/home/t/x`; a home of `/` keeps it.
+    const h = home.replace(/\/+$/, '')
+    return p === '~' ? h || '/' : `${h}${p.slice(1)}`
   }
   return p
 }
@@ -130,6 +131,8 @@ async function readRun($: EngineInterface, dir: string): Promise<RunFiles> {
   let eventsTail: string | null = null
   let eventsCut = false
   let eventsMtimeMs: number | null = null
+  let eventsStart: number | null = null
+  let eventsEnd: number | null = null
   try {
     const st = await $.fs.stat(`${dir}/events.jsonl`)
     eventsMtimeMs = st.mtimeMs
@@ -139,6 +142,8 @@ async function readRun($: EngineInterface, dir: string): Promise<RunFiles> {
       length: EVENTS_TAIL_BYTES,
     })
     eventsCut = offset > 0
+    eventsStart = offset
+    eventsEnd = st.size
   } catch {
     // No events yet.
   }
@@ -153,6 +158,8 @@ async function readRun($: EngineInterface, dir: string): Promise<RunFiles> {
     tracker: await readOrNull($, `${dir}/tracker.json`),
     eventsTail,
     eventsCut,
+    eventsStart,
+    eventsEnd,
     eventsMtimeMs,
     sessions,
     stopRequested: await existsOrFalse($, `${dir}/STOP`),

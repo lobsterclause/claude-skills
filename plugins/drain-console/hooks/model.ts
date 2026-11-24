@@ -27,6 +27,9 @@ export type RunFiles = {
   eventsTail: string | null
   /** True when eventsTail starts mid-file, so its first line may be partial. */
   eventsCut: boolean
+  /** Byte offsets of eventsTail in events.jsonl: where it starts and the file's size. */
+  eventsStart: number | null
+  eventsEnd: number | null
   eventsMtimeMs: number | null
   /** units/<n>/session.json text per unit, when there is one. */
   sessions: Readonly<Record<number, string | null>>
@@ -247,17 +250,27 @@ const msOf = (iso: string | null): number | null => {
  * Builds the view of one run folder. Throws when state.json is unreadable.
  *
  * `prev`, the last view of the same folder, fills in a unit's note and gate
- * refusals when their lines have scrolled out of the events tail: a unit
- * with no line in the tail has not changed since.
+ * refusals when their lines have scrolled out of the events tail. That holds
+ * only when this tail starts before the end of the last one, so no event in
+ * between went unread: then a unit with no line in the tail has not changed
+ * since. Strictly before: the tail's first line is dropped as partial, and it
+ * began before the last read's end, which fell on a line boundary.
  */
 export function buildView(files: RunFiles, prev: View | null = null): View {
   const state = parseState(files.state)
   const queue = parseQueue(files.queue)
   const tracker = parseTracker(files.tracker)
   const facts = scanEvents(files.eventsTail, files.eventsCut)
-  const before = new Map(
-    prev !== null && prev.runDir === files.runDir ? prev.units.map(u => [u.unit, u]) : [],
-  )
+  const unbroken =
+    prev !== null &&
+    prev.runDir === files.runDir &&
+    prev.eventsEnd !== null &&
+    files.eventsStart !== null &&
+    files.eventsEnd !== null &&
+    prev.eventsEnd !== undefined &&
+    files.eventsEnd >= prev.eventsEnd &&
+    (files.eventsStart === 0 || files.eventsStart < prev.eventsEnd)
+  const before = new Map(unbroken ? prev.units.map(u => [u.unit, u]) : [])
   const units: UnitRow[] = state.units.map(u => {
     const id = `U${u.unit}`
     const old = before.get(u.unit)
@@ -296,6 +309,7 @@ export function buildView(files: RunFiles, prev: View | null = null): View {
     isFinished: units.length > 0 && finished === units.length,
     lastCall: facts.lastCall,
     lastActivityMs,
+    eventsEnd: files.eventsEnd,
   }
 }
 

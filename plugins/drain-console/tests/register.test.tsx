@@ -35,6 +35,9 @@ const moved = (unit: number, to: string, note: string) =>
   JSON.stringify({ ts: '2026-11-24T10:00:00Z', unit, from: 'reviewing', to, note })
 
 type World = {
+  /** While set, reading RUN's events.jsonl calls `held` and waits for `hold`. */
+  hold: Promise<void> | null
+  held: () => void
   clock: ReturnType<typeof mock.clock>
   files: Map<string, string>
   writes: { path: string; text: string }[]
@@ -49,6 +52,8 @@ type World = {
 /** An engine beneath the plugin: a run folder in memory, and records of what it was asked. */
 function world(on: On, env: Record<string, string> = { HOME }): World {
   const w: World = {
+    hold: null,
+    held: () => {},
     clock: mock.clock(on, { now: NOW }),
     files: new Map([
       [`${RUN}/state.json`, state('implementing')],
@@ -68,7 +73,11 @@ function world(on: On, env: Record<string, string> = { HOME }): World {
   const missing = (path: string) => new Error(`ENOENT: ${path}`)
   mock.store(on)
   mock.env(on, env)
-  on('fs.read', (_, e) => {
+  on('fs.read', async (_, e) => {
+    if (w.hold !== null && e.path === `${RUN}/events.jsonl`) {
+      w.held()
+      await w.hold
+    }
     const text = w.files.get(e.path)
     if (text === undefined) throw missing(e.path)
     const from = e.offset ?? 0
@@ -230,7 +239,23 @@ test('/drain stop after a switch reads the new run, not a poll already running',
   }
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
 
-  const out = await $.command.run(typed(OTHER))
+  // A timer poll picks RUN and stalls reading it; the switch starts meanwhile
+  // and is given time to reach its own poll before the old one finishes.
+  let release = () => {}
+  w.hold = new Promise(r => {
+    release = r
+  })
+  const stalled = new Promise<void>(r => {
+    w.held = r
+  })
+  const tick = w.clock.advance(15000)
+  await stalled
+  w.hold = null
+  const switched = $.command.run(typed(OTHER))
+  for (let i = 0; i < 200; i++) await Promise.resolve()
+  release()
+  await tick
+  const out = await switched
   expect(out.text).toContain('run 2026-11-24-b')
   const stop = await $.command.run(typed('stop'))
   expect(stop.text).toBe(`Wrote ${OTHER}/STOP. The driver finishes the unit it is on and stops before it claims the next one.`)
@@ -281,6 +306,14 @@ test('an empty ISSUE_DRAIN_UNIT_FILE counts as unset', async ($, on) => {
   const w = world(on, { HOME, ISSUE_DRAIN_UNIT_FILE: '' })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   expect(w.commands).toEqual(['drain'])
+})
+
+test('a home of / still expands ~', async ($, on) => {
+  const w = world(on, { HOME: '/' })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const out = await $.command.run(typed('~/nowhere'))
+  expect(out.text).toBe('No state.json in /nowhere: not a run the driver has started.')
+  expect(w.writes).toEqual([])
 })
 
 test('a unit process gets nothing', async ($, on) => {

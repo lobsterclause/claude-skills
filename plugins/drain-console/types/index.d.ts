@@ -40,6 +40,11 @@ export type View = {
   lastCall: string | null
   /** The newest sign of life: events.jsonl's mtime or a unit's `updated`. */
   lastActivityMs: number | null
+  /**
+   * events.jsonl's size at this read. Absent in a view an older version
+   * stored, which then carries nothing forward.
+   */
+  eventsEnd?: number | null
 }
 
 /** What the pane draws: the newest read, or why there is none. */
