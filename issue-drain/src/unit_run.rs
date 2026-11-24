@@ -11,6 +11,10 @@
 //!
 //! One run of a unit at a time: it holds a lock on `units/<n>/unit-run.lock`
 //! from reading session.json to writing it, and a second run is refused (exit 3).
+//! While claude runs, its process group is in `units/<n>/unit-run-child.pid`.
+//! A `unit-run` killed mid-run leaves that file and claude may still be
+//! running, so the next run is refused (exit 3) while that group is alive, and
+//! removes the file once it is not.
 //!
 //! A new run starts a session with a fixed prompt that names the run, points at
 //! `references/unit.md` and at the unit file. It is refused when
@@ -67,6 +71,9 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, read_json, rfc3339, write_json};
 use crate::error::{Fail, Res};
 use crate::exec;
+
+/// In the unit's folder while its claude process runs: the process group.
+const CHILD_PID: &str = "unit-run-child.pid";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -168,6 +175,10 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
     } else {
         Some(UnitLock::take(&state_dir, unit)?)
     };
+    let child_pid = state_dir.join(CHILD_PID);
+    if !ctx.dry_run {
+        refuse_if_child_alive(&child_pid, unit)?;
+    }
     let mut session: Value = read_json(&session_file).unwrap_or_else(|| json!({}));
     // A resume keeps what the session last ran with unless told otherwise, so
     // a repair round that stepped up a tier is not stepped back down.
@@ -280,7 +291,7 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
         Duration::from_secs(p.unit_timeout_secs),
         (&transcript, &stderr_log),
         &env,
-        None,
+        Some(&child_pid),
         Some(&prompt_file),
     )?;
     let ended = ctx.now();
@@ -355,6 +366,24 @@ impl UnitLock {
             Err(fs::TryLockError::Error(e)) => Err(Fail::failed(format!("cannot lock {}: {e}", path.display()))),
         }
     }
+}
+
+/// An earlier `unit-run` killed while claude ran leaves `unit-run-child.pid`,
+/// and claude, in its own process group, may still be running in the worktree.
+/// Refuse while that group is alive; remove the file once it is not.
+fn refuse_if_child_alive(file: &std::path::Path, unit: u64) -> Res<()> {
+    let Ok(text) = fs::read_to_string(file) else {
+        return Ok(());
+    };
+    if exec::group_alive(&text) {
+        return Err(Fail::refused(format!(
+            "unit {unit}: a claude process an earlier unit-run started (process group {}) is still running; \
+             wait for it to end or kill it, then remove {}",
+            text.trim(),
+            file.display()
+        )));
+    }
+    fs::remove_file(file).map_err(|e| Fail::failed(format!("cannot remove {}: {e}", file.display())))
 }
 
 /// The session already recorded, else the one this run reported.

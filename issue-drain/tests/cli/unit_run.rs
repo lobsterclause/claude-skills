@@ -14,6 +14,8 @@ n=1
 while [ -e "$FAKE_REC/argv.$n" ]; do n=$((n+1)); done
 printf '%s\n' "$@" > "$FAKE_REC/argv.$n"
 cat > "$FAKE_REC/stdin.$n"
+cat "$(dirname "$ISSUE_DRAIN_UNIT_FILE")/unit-run-child.pid" > "$FAKE_REC/childpid.$n" 2>/dev/null
+echo $$ > "$FAKE_REC/mypid.$n"
 pwd -P > "$FAKE_REC/cwd.$n"
 printf '%s\n%s\n%s\n%s\n' "$VERIFY_GATE_SKIP" "$CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" "$ISSUE_DRAIN_MODE" "$ISSUE_DRAIN_UNIT_FILE" > "$FAKE_REC/env.$n"
 [ -e "$FAKE_REC/sleep" ] && sleep "$(cat "$FAKE_REC/sleep")"
@@ -322,7 +324,11 @@ fn a_dry_run_prints_the_command_and_changes_nothing() {
     let out = c.env.run(&["unit-run", "--unit", "3"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert!(out.stdout.starts_with("WOULD: claude -p "), "{}", out.stdout);
-    assert!(out.stdout.contains(" < 'Run unit 3 of") || out.stdout.contains(" < Run"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains(" < 'Run unit 3 of") || out.stdout.contains(" < Run"),
+        "{}",
+        out.stdout
+    );
     assert!(out.stdout.contains("--permission-prompts none") && out.stdout.contains("--allowedTools Bash Read"));
     assert_eq!(c.calls(), 0);
     assert!(!c.unit_dir().join("session.json").exists());
@@ -401,5 +407,47 @@ fn a_very_long_resume_prompt_reaches_claude_on_stdin_and_never_in_argv() {
     let out = c.resume(&long, &[]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(c.stdin(2), long);
-    assert!(c.argv(2).iter().all(|a| a.len() < 1000), "an argument carries the prompt");
+    assert!(
+        c.argv(2).iter().all(|a| a.len() < 1000),
+        "an argument carries the prompt"
+    );
+}
+
+#[test]
+fn the_process_group_is_recorded_while_claude_runs_and_cleared_after() {
+    let c = case("");
+    c.start();
+    let seen = fs::read_to_string(c.rec.join("childpid.1")).expect("the pid file existed during the run");
+    let mine = fs::read_to_string(c.rec.join("mypid.1")).unwrap();
+    assert_eq!(seen.trim(), mine.trim());
+    assert!(!c.unit_dir().join("unit-run-child.pid").exists());
+}
+
+#[test]
+fn a_run_is_refused_while_an_earlier_claude_is_still_alive() {
+    let c = case("");
+    let mut alive = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("sleep")
+    };
+    fs::write(c.unit_dir().join("unit-run-child.pid"), format!("{}\n", alive.id())).unwrap();
+    let out = c.env.run(&["unit-run", "--unit", "3"]);
+    let _ = alive.kill();
+    let _ = alive.wait();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("still running"), "{}", out.stderr);
+    assert_eq!(c.calls(), 0);
+}
+
+#[test]
+fn a_stale_pid_file_is_removed_and_the_run_goes_ahead() {
+    let c = case("");
+    fs::write(c.unit_dir().join("unit-run-child.pid"), "2147483000\n").unwrap();
+    c.start();
+    assert_eq!(c.calls(), 1);
+    assert!(!c.unit_dir().join("unit-run-child.pid").exists());
 }

@@ -157,9 +157,9 @@ fn supervise(
     stdin: Option<&Path>,
 ) -> Res<Ran> {
     let input = match stdin {
-        Some(path) => Stdio::from(
-            File::open(path).map_err(|e| Fail::failed(format!("cannot read {}: {e}", path.display())))?,
-        ),
+        Some(path) => {
+            Stdio::from(File::open(path).map_err(|e| Fail::failed(format!("cannot read {}: {e}", path.display())))?)
+        }
         None => Stdio::null(),
     };
     let mut child = Command::new(program)
@@ -207,6 +207,19 @@ fn supervise(
         timed_out,
         tail: tail_of(tail_log),
     })
+}
+
+/// Is any process still in the process group whose leader had this pid? A
+/// pidfile written by `run_env` names such a group. Anything that is not a
+/// pid counts as not alive.
+pub fn group_alive(pid: &str) -> bool {
+    pid.trim().parse::<u32>().is_ok()
+        && Command::new("kill")
+            .args(["-0", "--", &format!("-{}", pid.trim())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
 }
 
 /// `git -C <dir> <args>`, with the same limits and log.
