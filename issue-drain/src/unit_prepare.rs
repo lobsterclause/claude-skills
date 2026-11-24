@@ -157,7 +157,10 @@ fn init_codegraph(ctx: &Ctx, main: &Path, worktree: &Path, log: &Path) -> &'stat
                 "failed"
             }
             Err(e) => {
-                eprintln!("issue-drain unit-prepare: {}; the unit falls back to Grep and LSP", e.msg);
+                eprintln!(
+                    "issue-drain unit-prepare: {}; the unit falls back to Grep and LSP",
+                    e.msg
+                );
                 "failed"
             }
         };

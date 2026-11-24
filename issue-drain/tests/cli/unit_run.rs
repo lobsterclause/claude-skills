@@ -58,7 +58,8 @@ fn case(profile_extra: &str) -> Case {
     );
     env.write(
         "units/3/guards-unit.json",
-        &json!({"unit": 3, "worktree": worktree, "branch": "fix/3", "protected_paths": [".github/workflows/"]}).to_string(),
+        &json!({"unit": 3, "worktree": worktree, "branch": "fix/3", "protected_paths": [".github/workflows/"]})
+            .to_string(),
     );
     env.set(
         "FAKE_RESULT",
@@ -147,7 +148,12 @@ fn a_new_run_starts_claude_in_the_worktree_with_the_unit_environment() {
     let env: Vec<&str> = env.lines().collect();
     assert_eq!(
         env,
-        ["1", "0", "unit", &c.unit_dir().join("guards-unit.json").display().to_string()],
+        [
+            "1",
+            "0",
+            "unit",
+            &c.unit_dir().join("guards-unit.json").display().to_string()
+        ],
         "the guards read guards-unit.json, which carries protected_paths"
     );
 
@@ -347,9 +353,13 @@ fn a_prompt_file_without_resume_is_a_usage_error() {
     let c = case("");
     let prompt = c.env.dir.path().join("p.txt");
     fs::write(&prompt, "x").unwrap();
-    let out = c
-        .env
-        .run(&["unit-run", "--unit", "3", "--prompt-file", &prompt.display().to_string()]);
+    let out = c.env.run(&[
+        "unit-run",
+        "--unit",
+        "3",
+        "--prompt-file",
+        &prompt.display().to_string(),
+    ]);
     assert_eq!(out.code, 2, "{}", out.stderr);
     assert_eq!(c.calls(), 0);
 }

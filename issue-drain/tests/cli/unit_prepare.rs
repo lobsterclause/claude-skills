@@ -728,7 +728,10 @@ fn an_index_already_in_a_reused_worktree_is_synced_and_never_removed() {
     let text = fs::read_to_string(&seen).expect("codegraph ran");
     assert_eq!(text.lines().collect::<Vec<_>>(), ["sync ."], "{text}");
     assert!(own.is_file(), "an index this attempt did not make is left alone");
-    assert!(!c.worktree().join(".codegraph/codegraph.db").exists(), "not seeded over");
+    assert!(
+        !c.worktree().join(".codegraph/codegraph.db").exists(),
+        "not seeded over"
+    );
 }
 
 #[test]
