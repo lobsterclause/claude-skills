@@ -8,8 +8,10 @@
 //! (`unit-run`, `merge-gate`, `base-sync`, `post-merge`, `stamp-remote-pass`,
 //! `unit-prepare`, `cleanup`, `retro`) naming its `drive/<seq>-<name>.out|.err`
 //! files, and, while CI is awaited, a line about every five minutes (never more
-//! than one poll early) saying which unit and PR the driver waits on. `--quiet`
-//! turns all of it off. While
+//! than one poll early) saying which unit and PR the driver waits on. The lines
+//! are best effort: a stderr nobody reads loses lines, never stalls the driver.
+//! A `running` line is printed once its two files exist. `--quiet` turns all of
+//! it off. While
 //! the driver runs, `<run folder>/drive.pid` holds its pid; the file is removed
 //! on any return, but a killed driver leaves it, so a watcher must check the
 //! pid is alive (`kill -0`). The repo-level `drive.lock` below also holds a pid.
@@ -177,6 +179,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -555,6 +558,52 @@ impl Drop for PidFile {
     }
 }
 
+/// Progress lines that may be queued while stderr is not being read. Past
+/// this, lines are dropped rather than wait.
+const PROGRESS_BACKLOG: usize = 256;
+/// How long the driver waits at exit for queued lines to reach stderr.
+const PROGRESS_FLUSH: Duration = Duration::from_secs(2);
+
+/// Writes progress lines to stderr on its own thread. A write to a pipe nobody
+/// drains blocks; this way it blocks only the writer, never the driver.
+struct Progress {
+    tx: Option<SyncSender<String>>,
+    done: Receiver<()>,
+}
+
+impl Progress {
+    fn start() -> Progress {
+        Progress::to(std::io::stderr())
+    }
+
+    fn to(mut err: impl std::io::Write + Send + 'static) -> Progress {
+        let (tx, rx) = sync_channel::<String>(PROGRESS_BACKLOG);
+        let (done_tx, done) = sync_channel(1);
+        std::thread::spawn(move || {
+            for line in rx {
+                let _ = writeln!(err, "drive: {line}");
+            }
+            let _ = done_tx.send(());
+        });
+        Progress { tx: Some(tx), done }
+    }
+
+    fn say(&self, line: &str) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(line.to_string());
+        }
+    }
+}
+
+impl Drop for Progress {
+    /// Give queued lines a moment to reach stderr, without waiting on a reader
+    /// that never comes.
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        let _ = self.done.recv_timeout(PROGRESS_FLUSH);
+    }
+}
+
 struct Caffeinate(Option<Child>);
 
 impl Caffeinate {
@@ -590,7 +639,7 @@ struct Driver<'a> {
     dry: bool,
     seq: Cell<u32>,
     child_pid: PathBuf,
-    quiet: bool,
+    progress: Option<Progress>,
     /// The unit the driver is napping for, since when, and the last waiting line.
     waiting: Cell<Option<(u64, Instant)>>,
     last_beat: Cell<Option<Instant>>,
@@ -618,7 +667,7 @@ impl<'a> Driver<'a> {
             dry: ctx.dry_run,
             seq: Cell::new(logged / 2),
             child_pid: lock.dir.join(CHILD_PID),
-            quiet,
+            progress: (!quiet).then(Progress::start),
             waiting: Cell::new(None),
             last_beat: Cell::new(None),
         })
@@ -634,11 +683,12 @@ impl<'a> Driver<'a> {
         }
     }
 
-    /// One progress line on stderr, unless `--quiet`. Best effort: a closed
-    /// stderr must not stop the run, so a failed write is ignored.
+    /// One progress line on stderr, unless `--quiet`. Best effort: the line is
+    /// handed to the writer thread and dropped if it is backed up, so a closed
+    /// or undrained stderr never stops the run.
     fn say(&self, line: &str) {
-        if !self.quiet {
-            let _ = writeln!(std::io::stderr(), "drive: {line}");
+        if let Some(p) = &self.progress {
+            p.say(line);
         }
     }
 
@@ -706,6 +756,8 @@ impl<'a> Driver<'a> {
             Some(&"unit-run") => Duration::from_secs(self.ctx.profile.unit_timeout_secs + 900),
             _ => Duration::from_secs(1800),
         };
+        // The logs exist before they are named, so a watcher can tail them at once.
+        let files = exec::open_logs((&out, &err))?;
         if args.first().is_some_and(|a| LONG_CHILDREN.contains(a)) {
             let rel = |p: &PathBuf| p.strip_prefix(&self.ctx.workdir).unwrap_or(p).display().to_string();
             self.say(&format!(
@@ -718,12 +770,13 @@ impl<'a> Driver<'a> {
         let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         // Children run in the run folder, so they get the profile's absolute path.
         let profile = self.ctx.profile_path.display().to_string();
-        let ran = exec::run_env(
+        let ran = exec::run_opened(
             &self.exe.display().to_string(),
             &argv,
             &self.ctx.workdir,
             limit,
-            (&out, &err),
+            files,
+            &err,
             &[("ISSUE_DRAIN_PROFILE", &profile)],
             Some(&self.child_pid),
         )?;
@@ -1887,6 +1940,61 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A writer that never returns, like a pipe nobody reads.
+    struct Stuck;
+
+    impl std::io::Write for Stuck {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            loop {
+                std::thread::park();
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stuck_stderr_never_holds_up_the_driver() {
+        let started = Instant::now();
+        let progress = Progress::to(Stuck);
+        for n in 0..(PROGRESS_BACKLOG * 4) {
+            progress.say(&format!("line {n}"));
+        }
+        drop(progress);
+        assert!(
+            started.elapsed() < PROGRESS_FLUSH + Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Writes into a shared buffer the test reads back.
+    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn queued_lines_reach_stderr_in_order_before_the_driver_exits() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = Progress::to(Shared(buf.clone()));
+        progress.say("one");
+        progress.say("two");
+        drop(progress);
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            "drive: one\ndrive: two\n"
+        );
+    }
+
     use super::*;
 
     fn r(code: &str, detail: &str) -> Refusal {

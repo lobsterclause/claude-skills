@@ -81,6 +81,13 @@ pub fn run_env(
     env: &[(&str, &str)],
     pidfile: Option<&Path>,
 ) -> Res<Ran> {
+    let files = open_logs(logs)?;
+    supervise(program, args, dir, limit, files, env, logs.1, pidfile)
+}
+
+/// Create the stdout and stderr logs `run_opened` writes to, so a caller can
+/// name them to a watcher once they exist and before the child starts.
+pub fn open_logs(logs: (&Path, &Path)) -> Res<(File, File)> {
     let open = |path: &Path| -> Res<File> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -88,8 +95,23 @@ pub fn run_env(
         }
         fresh(path).map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))
     };
-    let files = (open(logs.0)?, open(logs.1)?);
-    supervise(program, args, dir, limit, files, env, logs.1, pidfile)
+    Ok((open(logs.0)?, open(logs.1)?))
+}
+
+/// `run_env` with logs already made by `open_logs`; `err_log` is the stderr
+/// log's path, read back for the tail a failure reports.
+#[allow(clippy::too_many_arguments)] // mirrors run_env, plus the open files
+pub fn run_opened(
+    program: &str,
+    args: &[String],
+    dir: &Path,
+    limit: Duration,
+    files: (File, File),
+    err_log: &Path,
+    env: &[(&str, &str)],
+    pidfile: Option<&Path>,
+) -> Res<Ran> {
+    supervise(program, args, dir, limit, files, env, err_log, pidfile)
 }
 
 /// A new, empty log file at `path`. Whatever was there is removed first
