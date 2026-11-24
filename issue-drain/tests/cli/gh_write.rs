@@ -951,3 +951,89 @@ fn issue_edit_sends_a_private_copy_of_the_body_and_dry_run_never_hangs_on_a_fifo
     ]);
     assert_eq!(out.code, 2, "{}", out.stderr);
 }
+
+#[test]
+fn followup_create_makes_an_ordinary_issue_without_the_tracker_label() {
+    let mut env = Env::new();
+    env.set("GH_STUB_NEW_ISSUE", "4243");
+    let body = body(&env);
+    let out = env.run(&[
+        "gh-write",
+        "followup-create",
+        "--title",
+        "Tidy the cache",
+        "--body-file",
+        &body,
+        "--label",
+        "bug",
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stdout.trim(), "https://github.com/example/tidepool/issues/4243");
+    assert_eq!(
+        env.gh_calls(),
+        [format!(
+            "issue create --repo {REPO} --title Tidy the cache --body-file {body} --label bug"
+        )]
+    );
+    let logged = env.events_named("gh_write");
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0]["verb"], "followup-create");
+    // No label at all is fine too.
+    let env2 = Env::new();
+    let body2 = self::body(&env2);
+    let out = env2.run(&["gh-write", "followup-create", "--title", "x", "--body-file", &body2]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(!env2.gh_calls()[0].contains("--label"), "{:?}", env2.gh_calls());
+}
+
+#[test]
+fn followup_create_refuses_the_tracker_label_in_any_case() {
+    let env = Env::new();
+    let body = body(&env);
+    for label in ["issue-drain", "Issue-Drain"] {
+        let out = env.run(&[
+            "gh-write",
+            "followup-create",
+            "--title",
+            "x",
+            "--body-file",
+            &body,
+            "--label",
+            label,
+        ]);
+        assert_eq!(out.code, 3, "{label}: {}", out.stderr);
+        assert!(out.stderr.contains("tracker label"), "{}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+    assert_eq!(env.events_named("gh_write_refused").len(), 2);
+}
+
+#[test]
+fn followup_create_dry_run_prints_would_and_calls_nothing() {
+    let mut env = Env::new();
+    env.set("ISSUE_DRAIN_DRY_RUN", "1");
+    let body = body(&env);
+    let out = env.run(&["gh-write", "followup-create", "--title", "x", "--body-file", &body]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.starts_with("WOULD: gh issue create "), "{}", out.stdout);
+    assert!(!out.stdout.contains("--label"), "{}", out.stdout);
+    assert!(env.gh_calls().is_empty());
+    assert_eq!(env.events_named("gh_write")[0]["dry_run"], true);
+}
+
+#[test]
+fn followup_create_takes_no_other_options() {
+    let env = Env::new();
+    let body = body(&env);
+    let out = env.run(&[
+        "gh-write",
+        "followup-create",
+        "--title",
+        "x",
+        "--body-file",
+        &body,
+        "--draft",
+    ]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(env.gh_calls().is_empty());
+}
