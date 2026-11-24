@@ -893,7 +893,7 @@ fn history(c: &Case, unit: u64, head: &str, blocking: &[u64]) {
             let findings: Vec<String> = (0..*b).map(|k| format!("- [P1] finding {k}")).collect();
             let line = json!({"run_dir": format!("/runs/pass-{}", i + 1), "proof": {"head": head, "reviewers": [
                 {"name": "codex", "has_output": true, "findings": findings, "blocking": b}
-            ]}});
+            ], "scoped": false}});
             format!("{line}\n")
         })
         .collect();
@@ -1037,6 +1037,34 @@ fn a_parked_unit_parks_the_later_queued_units_that_share_its_files() {
     let (out, _) = c.drive(&[]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(c.state_of(1), "parked");
+    assert_eq!(c.state_of(2), "parked");
+    assert_eq!(c.count("claim take --unit 2"), 0, "a held unit is never claimed");
+    assert_eq!(c.count("claim take --unit 3"), 1, "a unit that shares nothing goes on");
+    let events = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("events");
+    assert!(events.contains("waiting for unit 1"), "{events}");
+}
+
+#[test]
+fn a_unit_parked_by_hand_with_a_pr_holds_the_later_units_that_share_its_files() {
+    // `state record --state parked` writes no drive-park-holds.json; the PR
+    // is still open, so a later unit that shares its files waits for it.
+    let c = case(&[1, 2, 3]);
+    let path = c.env.workdir.join("queue.json");
+    let mut queue: Value = serde_json::from_str(&fs::read_to_string(&path).expect("queue")).expect("json");
+    queue["units"][0]["shares_files_with"] = json!([2]);
+    queue["units"][1]["shares_files_with"] = json!([1]);
+    c.env.write("queue.json", &queue.to_string());
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing", "parked"],
+        Some(4701),
+    );
+    c.result(
+        3,
+        json!({"unit": 3, "outcome": "blocked", "pr": null, "notes": ["stop here"]}),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(c.state_of(2), "parked");
     assert_eq!(c.count("claim take --unit 2"), 0, "a held unit is never claimed");
     assert_eq!(c.count("claim take --unit 3"), 1, "a unit that shares nothing goes on");

@@ -29,10 +29,18 @@
 //! `- [Pn] ...` lines after the last top-level `Full review comments:` or
 //! `Review comment:` line (codex prints its review block twice; the last one
 //! is whole). Indented lines are a finding's explanation and are never read
-//! as a heading or a finding. A final message with neither is a review that
-//! found nothing (`findings: []`). No `codex` line, or a heading with no
+//! as a heading or a finding. A final message that is JSON (codex's
+//! structured review: objects with a `findings` list, each finding with a
+//! `title` and a numeric `priority`) is read from its last object, and one
+//! that does not parse is `findings: None`. A prose message with neither is a
+//! review that found nothing (`findings: []`). No `codex` line, or a heading with no
 //! finding line after it, is `findings: None`, which the driver reads as a
 //! pass it cannot weigh. No other reviewer's output is parsed.
+//!
+//! The proof also records `scoped`: whether the run reviewed only some paths
+//! of the diff, read from a non-empty `paths` in `context.json` or in any
+//! lane's meta file. A scoped review cannot clear a merge, so neither the
+//! driver's cap default nor the gate's cap waiver accepts one.
 //!
 //! Each run also appends `{"run_dir", "proof"}` to
 //! `units/<n>/review-history.jsonl`, so the driver can tell one pass from the
@@ -107,6 +115,14 @@ pub(crate) fn codex_findings(stdout: &str) -> Option<(Vec<String>, u64)> {
     let lines: Vec<&str> = stdout.lines().map(str::trim_end).collect();
     let speaker = lines.iter().rposition(|l| *l == "codex")?;
     let message = &lines[speaker + 1..];
+    let text = message.join("\n");
+    let fenced = text.trim().strip_prefix("```json").and_then(|t| t.strip_suffix("```"));
+    if let Some(inner) = fenced {
+        return codex_json_findings(inner);
+    }
+    if text.trim_start().starts_with('{') {
+        return codex_json_findings(&text);
+    }
     let heading = message
         .iter()
         .rposition(|l| matches!(*l, "Full review comments:" | "Review comment:"));
@@ -116,10 +132,52 @@ pub(crate) fn codex_findings(stdout: &str) -> Option<(Vec<String>, u64)> {
         .filter(|l| severity(l).is_some())
         .map(|l| l.to_string())
         .collect();
-    if findings.is_empty() && heading.is_some() {
+    // A heading with no finding after it, or JSON findings this did not read
+    // as JSON, is a review that cannot be weighed, never a clean one.
+    if findings.is_empty() && (heading.is_some() || text.contains("\"priority\"")) {
         return None;
     }
     let blocking = findings.iter().filter(|l| severity(l).is_some_and(|p| p <= 1)).count() as u64;
+    Some((findings, blocking))
+}
+
+/// Codex's structured review: one or more JSON objects (it can print the same
+/// one twice), each with a `findings` list whose items carry a `title` and a
+/// numeric `priority`. The last object is read. Anything that does not parse,
+/// an object with no `findings` list, or a finding with no title or with a
+/// priority outside 0 to 3 is `None`: a review that cannot be weighed is
+/// never read as clean.
+fn codex_json_findings(text: &str) -> Option<(Vec<String>, u64)> {
+    use serde_json::Value;
+    let mut last = None;
+    for value in serde_json::Deserializer::from_str(text).into_iter::<Value>() {
+        last = Some(value.ok()?);
+    }
+    let mut findings = Vec::new();
+    let mut blocking = 0;
+    for item in last?.get("findings")?.as_array()? {
+        let priority = item.get("priority")?.as_u64().filter(|p| *p <= 3)?;
+        let title = item.get("title")?.as_str()?.trim();
+        // The title repeats the priority as a `[Pn] ` prefix; the number wins.
+        let title = match title.strip_prefix("[P").and_then(|t| t.split_once("] ")) {
+            Some((n, rest)) if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => rest,
+            _ => title,
+        };
+        let location = item.get("code_location").and_then(|loc| {
+            let path = loc.get("absolute_file_path")?.as_str()?;
+            let range = loc.get("line_range");
+            let line = |k: &str| range.and_then(|r| r.get(k)).and_then(Value::as_u64);
+            Some(match (line("start"), line("end")) {
+                (Some(a), Some(b)) => format!(" — {path}:{a}-{b}"),
+                (Some(a), None) => format!(" — {path}:{a}"),
+                _ => format!(" — {path}"),
+            })
+        });
+        if priority <= 1 {
+            blocking += 1;
+        }
+        findings.push(format!("- [P{priority}] {title}{}", location.unwrap_or_default()));
+    }
     Some((findings, blocking))
 }
 
@@ -145,6 +203,41 @@ fn context_head(run_dir: &Path) -> Result<Option<String>, String> {
         Some(head) if is_sha(head) => Ok(Some(head.to_string())),
         _ => Err(format!("{} has no usable head_sha", path.display())),
     }
+}
+
+/// Whether the run reviewed only some paths of the diff. Cross-review records
+/// a scope as a non-empty `paths` list in `context.json` or in any lane's
+/// meta file (`run_reviewers.sh --paths` alone writes only the latter); one
+/// scoped lane makes the whole run scoped. A meta file that is not JSON says
+/// nothing here: that lane has no output anyway.
+fn scoped(run_dir: &Path, raw: &Path) -> Result<bool, String> {
+    let has_paths = |v: &serde_json::Value| match v.get("paths") {
+        Some(serde_json::Value::Array(list)) => !list.is_empty(),
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        _ => false,
+    };
+    let context = run_dir.join("context.json");
+    if context.exists() {
+        let text = fs::read_to_string(&context).map_err(|e| format!("cannot read {}: {e}", context.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", context.display()))?;
+        if has_paths(&value) {
+            return Ok(true);
+        }
+    }
+    let entries = fs::read_dir(raw).map_err(|e| format!("cannot read {}: {e}", raw.display()))?;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().ends_with(".meta.json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| has_paths(&v)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The string `failure_kind` of a meta file, if it has one.
@@ -225,10 +318,12 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             }
         })
         .collect();
+    let scoped = scoped(&args.run_dir, &raw).map_err(Fail::refused)?;
     let unit = args.unit;
     let proof = Proof {
         head: args.head.clone(),
         reviewers,
+        scoped: Some(scoped),
     };
     write_json(&ctx.path(&format!("units/{unit}/review-proof.json")), &proof)?;
     let run_dir = fs::canonicalize(&args.run_dir).unwrap_or_else(|_| args.run_dir.clone());
@@ -267,6 +362,57 @@ fn append_history(path: &Path, line: &serde_json::Value) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn json_finding(priority: u64, title: &str) -> serde_json::Value {
+        json!({"title": title, "body": "why", "confidence_score": 0.9, "priority": priority,
+            "code_location": {"absolute_file_path": "/wt/src/a.rs", "line_range": {"start": 3, "end": 5}}})
+    }
+
+    #[test]
+    fn a_json_review_is_read_from_its_last_object() {
+        let first = json!({"findings": [json_finding(2, "[P2] an early draft")], "overall_correctness": "x"});
+        let last = json!({"findings": [json_finding(1, "[P1] a real problem"), json_finding(3, "[P3] a nit")],
+            "overall_correctness": "patch is incorrect"});
+        let out = format!("exec\nthinking\ncodex\n{:#}\n{:#}\n", first, last);
+        let (findings, blocking) = codex_findings(&out).expect("read");
+        assert_eq!(
+            findings,
+            [
+                "- [P1] a real problem — /wt/src/a.rs:3-5",
+                "- [P3] a nit — /wt/src/a.rs:3-5"
+            ]
+        );
+        assert_eq!(blocking, 1, "a P1 in JSON form blocks");
+
+        let clean = format!(
+            "codex\n{}\n",
+            json!({"findings": [], "overall_correctness": "patch is correct"})
+        );
+        assert_eq!(codex_findings(&clean), Some((vec![], 0)));
+        let fenced = format!(
+            "codex\n```json\n{}\n```\n",
+            json!({"findings": [json_finding(0, "[P0] fenced")]})
+        );
+        assert_eq!(codex_findings(&fenced).map(|(_, b)| b), Some(1));
+    }
+
+    #[test]
+    fn a_json_review_that_cannot_be_weighed_is_not_clean() {
+        for bad in [
+            "{\"findings\": [".to_string(),
+            json!({"overall_correctness": "patch is incorrect"}).to_string(),
+            json!({"findings": [{"title": "[P1] no priority"}]}).to_string(),
+            json!({"findings": [json_finding(7, "[P7] out of range")]}).to_string(),
+            json!({"findings": [{"priority": 0}]}).to_string(),
+            format!("{}\ntrailing prose", json!({"findings": []})),
+            format!(
+                "Here is the review:\n{}",
+                json!({"findings": [json_finding(1, "[P1] x")]})
+            ),
+        ] {
+            assert_eq!(codex_findings(&format!("codex\n{bad}\n")), None, "{bad}");
+        }
+    }
 
     #[test]
     fn codex_findings_come_from_the_last_review_block() {

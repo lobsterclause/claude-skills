@@ -279,6 +279,9 @@ pub struct ReviewRecord {
     pub sha: String,
     /// The marker's `verdict=`; empty when it carries none.
     pub verdict: String,
+    /// GitHub's id of the comment; 0 when the answer carried none. Ids only
+    /// grow, so a newer record has a larger one.
+    pub id: u64,
 }
 
 /// Whether an `author_association` is in the profile's trusted list (case
@@ -332,6 +335,11 @@ pub struct Reviewer {
 pub struct Proof {
     pub head: String,
     pub reviewers: Vec<Reviewer>,
+    /// Whether the run reviewed only some paths of the diff (cross-review's
+    /// `--paths`); `None` in a proof written before the field existed, which
+    /// neither the cap default nor a cap waiver accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -406,6 +414,9 @@ pub struct Facts {
     /// The commit the driver's cap decision (`units/<n>/drive-cap-accepted.json`)
     /// accepted, if the driver wrote one. The flag alone waives nothing.
     pub cap_record: Option<String>,
+    /// The review record (comment id) the first waiver under that cap decision
+    /// let stand (`units/<n>/cap-waived-record.json`), if one did.
+    pub cap_pin: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -600,6 +611,25 @@ pub fn cap_waiver(f: &Facts, head: Option<&str>) -> Result<Option<String>, Strin
     }
     if !same_commit(rec, h) {
         return Err(format!("the driver's cap decision accepted {rec}, not the PR head"));
+    }
+    match &f.proof {
+        Ok(proof) if proof.scoped == Some(false) => {}
+        Ok(proof) if proof.scoped == Some(true) => {
+            return Err(
+                "the review proof covers only some paths of the diff, and a scoped review cannot clear a merge".into(),
+            );
+        }
+        Ok(_) => return Err("the review proof does not say it covered the whole diff".into()),
+        Err(_) => return Err("the review proof could not be read".into()),
+    }
+    let id = match &f.review_record {
+        Ok(Some(r)) if r.id != 0 => r.id,
+        _ => return Err("the newest review record has no comment id to bind the waiver to".into()),
+    };
+    if let Some(pin) = f.cap_pin.filter(|pin| *pin != id) {
+        return Err(format!(
+            "the cap decision was first used for review record {pin}, and record {id} was posted since"
+        ));
     }
     Ok(Some(p.reviewed.clone()))
 }
@@ -1777,6 +1807,7 @@ pub fn parse_review_records(raw: &str) -> Read<Vec<ReviewRecord>> {
                     association: word("/author_association"),
                     sha,
                     verdict,
+                    id: comment.get("id").and_then(Value::as_u64).unwrap_or(0),
                 });
             }
         }
@@ -1973,13 +2004,30 @@ pub(crate) fn unit_file<T: serde::de::DeserializeOwned>(ctx: &Ctx, unit: u64, na
 /// one: `units/<n>/drive-cap-accepted.json` (`dry-` prefixed in a dry run,
 /// as the driver names it).
 fn cap_record(ctx: &Ctx, unit: u64) -> Option<String> {
-    let name = if ctx.dry_run {
-        format!("dry-{}", crate::drive::CAP_ACCEPTED)
-    } else {
-        crate::drive::CAP_ACCEPTED.to_string()
-    };
-    let v: Value = read_json(&ctx.path(&format!("units/{unit}/{name}")))?;
+    let v: Value = read_json(&ctx.path(&format!("units/{unit}/{}", marked(ctx, crate::drive::CAP_ACCEPTED))))?;
     v["reviewed"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// The file that pins a cap decision to the review record its first waiver
+/// let stand.
+const CAP_PIN: &str = "cap-waived-record.json";
+
+/// A file name with the driver's `dry-` prefix in a dry run.
+fn marked(ctx: &Ctx, name: &str) -> String {
+    if ctx.dry_run {
+        format!("dry-{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// The review record the first waiver under the cap decision for `reviewed`
+/// let stand. A pin written for another cap decision does not count.
+fn cap_pin(ctx: &Ctx, unit: u64, reviewed: Option<&str>) -> Option<u64> {
+    let v: Value = read_json(&ctx.path(&format!("units/{unit}/{}", marked(ctx, CAP_PIN))))?;
+    (reviewed.is_some() && v["reviewed"].as_str() == reviewed)
+        .then(|| v["record"].as_u64())
+        .flatten()
 }
 
 /// Every read the decision needs. Nothing here decides anything.
@@ -2146,6 +2194,7 @@ fn gather(
         unit_entry,
         accept_cap: None,
         cap_record: None,
+        cap_pin: None,
     }
 }
 
@@ -2413,6 +2462,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let mut facts = gather(ctx, &repo, unit, pr, view, unit_entry, unit_branch);
     facts.accept_cap = args.accept_cap.clone();
     facts.cap_record = cap_record(ctx, unit);
+    facts.cap_pin = cap_pin(ctx, unit, facts.cap_record.as_deref());
     let refusals = judge(&facts);
     let head = facts.view.as_ref().map(|v| v.head.clone()).unwrap_or_default();
     // The commit a cap waiver let stand for a CLEAN review, so the record of
@@ -2420,6 +2470,19 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let waived = cap_waiver(&facts, facts.view.as_ref().ok().map(|v| v.head.as_str()))
         .ok()
         .flatten();
+    // The first waiver under a cap decision pins the record it let stand, so
+    // a record posted later at the same head is never waived unread. The
+    // driver asks the gate right after it accepts the cap.
+    if waived.is_some()
+        && facts.cap_pin.is_none()
+        && let (Some(rec), Ok(Some(r))) = (&facts.cap_record, &facts.review_record)
+    {
+        let pin = json!({"reviewed": rec, "record": r.id});
+        crate::ctx::write_atomic(
+            &ctx.path(&format!("units/{unit}/{}", marked(ctx, CAP_PIN))),
+            format!("{pin}\n").as_bytes(),
+        )?;
+    }
     let output = |merged: bool| {
         let list: Vec<Value> = refusals
             .iter()
@@ -2635,6 +2698,7 @@ mod tests {
             reviewed_ancestry: None,
             accept_cap: None,
             cap_record: None,
+            cap_pin: None,
             preflight: Ok(Preflight {
                 status: "clear".into(),
                 verdict: "CLEAN".into(),
@@ -2647,12 +2711,14 @@ mod tests {
                 association: "OWNER".into(),
                 sha: HEAD.into(),
                 verdict: "CLEAN".into(),
+                id: 7,
             })),
             trusted_authors: vec!["OWNER".into(), "MEMBER".into()],
             in_merge_queue: Ok(false),
             proof: Ok(Proof {
                 head: HEAD.into(),
                 reviewers: vec![reviewer("codex", true), reviewer("kimi", true)],
+                scoped: Some(false),
             }),
             deliver: Ok(Deliver {
                 ok: true,
@@ -3395,6 +3461,28 @@ mod tests {
         assert_eq!(cap_waiver(&f, Some(HEAD)), Ok(Some(HEAD.into())));
         f.accept_cap = Some(HEAD[..9].into());
         assert!(codes(&f).is_empty(), "an abbreviated commit names it too");
+        // The first waiver pins the record it let stand; a newer record at
+        // the same head is not waived under that decision.
+        f.cap_pin = Some(7);
+        assert!(codes(&f).is_empty(), "the pinned record still stands");
+        f.cap_pin = Some(6);
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("was posted since"), "{why}");
+        assert_eq!(codes(&f), ["review", "review_author"]);
+        f.cap_pin = None;
+        f.review_record.as_mut().unwrap().as_mut().unwrap().id = 0;
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("no comment id"), "{why}");
+        f.review_record.as_mut().unwrap().as_mut().unwrap().id = 7;
+        // A path-scoped review never stands for the whole PR.
+        f.proof.as_mut().unwrap().scoped = Some(true);
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("only some paths"), "{why}");
+        f.proof.as_mut().unwrap().scoped = None;
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("whole diff"), "{why}");
+        f.proof.as_mut().unwrap().scoped = Some(false);
+        assert_eq!(cap_waiver(&f, Some(HEAD)), Ok(Some(HEAD.into())));
 
         let mut f = capped("FIXES_APPLIED");
         f.accept_cap = Some(HEAD.into());

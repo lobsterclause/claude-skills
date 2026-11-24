@@ -565,7 +565,8 @@ fn review_passes(history: &str) -> Result<Vec<Proof>, String> {
 }
 
 /// Whether the cap default holds for these passes: there are at least
-/// CAP_DEFAULT_FROM, and in each from that one on codex reviewed, its findings
+/// CAP_DEFAULT_FROM, and in each from that one on the whole diff was reviewed
+/// (a path-scoped pass cannot clear a merge), codex reviewed, its findings
 /// were read, and none is P0 or P1. Only codex's severities are read, so another
 /// reviewer's output in those passes stops the default, unless `others_allowed`
 /// (a later queued unit shares files with this one and is held by it).
@@ -579,6 +580,11 @@ fn cap_default_holds(passes: &[Proof], others_allowed: bool) -> Result<(), Strin
     let is_codex = |name: &str| name.eq_ignore_ascii_case("codex");
     for (i, pass) in passes.iter().enumerate().skip(CAP_DEFAULT_FROM - 1) {
         let k = i + 1;
+        match pass.scoped {
+            Some(false) => {}
+            Some(true) => return Err(format!("pass {k} reviewed only some paths of the diff")),
+            None => return Err(format!("pass {k} does not say it reviewed the whole diff")),
+        }
         let codex = pass.reviewers.iter().find(|r| is_codex(&r.name));
         match codex {
             None => return Err(format!("pass {k} has no codex review")),
@@ -1123,21 +1129,35 @@ impl<'a> Driver<'a> {
         v["reviewed"].as_str().filter(|s| is_sha(s)).map(str::to_string)
     }
 
-    /// The parked unit whose PARK_HOLDS names this one, if any: this unit
-    /// shares files with it and was to be parked with it.
+    /// The parked unit that holds this one, if any: one whose PARK_HOLDS names
+    /// it, or one earlier in the queue that has a PR and shares files with
+    /// it. A unit parked by hand (`state record --state parked`) writes no
+    /// PARK_HOLDS, and while it has a PR its change can still land, so the
+    /// queue's overlap is read for it directly. Whether that PR is still open
+    /// is not read: a parked unit's PR holds until a person moves the unit.
     fn held_by(&self, unit: u64) -> Option<u64> {
         let snap = state::load(self.ctx)?;
+        let pos = |n: u64| snap.queue.iter().position(|q| *q == n);
+        let me = pos(unit);
         snap.units
             .iter()
-            .filter(|s| s.state == State::Parked)
-            .map(|s| s.unit)
-            .find(|&n| {
-                read_json::<Value>(&self.unit_dir(n).join(self.mark(PARK_HOLDS))).is_some_and(|v| {
+            .filter(|s| s.state == State::Parked && s.unit != unit)
+            .find(|s| {
+                let n = s.unit;
+                let listed = read_json::<Value>(&self.unit_dir(n).join(self.mark(PARK_HOLDS))).is_some_and(|v| {
                     v["held"]
                         .as_array()
                         .is_some_and(|a| a.iter().any(|x| x.as_u64() == Some(unit)))
-                })
+                });
+                listed
+                    || (s.pr.is_some()
+                        && pos(n).zip(me).is_some_and(|(p, m)| p < m)
+                        && self
+                            .ctx
+                            .queue_unit(n)
+                            .is_ok_and(|e| e.shares_files_with.contains(&unit)))
             })
+            .map(|s| s.unit)
     }
 
     /// The later queued units (by queue position) that share a file with this one.
@@ -2919,6 +2939,7 @@ mod tests {
         super::Proof {
             head: head.into(),
             reviewers,
+            scoped: Some(false),
         }
     }
 
@@ -2971,6 +2992,22 @@ mod tests {
 
         let p1 = super::cap_default_holds(&[clean(), clean(), clean(), early_p1.clone()], false).unwrap_err();
         assert!(p1.contains("2 P0/P1") && p1.contains("pass 4"), "{p1}");
+
+        // A path-scoped pass, or one that does not say, never counts.
+        let mut scoped = clean();
+        scoped.scoped = Some(true);
+        let why = super::cap_default_holds(&[clean(), clean(), scoped.clone()], false).unwrap_err();
+        assert!(why.contains("pass 3 reviewed only some paths"), "{why}");
+        scoped.scoped = None;
+        let why = super::cap_default_holds(&[clean(), clean(), clean(), scoped], false).unwrap_err();
+        assert!(why.contains("pass 4 does not say"), "{why}");
+        // Passes before the third may be scoped.
+        let mut early = clean();
+        early.scoped = Some(true);
+        assert_eq!(
+            super::cap_default_holds(&[early.clone(), early, clean()], false),
+            Ok(())
+        );
 
         let unread = pass("h", Some((true, None)), &[]);
         let why = super::cap_default_holds(&[clean(), clean(), unread], false).unwrap_err();
