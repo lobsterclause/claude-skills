@@ -18,6 +18,10 @@
 //! way on is `--resume`. A resume needs a recorded session id and a `--prompt-file`,
 //! whose text is the message; it keeps the session and may change model and effort.
 //!
+//! The prompt is not in argv: a failing check's log can be long, and argv is
+//! size-limited and visible to other users through `ps`. It is written to
+//! `units/<n>/prompt-<attempt>.txt` and that file is the process's stdin.
+//!
 //! The process is `claude -p` with `--permission-mode acceptEdits`,
 //! `--permission-prompts none`, the profile's `unit_allowed_tools`, the skill's
 //! `guards` mod as `--plugin-dir`, and `--output-format stream-json --verbose`. It
@@ -31,6 +35,7 @@
 //! Files, all under `units/<n>/`:
 //!   transcript-<attempt>.jsonl   its stdout, one stream-json object per line
 //!   transcript-<attempt>.stderr  its stderr
+//!   prompt-<attempt>.txt         the prompt, which is its stdin
 //!   session.json                 `{session_id, attempts: [{attempt, resumed, model,
 //!                                effort, started, ended, exit_code, timed_out,
 //!                                cost_usd, num_turns, is_error, session_id}]}`,
@@ -228,7 +233,9 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
     };
     let (prompt, resume_id) = prompt_and_resume;
 
-    let mut argv: Vec<String> = vec!["-p".into(), prompt];
+    // The prompt goes to the child on stdin, never in argv: a failing check's
+    // log can be long, and argv is size-limited and visible to `ps`.
+    let mut argv: Vec<String> = vec!["-p".into()];
     if let Some(id) = &resume_id {
         argv.extend(["--resume".into(), id.clone()]);
     }
@@ -247,7 +254,7 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
 
     if ctx.dry_run {
         return Ok(
-            json!({"unit": unit, "dry_run": true, "argv": std::iter::once("claude".to_string()).chain(argv).collect::<Vec<_>>()}),
+            json!({"unit": unit, "dry_run": true, "prompt": prompt, "argv": std::iter::once("claude".to_string()).chain(argv).collect::<Vec<_>>()}),
         );
     }
 
@@ -255,6 +262,9 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
     let attempt = attempts.len() as u64 + 1;
     let transcript = state_dir.join(format!("transcript-{attempt}.jsonl"));
     let stderr_log = state_dir.join(format!("transcript-{attempt}.stderr"));
+    let prompt_file = state_dir.join(format!("prompt-{attempt}.txt"));
+    fs::write(&prompt_file, &prompt)
+        .map_err(|e| Fail::failed(format!("cannot write {}: {e}", prompt_file.display())))?;
     let guards_file_text = guards_file.display().to_string();
     let env = [
         ("VERIFY_GATE_SKIP", "1"),
@@ -263,7 +273,7 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
         ("ISSUE_DRAIN_UNIT_FILE", guards_file_text.as_str()),
     ];
     let started = ctx.now();
-    let ran = exec::run_env(
+    let ran = exec::run_env_stdin(
         "claude",
         &argv,
         &worktree,
@@ -271,6 +281,7 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
         (&transcript, &stderr_log),
         &env,
         None,
+        Some(&prompt_file),
     )?;
     let ended = ctx.now();
 
@@ -361,7 +372,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             .filter_map(Value::as_str)
             .map(|w| shlex::try_quote(w).map_or_else(|_| w.to_string(), |q| q.into_owned()))
             .collect();
-        println!("WOULD: {}", words.join(" "));
+        let prompt = out["prompt"].as_str().unwrap_or_default();
+        let prompt = shlex::try_quote(prompt).map_or_else(|_| prompt.to_string(), |q| q.into_owned());
+        println!("WOULD: {} < {prompt}", words.join(" "));
     } else {
         println!("{out}");
     }

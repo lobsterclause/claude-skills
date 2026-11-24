@@ -13,6 +13,7 @@ const FAKE: &str = r#"#!/bin/sh
 n=1
 while [ -e "$FAKE_REC/argv.$n" ]; do n=$((n+1)); done
 printf '%s\n' "$@" > "$FAKE_REC/argv.$n"
+cat > "$FAKE_REC/stdin.$n"
 pwd -P > "$FAKE_REC/cwd.$n"
 printf '%s\n%s\n%s\n%s\n' "$VERIFY_GATE_SKIP" "$CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" "$ISSUE_DRAIN_MODE" "$ISSUE_DRAIN_UNIT_FILE" > "$FAKE_REC/env.$n"
 [ -e "$FAKE_REC/sleep" ] && sleep "$(cat "$FAKE_REC/sleep")"
@@ -78,6 +79,10 @@ impl Case {
         text.lines().map(str::to_string).collect()
     }
 
+    fn stdin(&self, n: u32) -> String {
+        fs::read_to_string(self.rec.join(format!("stdin.{n}"))).expect("the fake ran")
+    }
+
     fn calls(&self) -> usize {
         fs::read_dir(&self.rec)
             .expect("rec")
@@ -119,9 +124,13 @@ fn a_new_run_starts_claude_in_the_worktree_with_the_unit_environment() {
 
     let argv = c.argv(1);
     assert_eq!(argv[0], "-p");
+    assert!(
+        argv.iter().all(|a| !a.contains("Run unit 3")),
+        "the prompt is not in argv: {argv:?}"
+    );
     let run_id = "run";
     assert_eq!(
-        argv[1],
+        c.stdin(1),
         format!(
             "Run unit 3 of issue-drain run {run_id}. Read {}/references/unit.md and follow it. Your unit file is {}.",
             manifest_dir().display(),
@@ -185,7 +194,9 @@ fn a_resume_names_the_session_and_sends_the_prompt_file() {
     );
     assert_eq!(out.code, 0, "{}", out.stderr);
     let argv = c.argv(2);
-    assert_eq!(argv[..2], ["-p", "Fix the failing check: lint says no."]);
+    assert_eq!(argv[0], "-p");
+    assert!(!argv.iter().any(|a| a.contains("lint says no")), "{argv:?}");
+    assert_eq!(c.stdin(2), "Fix the failing check: lint says no.");
     assert_eq!(after(&argv, "--resume"), "sess-1");
     assert_eq!(after(&argv, "--model"), "sonnet");
     assert_eq!(after(&argv, "--effort"), "medium");
@@ -311,6 +322,7 @@ fn a_dry_run_prints_the_command_and_changes_nothing() {
     let out = c.env.run(&["unit-run", "--unit", "3"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert!(out.stdout.starts_with("WOULD: claude -p "), "{}", out.stdout);
+    assert!(out.stdout.contains(" < 'Run unit 3 of") || out.stdout.contains(" < Run"), "{}", out.stdout);
     assert!(out.stdout.contains("--permission-prompts none") && out.stdout.contains("--allowedTools Bash Read"));
     assert_eq!(c.calls(), 0);
     assert!(!c.unit_dir().join("session.json").exists());
@@ -379,4 +391,15 @@ fn a_unit_already_running_is_refused() {
     let status = first.wait_with_output().expect("the first run");
     assert!(status.status.success());
     assert_eq!(c.calls(), 1);
+}
+
+#[test]
+fn a_very_long_resume_prompt_reaches_claude_on_stdin_and_never_in_argv() {
+    let c = case("");
+    c.start();
+    let long = format!("lint says no: {}", "x".repeat(400_000));
+    let out = c.resume(&long, &[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.stdin(2), long);
+    assert!(c.argv(2).iter().all(|a| a.len() < 1000), "an argument carries the prompt");
 }

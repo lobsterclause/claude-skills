@@ -65,7 +65,7 @@ pub fn run(program: &str, args: &[String], dir: &Path, limit: Duration, log: &Pa
         Ok((out, err))
     };
     let (out, err) = open().map_err(|e| Fail::failed(format!("cannot write {}: {e}", log.display())))?;
-    supervise(program, args, dir, limit, (out, err), &[], log, None)
+    supervise(program, args, dir, limit, (out, err), &[], log, None, None)
 }
 
 /// `run`, with extra environment variables for the child and stdout and stderr
@@ -81,8 +81,26 @@ pub fn run_env(
     env: &[(&str, &str)],
     pidfile: Option<&Path>,
 ) -> Res<Ran> {
+    run_env_stdin(program, args, dir, limit, logs, env, pidfile, None)
+}
+
+/// `run_env`, with the child's standard input read from the file `stdin`. The
+/// child gets the file open from the start, so the text never goes through
+/// argv, which has a size limit and is visible to `ps`. Without it the child's
+/// stdin is empty.
+#[allow(clippy::too_many_arguments)] // `run_env` plus one
+pub fn run_env_stdin(
+    program: &str,
+    args: &[String],
+    dir: &Path,
+    limit: Duration,
+    logs: (&Path, &Path),
+    env: &[(&str, &str)],
+    pidfile: Option<&Path>,
+    stdin: Option<&Path>,
+) -> Res<Ran> {
     let files = open_logs(logs)?;
-    supervise(program, args, dir, limit, files, env, logs.1, pidfile)
+    supervise(program, args, dir, limit, files, env, logs.1, pidfile, stdin)
 }
 
 /// Create the stdout and stderr logs `run_opened` writes to, so a caller can
@@ -111,7 +129,7 @@ pub fn run_opened(
     env: &[(&str, &str)],
     pidfile: Option<&Path>,
 ) -> Res<Ran> {
-    supervise(program, args, dir, limit, files, env, err_log, pidfile)
+    supervise(program, args, dir, limit, files, env, err_log, pidfile, None)
 }
 
 /// A new, empty log file at `path`. Whatever was there is removed first
@@ -136,12 +154,19 @@ fn supervise(
     env: &[(&str, &str)],
     tail_log: &Path,
     pidfile: Option<&Path>,
+    stdin: Option<&Path>,
 ) -> Res<Ran> {
+    let input = match stdin {
+        Some(path) => Stdio::from(
+            File::open(path).map_err(|e| Fail::failed(format!("cannot read {}: {e}", path.display())))?,
+        ),
+        None => Stdio::null(),
+    };
     let mut child = Command::new(program)
         .args(args)
         .envs(env.iter().copied())
         .current_dir(dir)
-        .stdin(Stdio::null())
+        .stdin(input)
         .stdout(out)
         .stderr(err)
         .process_group(0)
