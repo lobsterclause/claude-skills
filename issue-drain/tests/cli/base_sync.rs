@@ -802,3 +802,49 @@ fn a_failed_update_with_no_conflict_keeps_the_plain_error() {
     assert!(out.stderr.contains("update-branch"), "{}", out.stderr);
     assert!(c.env.events_named("base_sync_conflict").is_empty());
 }
+
+#[test]
+fn a_rebased_merge_by_hand_is_judged_by_its_prs_files() {
+    // U2 planned README.md only, and its merge commit cannot be read here; the
+    // PR's own file list (a rebase leaves only its last commit as the merge
+    // commit) is what shows it changed the file
+    let c = case_with(two_unit_queue(json!(["README.md"])));
+    c.conflicting_base();
+    merged_by_hand(&c.env, 2, 41);
+    c.state(&[
+        "record", "--unit", "2", "--state", "merged", "--pr", "41", "--reason", "by hand",
+    ]);
+    c.env.stub_file("pr-diff-41.txt", "README.md\nsrc/timer/countdown.ts\n");
+    c.pr_is_at(&c.old_head);
+    c.env.stub_file("fail-update-branch", "");
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    let events = c.env.events_named("base_sync_conflict");
+    assert_eq!(events[0]["touched_by"]["src/timer/countdown.ts"], json!([2]));
+}
+
+#[test]
+fn a_failed_fast_forward_reports_the_conflict_between_the_local_and_fetched_branch() {
+    let c = case();
+    c.advance_base();
+    c.update_branch(true);
+    // someone else's commit on the PR's branch, and a different one made here
+    let other = c.env.dir.path().join("other");
+    fs::write(other.join("src/timer/countdown.ts"), "export const remote = 1;\n").expect("the file");
+    git(&other, &["add", "src/timer/countdown.ts"]);
+    identity(&other, &["commit", "-q", "-m", "remote"]);
+    git(&other, &["push", "-q", "origin", BRANCH]);
+    let new_head = git(&other, &["rev-parse", "HEAD"]);
+    fs::write(c.wt.join("src/timer/countdown.ts"), "export const local = 1;\n").expect("the file");
+    git(&c.wt, &["add", "src/timer/countdown.ts"]);
+    identity(&c.wt, &["commit", "-q", "-m", "local"]);
+    c.pr_is_at(&new_head);
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("could not fast-forward"), "{}", out.stderr);
+    assert!(out.stderr.contains("src/timer/countdown.ts"), "{}", out.stderr);
+    let events = c.env.events_named("base_sync_conflict");
+    assert_eq!(events.len(), 1, "{:?}", c.env.events());
+    assert_eq!(events[0]["files"], json!(["src/timer/countdown.ts"]));
+    assert_eq!(events[0]["between"][0], "HEAD");
+}

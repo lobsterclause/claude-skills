@@ -516,7 +516,9 @@ fn no_temporary_file_is_left_behind() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, ["events.jsonl", "queue.json", "state.json"]);
+    // state.lock stays: removing it after use would let a second writer
+    // lock a new file while the first still holds the old one.
+    assert_eq!(names, ["events.jsonl", "queue.json", "state.json", "state.lock"]);
 }
 
 fn record(env: &Env, args: &[&str]) -> Out {
@@ -641,4 +643,90 @@ fn record_refuses_a_merge_github_does_not_show_for_the_unit() {
     merged_by_hand(&env, 1, 41);
     assert_eq!(record(&env, &merged).code, 0);
     assert_eq!(unit_state(&env, 1), "merged");
+}
+
+/// GitHub's answer to the merge-status read of PR 7 (the stub answers every
+/// query that asks for `isInMergeQueue` from merge-queue.json).
+fn merge_status(env: &Env, state: &str, in_queue: bool, auto_merge: bool) {
+    let pr = json!({
+        "state": state,
+        "isInMergeQueue": in_queue,
+        "mergeCommit": if state == "MERGED" { json!({"oid": "c".repeat(40)}) } else { Value::Null },
+        "autoMergeRequest": if auto_merge { json!({"enabledAt": "2026-11-24T00:00:00Z"}) } else { Value::Null },
+    });
+    env.stub_file(
+        "merge-queue.json",
+        &json!({"data": {"repository": {"pullRequest": pr}}}).to_string(),
+    );
+}
+
+#[test]
+fn record_refuses_to_park_a_unit_whose_pr_may_still_merge() {
+    let env = ready();
+    walk(
+        &env,
+        "1",
+        &[
+            "claimed",
+            "prepared",
+            "implementing",
+            "pr_open",
+            "reviewing",
+            "ci_wait",
+            "gate",
+        ],
+    );
+    let park = ["--unit", "1", "--state", "parked", "--reason", "stopped waiting"];
+    for (state, queued, auto, needle) in [
+        ("OPEN", true, false, "merge queue"),
+        ("OPEN", false, true, "auto-merge"),
+        ("MERGED", false, false, "--state merged"),
+    ] {
+        merge_status(&env, state, queued, auto);
+        let out = record(&env, &park);
+        assert_eq!(out.code, 3, "{state}: {}", out.stderr);
+        assert!(out.stderr.contains(needle), "{needle}: {}", out.stderr);
+        assert_eq!(unit_state(&env, 1), "gate");
+    }
+    // a PR GitHub cannot report on refuses too
+    fs::remove_file(env.stub.join("merge-queue.json")).unwrap();
+    assert_eq!(record(&env, &park).code, 1);
+    assert_eq!(unit_state(&env, 1), "gate");
+    // control: an open PR that nothing will merge
+    merge_status(&env, "OPEN", false, false);
+    let out = record(&env, &park);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(unit_state(&env, 1), "parked");
+}
+
+#[test]
+fn record_parks_a_unit_whose_pr_was_closed() {
+    let env = ready();
+    walk(&env, "1", &["claimed", "prepared", "implementing", "pr_open"]);
+    merge_status(&env, "CLOSED", false, false);
+    let out = record(
+        &env,
+        &["--unit", "1", "--state", "parked", "--reason", "closed by hand"],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(unit_state(&env, 1), "parked");
+}
+
+#[test]
+fn record_refuses_when_the_unit_moves_while_github_is_read() {
+    let env = ready();
+    walk(&env, "1", &["claimed", "prepared", "implementing", "pr_open"]);
+    merge_status(&env, "OPEN", false, false);
+    // the driver moves the unit on while the record is reading GitHub
+    env.stub_file(
+        "once-merge-queue",
+        &format!("'{}' state event 1 reviewing\n", env!("CARGO_BIN_EXE_issue-drain")),
+    );
+    let out = record(&env, &["--unit", "1", "--state", "parked", "--reason", "x"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("moved to reviewing"), "{}", out.stderr);
+    assert_eq!(unit_state(&env, 1), "reviewing");
+    // the log still replays
+    assert_eq!(env.run(&["state", "rebuild"]).code, 0);
+    assert_eq!(unit_state(&env, 1), "reviewing");
 }

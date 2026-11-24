@@ -458,8 +458,27 @@ fn write_snapshot(ctx: &Ctx, snapshot: &Snapshot) -> Res<()> {
     write_json(&snapshot_path(ctx), snapshot)
 }
 
+/// Held from the replay to the append, so two writers cannot both build an
+/// event on the same old state: the second waits, then replays the first's
+/// event. Released when the file is dropped.
+fn lock_state(ctx: &Ctx) -> Res<fs::File> {
+    let path = ctx.path(if ctx.dry_run { "state.dry.lock" } else { "state.lock" });
+    let open = || -> std::io::Result<fs::File> {
+        fs::create_dir_all(&ctx.workdir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        file.lock()?;
+        Ok(file)
+    };
+    open().map_err(|e| Fail::failed(format!("cannot lock {}: {e}", path.display())))
+}
+
 /// Apply one new event to a started drain, then record it.
 fn record(ctx: &Ctx, ev: Event) -> Res<()> {
+    let _lock = lock_state(ctx)?;
     let Replay { mut snapshot, text, .. } = started(ctx)?;
     snapshot.apply(&ev).map_err(Fail::refused)?;
     append(ctx, &text, &[ev])?;
@@ -662,6 +681,7 @@ fn init(ctx: &Ctx, args: &InitArgs) -> Res<usize> {
 /// `init`, with the approved tracker (a `tracker parse` answer and the name to
 /// call it in messages) already read.
 fn init_from(ctx: &Ctx, source: Option<(Value, String)>) -> Res<usize> {
+    let _lock = lock_state(ctx)?;
     let replay = replay(ctx)?;
     if replay.events > 0 {
         return Err(Fail::refused(format!(
@@ -791,6 +811,7 @@ fn event(ctx: &Ctx, args: &EventArgs) -> Res<()> {
             "--head must be a full 40 or 64 digit commit SHA (got '{head}')"
         )));
     }
+    let _lock = lock_state(ctx)?;
     let Replay { mut snapshot, text, .. } = started(ctx)?;
     let Some(unit) = snapshot.unit(args.unit) else {
         return Err(Fail::refused(format!(
@@ -827,14 +848,30 @@ fn record_by_hand(ctx: &Ctx, args: &RecordArgs) -> Res<()> {
     if reason.is_empty() {
         return Err(Fail::usage("--reason needs some text"));
     }
-    let Replay { mut snapshot, text, .. } = started(ctx)?;
-    let Some(unit) = snapshot.unit(args.unit) else {
-        return Err(Fail::refused(format!("unit {} is not in the queue", args.unit)));
-    };
+    let not_queued = || Fail::refused(format!("unit {} is not in the queue", args.unit));
+    let seen = started(ctx)?.snapshot;
+    let (seen_state, seen_pr) = seen.unit(args.unit).map(|u| (u.state, u.pr)).ok_or_else(not_queued)?;
     let merge_commit = match (to, args.pr) {
         (Merged, Some(pr)) => merged_pr_is_the_units(ctx, args.unit, pr)?,
-        _ => None,
+        _ => {
+            if let Some(pr) = args.pr.or(seen_pr) {
+                merge_is_settled(ctx, pr)?;
+            }
+            None
+        }
     };
+    // GitHub was read without the lock. The log is replayed again under it, and
+    // the record stands only if the unit is where it was when GitHub was read.
+    let _lock = lock_state(ctx)?;
+    let Replay { mut snapshot, text, .. } = started(ctx)?;
+    let unit = snapshot.unit(args.unit).ok_or_else(not_queued)?;
+    if unit.state != seen_state || unit.pr != seen_pr {
+        return Err(Fail::refused(format!(
+            "unit {} moved to {} while this record was being checked; run it again",
+            args.unit,
+            unit.state.as_str()
+        )));
+    }
     let mut ev = now_event(ctx, Some(args.unit), to.as_str(), Some(reason.to_string()));
     ev.from = Some(unit.state.as_str().to_string());
     ev.pr = args.pr;
@@ -843,6 +880,30 @@ fn record_by_hand(ctx: &Ctx, args: &RecordArgs) -> Res<()> {
     snapshot.apply(&ev).map_err(Fail::refused)?;
     append(ctx, &text, &[ev])?;
     write_snapshot(ctx, &snapshot)
+}
+
+/// A unit is parked by hand only when its PR cannot merge behind the run's
+/// back. One in the merge queue, or with auto-merge armed, may still merge, and
+/// a parked unit gets no post-merge check of its tree; a merged PR is recorded
+/// as merged instead, which does get one. A PR that cannot be read refuses too.
+fn merge_is_settled(ctx: &Ctx, pr: u64) -> Res<()> {
+    use crate::merge_gate::{self, PrState};
+    let repo = ctx.repo()?;
+    let status = merge_gate::merge_status(&repo, pr).map_err(|e| Fail::failed(format!("could not read {e}")))?;
+    let why = match status.state {
+        PrState::Merged => {
+            format!("PR #{pr} is merged; record the unit with --state merged --pr {pr} so post-merge checks its tree")
+        }
+        PrState::Open if status.in_queue => format!(
+            "PR #{pr} is in the merge queue, so GitHub may still merge it; take it out of the queue or let it merge, then record the unit"
+        ),
+        PrState::Open if status.auto_merge => format!(
+            "PR #{pr} has auto-merge armed, so GitHub may still merge it; turn auto-merge off or let it merge, then record the unit"
+        ),
+        PrState::Other => format!("PR #{pr} is in a state issue-drain does not know"),
+        PrState::Open | PrState::Closed => return Ok(()),
+    };
+    Err(Fail::refused(why))
 }
 
 /// A merge recorded by hand is checked the way post-merge will check it: the
