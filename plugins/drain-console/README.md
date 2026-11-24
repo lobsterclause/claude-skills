@@ -1,6 +1,6 @@
 # drain-console
 
-A Claude Code mod for watching an [issue-drain](../../issue-drain) run while it works. It reads the run folder (`~/.issue-drain/<owner>__<repo>/<run id>/`) on a timer and shows:
+A Claude Code mod for watching an issue-drain run while it works (issue-drain itself now lives in a private repository). It reads the run folder (`~/.issue-drain/<owner>__<repo>/<run id>/`) on a timer and shows:
 
 - **A pane** with the run's repo and id, the tracker link, and one row per unit: its state, how long since it last moved, its PR, the merge gate's last refusals, the note from a park or block, and its cost. Cost is summed from `units/<n>/session.json` and is an estimate, not a bill.
 - **A status line entry**, e.g. `drain 4/12 · U5 #4711 ci_wait 3m`. It clears when the run has been quiet for six hours.
