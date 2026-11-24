@@ -416,6 +416,7 @@ fn fail_code(code: i32, msg: String) -> Fail {
     Fail {
         code: u8::try_from(code).ok().filter(|c| (1..=4).contains(c)).unwrap_or(1),
         msg,
+        reported: false,
     }
 }
 
@@ -581,7 +582,7 @@ impl Progress {
         let (done_tx, done) = sync_channel(1);
         std::thread::spawn(move || {
             for line in rx {
-                let _ = writeln!(err, "drive: {line}");
+                let _ = writeln!(err, "{line}");
             }
             let _ = done_tx.send(());
         });
@@ -590,8 +591,19 @@ impl Progress {
 
     fn say(&self, line: &str) {
         if let Some(tx) = &self.tx {
-            let _ = tx.try_send(line.to_string());
+            let _ = tx.try_send(format!("drive: {line}"));
         }
+    }
+
+    /// The command's own last line, `issue-drain drive: <why>`, queued behind
+    /// the progress lines and flushed like them. A failing driver says why
+    /// through here, so a stuck stderr cannot keep it from exiting either.
+    fn finish(self, fail: Fail) -> Fail {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(format!("issue-drain drive: {}", fail.msg));
+        }
+        drop(self);
+        Fail { reported: true, ..fail }
     }
 }
 
@@ -602,6 +614,19 @@ impl Drop for Progress {
         drop(self.tx.take());
         let _ = self.done.recv_timeout(PROGRESS_FLUSH);
     }
+}
+
+/// One poll's sleep cut into pieces no longer than `beat`, so a waiting line
+/// can be said between them. A zero poll is no sleep at all.
+fn poll_slices(poll: Duration, beat: Duration) -> Vec<Duration> {
+    let mut left = poll;
+    let mut out = Vec::new();
+    while !left.is_zero() && !beat.is_zero() {
+        let slice = left.min(beat);
+        out.push(slice);
+        left -= slice;
+    }
+    out
 }
 
 struct Caffeinate(Option<Child>);
@@ -709,7 +734,9 @@ impl<'a> Driver<'a> {
 
     /// Sleep one poll. While one unit keeps the driver waiting, say so about
     /// every five minutes: never more than one poll early, and late by no more
-    /// than the gate call between polls.
+    /// than the gate call between polls. A poll longer than the heartbeat is
+    /// slept in slices, with a line between them, so GitHub is not asked any
+    /// more often than the poll says.
     fn nap(&self, u: &UnitState) {
         let since = match self.waiting.get() {
             Some((unit, at)) if unit == u.unit => at,
@@ -720,13 +747,7 @@ impl<'a> Driver<'a> {
                 now
             }
         };
-        // Say it now if waiting for the next poll would pass the heartbeat, so
-        // the gap between lines stays within HEARTBEAT plus one gate call.
-        if self
-            .last_beat
-            .get()
-            .is_none_or(|t| t.elapsed() + self.poll >= HEARTBEAT)
-        {
+        let beat = || {
             let pr = u.pr.map_or_else(String::new, |p| format!(" PR #{p}"));
             self.say(&format!(
                 "U{}{pr} in {} waiting, {}s so far",
@@ -735,9 +756,22 @@ impl<'a> Driver<'a> {
                 since.elapsed().as_secs()
             ));
             self.last_beat.set(Some(Instant::now()));
+        };
+        // Say it now if waiting for the next poll would pass the heartbeat, so
+        // the gap between lines stays within HEARTBEAT plus one gate call.
+        if self
+            .last_beat
+            .get()
+            .is_none_or(|t| t.elapsed() + self.poll.min(HEARTBEAT) >= HEARTBEAT)
+        {
+            beat();
         }
-        if !self.poll.is_zero() {
-            sleep(self.poll);
+        let slices = poll_slices(self.poll, HEARTBEAT);
+        for (i, slice) in slices.iter().enumerate() {
+            if i > 0 {
+                beat();
+            }
+            sleep(*slice);
         }
     }
 
@@ -1932,9 +1966,14 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         .map(|(unit, state)| json!({"unit": unit, "state": state.as_str()}))
         .collect();
     println!("{}", json!({"processed": processed, "stopped": stopped}));
-    match done? {
-        Some(stop) if stop.code != 0 => Err(Fail::refused(stop.reason)),
-        _ => Ok(()),
+    let result = match done {
+        Ok(Some(stop)) if stop.code != 0 => Err(Fail::refused(stop.reason)),
+        Ok(_) => Ok(()),
+        Err(fail) => Err(fail),
+    };
+    match (result, driver.progress) {
+        (Err(fail), Some(progress)) => Err(progress.finish(fail)),
+        (result, _) => result,
     }
 }
 
@@ -1980,6 +2019,38 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_failing_driver_says_why_last_and_a_stuck_stderr_cannot_hold_it() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = Progress::to(Shared(buf.clone()));
+        progress.say("one");
+        let fail = progress.finish(Fail::refused("STOP file"));
+        assert!(fail.reported);
+        assert_eq!(fail.code, 3);
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            "drive: one\nissue-drain drive: STOP file\n"
+        );
+
+        let progress = Progress::to(Stuck);
+        for n in 0..PROGRESS_BACKLOG + 10 {
+            progress.say(&format!("line {n}"));
+        }
+        let start = Instant::now();
+        let fail = progress.finish(Fail::failed("gh failed"));
+        assert!(fail.reported);
+        assert!(start.elapsed() < PROGRESS_FLUSH + Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_long_poll_is_slept_in_heartbeat_slices() {
+        let s = Duration::from_secs;
+        assert_eq!(poll_slices(s(900), s(300)), vec![s(300), s(300), s(300)]);
+        assert_eq!(poll_slices(s(700), s(300)), vec![s(300), s(300), s(100)]);
+        assert_eq!(poll_slices(s(60), s(300)), vec![s(60)]);
+        assert!(poll_slices(Duration::ZERO, s(300)).is_empty());
     }
 
     #[test]

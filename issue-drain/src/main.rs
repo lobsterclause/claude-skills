@@ -158,7 +158,9 @@ fn main() -> ExitCode {
     match run(&cli.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(fail) => {
-            eprintln!("issue-drain {}: {}", name(&cli.command), fail.msg);
+            if !fail.reported {
+                eprintln!("issue-drain {}: {}", name(&cli.command), fail.msg);
+            }
             ExitCode::from(fail.code)
         }
     }

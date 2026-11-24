@@ -11,6 +11,9 @@
 pub struct Fail {
     pub code: u8,
     pub msg: String,
+    /// The command already wrote its one line about this failure to stderr,
+    /// so `main` prints nothing more.
+    pub reported: bool,
 }
 
 pub type Res<T> = Result<T, Fail>;
@@ -20,6 +23,7 @@ impl Fail {
         Fail {
             code: 2,
             msg: msg.into(),
+            reported: false,
         }
     }
 
@@ -27,6 +31,7 @@ impl Fail {
         Fail {
             code: 3,
             msg: msg.into(),
+            reported: false,
         }
     }
 
@@ -34,6 +39,7 @@ impl Fail {
         Fail {
             code: 4,
             msg: msg.into(),
+            reported: false,
         }
     }
 
@@ -41,6 +47,7 @@ impl Fail {
         Fail {
             code: 1,
             msg: msg.into(),
+            reported: false,
         }
     }
 }

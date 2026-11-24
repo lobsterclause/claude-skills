@@ -391,6 +391,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         Some(fail) => Err(Fail {
             code: fail.code,
             msg: format!("not every unit was cleaned up; the worst: {}", fail.msg),
+            reported: false,
         }),
         None => Ok(()),
     }
