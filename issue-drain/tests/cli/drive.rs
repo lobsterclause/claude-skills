@@ -297,6 +297,76 @@ fn one_unit_goes_from_queued_to_done_with_post_merge_and_cleanup() {
 }
 
 #[test]
+fn a_run_whose_state_disagrees_with_github_is_refused_before_any_unit_starts() {
+    let c = case(&[1, 2]);
+    c.seed(1, &[], None);
+    c.env.stub_file(
+        "pr-list-fix_2.json",
+        &json!([{"number": 41, "state": "MERGED"}]).to_string(),
+    );
+    c.env.stub_file(
+        "pr-list-fix_1.json",
+        &json!([{"number": 40, "state": "CLOSED"}]).to_string(),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    for needle in [
+        "state disagrees with GitHub",
+        "unit 1 is queued but PR #40 is closed",
+        "unit 2 is queued but PR #41 is merged",
+        "state record",
+    ] {
+        assert!(out.stderr.contains(needle), "{needle}: {}", out.stderr);
+    }
+    assert_eq!(c.count("claim take"), 0);
+    assert_eq!(c.state_of(1), "queued");
+    assert!(
+        c.env
+            .gh_calls()
+            .iter()
+            .any(|l| l.starts_with("pr list") && l.contains("--head fix/1"))
+    );
+}
+
+#[test]
+fn state_that_matches_github_is_not_refused() {
+    let c = case(&[1, 2]);
+    c.seed(1, &[], None);
+    // an open PR on a queued unit's branch is no disagreement
+    c.env.stub_file(
+        "pr-list-fix_1.json",
+        &json!([{"number": 40, "state": "OPEN"}]).to_string(),
+    );
+    // a unit already finished by hand and recorded may have a merged PR
+    c.env.stub_file(
+        "pr-list-fix_2.json",
+        &json!([{"number": 41, "state": "MERGED"}]).to_string(),
+    );
+    assert_eq!(
+        c.env
+            .run(&[
+                "state", "record", "--unit", "2", "--state", "merged", "--pr", "41", "--reason", "by hand"
+            ])
+            .code,
+        0
+    );
+    let (out, _) = c.drive(&["--once"]);
+    assert!(!out.stderr.contains("state disagrees"), "{}", out.stderr);
+    assert_eq!(c.count("claim take --unit 1"), 1);
+}
+
+#[test]
+fn a_failed_github_read_is_reported_not_ignored() {
+    let c = case(&[1]);
+    c.seed(1, &[], None);
+    c.env.stub_file("fail-pr-list", "");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("fix/1"), "{}", out.stderr);
+    assert_eq!(c.count("claim take"), 0);
+}
+
+#[test]
 fn a_blocked_result_ends_the_unit_with_a_comment_and_a_claim_release() {
     let c = case(&[1]);
     c.result(
