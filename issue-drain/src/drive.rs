@@ -25,8 +25,15 @@
 //! `$HOME/.issue-drain/<owner>__<repo>/drive.lock` for its whole life and writes
 //! its pid there for whoever is refused; the kernel releases the lock when the
 //! process exits, however it exits, and the file is left in place. (pr-drain's `lock.sh`
-//! is not located by this crate, so the lock is made here.) `caffeinate -i -w
-//! <pid>` keeps the Mac awake while the driver runs, if `caffeinate` exists.
+//! is not located by this crate, so the lock is made here.) While a child runs,
+//! its process group is in `drive-child.pid` beside the lock; a driver killed
+//! mid-call leaves that file, and the next driver refuses (exit 3) while that
+//! group is alive and removes the file once it is not. `caffeinate -i -w <pid>`
+//! keeps the Mac awake while the driver runs, if `caffeinate` exists.
+//!
+//! Unattended runs. Without `--once` the driver carries unit after unit with
+//! nobody watching, so it refuses (exit 3) unless ISSUE_DRAIN_UNATTENDED_OK=1:
+//! set that once the unit's GitHub identity is a non-admin token.
 //!
 //! Per unit, by state:
 //!   queued        `claim take`. An exit 3 (an issue is someone else's) goes to
@@ -43,24 +50,35 @@
 //!                 PR moves to pr_open then parked; without a PR it goes to
 //!                 blocked.
 //!   pr_open       move to reviewing.
-//!   reviewing     `merge-gate --dry-run`. No review refusal moves to ci_wait.
-//!                 Otherwise the unit is resumed once to run a review pass; a
-//!                 second refusal goes to parked.
+//!   reviewing     `merge-gate --dry-run`. A refusal that needs a person parks
+//!                 the unit. No review refusal moves to ci_wait (an unreadable
+//!                 gate is read once more, then blocked as infrastructure).
+//!                 Otherwise the unit is resumed to run a review pass, at most
+//!                 MAX_REVIEW_PASSES over its life (`drive-review-passes`); a
+//!                 refusal right after a pass (`drive-review-resumed`), or the
+//!                 cap, goes to parked. A resume whose run fails, or whose
+//!                 result.json says blocked, parked or cap_reached, ends the
+//!                 unit that way; repair resumes are read the same way.
 //!   ci_wait       poll `merge-gate --dry-run` every ISSUE_DRAIN_DRIVE_POLL_SECS
 //!                 (default 180) until no refusal says a check is pending, then
-//!                 move to gate. This uses the gate's own live reading of the
+//!                 move to gate. Five unreadable gate reads in a row block the
+//!                 unit as infrastructure; a pending read resets that count. This uses the gate's own live reading of the
 //!                 required checks, not pr-drain's poll-ci.sh, whose check list
 //!                 is fixed. Past ISSUE_DRAIN_DRIVE_CI_MAX_SECS (default 3600)
 //!                 the unit goes to blocked with an infrastructure note.
 //!   gate          `merge-gate` for real. Exit 0 records merged with the merge
-//!                 commit; exit 4 waits one poll and asks again; exit 3 is
-//!                 mapped as below.
+//!                 commit; exit 4 (in the merge queue) waits one poll and asks
+//!                 again, and past the CI limit stops the drain with the unit
+//!                 still in gate (nothing to undo; drive again once it merges);
+//!                 exit 3 is mapped as below.
 //!   repairing     resume the unit with the reason that was recorded when the
 //!                 move was made; the second repair uses one tier up; then
 //!                 ci_wait.
 //!   merged        `post-merge`, then done. A tree mismatch (`tree_match`
-//!                 false) still records done and then stops the drain, since
-//!                 verifying the base tip is a person's job for now. A
+//!                 false) writes `units/<n>/drive-tree-mismatch` before done
+//!                 and stops the drain, since verifying the base tip is a
+//!                 person's job for now. Every later drive refuses while that
+//!                 file exists. A
 //!                 post-merge failure stops the drain and leaves the unit in
 //!                 merged, so a restart runs post-merge again.
 //!
@@ -71,7 +89,9 @@
 //!                                 purpose: a person has to act on the PR, and
 //!                                 syncing or repairing it would move the head
 //!                                 under them.
-//!   behind_base                   `base-sync`, then ci_wait, or reviewing if
+//!   behind_base                   `base-sync` (an exit 1 is tried up to
+//!                                 BASE_SYNC_TRIES times, since GitHub may not
+//!                                 have applied the update yet), then ci_wait, or reviewing if
 //!                                 base-sync says a review round is needed. A
 //!                                 unit at its sync cap, a refused base-sync, or
 //!                                 a failed delivery check goes to parked.
@@ -96,17 +116,23 @@
 //! the PR and the note. Blocked, skipped and parked units get `claim release`
 //! (which removes only a claim that is ours, and no worktree: a person may want
 //! it); a done unit gets `cleanup --unit --pr`, which removes its worktree and
-//! branch and releases the claim if still held.
+//! branch and releases the claim if still held. The claim release comes first:
+//! if it fails (anything but exit 0, or exit 3 for a claim that is not ours),
+//! the driver stops with that exit code before the comment and before
+//! `drive-ended.json`, so a restart ends the unit again.
 //!
 //! Stop conditions. Before claiming a unit: a `STOP` file in the run folder, or
 //! `tracker parse` saying the tracker is not OPEN, has a STOP line, or lists
 //! something the run never offered (a null tracker_state is accepted only in a
-//! dry run). Always: three units in a row that ended blocked; two in a row that
+//! dry run). `tracker parse` exits 1 when it names such lines; that JSON is
+//! read, and the driver refuses with them. At startup: a
+//! `units/<n>/drive-tree-mismatch` file. Always: three units in a row that ended blocked; two in a row that
 //! ended blocked or parked with an infrastructure note; a post-merge tree
 //! mismatch or failure; a drain already stopped in the state log. The count of
 //! units in a row is read back from the `drive-ended.json` files, so a restart
-//! does not forget it; a stop for it records a floor so a resumed drain starts
-//! counting again. A stop other than finishing runs `state stop --reason` and
+//! does not forget it. It is checked only when there is a next unit to carry,
+//! so a queue that finished runs its retro; a stop for it records a floor
+//! (after the stop is recorded) so a resumed drain starts counting again. A stop other than finishing runs `state stop --reason` and
 //! posts a tracker comment. Finishing (`state next` names no unit) runs
 //! `retro --publish`.
 //!
@@ -160,6 +186,12 @@ pub struct Args {
 
 pub(crate) const LADDER: [&str; 3] = ["haiku", "sonnet", "opus"];
 const MAX_STEPS: u32 = 200;
+/// Review passes the driver asks of one unit, over its whole life.
+const MAX_REVIEW_PASSES: u32 = 4;
+/// Calls of `base-sync` for one sync while GitHub has not applied the update.
+const BASE_SYNC_TRIES: u32 = 3;
+const CHILD_PID: &str = "drive-child.pid";
+const TREE_MISMATCH: &str = "drive-tree-mismatch";
 const INFRA: &str = "infrastructure failure: ";
 const CLAIM_REFUSED: &str = "claim refused: ";
 const REMOVED: &str = "removed from the tracker";
@@ -167,13 +199,20 @@ const REMOVED: &str = "removed from the tracker";
 /// What a child printed and how it ended.
 struct Reply {
     code: i32,
+    timed_out: bool,
     stdout: String,
     stderr: String,
 }
 
 impl Reply {
     fn ok(&self) -> bool {
-        self.code == 0
+        self.code == 0 && !self.timed_out
+    }
+
+    /// A failure of the machinery (exit 1, or killed at its time limit), not
+    /// a refusal.
+    fn infra(&self) -> bool {
+        self.timed_out || self.code == 1
     }
 
     /// The JSON object or list on the last line that has one.
@@ -192,7 +231,9 @@ impl Reply {
         };
         let said = line(&self.stderr).or_else(|| line(&self.stdout));
         match said {
+            Some(said) if self.timed_out => format!("timed out: {said}"),
             Some(said) => format!("exit {}: {said}", self.code),
+            None if self.timed_out => "timed out".to_string(),
             None => format!("exit {}", self.code),
         }
     }
@@ -218,18 +259,18 @@ struct Refusal {
 fn refusals_of(reply: &Reply) -> Vec<Refusal> {
     let list = reply.json().and_then(|j| j["refusals"].as_array().cloned());
     match list {
-        Some(list) => list
+        Some(list) if !list.is_empty() => list
             .iter()
             .map(|r| Refusal {
                 code: r["code"].as_str().unwrap_or_default().to_string(),
                 detail: r["detail"].as_str().unwrap_or_default().to_string(),
             })
             .collect(),
-        None if reply.code == 3 => vec![Refusal {
+        _ if reply.code == 3 => vec![Refusal {
             code: "unreadable".into(),
             detail: reply.why(),
         }],
-        None => Vec::new(),
+        _ => Vec::new(),
     }
 }
 
@@ -242,7 +283,7 @@ fn listed(refusals: &[Refusal]) -> String {
 }
 
 fn is_pending(r: &Refusal) -> bool {
-    (r.code == "required_check" && (r.detail.contains(" is pending ") || r.detail.contains("has no run")))
+    (r.code == "required_check" && (r.detail.contains(" is pending") || r.detail.contains("has no run")))
         || (r.code == "not_mergeable" && r.detail.contains("'UNKNOWN'"))
 }
 
@@ -340,6 +381,26 @@ fn one_line(text: &str) -> String {
         .collect()
 }
 
+/// The notes a unit wrote in result.json, as one line.
+fn notes_of(result: &Value) -> String {
+    match &result["notes"] {
+        Value::Array(list) => list.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+        Value::String(s) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// The tracker lines the run never offered, when `tracker parse` named any.
+fn unknown_lines(j: &Value) -> Option<String> {
+    let list: Vec<&str> = j["unknown"].as_array()?.iter().filter_map(Value::as_str).collect();
+    (!list.is_empty()).then(|| list.join("; "))
+}
+
+/// Whether the gate's dry read could not be taken at all.
+fn unreadable(r: &Reply, refusals: &[Refusal]) -> bool {
+    (!r.ok() && (r.timed_out || r.code != 3)) || (!refusals.is_empty() && decide(refusals) == Action::ReadError)
+}
+
 /// Why the driver stops, and the exit code that goes with it.
 struct Stop {
     reason: String,
@@ -355,7 +416,15 @@ struct Report {
 /// stale lock to reap. The file is never removed: removing a locked file lets
 /// a later driver lock a new file at the same path while an earlier one still
 /// holds the old one.
-struct Lock(#[allow(dead_code)] File);
+///
+/// A child the driver ran is tracked in `drive-child.pid` beside the lock file
+/// while it runs. A driver killed mid-call leaves that file behind, and the
+/// child may still be running in its own process group; the next driver will
+/// not start while that group is alive.
+struct Lock {
+    _file: File,
+    dir: PathBuf,
+}
 
 impl Lock {
     fn take(ctx: &Ctx) -> Res<Lock> {
@@ -396,7 +465,25 @@ impl Lock {
             .and_then(|()| f.seek(SeekFrom::Start(0)).map(|_| ()))
             .and_then(|()| writeln!(f, "{}", std::process::id()))
             .map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))?;
-        Ok(Lock(f))
+        let child = dir.join(CHILD_PID);
+        if let Ok(text) = fs::read_to_string(&child) {
+            let pid = text.trim();
+            let alive = pid.parse::<u32>().is_ok()
+                && Command::new("kill")
+                    .args(["-0", "--", &format!("-{pid}")])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+            if alive {
+                return Err(Fail::refused(format!(
+                    "a process an earlier driver started (process group {pid}) is still running; wait for it to end or kill it, then remove {}",
+                    child.display()
+                )));
+            }
+            fs::remove_file(&child).map_err(|e| Fail::failed(format!("cannot remove {}: {e}", child.display())))?;
+        }
+        Ok(Lock { _file: f, dir })
     }
 }
 
@@ -434,6 +521,7 @@ struct Driver<'a> {
     ci_max: Duration,
     dry: bool,
     seq: Cell<u32>,
+    child_pid: PathBuf,
 }
 
 fn secs(name: &str, default: u64) -> Duration {
@@ -441,7 +529,7 @@ fn secs(name: &str, default: u64) -> Duration {
 }
 
 impl<'a> Driver<'a> {
-    fn new(ctx: &'a Ctx) -> Res<Driver<'a>> {
+    fn new(ctx: &'a Ctx, lock: &Lock) -> Res<Driver<'a>> {
         let exe = match env_str("ISSUE_DRAIN_DRIVE_EXE") {
             hook if env_str("ISSUE_DRAIN_DRIVE_TESTING") == "1" && !hook.is_empty() => PathBuf::from(hook),
             _ => std::env::current_exe().map_err(|e| Fail::failed(format!("cannot find this program: {e}")))?,
@@ -457,6 +545,7 @@ impl<'a> Driver<'a> {
             ci_max: secs("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", 3600),
             dry: ctx.dry_run,
             seq: Cell::new(logged / 2),
+            child_pid: lock.dir.join(CHILD_PID),
         })
     }
 
@@ -487,16 +576,20 @@ impl<'a> Driver<'a> {
             _ => Duration::from_secs(1800),
         };
         let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        // Children run in the run folder, so they get the profile's absolute path.
+        let profile = self.ctx.profile_path.display().to_string();
         let ran = exec::run_env(
             &self.exe.display().to_string(),
             &argv,
             &self.ctx.workdir,
             limit,
             (&out, &err),
-            &[],
+            &[("ISSUE_DRAIN_PROFILE", &profile)],
+            Some(&self.child_pid),
         )?;
         let reply = Reply {
             code: ran.code.unwrap_or(-1),
+            timed_out: ran.timed_out,
             stdout: fs::read_to_string(&out).unwrap_or_default(),
             stderr: fs::read_to_string(&err).unwrap_or_default(),
         };
@@ -601,6 +694,11 @@ impl<'a> Driver<'a> {
         }
         let parsed = self.call(&["tracker", "parse"])?;
         if !parsed.ok() {
+            if let Some(list) = parsed.json().as_ref().and_then(unknown_lines) {
+                return Err(Fail::refused(format!(
+                    "the tracker has lines the run never offered: {list}"
+                )));
+            }
             return Err(fail_code(
                 parsed.code,
                 format!("tracker parse failed: {}", parsed.why()),
@@ -628,10 +726,13 @@ impl<'a> Driver<'a> {
             return Ok((Some(Stop { reason, code: 0 }), Vec::new()));
         }
         let r = self.call(&["tracker", "parse"])?;
-        if !r.ok() {
-            return Err(fail_code(r.code, format!("tracker parse failed: {}", r.why())));
-        }
-        let j = r.json().ok_or_else(|| Fail::failed("tracker parse printed no JSON"))?;
+        // `tracker parse` prints its JSON and exits 1 when it names lines the
+        // run never offered; that JSON is read like any other.
+        let j = match r.json() {
+            Some(j) if r.ok() || (r.code == 1 && !r.timed_out && unknown_lines(&j).is_some()) => j,
+            _ if r.ok() => return Err(Fail::failed("tracker parse printed no JSON")),
+            _ => return Err(fail_code(r.code, format!("tracker parse failed: {}", r.why()))),
+        };
         let stop = |reason: String, code: u8| Ok((Some(Stop { reason, code }), Vec::new()));
         match j["tracker_state"].as_str() {
             Some("OPEN") => {}
@@ -662,12 +763,18 @@ impl<'a> Driver<'a> {
     // ---- the loop ----
 
     fn drive(&self, once: bool, report: &mut Report) -> Res<Option<Stop>> {
+        if let Some(marker) = self.tree_mismatch() {
+            return Ok(Some(Stop {
+                reason: format!(
+                    "a unit merged a different tree than the gate approved; verify the base tip, then remove {}",
+                    marker.display()
+                ),
+                code: 3,
+            }));
+        }
         let mut visited: Vec<u64> = Vec::new();
         loop {
             self.reconcile()?;
-            if let Some(stop) = self.streak_stop()? {
-                return self.stop(stop);
-            }
             let snap = self.snapshot()?;
             if let Some(stopped) = &snap.stopped {
                 return Ok(Some(Stop {
@@ -701,6 +808,11 @@ impl<'a> Driver<'a> {
                 }
                 return Ok(None);
             };
+            if let Some((stop, top)) = self.streak_stop() {
+                let stopped = self.stop(stop)?;
+                write_atomic(&self.ctx.path("drive-streak-floor"), format!("{top}\n").as_bytes())?;
+                return Ok(stopped);
+            }
             visited.push(unit);
             if state == State::Queued {
                 let (stop, listed) = self.boundary()?;
@@ -769,6 +881,19 @@ impl<'a> Driver<'a> {
         write_atomic(&dir.join("drive-owned"), b"1\n")
     }
 
+    /// The first `units/<n>/drive-tree-mismatch` marker, if any unit left one.
+    fn tree_mismatch(&self) -> Option<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(self.ctx.path("units"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join(TREE_MISMATCH))
+            .filter(|p| p.exists())
+            .collect();
+        found.sort();
+        found.into_iter().next()
+    }
+
     /// Take a unit to a terminal state (or one step, in a dry run). `Some` is a
     /// reason to stop the drain.
     fn carry(&self, unit: u64) -> Res<Option<String>> {
@@ -831,7 +956,7 @@ impl<'a> Driver<'a> {
         if r.ok() {
             self.mv(u.unit, "prepared", None, None, None)
         } else {
-            self.block(u, &format!("unit-prepare failed: {}", r.why()), r.code == 1)
+            self.block(u, &format!("unit-prepare failed: {}", r.why()), r.infra())
         }
     }
 
@@ -861,11 +986,42 @@ impl<'a> Driver<'a> {
         let file = dir.join(format!("drive-prompt-{}.md", count + 1));
         write_atomic(&file, text.as_bytes())?;
         let (n, f) = (unit.to_string(), file.display().to_string());
-        let mut args = vec!["unit-run", "--unit", &n, "--resume", "--prompt-file", &f];
-        if let Some(model) = model {
-            args.extend(["--model", model]);
+        // Always named: a resume without one would fall back to the unit's
+        // first model and undo an earlier step up the ladder.
+        let model = model.map_or_else(|| self.last_model(unit), str::to_string);
+        self.call(&[
+            "unit-run",
+            "--unit",
+            &n,
+            "--resume",
+            "--prompt-file",
+            &f,
+            "--model",
+            &model,
+        ])
+    }
+
+    /// After a resume: `true` when the unit is now ended, because the run
+    /// failed or its result.json says it blocked or parked.
+    fn settled_by_resume(&self, u: &UnitState, ran: &Reply, what: &str) -> Res<bool> {
+        if !ran.ok() {
+            self.block(u, &format!("{what} failed: {}", ran.why()), ran.infra())?;
+            return Ok(true);
         }
-        self.call(&args)
+        let result: Value = read_json(&self.unit_dir(u.unit).join("result.json")).unwrap_or(Value::Null);
+        let notes = notes_of(&result);
+        let said = |outcome: &str| {
+            if notes.is_empty() {
+                format!("after {what}, the unit reported {outcome}")
+            } else {
+                format!("after {what}, the unit reported {outcome}: {notes}")
+            }
+        };
+        match result["outcome"].as_str() {
+            Some("blocked") => self.block(u, &said("blocked"), false).map(|()| true),
+            Some(o @ ("parked" | "cap_reached")) => self.park(u, &said(o), false).map(|()| true),
+            _ => Ok(false),
+        }
     }
 
     fn model_up(&self, unit: u64) -> Option<String> {
@@ -901,7 +1057,7 @@ impl<'a> Driver<'a> {
         if ran.ok() {
             Ok(())
         } else {
-            self.block(u, &format!("unit-run failed: {}", ran.why()), ran.code == 1)
+            self.block(u, &format!("unit-run failed: {}", ran.why()), ran.infra())
         }
     }
 
@@ -928,11 +1084,7 @@ impl<'a> Driver<'a> {
 
     fn read_result(&self, u: &UnitState, result: &Value) -> Res<()> {
         let outcome = result["outcome"].as_str().unwrap_or_default();
-        let notes = match &result["notes"] {
-            Value::Array(list) => list.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
-            Value::String(s) => s.clone(),
-            _ => String::new(),
-        };
+        let notes = notes_of(result);
         let said = |what: &str| {
             if notes.is_empty() {
                 what.to_string()
@@ -987,13 +1139,19 @@ impl<'a> Driver<'a> {
     }
 
     fn reviewing(&self, u: &UnitState) -> Res<()> {
-        let marker = self.unit_dir(u.unit).join("drive-review-resumed");
+        let dir = self.unit_dir(u.unit);
+        let marker = dir.join("drive-review-resumed");
+        let passes_file = dir.join("drive-review-passes");
         let mut reads = 0;
         loop {
             let (r, refusals) = self.gate_dry(u)?;
+            let person: Vec<Refusal> = refusals.iter().filter(|x| needs_a_person(x)).cloned().collect();
+            if !person.is_empty() {
+                return self.park(u, &format!("needs a person: {}", listed(&person)), false);
+            }
             let review: Vec<Refusal> = refusals.iter().filter(|x| is_review(x)).cloned().collect();
             if review.is_empty() {
-                if refusals.iter().any(|x| x.code == "read_error") || (!r.ok() && r.code != 3) {
+                if unreadable(&r, &refusals) {
                     reads += 1;
                     if self.dry {
                         return Ok(());
@@ -1004,6 +1162,11 @@ impl<'a> Driver<'a> {
                     self.nap();
                     continue;
                 }
+                match fs::remove_file(&marker) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Fail::failed(format!("cannot remove {}: {e}", marker.display()))),
+                }
                 return self.mv(u.unit, "ci_wait", None, None, None);
             }
             if marker.exists() {
@@ -1013,15 +1176,33 @@ impl<'a> Driver<'a> {
                     false,
                 );
             }
+            let passes: u32 = fs::read_to_string(&passes_file)
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+                .unwrap_or(0);
+            if passes >= MAX_REVIEW_PASSES {
+                return self.park(
+                    u,
+                    &format!(
+                        "review cap reached: the driver asked for {passes} review passes; still refused: {}",
+                        listed(&review)
+                    ),
+                    false,
+                );
+            }
+            if self.dry {
+                return Ok(());
+            }
             let text = format!(
                 "A review pass is due on PR #{}. The merge gate refuses: {}. Run the cross-review on the PR's \
                  current head, address what it finds, post the review record, update result.json and stop.\n",
                 self.pr_of(u)?,
                 listed(&review)
             );
+            write_atomic(&passes_file, format!("{}\n", passes + 1).as_bytes())?;
             let ran = self.resume(u.unit, &text, None)?;
-            if !ran.ok() {
-                return self.block(u, &format!("the review resume failed: {}", ran.why()), ran.code == 1);
+            if self.settled_by_resume(u, &ran, "the review pass")? {
+                return Ok(());
             }
             write_atomic(&marker, b"1\n")?;
             return Ok(());
@@ -1033,16 +1214,15 @@ impl<'a> Driver<'a> {
         let mut reads = 0;
         loop {
             let (r, refusals) = self.gate_dry(u)?;
-            let waiting = refusals.iter().any(is_pending);
-            let unreadable = !waiting && (refusals.iter().any(|x| x.code == "read_error") || (!r.ok() && r.code != 3));
-            if !waiting && !unreadable {
-                return self.mv(u.unit, "gate", None, None, None);
-            }
-            if unreadable {
+            if unreadable(&r, &refusals) {
                 reads += 1;
                 if reads >= 5 {
                     return self.block(u, &format!("the gate could not be read five times: {}", r.why()), true);
                 }
+            } else if !refusals.is_empty() && decide(&refusals) == Action::Pending {
+                reads = 0;
+            } else {
+                return self.mv(u.unit, "gate", None, None, None);
             }
             if self.dry {
                 return Ok(());
@@ -1080,9 +1260,17 @@ impl<'a> Driver<'a> {
                     return self.merged(u.unit, pr);
                 }
                 4 => {
-                    if self.dry || start.elapsed() >= self.ci_max {
-                        self.park(u, "the merge queue did not finish in time", true)?;
+                    // In the merge queue: not merged yet, and nothing to undo.
+                    // The unit stays in gate for the next driver to ask again.
+                    if self.dry {
                         return Ok(None);
+                    }
+                    if start.elapsed() >= self.ci_max {
+                        return Ok(Some(format!(
+                            "PR #{pr} of unit {} is still in the merge queue after {} seconds; once it merges, run `state resume` and drive again",
+                            u.unit,
+                            self.ci_max.as_secs()
+                        )));
                     }
                     self.nap();
                 }
@@ -1117,6 +1305,7 @@ impl<'a> Driver<'a> {
             )),
             Action::Review => moved(self.mv(u.unit, "reviewing", None, None, None)),
             Action::Pending => {
+                *errors = 0;
                 if self.dry {
                     return Ok(false);
                 }
@@ -1153,9 +1342,20 @@ impl<'a> Driver<'a> {
             );
         }
         let (n, p) = (u.unit.to_string(), self.pr_of(u)?.to_string());
-        let r = self.call(&["base-sync", "--unit", &n, "--pr", &p])?;
+        // Exit 1 is often GitHub not having applied the update yet; a retry
+        // spends no sync slot.
+        let mut tries = 0;
+        let r = loop {
+            let r = self.call(&["base-sync", "--unit", &n, "--pr", &p])?;
+            tries += 1;
+            if r.code == 1 && !r.timed_out && tries < BASE_SYNC_TRIES && !self.dry {
+                self.nap();
+                continue;
+            }
+            break r;
+        };
         if !r.ok() {
-            return self.park(u, &format!("base-sync failed: {}", r.why()), r.code == 1);
+            return self.park(u, &format!("base-sync failed: {}", r.why()), r.infra());
         }
         let j = r.json().unwrap_or(Value::Null);
         if j["deliver_ok"] == false {
@@ -1200,11 +1400,10 @@ impl<'a> Driver<'a> {
         );
         let model = if u.repairs >= 2 { self.model_up(u.unit) } else { None };
         let ran = self.resume(u.unit, &text, model.as_deref())?;
-        if ran.ok() {
-            self.mv(u.unit, "ci_wait", None, None, None)
-        } else {
-            self.block(u, &format!("the repair run failed: {}", ran.why()), ran.code == 1)
+        if self.settled_by_resume(u, &ran, "the repair run")? {
+            return Ok(());
         }
+        self.mv(u.unit, "ci_wait", None, None, None)
     }
 
     /// After a merge: `post-merge`, then done. `Some` stops the drain.
@@ -1218,6 +1417,15 @@ impl<'a> Driver<'a> {
             )));
         }
         let mismatch = r.json().is_some_and(|j| j["tree_match"] == false);
+        if mismatch {
+            // Written before `done`, so a driver that dies between the two
+            // still refuses to go on.
+            write_atomic(
+                &self.unit_dir(unit).join(TREE_MISMATCH),
+                format!("unit {unit}, PR #{pr}: the merge commit's tree is not the tree the gate approved\n")
+                    .as_bytes(),
+            )?;
+        }
         self.mv(unit, "done", None, None, None)?;
         Ok(mismatch.then(|| {
             format!(
@@ -1264,8 +1472,17 @@ impl<'a> Driver<'a> {
             }
         } else if !note.starts_with(CLAIM_REFUSED) && note != REMOVED {
             let r = self.call(&["claim", "release", "--unit", &n])?;
-            if !r.ok() {
-                self.log(Some(u.unit), "claim_release_failed", json!({"why": r.why()}))?;
+            match r.code {
+                0 if !r.timed_out => {}
+                // Not this run's claim (or no claim left): nothing to release.
+                3 if !r.timed_out => self.log(Some(u.unit), "claim_not_ours", json!({"why": r.why()}))?,
+                // Before the comment and the ended marker, so a restart tries again.
+                _ => {
+                    return Err(fail_code(
+                        r.code,
+                        format!("claim release failed for unit {}: {}", u.unit, r.why()),
+                    ));
+                }
             }
         }
         let issues: Vec<String> = u.issues.iter().map(|i| format!("#{i}")).collect();
@@ -1322,7 +1539,9 @@ impl<'a> Driver<'a> {
         list
     }
 
-    fn streak_stop(&self) -> Res<Option<Stop>> {
+    /// A streak that stops the drain, and the newest ended unit's seq: the
+    /// floor the caller writes once the stop is recorded.
+    fn streak_stop(&self) -> Option<(Stop, u64)> {
         let floor: u64 = fs::read_to_string(self.ctx.path("drive-streak-floor"))
             .ok()
             .and_then(|t| t.trim().parse().ok())
@@ -1335,21 +1554,29 @@ impl<'a> Driver<'a> {
         } else if infra >= 2 {
             "two units in a row ended with an infrastructure failure"
         } else {
-            return Ok(None);
+            return None;
         };
         let top = list.last().map_or(floor, |e| e.0);
-        write_atomic(&self.ctx.path("drive-streak-floor"), format!("{top}\n").as_bytes())?;
-        Ok(Some(Stop {
-            reason: reason.into(),
-            code: 3,
-        }))
+        Some((
+            Stop {
+                reason: reason.into(),
+                code: 3,
+            },
+            top,
+        ))
     }
 }
 
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     ctx.require_driver("drive")?;
-    let driver = Driver::new(ctx)?;
-    let _lock = Lock::take(ctx)?;
+    if !args.once && env_str("ISSUE_DRAIN_UNATTENDED_OK") != "1" {
+        return Err(Fail::refused(
+            "drive without --once carries units with nobody watching; run it with --once, or set \
+             ISSUE_DRAIN_UNATTENDED_OK=1 once the unit's GitHub identity is set up for unattended runs",
+        ));
+    }
+    let lock = Lock::take(ctx)?;
+    let driver = Driver::new(ctx, &lock)?;
     let _awake = Caffeinate::start();
     driver.ensure_state()?;
     let mut report = Report { processed: Vec::new() };

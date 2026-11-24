@@ -270,6 +270,7 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
         Duration::from_secs(p.unit_timeout_secs),
         (&transcript, &stderr_log),
         &env,
+        None,
     )?;
     let ended = ctx.now();
 

@@ -14,7 +14,8 @@ use crate::common::*;
 /// the merge commit.
 fn squash_merge(c: &Case) -> String {
     git(&c.work, &["fetch", "-q", &c.bare.display().to_string(), BRANCH]);
-    git(&c.work, &["merge", "--squash", "FETCH_HEAD"]);
+    // A squash that has to merge needs an identity; CI runners have none.
+    identity(&c.work, &["merge", "--squash", "FETCH_HEAD"]);
     identity(&c.work, &["commit", "-q", "-m", "pad (#7)"]);
     git(&c.work, &["push", "-q", &c.bare.display().to_string(), "develop"]);
     git(&c.work, &["rev-parse", "HEAD"])

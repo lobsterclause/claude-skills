@@ -86,7 +86,8 @@ fn case(units: &[u64]) -> Case {
         .set("ISSUE_DRAIN_DRIVE_TESTING", "1")
         .set("ISSUE_DRAIN_DRIVE_EXE", &text(&wrapper))
         .set("ISSUE_DRAIN_DRIVE_POLL_SECS", "0")
-        .set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "5");
+        .set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "5")
+        .set("ISSUE_DRAIN_UNATTENDED_OK", "1");
 
     // The queue: one unit per number, issues 100+n.
     let mut queue = queue_with_unit(json!({}));
@@ -529,4 +530,278 @@ fn a_held_lock_refuses_and_a_dead_drivers_file_does_not() {
         !fs::read_to_string(&lock).unwrap().contains("4242"),
         "the new driver wrote its own pid"
     );
+}
+
+#[test]
+fn without_once_the_driver_wants_the_unattended_opt_in() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_UNATTENDED_OK", "0");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("ISSUE_DRAIN_UNATTENDED_OK=1"), "{}", out.stderr);
+    assert!(c.calls().is_empty(), "a refused driver does nothing");
+
+    c.result(1, json!({"unit": 1, "outcome": "skipped", "notes": ["done elsewhere"]}));
+    let (out, report) = c.drive(&["--once"]);
+    assert_eq!(out.code, 0, "--once needs no opt-in: {}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "skipped"}]));
+}
+
+#[test]
+fn a_live_child_of_an_earlier_driver_refuses_and_a_dead_ones_file_is_removed() {
+    use std::os::unix::process::CommandExt;
+    let c = case(&[1]);
+    let lock_dir = c.env.dir.path().join("home/.issue-drain/example__tidepool");
+    fs::create_dir_all(&lock_dir).unwrap();
+    let pidfile = lock_dir.join("drive-child.pid");
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    fs::write(&pidfile, format!("{}\n", child.id())).unwrap();
+    let (out, _) = c.drive(&[]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(
+        out.stderr.contains(&format!("process group {}", child.id())),
+        "{}",
+        out.stderr
+    );
+    assert!(c.calls().is_empty(), "a refused driver does nothing");
+
+    c.env.write("STOP", "");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "a dead child's file does not block: {}", out.stderr);
+    assert!(!pidfile.exists(), "the stale file is removed");
+}
+
+#[test]
+fn the_driver_tracks_its_running_child_and_clears_the_file_after() {
+    let c = case(&[1]);
+    // The fake claude records whether the pid file was there while it ran.
+    c.result(1, json!({"unit": 1, "outcome": "skipped", "notes": ["x"]}));
+    let (out, _) = c.drive(&["--once"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let pidfile = c
+        .env
+        .dir
+        .path()
+        .join("home/.issue-drain/example__tidepool/drive-child.pid");
+    assert!(!pidfile.exists(), "no pid file is left once the child ends");
+}
+
+#[test]
+fn a_tree_mismatch_writes_a_marker_that_stops_every_later_drive() {
+    let c = case(&[1, 2]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.canned("merge-gate", 0, &Case::merged());
+    c.canned("post-merge", 0, &json!({"tree_match": false}).to_string());
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(
+        report["stopped"].as_str().unwrap().contains("different tree"),
+        "{report}"
+    );
+    assert_eq!(c.state_of(1), "done");
+    let marker = c.env.workdir.join("units/1/drive-tree-mismatch");
+    assert!(marker.exists());
+
+    c.env.run(&["state", "resume"]);
+    let before = c.calls().len();
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(
+        report["stopped"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("drive-tree-mismatch")
+            || out.stderr.contains("drive-tree-mismatch"),
+        "{report} {}",
+        out.stderr
+    );
+    let later: Vec<String> = c.calls().split_off(before);
+    assert!(
+        later
+            .iter()
+            .all(|l| l.starts_with("tracker parse") || l.starts_with("state show")),
+        "only reads run while the marker is there: {later:?}"
+    );
+    assert_eq!(c.state_of(2), "queued");
+
+    fs::remove_file(&marker).unwrap();
+    c.result(2, json!({"unit": 2, "outcome": "skipped", "notes": ["x"]}));
+    let (out, _) = c.drive(&["--once"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(2), "skipped");
+}
+
+#[test]
+fn a_pr_still_in_the_merge_queue_stops_the_drive_and_stays_at_the_gate() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n(
+        "merge-gate",
+        2,
+        4,
+        &json!({"merged": false, "queued": true, "refusals": []}).to_string(),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(report["stopped"].as_str().unwrap().contains("merge queue"), "{report}");
+    assert_eq!(c.state_of(1), "gate", "a queued PR is not parked");
+    assert_eq!(c.count("claim release"), 0);
+}
+
+#[test]
+fn a_claim_release_that_fails_leaves_the_unit_to_end_again() {
+    let c = case(&[1]);
+    c.result(1, json!({"unit": 1, "outcome": "blocked", "notes": ["no"]}));
+    c.canned("claim-release", 1, "");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("claim release failed for unit 1"), "{}", out.stderr);
+    assert!(!c.env.workdir.join("units/1/drive-ended.json").exists());
+    assert!(c.last_comment().is_empty(), "no comment before the claim is gone");
+
+    c.canned("claim-release", 3, "");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(
+        out.code, 0,
+        "a claim that is not ours is logged, not fatal: {}",
+        out.stderr
+    );
+    assert!(c.env.workdir.join("units/1/drive-ended.json").exists());
+    assert!(c.last_comment().contains("is blocked"));
+}
+
+#[test]
+fn a_refusal_that_needs_a_person_parks_a_unit_in_review() {
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[
+            ("review", "no review at the head"),
+            ("risk_path", "touches firestore.rules"),
+        ]),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+    assert_eq!(c.claude_runs(1), 0, "no review pass for a unit a person must see");
+    assert!(c.last_comment().contains("risk_path"), "{}", c.last_comment());
+}
+
+#[test]
+fn the_review_cap_parks_a_unit_after_four_passes() {
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.env.write("units/1/drive-review-passes", "4\n");
+    c.canned("merge-gate", 3, &Case::refused(&[("review", "verdict is NEEDS_WORK")]));
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+    assert_eq!(c.claude_runs(1), 0);
+    assert!(c.last_comment().contains("review cap reached"), "{}", c.last_comment());
+}
+
+#[test]
+fn a_review_pass_whose_result_says_blocked_blocks_the_unit() {
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.env.write(
+        "units/1/session.json",
+        &json!({"session_id": "sess-1", "attempts": [{"attempt": 1, "model": "sonnet"}]}).to_string(),
+    );
+    c.canned("merge-gate", 3, &Case::refused(&[("review", "no review at the head")]));
+    c.result(
+        1,
+        json!({"unit": 1, "outcome": "blocked", "notes": ["reviewers all down"]}),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    let argv = fs::read_to_string(c.rec.join("argv.1.1")).expect("the review pass");
+    assert!(
+        argv.contains("--model") && argv.contains("sonnet"),
+        "the last model is kept: {argv}"
+    );
+    assert!(c.last_comment().contains("reviewers all down"), "{}", c.last_comment());
+    assert_eq!(
+        fs::read_to_string(c.env.workdir.join("units/1/drive-review-passes"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+}
+
+#[test]
+fn a_base_sync_that_github_has_not_applied_yet_is_tried_again() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n(
+        "merge-gate",
+        1,
+        3,
+        &Case::refused(&[("behind_base", "the PR branch is 3 commits behind develop")]),
+    );
+    c.canned_n("merge-gate", 3, 0, &Case::merged());
+    c.canned_n("base-sync", 1, 1, "");
+    c.canned(
+        "base-sync",
+        0,
+        &json!({"unit": 1, "deliver_ok": true, "review_round_needed": false}).to_string(),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "done"}]));
+    assert_eq!(c.count("base-sync"), 2);
+}
+
+#[test]
+fn a_tracker_with_lines_the_run_never_offered_refuses_at_the_boundary() {
+    let c = case(&[1]);
+    let parsed = json!({"run": "run", "stop": false, "units": ["U1"], "approved_closures": [],
+                        "release_claims": [], "tracker_state": "OPEN", "unknown": ["line 9: - [x] close #999"]});
+    c.canned("tracker-parse", 1, &parsed.to_string());
+    let (out, _) = c.drive(&["--once"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("close #999"), "{}", out.stderr);
+    assert_eq!(c.count("claim take"), 0);
+}
+
+#[test]
+fn a_relative_profile_reaches_the_children_as_an_absolute_path() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_PROFILE", "tidepool.toml");
+    fs::write(
+        c.fake.join("claim-take.sh"),
+        "printf '%s' \"$ISSUE_DRAIN_PROFILE\" > \"$FAKE_DIR/profile.seen\"\n",
+    )
+    .expect("the hook");
+    c.result(1, json!({"unit": 1, "outcome": "skipped", "notes": ["x"]}));
+    // Started in the fixtures folder, where the relative name resolves; the
+    // children run in the run folder, where it would not.
+    let out = c.env.run_in(Some(&eval_fixtures()), &["drive", "--once"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let seen = fs::read_to_string(c.fake.join("profile.seen")).expect("the child ran");
+    assert_eq!(PathBuf::from(seen), eval_fixtures().join("tidepool.toml"));
 }

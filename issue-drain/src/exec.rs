@@ -65,12 +65,13 @@ pub fn run(program: &str, args: &[String], dir: &Path, limit: Duration, log: &Pa
         Ok((out, err))
     };
     let (out, err) = open().map_err(|e| Fail::failed(format!("cannot write {}: {e}", log.display())))?;
-    supervise(program, args, dir, limit, (out, err), &[], log)
+    supervise(program, args, dir, limit, (out, err), &[], log, None)
 }
 
 /// `run`, with extra environment variables for the child and stdout and stderr
 /// in separate files (`tail` is the end of stderr). The child inherits the rest
-/// of the environment.
+/// of the environment. With `pidfile`, the child's pid (also its process
+/// group) is written there while it runs, and the file is removed after it ends.
 pub fn run_env(
     program: &str,
     args: &[String],
@@ -78,6 +79,7 @@ pub fn run_env(
     limit: Duration,
     logs: (&Path, &Path),
     env: &[(&str, &str)],
+    pidfile: Option<&Path>,
 ) -> Res<Ran> {
     let open = |path: &Path| -> Res<File> {
         if let Some(parent) = path.parent() {
@@ -87,7 +89,7 @@ pub fn run_env(
         fresh(path).map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))
     };
     let files = (open(logs.0)?, open(logs.1)?);
-    supervise(program, args, dir, limit, files, env, logs.1)
+    supervise(program, args, dir, limit, files, env, logs.1, pidfile)
 }
 
 /// A new, empty log file at `path`. Whatever was there is removed first
@@ -102,6 +104,7 @@ fn fresh(path: &Path) -> std::io::Result<File> {
     std::fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
+#[allow(clippy::too_many_arguments)] // private; every caller passes all of them
 fn supervise(
     program: &str,
     args: &[String],
@@ -110,6 +113,7 @@ fn supervise(
     (out, err): (File, File),
     env: &[(&str, &str)],
     tail_log: &Path,
+    pidfile: Option<&Path>,
 ) -> Res<Ran> {
     let mut child = Command::new(program)
         .args(args)
@@ -121,6 +125,16 @@ fn supervise(
         .process_group(0)
         .spawn()
         .map_err(|e| Fail::failed(format!("cannot run {program}: {e}")))?;
+    if let Some(pidfile) = pidfile
+        && let Err(e) = std::fs::write(pidfile, format!("{}\n", child.id()))
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(Fail::failed(format!("cannot write {}: {e}", pidfile.display())));
+    }
     let deadline = Instant::now() + limit;
     let (code, timed_out) = loop {
         match child.try_wait() {
@@ -138,6 +152,9 @@ fn supervise(
             Err(e) => return Err(Fail::failed(format!("cannot wait for {program}: {e}"))),
         }
     };
+    if let Some(pidfile) = pidfile {
+        let _ = std::fs::remove_file(pidfile);
+    }
     Ok(Ran {
         code,
         timed_out,

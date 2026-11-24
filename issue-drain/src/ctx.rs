@@ -43,6 +43,8 @@ pub struct Ctx {
     pub workdir: PathBuf,
     pub skill_dir: PathBuf,
     pub profile: Profile,
+    /// The profile file, absolute, so the driver can hand it to its children.
+    pub profile_path: PathBuf,
     pub dry_run: bool,
 }
 
@@ -97,12 +99,17 @@ impl Ctx {
             _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         };
         let profile_path = match env_str("ISSUE_DRAIN_PROFILE") {
-            path if !path.is_empty() => PathBuf::from(path),
+            // Made absolute here: the driver runs its children in the run
+            // folder, where a path relative to the caller's folder misses.
+            path if !path.is_empty() => std::env::current_dir()
+                .map_err(|e| Fail::failed(format!("cannot read the current folder: {e}")))?
+                .join(path),
             _ => default_profile(&skill_dir.join("profiles"), &repo_from_env()?),
         };
         Ok(Ctx {
             workdir: PathBuf::from(workdir),
             profile: Profile::load(&profile_path, &skill_dir)?,
+            profile_path,
             skill_dir,
             dry_run: env_str("ISSUE_DRAIN_DRY_RUN") == "1",
         })
