@@ -2338,10 +2338,26 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     // The head was read at the start; the merge names it. Record it first, so
     // post-merge compares the merge commit with the head this gate approved,
     // not with whatever head the PR has by then.
+    let approved = ctx.path(&format!("units/{unit}/{APPROVED_HEAD}"));
     if !ctx.dry_run {
-        let path = ctx.path(&format!("units/{unit}/{APPROVED_HEAD}"));
-        crate::ctx::write_atomic(&path, format!("{head}\n").as_bytes())?;
+        crate::ctx::write_atomic(&approved, format!("{head}\n").as_bytes())?;
     }
+    // A merge call that was turned down leaves the record naming a head that
+    // never merged; a person who then merges a newer head by hand would get a
+    // false tree mismatch. It is removed only when GitHub says the PR is open,
+    // unqueued and not set to merge itself; an unknown outcome keeps it.
+    let forget_if_rejected = || {
+        if !ctx.dry_run
+            && let Ok(MergeStatus {
+                state: PrState::Open,
+                in_queue: false,
+                auto_merge: false,
+                ..
+            }) = merge_status(&repo, pr)
+        {
+            let _ = std::fs::remove_file(&approved);
+        }
+    };
     match gh::write(
         ctx,
         &Write::MergePr {
@@ -2384,6 +2400,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                     report(ctx, unit, pr, &head, false, &[]);
                     match gh::write(ctx, &Write::DisableAutoMerge { number: pr }) {
                         Ok(_) => {
+                            forget_if_rejected();
                             println!("{}", output_with(false, json!({"auto_merge_disabled": true})));
                             Err(Fail::refused(format!(
                                 "PR #{pr}: the merge call armed auto-merge instead of merging; auto-merge has been turned off"
@@ -2423,6 +2440,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             }
         }
         Err(fail) => {
+            forget_if_rejected();
             report(ctx, unit, pr, &head, false, &[]);
             println!("{}", output(false));
             Err(fail)

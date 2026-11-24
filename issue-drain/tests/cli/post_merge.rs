@@ -134,6 +134,25 @@ fn without_a_record_the_current_head_is_used_and_the_report_says_so() {
 }
 
 #[test]
+fn an_unreadable_or_invalid_record_fails_instead_of_using_the_current_head() {
+    let mut c = case();
+    quick(&mut c);
+    let merge = squash_merge(&c);
+    merged(&c, &merge, &[103]);
+    issue(&c, 103, "CLOSED");
+    c.env.write("units/3/merge-approved-head", "not a sha\n");
+    let out = post_merge(&c);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("does not hold a commit SHA"), "{}", out.stderr);
+    let record = c.env.workdir.join("units/3/merge-approved-head");
+    fs::remove_file(&record).expect("remove the record");
+    fs::create_dir(&record).expect("a directory where the record goes");
+    let out = post_merge(&c);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("could not read"), "{}", out.stderr);
+}
+
+#[test]
 fn a_moved_base_is_reported_but_is_not_an_error() {
     let mut c = case();
     quick(&mut c);

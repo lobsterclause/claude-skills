@@ -1381,7 +1381,7 @@ impl<'a> Driver<'a> {
         if view.state != PrState::Open {
             return Ok(Some(format!("PR #{pr} is not open")));
         }
-        Ok(self.binding_problem(unit, pr, &view))
+        self.binding_problem(unit, pr, &view)
     }
 
     fn read_result(&self, u: &UnitState, result: &Value) -> Res<()> {
@@ -1563,10 +1563,20 @@ impl<'a> Driver<'a> {
 
     /// Settle a unit whose PR merged while a base sync was in flight.
     fn settle_merged(&self, u: &UnitState, pr: u64, view: &PrView, marker: &Path) -> Res<Option<String>> {
-        if let Some(why) = self.binding_problem(u.unit, pr, view) {
-            return self
-                .park(u, &format!("PR #{pr} merged, but {why}"), false)
-                .map(|()| None);
+        match self.binding_problem(u.unit, pr, view) {
+            Ok(None) => {}
+            Ok(Some(why)) => {
+                return self
+                    .park(u, &format!("PR #{pr} merged, but {why}"), false)
+                    .map(|()| None);
+            }
+            // Parking would release the claim on what may be the unit's merge.
+            Err(e) => {
+                return Ok(Some(format!(
+                    "PR #{pr} of unit {} merged, but {e}: fix the unit's record, then drive again",
+                    u.unit
+                )));
+            }
         }
         let Some(commit) = view.merge_commit.clone().filter(|c| is_sha(c)) else {
             return self
@@ -1796,21 +1806,27 @@ impl<'a> Driver<'a> {
     /// else why not. `Err` is a read that failed.
     fn unbound(&self, unit: u64, pr: u64) -> Result<Option<String>, String> {
         let view = read_view(&self.repo, pr).map_err(|e| format!("could not read PR #{pr}: {e}"))?;
-        Ok(self.binding_problem(unit, pr, &view))
+        self.binding_problem(unit, pr, &view)
     }
 
-    fn binding_problem(&self, unit: u64, pr: u64, view: &PrView) -> Option<String> {
-        let unit_file: Value = read_json(&self.unit_dir(unit).join("unit.json")).unwrap_or(Value::Null);
+    /// Why the PR is not the unit's (wrong base, branch or repository):
+    /// `Ok(None)` when it is. `Err` is a `unit.json` that cannot be read or
+    /// names no branch: that proves nothing about the PR, so no caller may
+    /// treat it as a mismatch and let the unit go.
+    fn binding_problem(&self, unit: u64, pr: u64, view: &PrView) -> Result<Option<String>, String> {
+        let path = self.unit_dir(unit).join("unit.json");
+        let unit_file: Value =
+            read_json(&path).ok_or_else(|| format!("{} is missing or not valid JSON", path.display()))?;
         let branch = unit_file["branch"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| format!("unit {unit} has no branch in unit.json"));
-        let refusals = binding(&self.repo, &self.ctx.profile.base_branch, unit, pr, view, &branch);
+            .ok_or_else(|| format!("unit {unit} has no branch in unit.json"))?;
+        let refusals = binding(&self.repo, &self.ctx.profile.base_branch, unit, pr, view, &Ok(branch));
         if refusals.is_empty() {
-            None
+            Ok(None)
         } else {
             let text: Vec<String> = refusals.iter().map(|r| format!("{}: {}", r.code, r.detail)).collect();
-            Some(text.join("; "))
+            Ok(Some(text.join("; ")))
         }
     }
 

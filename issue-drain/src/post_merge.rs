@@ -118,7 +118,10 @@ fn without_code_spans(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let (mut i, mut copied) = (0, 0);
     while i < b.len() {
-        if b[i] != b'`' || (i > 0 && b[i - 1] == b'\\') {
+        // A backtick is escaped by an odd run of backslashes before it; after
+        // an even run the backslashes escape each other and the tick opens.
+        let escapes = b[..i].iter().rev().take_while(|&&c| c == b'\\').count();
+        if b[i] != b'`' || escapes % 2 == 1 {
             i += 1;
             continue;
         }
@@ -156,7 +159,12 @@ fn without_code_spans(text: &str) -> String {
 fn block_end(text: &str, from: usize) -> usize {
     let mut at = from;
     for line in text[from..].split_inclusive('\n') {
-        if at > from && line.trim().is_empty() {
+        // Blank means spaces and tabs only, as Markdown counts it; a line of
+        // other whitespace (a no-break space) does not end a paragraph.
+        let content = line
+            .strip_suffix('\n')
+            .map_or(line, |l| l.strip_suffix('\r').unwrap_or(l));
+        if at > from && content.bytes().all(|c| c == b' ' || c == b'\t') {
             return at;
         }
         at += line.len();
@@ -377,9 +385,16 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         .clone()
         .filter(|s| is_sha(s))
         .ok_or_else(|| Fail::failed(format!("PR #{pr} is merged but names no merge commit")))?;
-    let head = match fs::read_to_string(ctx.path(&format!("units/{unit}/{}", merge_gate::APPROVED_HEAD))) {
+    let record = ctx.path(&format!("units/{unit}/{}", merge_gate::APPROVED_HEAD));
+    let head = match fs::read_to_string(&record) {
         Ok(text) if is_sha(text.trim()) => text.trim().to_string(),
-        _ => {
+        Ok(_) => {
+            return Err(Fail::failed(format!("{} does not hold a commit SHA", record.display())));
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(Fail::failed(format!("could not read {}: {e}", record.display())));
+        }
+        Err(_) => {
             eprintln!(
                 "issue-drain post-merge: there is no record of the head the gate approved for unit {unit}; comparing with the PR's current head"
             );
@@ -529,6 +544,23 @@ mod tests {
     fn an_escaped_backtick_opens_nothing() {
         let body = "A \\` here, then Fixes #1 and `Fixes #2`.";
         assert_eq!(body_closes(body, "a/b"), vec![1]);
+    }
+
+    #[test]
+    fn a_backtick_after_an_escaped_backslash_opens_a_span() {
+        // Two backslashes escape each other, so the tick after them is code.
+        let body = "A \\\\`Fixes #2` and Fixes #1.";
+        assert_eq!(body_closes(body, "a/b"), vec![1]);
+        let odd = "A \\\\\\` here, then Fixes #3 and `Fixes #4`.";
+        assert_eq!(body_closes(odd, "a/b"), vec![3]);
+    }
+
+    #[test]
+    fn a_line_of_other_whitespace_is_not_blank() {
+        let body = "`Fixes #1\n\u{a0}\nstill code` and Fixes #2.";
+        assert_eq!(body_closes(body, "a/b"), vec![2]);
+        let spaces = "A lone ` here.\n \t\r\nFixes #3 and `Fixes #4`.";
+        assert_eq!(body_closes(spaces, "a/b"), vec![3]);
     }
 
     #[test]

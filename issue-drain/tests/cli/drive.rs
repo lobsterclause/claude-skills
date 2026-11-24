@@ -1435,3 +1435,44 @@ fn a_pr_read_whose_output_a_leftover_process_holds_open_is_still_answered() {
     assert_eq!(lingered, drive(false).1, "{note}");
     assert!(!note.contains("timed out"), "{note}");
 }
+
+#[test]
+fn a_merged_pr_is_not_let_go_when_the_units_record_cannot_be_read() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/drive-merge-asked", "a merge was asked for\n");
+    c.env.write("units/1/unit.json", "not json");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("read_error", "checks could not be read")]),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "gate");
+    assert_eq!(c.count("claim release"), 0);
+    assert!(
+        c.env.workdir.join("units/1/drive-merge-asked").exists(),
+        "the record stays"
+    );
+}
+
+#[test]
+fn a_sync_in_flight_on_a_merged_pr_is_not_let_go_when_the_units_record_cannot_be_read() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    c.env.write("units/1/unit.json", "{}");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "gate");
+    assert_eq!(c.count("claim release"), 0);
+    assert!(
+        out.stderr.contains("no branch in unit.json") || out.stdout.contains("no branch in unit.json"),
+        "{}",
+        out.stderr
+    );
+}
