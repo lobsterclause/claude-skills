@@ -70,12 +70,12 @@
 //!
 //! `--accept-cap <sha>` is the driver's cap default (see `drive`): a review
 //! that stopped at the pass cap stands for a CLEAN one, at that commit only.
-//! It applies when the script's status is pending or stale, its verdict is
-//! FIXES_APPLIED or NEEDS_DECISION, its `reviewed` is the named commit, its
-//! `head` is the live head, and `reviewed` is the head or (by GitHub's compare
-//! answer) an ancestor of it; the comment's stamp must then name that verdict.
-//! Commits pushed after `reviewed` are not reviewed, the same as for the
-//! ancestor path above. Without the flag, or when any of that fails, the
+//! It applies when the script's status is pending, its verdict is
+//! FIXES_APPLIED or NEEDS_DECISION, its `reviewed` is the named commit and
+//! the live head, and its `head` is the live head; the comment's stamp must
+//! then name that verdict. A head that moved after the capped review (status
+//! stale) is never waived: ancestry cannot tell a base-only sync from new
+//! unreviewed code. Without the flag, or when any of that fails, the
 //! review refusal stands and says why the waiver did not apply. The output's
 //! `cap_waiver` names the commit a waiver let stand, or is null.
 //! GitHub's association is what the gate can read; a login is not compared.
@@ -551,11 +551,13 @@ pub fn binding(repo: &str, base: &str, unit: u64, pr: u64, view: &PrView, branch
 /// for a CLEAN one. `Ok(None)` when the flag was not given, `Ok(Some(sha))`
 /// when it applies, and `Err(why)` when it was given and does not.
 ///
-/// It applies only to a record the review script read as not clear because
-/// its verdict is FIXES_APPLIED or NEEDS_DECISION (BLOCKED never), stamped at
-/// the commit the flag names, which is the head or an ancestor of it. What it
-/// does not cover: commits pushed after that commit are unreviewed, and only
-/// codex's findings were weighed by the driver that passed the flag.
+/// It applies only to a record the review script read as `pending`: stamped
+/// at the PR head itself, with a FIXES_APPLIED or NEEDS_DECISION verdict
+/// (BLOCKED never), at the commit the flag names. A head that moved after the
+/// record is `stale` to the script, and ancestry cannot tell a base-only sync
+/// from new unreviewed code, so the waiver never covers it: the unit is
+/// reviewed again or parked. What it does not cover: only codex's findings
+/// were weighed by the driver that passed the flag.
 pub fn cap_waiver(f: &Facts, head: Option<&str>) -> Result<Option<String>, String> {
     let Some(sha) = f.accept_cap.as_deref() else {
         return Ok(None);
@@ -563,9 +565,9 @@ pub fn cap_waiver(f: &Facts, head: Option<&str>) -> Result<Option<String>, Strin
     let Ok(p) = &f.preflight else {
         return Err("the review record could not be read".into());
     };
-    if !matches!(p.status.as_str(), "pending" | "stale") {
+    if p.status != "pending" {
         return Err(format!(
-            "it covers a record the script reads as pending or stale, not '{}'",
+            "it covers a record the script reads as pending (stamped at the head), not '{}'",
             p.status
         ));
     }
@@ -584,8 +586,8 @@ pub fn cap_waiver(f: &Facts, head: Option<&str>) -> Result<Option<String>, Strin
     if p.head != h {
         return Err(format!("the review script read head {}, not the PR head", p.head));
     }
-    if !same_commit(&p.reviewed, h) && !matches!(f.reviewed_ancestry, Some(Ok(true))) {
-        return Err(format!("{} is not shown to be an ancestor of the head", p.reviewed));
+    if !same_commit(&p.reviewed, h) {
+        return Err(format!("the record is stamped at {}, not at the PR head", p.reviewed));
     }
     Ok(Some(p.reviewed.clone()))
 }
@@ -3382,7 +3384,10 @@ mod tests {
     }
 
     #[test]
-    fn a_waived_review_at_an_ancestor_needs_the_ancestry_and_a_proof_for_it() {
+    fn a_waiver_never_covers_a_head_that_moved_after_the_capped_review() {
+        // A stale record: the head moved after the capped review. Ancestry
+        // cannot tell a base-only sync from new unreviewed code, so the
+        // waiver does not apply even when the reviewed commit is an ancestor.
         let mut f = clear();
         let p = f.preflight.as_mut().unwrap();
         p.status = "stale".into();
@@ -3394,15 +3399,19 @@ mod tests {
         f.proof.as_mut().unwrap().head = BASE_TIP.into();
         f.accept_cap = Some(BASE_TIP.into());
         f.reviewed_ancestry = Some(Ok(true));
-        assert!(codes(&f).is_empty(), "{:?}", judge(&f));
-        f.reviewed_ancestry = Some(Ok(false));
-        let found = codes(&f);
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("pending"), "{why}");
+        let found = judge(&f);
         assert!(
-            found.contains(&"review") && found.contains(&"review_proof"),
+            found
+                .iter()
+                .any(|r| r.code == "review" && r.detail.contains("does not apply")),
             "{found:?}"
         );
-        f.reviewed_ancestry = None;
-        assert!(codes(&f).contains(&"review"));
+        // A pending record stamped elsewhere than the head is refused too.
+        f.preflight.as_mut().unwrap().status = "pending".into();
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("not at the PR head"), "{why}");
     }
 
     #[test]

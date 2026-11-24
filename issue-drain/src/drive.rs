@@ -193,13 +193,17 @@
 //! `drive-cap-accepted.json` (`reviewed`, `followup`, `passes`), logs
 //! `cap_default`, and passes `--accept-cap <reviewed>` to every later gate
 //! call. The gate then takes a FIXES_APPLIED or NEEDS_DECISION record at that
-//! commit as it would a CLEAN one; nothing else about the gate changes. A dry
+//! commit as it would a CLEAN one while that commit is the PR head; nothing
+//! else about the gate changes. A dry
 //! run logs what it would do and files nothing.
 //!
 //! A parked unit parks with it every later queued unit that shares a file with
 //! it (`shares_files_with`), noted "waiting for unit <n>": their change would
 //! be made over files the parked PR still changes. They were never claimed, so
-//! they get no end-of-unit work, and they stay parked for the run.
+//! they get no end-of-unit work, and they stay parked for the run. The held
+//! units are written to `units/<n>/drive-park-holds.json` before the unit
+//! parks, and a queued unit a parked unit's file names is parked instead of
+//! claimed, so a driver killed part way through the cascade finishes it.
 //!
 //! Known gaps. The tracker has no rolling status comment, because there is no
 //! comment-edit verb: it gets one comment per ended unit and one per stop. The
@@ -268,6 +272,8 @@ const CAP_DEFAULT_FROM: usize = 3;
 /// `{"reviewed": <sha>, "followup": <url or null>, "passes": <n>}`. While it
 /// exists the driver passes `--accept-cap <reviewed>` to the gate.
 const CAP_ACCEPTED: &str = "drive-cap-accepted.json";
+/// The later queued units a parked unit holds back (`{"held": [<unit>...]}`).
+const PARK_HOLDS: &str = "drive-park-holds.json";
 /// Calls of `base-sync` for one sync while GitHub has not applied the update.
 const BASE_SYNC_TRIES: u32 = 3;
 const CHILD_PID: &str = "drive-child.pid";
@@ -1065,8 +1071,22 @@ impl<'a> Driver<'a> {
     /// with it: their change would be made over files this unit's open PR
     /// still changes. Those units were never claimed or prepared, so they get
     /// no end-of-unit work, and they stay parked for this run.
+    ///
+    /// The held units are written to PARK_HOLDS before the unit parks, so a
+    /// driver killed part way through finishes the job: `queued` parks any
+    /// unit a parked unit's PARK_HOLDS names before it would claim it.
     fn park(&self, u: &UnitState, note: &str, infra: bool) -> Res<()> {
         let held = self.later_overlapping_queued(u.unit);
+        if !held.is_empty() {
+            let dir = self.unit_dir(u.unit);
+            fs::create_dir_all(&dir).map_err(|e| Fail::failed(format!("cannot create {}: {e}", dir.display())))?;
+            write_atomic(
+                &dir.join(self.mark(PARK_HOLDS)),
+                serde_json::to_vec(&json!({"held": held}))
+                    .map_err(|e| Fail::failed(e.to_string()))?
+                    .as_slice(),
+            )?;
+        }
         self.settle(u, State::Parked, note, infra)?;
         if self.unit_state(u.unit)?.state != State::Parked {
             return Ok(());
@@ -1101,6 +1121,23 @@ impl<'a> Driver<'a> {
     fn cap_accepted(&self, unit: u64) -> Option<String> {
         let v: Value = read_json(&self.unit_dir(unit).join(self.mark(CAP_ACCEPTED)))?;
         v["reviewed"].as_str().filter(|s| is_sha(s)).map(str::to_string)
+    }
+
+    /// The parked unit whose PARK_HOLDS names this one, if any: this unit
+    /// shares files with it and was to be parked with it.
+    fn held_by(&self, unit: u64) -> Option<u64> {
+        let snap = state::load(self.ctx)?;
+        snap.units
+            .iter()
+            .filter(|s| s.state == State::Parked)
+            .map(|s| s.unit)
+            .find(|&n| {
+                read_json::<Value>(&self.unit_dir(n).join(self.mark(PARK_HOLDS))).is_some_and(|v| {
+                    v["held"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|x| x.as_u64() == Some(unit)))
+                })
+            })
     }
 
     /// The later queued units (by queue position) that share a file with this one.
@@ -1586,6 +1623,15 @@ impl<'a> Driver<'a> {
     // ---- handlers ----
 
     fn queued(&self, u: &UnitState) -> Res<()> {
+        if let Some(by) = self.held_by(u.unit) {
+            return self.mv(
+                u.unit,
+                "parked",
+                Some(&format!("{WAITING_FOR}{by} (it parked, and they share files)")),
+                None,
+                None,
+            );
+        }
         let n = u.unit.to_string();
         let r = self.call(&["claim", "take", "--unit", &n])?;
         match r.code {
@@ -1892,6 +1938,20 @@ impl<'a> Driver<'a> {
                 return self.park(
                     u,
                     &format!("still refused after a review pass: {}", listed(&review)),
+                    false,
+                );
+            }
+            // The cap default already took this unit's capped review (the
+            // unit may have reported cap_reached itself, before the driver
+            // counted any pass): a gate that still refuses under it parks,
+            // and no further pass is run.
+            if let Some(sha) = self.cap_accepted(u.unit) {
+                return self.park(
+                    u,
+                    &format!(
+                        "review cap reached: the cap default accepted the review at {sha}; still refused: {}",
+                        listed(&review)
+                    ),
                     false,
                 );
             }

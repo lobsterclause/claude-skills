@@ -958,6 +958,36 @@ fn a_capped_review_with_clean_late_passes_goes_to_the_gate_with_a_followup() {
 }
 
 #[test]
+fn a_unit_whose_cap_was_accepted_parks_when_the_gate_still_refuses_and_runs_no_fifth_pass() {
+    // The unit reported cap_reached on its own run, so the driver counted no
+    // pass; the cap default accepted it, and the gate still refuses.
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    let reviewed = "c".repeat(40);
+    c.env.write(
+        "units/1/drive-cap-accepted.json",
+        &json!({"reviewed": reviewed, "followup": null, "passes": 4}).to_string(),
+    );
+    c.canned("merge-gate", 3, &Case::refused(&[("review", "verdict is BLOCKED")]));
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+    assert_eq!(c.claude_runs(1), 0, "no fifth review pass");
+    let comment = c.last_comment();
+    assert!(comment.contains("the cap default accepted the review"), "{comment}");
+    assert_eq!(
+        c.count(&format!(
+            "merge-gate --unit 1 --pr 4701 --dry-run --accept-cap {reviewed}"
+        )),
+        1
+    );
+}
+
+#[test]
 fn a_capped_review_with_a_late_p1_still_parks() {
     let c = case(&[1]);
     c.seed(
@@ -1007,6 +1037,35 @@ fn a_parked_unit_parks_the_later_queued_units_that_share_its_files() {
     let (out, _) = c.drive(&[]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(c.state_of(1), "parked");
+    assert_eq!(c.state_of(2), "parked");
+    assert_eq!(c.count("claim take --unit 2"), 0, "a held unit is never claimed");
+    assert_eq!(c.count("claim take --unit 3"), 1, "a unit that shares nothing goes on");
+    let events = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("events");
+    assert!(events.contains("waiting for unit 1"), "{events}");
+}
+
+#[test]
+fn a_driver_killed_mid_cascade_parks_the_held_units_before_it_would_claim_them() {
+    // Unit 1 parked and recorded that it holds unit 2, and the driver died
+    // before it parked unit 2. The next drive parks unit 2 instead of claiming it.
+    let c = case(&[1, 2, 3]);
+    let path = c.env.workdir.join("queue.json");
+    let mut queue: Value = serde_json::from_str(&fs::read_to_string(&path).expect("queue")).expect("json");
+    queue["units"][0]["shares_files_with"] = json!([2]);
+    queue["units"][1]["shares_files_with"] = json!([1]);
+    c.env.write("queue.json", &queue.to_string());
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing", "parked"],
+        Some(4701),
+    );
+    c.env.write("units/1/drive-park-holds.json", r#"{"held":[2]}"#);
+    c.result(
+        3,
+        json!({"unit": 3, "outcome": "blocked", "pr": null, "notes": ["stop here"]}),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(c.state_of(2), "parked");
     assert_eq!(c.count("claim take --unit 2"), 0, "a held unit is never claimed");
     assert_eq!(c.count("claim take --unit 3"), 1, "a unit that shares nothing goes on");

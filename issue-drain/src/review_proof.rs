@@ -24,12 +24,15 @@
 //! A folder with no `context.json` (the rewritten-history procedure) is taken
 //! on the caller's `--head`.
 //!
-//! Codex's findings are read too, for the driver's cap default: the
-//! `- [Pn] ...` lines after the last `Full review comments:` or
-//! `Review comment:` line of its stdout (codex prints its review block twice;
-//! the last one is whole). A codex run with neither line, or with no finding
-//! line after it, has `findings: None`, which the driver reads as a pass it
-//! cannot weigh. No other reviewer's output is parsed.
+//! Codex's findings are read too, for the driver's cap default, from its
+//! final message (after the last `codex` speaker line): the top-level
+//! `- [Pn] ...` lines after the last top-level `Full review comments:` or
+//! `Review comment:` line (codex prints its review block twice; the last one
+//! is whole). Indented lines are a finding's explanation and are never read
+//! as a heading or a finding. A final message with neither is a review that
+//! found nothing (`findings: []`). No `codex` line, or a heading with no
+//! finding line after it, is `findings: None`, which the driver reads as a
+//! pass it cannot weigh. No other reviewer's output is parsed.
 //!
 //! Each run also appends `{"run_dir", "proof"}` to
 //! `units/<n>/review-history.jsonl`, so the driver can tell one pass from the
@@ -90,21 +93,30 @@ fn has_output(name: &str, stdout: &[u8]) -> bool {
     stdout.iter().filter(|b| !b.is_ascii_whitespace()).count() >= floor
 }
 
-/// The finding lines of codex's last review block, and how many are P0 or P1.
-/// `None` when the output has no `Full review comments:` or `Review comment:`
-/// line, or none of the `- [Pn]` lines after the last one.
+/// The finding lines of codex's final message, and how many are P0 or P1.
+///
+/// The final message is everything after the last `codex` line (the speaker
+/// line codex prints before each message it writes). Only top-level lines are
+/// read: a heading or a `- [Pn]` line indented inside a finding's explanation
+/// is a quote, not a block. When the message has a `Full review comments:` or
+/// `Review comment:` heading, the findings are the `- [Pn]` lines after the
+/// last one, and a heading with none after it is `None`. A final message with
+/// neither a heading nor a finding line is a review that found nothing:
+/// `Some(([], 0))`. No `codex` line at all is `None`.
 pub(crate) fn codex_findings(stdout: &str) -> Option<(Vec<String>, u64)> {
-    let lines: Vec<&str> = stdout.lines().collect();
-    let start = lines
+    let lines: Vec<&str> = stdout.lines().map(str::trim_end).collect();
+    let speaker = lines.iter().rposition(|l| *l == "codex")?;
+    let message = &lines[speaker + 1..];
+    let heading = message
         .iter()
-        .rposition(|l| matches!(l.trim(), "Full review comments:" | "Review comment:"))?;
-    let findings: Vec<String> = lines[start + 1..]
+        .rposition(|l| matches!(*l, "Full review comments:" | "Review comment:"));
+    let block = heading.map_or(message, |h| &message[h + 1..]);
+    let findings: Vec<String> = block
         .iter()
-        .map(|l| l.trim())
         .filter(|l| severity(l).is_some())
-        .map(str::to_string)
+        .map(|l| l.to_string())
         .collect();
-    if findings.is_empty() {
+    if findings.is_empty() && heading.is_some() {
         return None;
     }
     let blocking = findings.iter().filter(|l| severity(l).is_some_and(|p| p <= 1)).count() as u64;
@@ -285,15 +297,32 @@ mod tests {
     }
 
     #[test]
-    fn a_review_with_no_block_or_no_finding_line_is_not_weighed() {
-        assert_eq!(
-            codex_findings("codex\nI found no discrete issues in this diff.\n"),
-            None
-        );
+    fn a_final_message_with_no_block_is_a_review_that_found_nothing() {
+        let out = "codex\nI'll read the diff.\nexec\n- [P1] a quoted line in a tool result — a.rs:1\n\
+                   codex\nNo actionable issues were found.\nNo actionable issues were found.\n";
+        assert_eq!(codex_findings(out), Some((vec![], 0)));
+    }
+
+    #[test]
+    fn a_quoted_heading_inside_a_finding_does_not_hide_the_findings_before_it() {
+        let out = "codex\nFull review comments:\n\n- [P1] Refuse it — a.rs:1\n  \
+                   For example the output\n  Review comment:\n  - [P3] quoted — z.rs:1\n\
+                   - [P2] Minor — b.rs:2\n  body\n";
+        let (found, blocking) = codex_findings(out).expect("parsed");
+        assert_eq!(found, ["- [P1] Refuse it — a.rs:1", "- [P2] Minor — b.rs:2"]);
+        assert_eq!(blocking, 1);
+    }
+
+    #[test]
+    fn a_review_with_no_speaker_or_no_finding_line_is_not_weighed() {
+        assert_eq!(codex_findings("I found no discrete issues in this diff.\n"), None);
         assert_eq!(codex_findings("codex\nFull review comments:\n\nnothing listed\n"), None);
         assert_eq!(codex_findings(""), None);
         // A line that only looks like a finding is not one.
-        assert_eq!(codex_findings("Review comment:\n- [Px] no — a\n- [P12] no — b\n"), None);
+        assert_eq!(
+            codex_findings("codex\nReview comment:\n- [Px] no — a\n- [P12] no — b\n"),
+            None
+        );
     }
 
     #[test]
