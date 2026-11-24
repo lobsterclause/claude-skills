@@ -2002,7 +2002,7 @@ pub(crate) fn unit_file<T: serde::de::DeserializeOwned>(ctx: &Ctx, unit: u64, na
 
 /// The commit the driver's cap decision accepted for this unit, if it wrote
 /// one: `units/<n>/drive-cap-accepted.json` (`dry-` prefixed in a dry run,
-/// as the driver names it).
+/// as the driver names it; see `marked`).
 fn cap_record(ctx: &Ctx, unit: u64) -> Option<String> {
     let v: Value = read_json(&ctx.path(&format!("units/{unit}/{}", marked(ctx, crate::drive::CAP_ACCEPTED))))?;
     v["reviewed"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
@@ -2012,9 +2012,11 @@ fn cap_record(ctx: &Ctx, unit: u64) -> Option<String> {
 /// let stand.
 const CAP_PIN: &str = "cap-waived-record.json";
 
-/// A file name with the driver's `dry-` prefix in a dry run.
+/// A file name with the driver's `dry-` prefix in a dry run. The prefix
+/// follows the run (`ctx.dry_files`), not `--dry-run`: the live driver asks
+/// the gate with `--dry-run` and the gate must read its unprefixed files.
 fn marked(ctx: &Ctx, name: &str) -> String {
-    if ctx.dry_run {
+    if ctx.dry_files {
         format!("dry-{name}")
     } else {
         name.to_string()
@@ -2472,8 +2474,14 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         .flatten();
     // The first waiver under a cap decision pins the record it let stand, so
     // a record posted later at the same head is never waived unread. The
-    // driver asks the gate right after it accepts the cap.
+    // driver asks the gate right after it accepts the cap. A record the gate
+    // refused (its author, its proof) is never pinned: removing it must leave
+    // the valid record eligible. Pending CI does not stop the pin.
+    let review_refused = refusals
+        .iter()
+        .any(|r| matches!(r.code, "review" | "review_author" | "review_proof"));
     if waived.is_some()
+        && !review_refused
         && facts.cap_pin.is_none()
         && let (Some(rec), Ok(Some(r))) = (&facts.cap_record, &facts.review_record)
     {
