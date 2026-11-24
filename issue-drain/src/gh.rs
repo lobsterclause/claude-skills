@@ -12,6 +12,10 @@
 //!     and may not add the claim label (a claim is the label plus a marker comment, which only
 //!     `claim take` makes). Claims, hold labels and closures belong to the driver and the session.
 //!
+//! A read (`read`, `read_raw`) has a time limit, 60 s or
+//! ISSUE_DRAIN_GH_READ_TIMEOUT_SECS, so a hung `gh` cannot stall a caller; a
+//! read cut off fails with exit 124 and callers treat it as an unreadable read.
+//!
 //! Bodies come from a file, never from an argument, so issue text never meets
 //! argument parsing.
 
@@ -276,15 +280,66 @@ fn gh() -> Command {
 
 /// Run gh for a read: its exit code and its stdout, whatever the code. gh's
 /// stderr is dropped: every caller turns a failure into its own message.
+///
+/// A read has a time limit (`READ_TIMEOUT_SECS`, or ISSUE_DRAIN_GH_READ_TIMEOUT_SECS):
+/// a `gh` that hangs is killed, with the process group it started, and the
+/// exit code is `READ_TIMED_OUT`.
 pub fn read_raw(args: &[&str]) -> (i32, String) {
-    match gh().args(args).stderr(Stdio::null()).output() {
-        Ok(out) => (
-            out.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        ),
-        Err(_) => (127, String::new()),
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+
+    let Ok(mut child) = gh()
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    else {
+        return (127, String::new());
+    };
+    let mut pipe = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(pipe) = pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let limit = std::env::var("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(READ_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(limit);
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(1),
+            Ok(None) if Instant::now() >= deadline => {
+                // A negative pid is the whole group; this crate forbids unsafe
+                // code, so `kill` does it.
+                let _ = Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", child.id())])
+                    .status();
+                let _ = child.kill();
+                let _ = child.wait();
+                break READ_TIMED_OUT;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => break 1,
+        }
+    };
+    let bytes = reader.join().unwrap_or_default();
+    if code == READ_TIMED_OUT {
+        return (code, String::new());
     }
+    (code, String::from_utf8_lossy(&bytes).into_owned())
 }
+
+/// How long a `gh` read may take, in seconds.
+const READ_TIMEOUT_SECS: u64 = 60;
+/// The exit code `read_raw` reports for a read it cut off, as `timeout(1)` does.
+pub const READ_TIMED_OUT: i32 = 124;
 
 /// Run gh for a read. stdout on exit 0, else gh's exit code.
 pub fn read(args: &[&str]) -> Result<String, i32> {

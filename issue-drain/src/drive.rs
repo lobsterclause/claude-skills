@@ -21,7 +21,9 @@
 //! each command keeps the exit codes, refusals and logging it is tested for.
 //! Their stdout and stderr go to `<run folder>/drive/<seq>-<command>.out|.err`,
 //! and the driver reads the JSON line at the end of stdout. Each step also logs
-//! a `drive` event. A unit process cannot run the driver (exit 3).
+//! a `drive` event. A unit process cannot run the driver (exit 3). The driver's
+//! own `gh` reads (the PR view and the rest) are cut off after 60 s
+//! (ISSUE_DRAIN_GH_READ_TIMEOUT_SECS) and count as unreadable reads.
 //!
 //! State. Every unit move goes through `state event`; only the driver moves
 //! state. The snapshot (`state show --json`) decides what to do next, so a

@@ -1136,3 +1136,23 @@ fn a_review_pass_whose_claude_exited_nonzero_is_not_a_pass() {
     assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
     assert!(!c.env.workdir.join("units/1/drive-review-resumed").exists());
 }
+
+#[test]
+fn a_pr_read_that_hangs_is_cut_off_and_blocks_the_unit_as_infrastructure() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS", "1");
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    c.pr_view(1, 4701);
+    c.env.stub_file("hang-pr-view", "");
+    let started = std::time::Instant::now();
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the read was not cut off"
+    );
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    let comment = c.last_comment();
+    assert!(comment.contains("timed out"), "{comment}");
+    assert!(comment.contains("infrastructure"), "{comment}");
+}

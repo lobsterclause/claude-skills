@@ -1708,7 +1708,13 @@ pub fn parse_in_queue(raw: &str) -> Read<bool> {
 // ---- reading ----
 
 fn read_gh(args: &[&str]) -> Read<String> {
-    gh::read(args).map_err(|rc| format!("gh exit {rc}"))
+    gh::read(args).map_err(|rc| {
+        if rc == gh::READ_TIMED_OUT {
+            "gh timed out".to_string()
+        } else {
+            format!("gh exit {rc}")
+        }
+    })
 }
 
 fn threads(repo: &str, pr: u64) -> Read<usize> {
