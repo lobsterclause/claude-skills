@@ -700,6 +700,12 @@ fn init_from(ctx: &Ctx, source: Option<(Value, String)>) -> Res<usize> {
     Ok(events.len())
 }
 
+/// The run's state, or `None` when the run has none yet or its log does not
+/// replay. For a reader that can do without it.
+pub fn load(ctx: &Ctx) -> Option<Snapshot> {
+    replay(ctx).ok().filter(|r| r.events > 0).map(|r| r.snapshot)
+}
+
 /// Refuse (exit 3) a unit that is not in the run's state queue: the approved
 /// tracker left it out, so it is not to be worked.
 pub fn require_queued(ctx: &Ctx, unit: u64) -> Res<()> {

@@ -33,6 +33,36 @@ pub fn commit(dir: &Path, reference: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The files that would conflict if `a` and `b` were merged, from
+/// `git merge-tree --write-tree --name-only`. It changes no ref and no
+/// worktree. `Some(empty)` when the merge is clean; `None` when git cannot say.
+pub fn merge_conflicts(dir: &Path, a: &str, b: &str) -> Option<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["merge-tree", "--write-tree", "--name-only", "--no-messages", a, b])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    match output.status.code()? {
+        0 => Some(Vec::new()),
+        1 => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut files: Vec<String> = text
+                .lines()
+                .skip(1)
+                .take_while(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            files.sort();
+            files.dedup();
+            Some(files)
+        }
+        _ => None,
+    }
+}
+
 /// The commit origin's branch `base` was at when it was last fetched. The ref
 /// is named in full: `origin/<base>` alone is read as a tag or a local branch
 /// of that name before the remote branch.

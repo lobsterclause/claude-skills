@@ -51,6 +51,10 @@ pub fn identity(dir: &Path, args: &[&str]) -> String {
 }
 
 pub fn case() -> Case {
+    case_with(queue_with_unit(json!({})))
+}
+
+pub fn case_with(queue: Value) -> Case {
     let mut env = Env::new();
     let dir = env.dir.path().to_path_buf();
     let work = private_repo(&dir);
@@ -67,7 +71,7 @@ pub fn case() -> Case {
     );
     let checkout = origin_clone(&dir, &bare);
     env.set("ISSUE_DRAIN_REPO_DIR", &checkout.display().to_string());
-    env.write("queue.json", &queue_with_unit(json!({})).to_string());
+    env.write("queue.json", &queue.to_string());
     let out = env.run(&["unit-prepare", "--unit", "3"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     let wt = fs::canonicalize(&env.workdir)
@@ -690,4 +694,110 @@ fn a_newer_request_than_the_pending_line_is_counted_from_its_marker() {
     let remote = c.env.events_named("base_sync_remote");
     assert_eq!(remote.len(), 2, "the second request spent its own slot");
     assert_eq!(remote[1]["base_head"], second);
+}
+
+/// U2 (issue 104, carrying `files`) ahead of U3, which lists U2 as sharing files.
+fn two_unit_queue(files: Value) -> Value {
+    let mut queue = queue_with_unit(json!({"shares_files_with": [2]}));
+    let mut other = queue["units"][0].clone();
+    other["id"] = json!("U2");
+    other["issues"] = json!([104]);
+    other["live"] = json!([104]);
+    other["acceptance"] = json!({"104": "it works"});
+    other["files"] = files;
+    other["shares_files_with"] = json!([3]);
+    queue["units"].as_array_mut().unwrap().insert(0, other);
+    queue
+}
+
+impl Case {
+    /// A commit on origin's develop that rewrites the file the unit's branch
+    /// also rewrote, so the branch cannot take the base without a conflict.
+    fn conflicting_base(&self) -> String {
+        fs::write(self.work.join("src/timer/countdown.ts"), "export const other = 1;\n").expect("the file");
+        git(&self.work, &["add", "src/timer/countdown.ts"]);
+        identity(&self.work, &["commit", "-q", "-m", "other"]);
+        git(&self.work, &["push", "-q", &self.bare.display().to_string(), "develop"]);
+        git(&self.work, &["rev-parse", "HEAD"])
+    }
+
+    fn state(&self, args: &[&str]) {
+        let mut full = vec!["state"];
+        full.extend_from_slice(args);
+        let out = self.env.run(&full);
+        assert_eq!(out.code, 0, "{args:?}: {}", out.stderr);
+    }
+}
+
+#[test]
+fn a_conflicting_update_names_the_files_and_the_merged_unit_that_touched_them() {
+    let c = case_with(two_unit_queue(json!(["src/timer/countdown.ts"])));
+    c.conflicting_base();
+    c.state(&[
+        "record", "--unit", "2", "--state", "merged", "--pr", "41", "--reason", "by hand",
+    ]);
+    c.pr_is_at(&c.old_head);
+    c.env.stub_file("fail-update-branch", "");
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    for needle in ["conflict", "src/timer/countdown.ts", "unit 2"] {
+        assert!(out.stderr.contains(needle), "{needle}: {}", out.stderr);
+    }
+    let events = c.env.events_named("base_sync_conflict");
+    assert_eq!(events.len(), 1, "{:?}", c.env.events());
+    assert_eq!(events[0]["unit"], 3);
+    assert_eq!(events[0]["files"], json!(["src/timer/countdown.ts"]));
+    assert_eq!(events[0]["touched_by"]["src/timer/countdown.ts"], json!([2]));
+    // read-only: the worktree is where it was, and no sync was recorded
+    assert_eq!(git(&c.wt, &["rev-parse", "HEAD"]), c.old_head);
+    assert_eq!(git(&c.wt, &["status", "--porcelain"]), "");
+    assert!(c.env.events_named("base_sync").is_empty());
+}
+
+#[test]
+fn the_merged_units_own_commit_decides_whether_it_touched_a_file() {
+    // U2's planned files do not list the file, but the commit it merged changed it
+    let c = case_with(two_unit_queue(json!(["README.md"])));
+    let merged = c.conflicting_base();
+    for to in ["claimed", "prepared", "implementing"] {
+        c.state(&["event", "2", to]);
+    }
+    c.state(&["event", "2", "pr_open", "--pr", "41"]);
+    for to in ["reviewing", "ci_wait", "gate"] {
+        c.state(&["event", "2", to]);
+    }
+    c.state(&["event", "2", "merged", "--head", &merged]);
+    c.pr_is_at(&c.old_head);
+    c.env.stub_file("fail-update-branch", "");
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    let events = c.env.events_named("base_sync_conflict");
+    assert_eq!(events[0]["touched_by"]["src/timer/countdown.ts"], json!([2]));
+}
+
+#[test]
+fn a_conflict_no_merged_unit_touched_says_so() {
+    let c = case_with(two_unit_queue(json!(["README.md"])));
+    c.conflicting_base();
+    // U2 is still queued: nothing merged shares the file
+    c.pr_is_at(&c.old_head);
+    c.env.stub_file("fail-update-branch", "");
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("src/timer/countdown.ts"), "{}", out.stderr);
+    assert!(out.stderr.contains("no merged unit"), "{}", out.stderr);
+    let events = c.env.events_named("base_sync_conflict");
+    assert_eq!(events[0]["touched_by"]["src/timer/countdown.ts"], json!([]));
+}
+
+#[test]
+fn a_failed_update_with_no_conflict_keeps_the_plain_error() {
+    let c = case();
+    c.advance_base();
+    c.pr_is_at(&c.old_head);
+    c.env.stub_file("fail-update-branch", "");
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("update-branch"), "{}", out.stderr);
+    assert!(c.env.events_named("base_sync_conflict").is_empty());
 }
