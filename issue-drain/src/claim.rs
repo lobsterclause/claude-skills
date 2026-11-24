@@ -278,7 +278,11 @@ impl Run<'_> {
         if !left.is_empty() {
             msg = format!("{msg}; left {} alone: no longer this unit's claim", left.join(", "));
         }
-        Fail { code: cause.code, msg }
+        Fail {
+            code: cause.code,
+            msg,
+            reported: false,
+        }
     }
 
     fn post_marker(&self, number: u64) -> Res<()> {

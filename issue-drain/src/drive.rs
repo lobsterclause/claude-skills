@@ -2,6 +2,20 @@
 //! carries each queued unit from `queued` to a terminal state by calling this
 //! crate's own subcommands, and stops on the stop conditions below.
 //!
+//! Output. Stdout is one JSON line, printed when the driver ends. Progress goes
+//! to stderr, one line each, prefixed `drive: `: every log step and every state
+//! move (`drive: U1 -> parked (cap reached)`), a line before each long child
+//! (`unit-run`, `merge-gate`, `base-sync`, `post-merge`, `stamp-remote-pass`,
+//! `unit-prepare`, `cleanup`, `retro`) naming its `drive/<seq>-<name>.out|.err`
+//! files, and, while CI is awaited, a line about every five minutes (never more
+//! than one poll early) saying which unit and PR the driver waits on. The lines
+//! are best effort: a stderr nobody reads loses lines, never stalls the driver.
+//! A `running` line is printed once its two files exist. `--quiet` turns all of
+//! it off. While
+//! the driver runs, `<run folder>/drive.pid` holds its pid; the file is removed
+//! on any return, but a killed driver leaves it, so a watcher must check the
+//! pid is alive (`kill -0`). The repo-level `drive.lock` below also holds a pid.
+//!
 //! Calls. Every step runs a subcommand as a child of this same binary
 //! (`std::env::current_exe()`), through `exec`, with the same environment, so
 //! each command keeps the exit codes, refusals and logging it is tested for.
@@ -163,8 +177,9 @@
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Seek as _, SeekFrom, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -182,6 +197,9 @@ pub struct Args {
     /// Carry one unit to a terminal state, then exit.
     #[arg(long)]
     pub once: bool,
+    /// Print no progress lines on stderr.
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 pub(crate) const LADDER: [&str; 3] = ["haiku", "sonnet", "opus"];
@@ -191,6 +209,22 @@ const MAX_REVIEW_PASSES: u32 = 4;
 /// Calls of `base-sync` for one sync while GitHub has not applied the update.
 const BASE_SYNC_TRIES: u32 = 3;
 const CHILD_PID: &str = "drive-child.pid";
+/// The driver's pid, in the run folder, while the driver runs.
+const DRIVE_PID: &str = "drive.pid";
+/// Children that can run for minutes. The driver names their output files on
+/// stderr before it calls them, so a watcher knows what to tail.
+const LONG_CHILDREN: [&str; 8] = [
+    "unit-run",
+    "unit-prepare",
+    "merge-gate",
+    "base-sync",
+    "post-merge",
+    "stamp-remote-pass",
+    "cleanup",
+    "retro",
+];
+/// Longest gap between two waiting lines for one unit.
+const HEARTBEAT: Duration = Duration::from_secs(300);
 const TREE_MISMATCH: &str = "drive-tree-mismatch";
 /// Written when the gate queued the PR or sent a merge call whose outcome is
 /// unknown, and removed once the PR is read back merged, or open and out of
@@ -382,6 +416,7 @@ fn fail_code(code: i32, msg: String) -> Fail {
     Fail {
         code: u8::try_from(code).ok().filter(|c| (1..=4).contains(c)).unwrap_or(1),
         msg,
+        reported: false,
     }
 }
 
@@ -505,6 +540,95 @@ impl Lock {
     }
 }
 
+/// `<run folder>/drive.pid` holds the driver's pid for as long as the driver
+/// runs, and is removed when it returns by any path. A driver that is killed
+/// leaves the file, so a watcher must check that the pid is alive (`kill -0`).
+struct PidFile(PathBuf);
+
+impl PidFile {
+    fn write(dir: &Path) -> Res<PidFile> {
+        let path = dir.join(DRIVE_PID);
+        write_atomic(&path, format!("{}\n", std::process::id()).as_bytes())?;
+        Ok(PidFile(path))
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Progress lines that may be queued while stderr is not being read. Past
+/// this, lines are dropped rather than wait.
+const PROGRESS_BACKLOG: usize = 256;
+/// How long the driver waits at exit for queued lines to reach stderr.
+const PROGRESS_FLUSH: Duration = Duration::from_secs(2);
+
+/// Writes progress lines to stderr on its own thread. A write to a pipe nobody
+/// drains blocks; this way it blocks only the writer, never the driver.
+struct Progress {
+    tx: Option<SyncSender<String>>,
+    done: Receiver<()>,
+}
+
+impl Progress {
+    fn start() -> Progress {
+        Progress::to(std::io::stderr())
+    }
+
+    fn to(mut err: impl std::io::Write + Send + 'static) -> Progress {
+        let (tx, rx) = sync_channel::<String>(PROGRESS_BACKLOG);
+        let (done_tx, done) = sync_channel(1);
+        std::thread::spawn(move || {
+            for line in rx {
+                let _ = writeln!(err, "{line}");
+            }
+            let _ = done_tx.send(());
+        });
+        Progress { tx: Some(tx), done }
+    }
+
+    fn say(&self, line: &str) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(format!("drive: {line}"));
+        }
+    }
+
+    /// The command's own last line, `issue-drain drive: <why>`, queued behind
+    /// the progress lines and flushed like them. A failing driver says why
+    /// through here, so a stuck stderr cannot keep it from exiting either.
+    fn finish(self, fail: Fail) -> Fail {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(format!("issue-drain drive: {}", fail.msg));
+        }
+        drop(self);
+        Fail { reported: true, ..fail }
+    }
+}
+
+impl Drop for Progress {
+    /// Give queued lines a moment to reach stderr, without waiting on a reader
+    /// that never comes.
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        let _ = self.done.recv_timeout(PROGRESS_FLUSH);
+    }
+}
+
+/// One poll's sleep cut into pieces no longer than `beat`, so a waiting line
+/// can be said between them. A zero poll is no sleep at all.
+fn poll_slices(poll: Duration, beat: Duration) -> Vec<Duration> {
+    let mut left = poll;
+    let mut out = Vec::new();
+    while !left.is_zero() && !beat.is_zero() {
+        let slice = left.min(beat);
+        out.push(slice);
+        left -= slice;
+    }
+    out
+}
+
 struct Caffeinate(Option<Child>);
 
 impl Caffeinate {
@@ -540,6 +664,10 @@ struct Driver<'a> {
     dry: bool,
     seq: Cell<u32>,
     child_pid: PathBuf,
+    progress: Option<Progress>,
+    /// The unit the driver is napping for, since when, and the last waiting line.
+    waiting: Cell<Option<(u64, Instant)>>,
+    last_beat: Cell<Option<Instant>>,
 }
 
 fn secs(name: &str, default: u64) -> Duration {
@@ -547,7 +675,7 @@ fn secs(name: &str, default: u64) -> Duration {
 }
 
 impl<'a> Driver<'a> {
-    fn new(ctx: &'a Ctx, lock: &Lock) -> Res<Driver<'a>> {
+    fn new(ctx: &'a Ctx, lock: &Lock, quiet: bool) -> Res<Driver<'a>> {
         let exe = match env_str("ISSUE_DRAIN_DRIVE_EXE") {
             hook if env_str("ISSUE_DRAIN_DRIVE_TESTING") == "1" && !hook.is_empty() => PathBuf::from(hook),
             _ => std::env::current_exe().map_err(|e| Fail::failed(format!("cannot find this program: {e}")))?,
@@ -564,6 +692,9 @@ impl<'a> Driver<'a> {
             dry: ctx.dry_run,
             seq: Cell::new(logged / 2),
             child_pid: lock.dir.join(CHILD_PID),
+            progress: (!quiet).then(Progress::start),
+            waiting: Cell::new(None),
+            last_beat: Cell::new(None),
         })
     }
 
@@ -577,14 +708,70 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// One progress line on stderr, unless `--quiet`. Best effort: the line is
+    /// handed to the writer thread and dropped if it is backed up, so a closed
+    /// or undrained stderr never stops the run.
+    fn say(&self, line: &str) {
+        if let Some(p) = &self.progress {
+            p.say(line);
+        }
+    }
+
     fn log(&self, unit: Option<u64>, what: &str, detail: Value) -> Res<()> {
+        let who = unit.map_or_else(String::new, |n| format!("U{n} "));
+        let detail_text = match &detail {
+            Value::Object(m) if what == "step" && m.contains_key("state") => {
+                format!(" in {}", m["state"].as_str().unwrap_or_default())
+            }
+            Value::Null => String::new(),
+            Value::Object(m) if m.is_empty() => String::new(),
+            other => format!(" {}", one_line(&other.to_string())),
+        };
+        self.say(&format!("{who}{}{detail_text}", what.replace('_', " ")));
         self.ctx
             .event("drive", json!({"unit": unit, "step": what, "detail": detail}))
     }
 
-    fn nap(&self) {
-        if !self.poll.is_zero() {
-            sleep(self.poll);
+    /// Sleep one poll. While one unit keeps the driver waiting, say so about
+    /// every five minutes: never more than one poll early, and late by no more
+    /// than the gate call between polls. A poll longer than the heartbeat is
+    /// slept in slices, with a line between them, so GitHub is not asked any
+    /// more often than the poll says.
+    fn nap(&self, u: &UnitState) {
+        let since = match self.waiting.get() {
+            Some((unit, at)) if unit == u.unit => at,
+            _ => {
+                let now = Instant::now();
+                self.waiting.set(Some((u.unit, now)));
+                self.last_beat.set(None);
+                now
+            }
+        };
+        let beat = || {
+            let pr = u.pr.map_or_else(String::new, |p| format!(" PR #{p}"));
+            self.say(&format!(
+                "U{}{pr} in {} waiting, {}s so far",
+                u.unit,
+                u.state.as_str(),
+                since.elapsed().as_secs()
+            ));
+            self.last_beat.set(Some(Instant::now()));
+        };
+        // Say it now if waiting for the next poll would pass the heartbeat, so
+        // the gap between lines stays within HEARTBEAT plus one gate call.
+        if self
+            .last_beat
+            .get()
+            .is_none_or(|t| t.elapsed() + self.poll.min(HEARTBEAT) >= HEARTBEAT)
+        {
+            beat();
+        }
+        let slices = poll_slices(self.poll, HEARTBEAT);
+        for (i, slice) in slices.iter().enumerate() {
+            if i > 0 {
+                beat();
+            }
+            sleep(*slice);
         }
     }
 
@@ -603,15 +790,27 @@ impl<'a> Driver<'a> {
             Some(&"unit-run") => Duration::from_secs(self.ctx.profile.unit_timeout_secs + 900),
             _ => Duration::from_secs(1800),
         };
+        // The logs exist before they are named, so a watcher can tail them at once.
+        let files = exec::open_logs((&out, &err))?;
+        if args.first().is_some_and(|a| LONG_CHILDREN.contains(a)) {
+            let rel = |p: &PathBuf| p.strip_prefix(&self.ctx.workdir).unwrap_or(p).display().to_string();
+            self.say(&format!(
+                "running {} (stdout {}, stderr {})",
+                args.join(" "),
+                rel(&out),
+                rel(&err)
+            ));
+        }
         let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         // Children run in the run folder, so they get the profile's absolute path.
         let profile = self.ctx.profile_path.display().to_string();
-        let ran = exec::run_env(
+        let ran = exec::run_opened(
             &self.exe.display().to_string(),
             &argv,
             &self.ctx.workdir,
             limit,
-            (&out, &err),
+            files,
+            &err,
             &[("ISSUE_DRAIN_PROFILE", &profile)],
             Some(&self.child_pid),
         )?;
@@ -621,7 +820,10 @@ impl<'a> Driver<'a> {
             stdout: fs::read_to_string(&out).unwrap_or_default(),
             stderr: fs::read_to_string(&err).unwrap_or_default(),
         };
-        self.log(None, "call", json!({"args": args, "code": reply.code}))?;
+        self.ctx.event(
+            "drive",
+            json!({"unit": null, "step": "call", "detail": {"args": args, "code": reply.code}}),
+        )?;
         Ok(reply)
     }
 
@@ -657,6 +859,9 @@ impl<'a> Driver<'a> {
         }
         let r = self.call(&args)?;
         if r.ok() {
+            self.waiting.set(None);
+            let why = note.as_deref().map_or_else(String::new, |n| format!(" ({n})"));
+            self.say(&format!("U{unit} -> {to}{why}"));
             return Ok(());
         }
         let msg = format!("unit {unit} could not move to {to}: {}", r.why());
@@ -1210,7 +1415,7 @@ impl<'a> Driver<'a> {
                     if reads >= 2 {
                         return self.block(u, &format!("the gate could not be read: {}", r.why()), true);
                     }
-                    self.nap();
+                    self.nap(u);
                     continue;
                 }
                 match fs::remove_file(&marker) {
@@ -1251,6 +1456,7 @@ impl<'a> Driver<'a> {
                 listed(&review)
             );
             write_atomic(&passes_file, format!("{}\n", passes + 1).as_bytes())?;
+            self.say(&format!("U{} review pass {} started", u.unit, passes + 1));
             let ran = self.resume(u.unit, &text, None)?;
             if self.settled_by_resume(u, &ran, "the review pass")? {
                 return Ok(());
@@ -1282,7 +1488,7 @@ impl<'a> Driver<'a> {
                 let why = format!("the checks did not finish within {} seconds", self.ci_max.as_secs());
                 return self.block(u, &why, true);
             }
-            self.nap();
+            self.nap(u);
         }
     }
 
@@ -1325,7 +1531,7 @@ impl<'a> Driver<'a> {
                             self.ci_max.as_secs()
                         )));
                     }
-                    self.nap();
+                    self.nap(u);
                 }
                 3 => {
                     if !self.dry && self.unit_dir(u.unit).join(MERGE_ASKED).exists() {
@@ -1345,7 +1551,7 @@ impl<'a> Driver<'a> {
                                         u.unit
                                     )));
                                 }
-                                self.nap();
+                                self.nap(u);
                                 continue;
                             }
                         }
@@ -1379,7 +1585,7 @@ impl<'a> Driver<'a> {
                             u.unit
                         )));
                     }
-                    self.nap();
+                    self.nap(u);
                 }
                 _ => {
                     errors += 1;
@@ -1387,7 +1593,7 @@ impl<'a> Driver<'a> {
                         self.park(u, &format!("the merge call failed: {}", r.why()), true)?;
                         return Ok(None);
                     }
-                    self.nap();
+                    self.nap(u);
                 }
             }
         }
@@ -1448,7 +1654,7 @@ impl<'a> Driver<'a> {
                 if start.elapsed() >= self.ci_max {
                     return moved(self.park(u, "the checks stayed pending", true));
                 }
-                self.nap();
+                self.nap(u);
                 Ok(true)
             }
             Action::ReadError => {
@@ -1463,7 +1669,7 @@ impl<'a> Driver<'a> {
                         true,
                     ));
                 }
-                self.nap();
+                self.nap(u);
                 Ok(true)
             }
         }
@@ -1485,7 +1691,7 @@ impl<'a> Driver<'a> {
             let r = self.call(&["base-sync", "--unit", &n, "--pr", &p])?;
             tries += 1;
             if r.code == 1 && !r.timed_out && tries < BASE_SYNC_TRIES && !self.dry {
-                self.nap();
+                self.nap(u);
                 continue;
             }
             break r;
@@ -1739,7 +1945,13 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         state::reset_dry(ctx)?;
         reset_dry_markers(ctx)?;
     }
-    let driver = Driver::new(ctx, &lock)?;
+    let driver = Driver::new(ctx, &lock, args.quiet)?;
+    let _pid = PidFile::write(&ctx.workdir)?;
+    driver.say(&format!(
+        "pid {}, run folder {}",
+        std::process::id(),
+        ctx.workdir.display()
+    ));
     let _awake = Caffeinate::start();
     driver.ensure_state()?;
     let mut report = Report { processed: Vec::new() };
@@ -1754,14 +1966,106 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         .map(|(unit, state)| json!({"unit": unit, "state": state.as_str()}))
         .collect();
     println!("{}", json!({"processed": processed, "stopped": stopped}));
-    match done? {
-        Some(stop) if stop.code != 0 => Err(Fail::refused(stop.reason)),
-        _ => Ok(()),
+    let result = match done {
+        Ok(Some(stop)) if stop.code != 0 => Err(Fail::refused(stop.reason)),
+        Ok(_) => Ok(()),
+        Err(fail) => Err(fail),
+    };
+    match (result, driver.progress) {
+        (Err(fail), Some(progress)) => Err(progress.finish(fail)),
+        (result, _) => result,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A writer that never returns, like a pipe nobody reads.
+    struct Stuck;
+
+    impl std::io::Write for Stuck {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            loop {
+                std::thread::park();
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stuck_stderr_never_holds_up_the_driver() {
+        let started = Instant::now();
+        let progress = Progress::to(Stuck);
+        for n in 0..(PROGRESS_BACKLOG * 4) {
+            progress.say(&format!("line {n}"));
+        }
+        drop(progress);
+        assert!(
+            started.elapsed() < PROGRESS_FLUSH + Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Writes into a shared buffer the test reads back.
+    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failing_driver_says_why_last_and_a_stuck_stderr_cannot_hold_it() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = Progress::to(Shared(buf.clone()));
+        progress.say("one");
+        let fail = progress.finish(Fail::refused("STOP file"));
+        assert!(fail.reported);
+        assert_eq!(fail.code, 3);
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            "drive: one\nissue-drain drive: STOP file\n"
+        );
+
+        let progress = Progress::to(Stuck);
+        for n in 0..PROGRESS_BACKLOG + 10 {
+            progress.say(&format!("line {n}"));
+        }
+        let start = Instant::now();
+        let fail = progress.finish(Fail::failed("gh failed"));
+        assert!(fail.reported);
+        assert!(start.elapsed() < PROGRESS_FLUSH + Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_long_poll_is_slept_in_heartbeat_slices() {
+        let s = Duration::from_secs;
+        assert_eq!(poll_slices(s(900), s(300)), vec![s(300), s(300), s(300)]);
+        assert_eq!(poll_slices(s(700), s(300)), vec![s(300), s(300), s(100)]);
+        assert_eq!(poll_slices(s(60), s(300)), vec![s(60)]);
+        assert!(poll_slices(Duration::ZERO, s(300)).is_empty());
+    }
+
+    #[test]
+    fn queued_lines_reach_stderr_in_order_before_the_driver_exits() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = Progress::to(Shared(buf.clone()));
+        progress.say("one");
+        progress.say("two");
+        drop(progress);
+        assert_eq!(
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            "drive: one\ndrive: two\n"
+        );
+    }
+
     use super::*;
 
     fn r(code: &str, detail: &str) -> Refusal {
@@ -1827,5 +2131,17 @@ mod tests {
         let text = "WOULD: gh pr merge 4\n{\"merged\":false}\n";
         assert_eq!(last_json(text), Some(json!({"merged": false})));
         assert_eq!(last_json("nothing\n"), None);
+    }
+
+    #[test]
+    fn the_pid_file_holds_this_pid_and_goes_when_dropped() {
+        let dir = std::env::temp_dir().join(format!("drive-pid-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let guard = PidFile::write(&dir).expect("written");
+        let text = fs::read_to_string(dir.join(DRIVE_PID)).expect("read");
+        assert_eq!(text.trim(), std::process::id().to_string());
+        drop(guard);
+        assert!(!dir.join(DRIVE_PID).exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

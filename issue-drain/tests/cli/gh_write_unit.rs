@@ -206,7 +206,8 @@ fn a_unit_is_refused_the_drivers_verbs_and_allowed_the_rest() {
     }
     assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
 
-    let allowed: [&[&str]; 6] = [
+    let allowed: [&[&str]; 7] = [
+        &["gh-write", "followup-create", "--title", "t", "--body-file", &body],
         &["gh-write", "comment", "7", "--body-file", &body],
         &["gh-write", "add-label", "7", "needs-human"],
         &["gh-write", "ensure-label", "issue-drain"],
@@ -230,7 +231,7 @@ fn a_unit_is_refused_the_drivers_verbs_and_allowed_the_rest() {
         assert_eq!(out.code, 0, "{args:?}: {}", out.stderr);
     }
     // ensure-label makes a list call then a create call; the rest one each.
-    assert_eq!(env.gh_calls().len(), 7, "{:?}", env.gh_calls());
+    assert_eq!(env.gh_calls().len(), 8, "{:?}", env.gh_calls());
 }
 
 /// A claim is the label plus a marker comment, and only `claim take` makes

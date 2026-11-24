@@ -31,6 +31,13 @@ pub enum Write<'a> {
         title: &'a str,
         body_file: &'a Path,
     },
+    /// Create an ordinary issue. It never carries the tracker label, so it can
+    /// be edited with `issue-edit` and is not mistaken for a tracker.
+    FollowupCreate {
+        title: &'a str,
+        body_file: &'a Path,
+        labels: &'a [String],
+    },
     Comment {
         number: u64,
         body_file: &'a Path,
@@ -120,6 +127,20 @@ pub fn merge_argv(repo: &str, number: u64, head: &str) -> Vec<String> {
     .to_vec()
 }
 
+/// `gh issue create` for a follow-up: the labels given and no others.
+pub fn followup_create_argv(repo: &str, title: &str, body_file: &Path, labels: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = ["issue", "create", "--repo", repo, "--title", title]
+        .map(str::to_string)
+        .to_vec();
+    argv.push("--body-file".into());
+    argv.push(body_file.display().to_string());
+    for label in labels {
+        argv.push("--label".into());
+        argv.push(label.clone());
+    }
+    argv
+}
+
 pub fn pr_create_argv(
     repo: &str,
     head: &str,
@@ -186,7 +207,7 @@ pub fn thread_resolve_argv(thread: &str) -> Vec<String> {
 pub fn unit_may(verb: &str) -> bool {
     matches!(
         verb,
-        "comment" | "add-label" | "ensure-label" | "pr-create" | "thread-reply" | "thread-resolve"
+        "comment" | "add-label" | "ensure-label" | "pr-create" | "followup-create" | "thread-reply" | "thread-resolve"
     )
 }
 
@@ -217,6 +238,7 @@ impl Write<'_> {
     fn verb(&self) -> &'static str {
         match self {
             Write::IssueCreate { .. } => "issue-create",
+            Write::FollowupCreate { .. } => "followup-create",
             Write::Comment { .. } => "comment",
             Write::EnsureLabel { .. } => "ensure-label",
             Write::AddLabel { .. } => "add-label",
@@ -516,6 +538,46 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
                     own("--label"),
                     p.tracker_label.clone(),
                 ],
+            )
+        }
+        Write::FollowupCreate {
+            title,
+            body_file,
+            labels,
+        } => {
+            need_body(body_file)?;
+            if title.is_empty() {
+                return Err(Fail::usage("followup-create needs --title"));
+            }
+            // `gh` reads a `--label` value as CSV, so a comma, a quote or a line
+            // break could smuggle in a label this check never saw. One label per
+            // `--label`, as written, is all it forwards.
+            if let Some(bad) = labels.iter().find(|l| l.contains([',', '"', '\n', '\r'])) {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!("'{bad}' is not one label: pass each label with its own --label, without commas or quotes"),
+                ));
+            }
+            for label in labels.iter().map(|l| l.trim()) {
+                let why = if same_label(label, &p.tracker_label) {
+                    "the tracker label"
+                } else if same_label(label, &p.claim_label) {
+                    "the claim label, which only `claim take` adds"
+                } else {
+                    continue;
+                };
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!("'{label}' is {why}; a follow-up never carries it"),
+                ));
+            }
+            (
+                "follow-up issue".into(),
+                followup_create_argv(&repo, title, body_file, labels),
             )
         }
         Write::Comment { number, body_file } => {
@@ -851,13 +913,17 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
     })
 }
 
-const VERBS: &str = "<issue-create|comment|ensure-label|add-label|remove-label|pr-create|pr-edit|issue-edit|unblock|run-rerun|thread-reply|thread-resolve>";
+const VERBS: &str = "<issue-create|followup-create|comment|ensure-label|add-label|remove-label|pr-create|pr-edit|issue-edit|unblock|run-rerun|thread-reply|thread-resolve>";
 
 /// Per verb: its usage line, then who may use it.
 const USAGES: &[(&str, &str)] = &[
     (
         "issue-create",
-        "issue-create --title <text> --body-file <file>\n    Create the tracker issue. Not for a unit.",
+        "issue-create --title <text> --body-file <file>\n    Create the tracker issue, with the tracker label. For the tracker only: use followup-create for a follow-up. Not for a unit.",
+    ),
+    (
+        "followup-create",
+        "followup-create --title <text> --body-file <file> [--label <name>]...\n    Create an ordinary issue, never with the tracker or claim label (either is refused, exit 3), one label per --label (a comma, quote or line break is refused). Prints the new issue URL. A unit may.",
     ),
     (
         "comment",
@@ -986,6 +1052,7 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     let used: Option<&[&str]> = match verb {
         "issue-edit" => Some(&["--title", "--body-file"]),
         "unblock" => Some(&["--label", "--reason"]),
+        "followup-create" => Some(&["--title", "--body-file", "--label"]),
         _ => None,
     };
     if let Some(bad) = used.and_then(|used| given.iter().find(|o| !used.contains(o))) {
@@ -995,7 +1062,7 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
         return Err(Fail::usage(format!("{verb} does not take --reason")));
     }
     let wanted = match verb {
-        "issue-create" | "pr-create" | "thread-reply" | "thread-resolve" => Some(0),
+        "issue-create" | "followup-create" | "pr-create" | "thread-reply" | "thread-resolve" => Some(0),
         "issue-edit" | "unblock" => Some(1),
         _ => None,
     };
@@ -1028,6 +1095,11 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
         "issue-create" => Write::IssueCreate {
             body_file: body()?,
             title: &title,
+        },
+        "followup-create" => Write::FollowupCreate {
+            body_file: body()?,
+            title: &title,
+            labels: &labels,
         },
         "comment" => Write::Comment {
             number: number()?,
@@ -1099,6 +1171,19 @@ mod tests {
     }
 
     #[test]
+    fn followup_create_argv_has_only_the_labels_given() {
+        let labels = ["bug".to_string()];
+        assert_eq!(
+            followup_create_argv("o/r", "T", Path::new("/b.md"), &labels).join(" "),
+            "issue create --repo o/r --title T --body-file /b.md --label bug"
+        );
+        assert_eq!(
+            followup_create_argv("o/r", "T", Path::new("/b.md"), &[]).join(" "),
+            "issue create --repo o/r --title T --body-file /b.md"
+        );
+    }
+
+    #[test]
     fn thread_argv_passes_the_body_from_the_file() {
         let reply = thread_reply_argv("PRRT_kw-1=", Path::new("/b.md"));
         assert_eq!(&reply[..3], ["api", "graphql", "-f"]);
@@ -1144,6 +1229,7 @@ mod tests {
             "add-label",
             "ensure-label",
             "pr-create",
+            "followup-create",
             "thread-reply",
             "thread-resolve",
         ];
