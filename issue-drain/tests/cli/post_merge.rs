@@ -106,10 +106,7 @@ fn the_tree_is_compared_with_the_head_the_gate_approved() {
     let mut c = case();
     quick(&mut c);
     let merge = squash_merge(&c);
-    // The PR's head moved after the gate approved old_head.
-    let mut view = merged_view(&c, &merge, &[103]);
-    view["headRefOid"] = json!("b".repeat(40));
-    c.pr_with(&view);
+    merged(&c, &merge, &[103]);
     issue(&c, 103, "CLOSED");
     c.env.write("units/3/merge-approved-head", &format!("{}\n", c.old_head));
     let out = post_merge(&c);
@@ -118,6 +115,26 @@ fn the_tree_is_compared_with_the_head_the_gate_approved() {
     assert_eq!(r["head"], c.old_head);
     assert_eq!(r["tree_match"], true);
     assert!(!out.stderr.contains("no record"), "{}", out.stderr);
+    assert!(!out.stderr.contains("not this merge's"), "{}", out.stderr);
+}
+
+#[test]
+fn an_approval_for_a_head_that_never_merged_is_not_used() {
+    let mut c = case();
+    quick(&mut c);
+    let merge = squash_merge(&c);
+    // The gate approved a head that was dropped from the queue; a person then
+    // merged the PR at old_head by hand.
+    merged(&c, &merge, &[103]);
+    issue(&c, 103, "CLOSED");
+    c.env
+        .write("units/3/merge-approved-head", &format!("{}\n", "c".repeat(40)));
+    let out = post_merge(&c);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = printed(&out);
+    assert_eq!(r["head"], c.old_head);
+    assert_eq!(r["tree_match"], true);
+    assert!(out.stderr.contains("not this merge's"), "{}", out.stderr);
 }
 
 #[test]

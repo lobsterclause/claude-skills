@@ -1833,6 +1833,7 @@ impl<'a> Driver<'a> {
             read_json(&path).ok_or_else(|| format!("{} is missing or not valid JSON", path.display()))?;
         let branch = unit_file["branch"]
             .as_str()
+            .filter(|b| !b.is_empty())
             .map(str::to_string)
             .ok_or_else(|| format!("unit {unit} has no branch in unit.json"))?;
         let refusals = binding(&self.repo, &self.ctx.profile.base_branch, unit, pr, view, &Ok(branch));

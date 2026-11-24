@@ -1473,6 +1473,30 @@ fn a_merged_pr_is_not_let_go_when_the_units_record_cannot_be_read() {
 }
 
 #[test]
+fn a_merged_pr_is_not_let_go_when_the_units_record_names_an_empty_branch() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/drive-merge-asked", "a merge was asked for\n");
+    c.env.write("units/1/unit.json", "{\"unit\": 1, \"branch\": \"\"}");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("read_error", "checks could not be read")]),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "gate");
+    assert_eq!(c.count("claim release"), 0);
+    assert!(
+        out.stderr.contains("no branch in unit.json") || out.stdout.contains("no branch in unit.json"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
 fn a_sync_in_flight_on_a_merged_pr_is_not_let_go_when_the_units_record_cannot_be_read() {
     let c = case(&[1]);
     c.seed(1, &GATE_PATH, Some(4701));

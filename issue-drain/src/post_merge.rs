@@ -116,7 +116,7 @@ fn without_code_spans(text: &str) -> String {
     let b = text.as_bytes();
     let run_at = |i: usize| b[i..].iter().take_while(|&&c| c == b'`').count();
     let mut out = String::with_capacity(text.len());
-    let (mut i, mut copied) = (0, 0);
+    let (mut i, mut copied, mut block) = (0, 0, 0);
     while i < b.len() {
         // A backtick is escaped by an odd run of backslashes before it; after
         // an even run the backslashes escape each other and the tick opens.
@@ -128,7 +128,11 @@ fn without_code_spans(text: &str) -> String {
         }
         let n = run_at(i);
         let mut j = i + n;
-        let block = block_end(text, j);
+        // A paragraph's end is found once and reused for every span in it,
+        // so many short spans in one long paragraph stay linear.
+        if j >= block {
+            block = block_end(text, j);
+        }
         let close = loop {
             match b[j..block].iter().position(|&c| c == b'`') {
                 None => break None,
@@ -388,6 +392,18 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         .ok_or_else(|| Fail::failed(format!("PR #{pr} is merged but names no merge commit")))?;
     let record = ctx.path(&format!("units/{unit}/{}", merge_gate::APPROVED_HEAD));
     let head = match fs::read_to_string(&record) {
+        // The gate's merge call pins the head it approved, so a merge it made
+        // has that head. A record naming another head belongs to an approval
+        // that never merged (a dropped queue entry, then a merge by hand), and
+        // comparing with it would report a tree mismatch that is not there.
+        Ok(text) if is_sha(text.trim()) && text.trim() != view.head => {
+            eprintln!(
+                "issue-drain post-merge: the gate approved {} for unit {unit} but PR #{pr} merged {}, so that approval is not this merge's; comparing with the merged head",
+                sha7(text.trim()),
+                sha7(&view.head)
+            );
+            view.head.clone()
+        }
         Ok(text) if is_sha(text.trim()) => text.trim().to_string(),
         Ok(_) => {
             return Err(Fail::failed(format!("{} does not hold a commit SHA", record.display())));
@@ -559,6 +575,18 @@ mod tests {
     #[test]
     fn a_long_run_of_backslashes_is_scanned_in_linear_time() {
         let body = format!("{}Fixes #1.", "\\".repeat(200_000));
+        let started = std::time::Instant::now();
+        assert_eq!(body_closes(&body, "a/b"), vec![1]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn many_code_spans_in_one_long_paragraph_are_scanned_in_linear_time() {
+        let body = format!("{}Fixes #1.", "`a` b\n".repeat(60_000));
         let started = std::time::Instant::now();
         assert_eq!(body_closes(&body, "a/b"), vec![1]);
         assert!(
