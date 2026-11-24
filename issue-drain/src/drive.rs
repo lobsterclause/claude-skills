@@ -72,7 +72,12 @@
 //!                 refusal right after a pass (`drive-review-resumed`), or the
 //!                 cap, goes to parked. A resume whose run fails, or whose
 //!                 result.json says blocked, parked or cap_reached, ends the
-//!                 unit that way; repair resumes are read the same way.
+//!                 unit that way; repair resumes are read the same way. A
+//!                 resume has failed when `unit-run` fails, or when its JSON
+//!                 says the claude process exited nonzero or timed out, or when
+//!                 result.json is not newer than the `drive-resume-started`
+//!                 mark written just before the resume (an old result is not
+//!                 this round's answer); each blocks the unit.
 //!   ci_wait       poll `merge-gate --dry-run` every ISSUE_DRAIN_DRIVE_POLL_SECS
 //!                 (default 180) until no refusal says a check is pending, then
 //!                 move to gate. Five unreadable gate reads in a row block the
@@ -225,6 +230,8 @@ const LONG_CHILDREN: [&str; 8] = [
 ];
 /// Longest gap between two waiting lines for one unit.
 const HEARTBEAT: Duration = Duration::from_secs(300);
+/// Touched just before a resume; the resume's result.json must be newer.
+const RESUME_STARTED: &str = "drive-resume-started";
 const TREE_MISMATCH: &str = "drive-tree-mismatch";
 /// Written when the gate queued the PR or sent a merge call whose outcome is
 /// unknown, and removed once the PR is read back merged, or open and out of
@@ -283,6 +290,22 @@ impl Reply {
             None if self.timed_out => "timed out".to_string(),
             None => format!("exit {}", self.code),
         }
+    }
+}
+
+/// Why the claude process inside a successful `unit-run` failed, from the
+/// `exit_code` and `timed_out` in its JSON; `None` when it exited 0.
+fn child_failure(ran: &Reply) -> Option<String> {
+    let Some(j) = ran.json() else {
+        return Some("unit-run printed no result, so the process's status is unknown".into());
+    };
+    if j["timed_out"] == true {
+        return Some("the unit's process timed out".into());
+    }
+    match j["exit_code"].as_i64() {
+        Some(0) => None,
+        Some(code) => Some(format!("the unit's process exited {code}")),
+        None => Some("the unit's process was killed".into()),
     }
 }
 
@@ -1227,6 +1250,8 @@ impl<'a> Driver<'a> {
         // Always named: a resume without one would fall back to the unit's
         // first model and undo an earlier step up the ladder.
         let model = model.map_or_else(|| self.last_model(unit), str::to_string);
+        // A fresh mark: the resume must write result.json after this.
+        write_atomic(&dir.join(self.mark(RESUME_STARTED)), b"1\n")?;
         self.call(&[
             "unit-run",
             "--unit",
@@ -1246,7 +1271,28 @@ impl<'a> Driver<'a> {
             self.block(u, &format!("{what} failed: {}", ran.why()), ran.infra())?;
             return Ok(true);
         }
-        let result: Value = read_json(&self.unit_dir(u.unit).join("result.json")).unwrap_or(Value::Null);
+        // `unit-run` exits 0 whatever its claude process did; the process's own
+        // status is in its JSON.
+        if let Some(why) = child_failure(ran) {
+            self.block(
+                u,
+                &format!("{what} failed: {why}"),
+                ran.json().is_some_and(|j| j["timed_out"] == true),
+            )?;
+            return Ok(true);
+        }
+        // An old result.json is not this resume's answer. The prompt tells the
+        // unit to update the file in place, so it is dated, not deleted.
+        let dir = self.unit_dir(u.unit);
+        let mtime = |name: &str| fs::metadata(dir.join(name)).and_then(|m| m.modified()).ok();
+        if !mtime("result.json")
+            .zip(mtime(&self.mark(RESUME_STARTED)))
+            .is_some_and(|(result, started)| result >= started)
+        {
+            self.block(u, &format!("{what} ended without writing a new result.json"), false)?;
+            return Ok(true);
+        }
+        let result: Value = read_json(&dir.join("result.json")).unwrap_or(Value::Null);
         let notes = notes_of(&result);
         let said = |outcome: &str| {
             if notes.is_empty() {

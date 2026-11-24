@@ -40,7 +40,7 @@ printf '%s\n' "$@" > "$FAKE_REC/argv.$u.$k"
 echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
 echo '{"type":"result","subtype":"success","session_id":"sess-1","total_cost_usd":0.1,"is_error":false,"num_turns":2}'
 if [ -e "$FAKE_REC/result.$u" ]; then cp "$FAKE_REC/result.$u" "$d/result.json"; fi
-exit 0
+exit "$(cat "$FAKE_REC/exit.$u" 2>/dev/null || echo 0)"
 "#;
 
 const MERGE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -426,6 +426,7 @@ fn a_failed_check_repairs_the_unit_and_names_the_check() {
         &Case::refused(&[("check_failed", "check 'lint' is failure")]),
     );
     c.canned_n("merge-gate", 3, 0, &Case::merged());
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
 
     let (out, report) = c.drive(&[]);
     assert_eq!(out.code, 0, "{}", out.stderr);
@@ -1071,4 +1072,67 @@ fn drive_pid_is_gone_after_a_normal_exit_and_named_while_running() {
     assert!(!c.env.workdir.join("drive.pid").exists());
     // The first line names the pid and the run folder.
     assert!(out.stderr.lines().next().unwrap_or_default().starts_with("drive: pid "));
+}
+
+fn repair_case(c: &Case) {
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write(
+        "units/1/session.json",
+        &json!({"session_id": "sess-1", "attempts": [{"attempt": 1, "model": "haiku"}]}).to_string(),
+    );
+    c.canned_n(
+        "merge-gate",
+        1,
+        3,
+        &Case::refused(&[("check_failed", "check 'lint' is failure")]),
+    );
+    c.canned("merge-gate", 0, &Case::clean());
+}
+
+#[test]
+fn a_repair_that_wrote_no_new_result_does_not_reuse_the_old_one() {
+    let c = case(&[1]);
+    repair_case(&c);
+    // The previous round's result is on disk; the fake claude writes none.
+    c.env.write(
+        "units/1/result.json",
+        &json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}).to_string(),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    assert_eq!(c.count("merge-gate"), 1, "no CI wait on an old result");
+    assert!(c.last_comment().contains("new result.json"), "{}", c.last_comment());
+}
+
+#[test]
+fn a_repair_whose_claude_exited_nonzero_is_a_failed_repair() {
+    let c = case(&[1]);
+    repair_case(&c);
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    fs::write(c.rec.join("exit.1"), "1").unwrap();
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    assert!(c.last_comment().contains("exited 1"), "{}", c.last_comment());
+}
+
+#[test]
+fn a_review_pass_whose_claude_exited_nonzero_is_not_a_pass() {
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.env.write(
+        "units/1/session.json",
+        &json!({"session_id": "sess-1", "attempts": [{"attempt": 1, "model": "haiku"}]}).to_string(),
+    );
+    c.canned("merge-gate", 3, &Case::refused(&[("review", "no review at the head")]));
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    fs::write(c.rec.join("exit.1"), "2").unwrap();
+    let (_, report) = c.drive(&[]);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    assert!(!c.env.workdir.join("units/1/drive-review-resumed").exists());
 }
