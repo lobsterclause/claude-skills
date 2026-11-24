@@ -255,6 +255,10 @@ const msOf = (iso: string | null): number | null => {
  * between went unread: then a unit with no line in the tail has not changed
  * since. Strictly before: the tail's first line is dropped as partial, and it
  * began before the last read's end, which fell on a line boundary.
+ *
+ * A poll that could not read events.jsonl at all keeps the last view's event
+ * details and end offset, so the next successful read is still checked
+ * against the last one that worked.
  */
 export function buildView(files: RunFiles, prev: View | null = null): View {
   const state = parseState(files.state)
@@ -270,7 +274,13 @@ export function buildView(files: RunFiles, prev: View | null = null): View {
     prev.eventsEnd !== undefined &&
     files.eventsEnd >= prev.eventsEnd &&
     (files.eventsStart === 0 || files.eventsStart < prev.eventsEnd)
-  const before = new Map(unbroken ? prev.units.map(u => [u.unit, u]) : [])
+  const unread =
+    files.eventsEnd === null &&
+    prev !== null &&
+    prev.runDir === files.runDir &&
+    prev.eventsEnd !== undefined &&
+    prev.eventsEnd !== null
+  const before = new Map(unbroken || unread ? prev.units.map(u => [u.unit, u]) : [])
   const units: UnitRow[] = state.units.map(u => {
     const id = `U${u.unit}`
     const old = before.get(u.unit)
@@ -307,9 +317,9 @@ export function buildView(files: RunFiles, prev: View | null = null): View {
     finished,
     total: units.length,
     isFinished: units.length > 0 && finished === units.length,
-    lastCall: facts.lastCall,
+    lastCall: unread ? prev.lastCall : facts.lastCall,
     lastActivityMs,
-    eventsEnd: files.eventsEnd,
+    eventsEnd: unread ? prev.eventsEnd : files.eventsEnd,
   }
 }
 

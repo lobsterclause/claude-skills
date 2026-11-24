@@ -155,6 +155,15 @@ test('a unit whose lines left the tail keeps its note and refusals, only with no
   expect(gap.units[0]?.note).toBe(null)
   expect(gap.units[1]?.refusals).toEqual([])
 
+  // A failed read keeps the last good baseline, and the next good read is checked against it.
+  const failed = buildView(files([unit(1, 'parked'), unit(2, 'ci_wait')]), first)
+  expect(failed.units[0]?.note).toBe('review cap reached')
+  expect(failed.eventsEnd).toBe(100_000)
+  expect(buildView({ ...quiet, eventsStart: 99_000, eventsEnd: 160_000 }, failed).units[0]?.note).toBe(
+    'review cap reached',
+  )
+  expect(buildView({ ...quiet, eventsStart: 200_000, eventsEnd: 265_536 }, failed).units[0]?.note).toBe(null)
+
   // A shorter file was rewritten; another run, or a view stored before offsets, is no baseline.
   expect(buildView({ ...quiet, eventsStart: 0, eventsEnd: 50 }, first).units[0]?.note).toBe(null)
   const elsewhere = { ...quiet, runDir: '/elsewhere', eventsStart: 99_000, eventsEnd: 160_000 }
