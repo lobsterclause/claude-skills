@@ -305,10 +305,8 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                 .as_deref()
                 .is_some_and(|head| !before.head.eq_ignore_ascii_case(head)),
         };
-        if resume {
-            if let Some(recorded) = p.local_head {
-                old_head = recorded;
-            }
+        if resume && let Some(recorded) = p.local_head {
+            old_head = recorded;
         }
     }
     let taken = syncs_taken(ctx, unit);

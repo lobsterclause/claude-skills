@@ -93,10 +93,10 @@ fn replay(ctx: &Ctx) -> Replayed {
                 let Ok(ev) = serde_json::from_value::<Event>(value) else {
                     continue;
                 };
-                if out.snapshot.apply(&ev).is_ok() {
-                    if let (Some(n), Some(t)) = (ev.unit, stamp) {
-                        out.logs.entry(n).or_default().stamps.push(t);
-                    }
+                if out.snapshot.apply(&ev).is_ok()
+                    && let (Some(n), Some(t)) = (ev.unit, stamp)
+                {
+                    out.logs.entry(n).or_default().stamps.push(t);
                 }
             }
         }

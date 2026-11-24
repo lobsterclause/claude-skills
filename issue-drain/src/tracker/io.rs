@@ -415,22 +415,22 @@ pub fn publish(ctx: &Ctx, _args: &PublishArgs) -> Res<()> {
     let queue = load_queue(ctx)?;
 
     // A dry run reads nothing from GitHub, as everywhere else.
-    if !ctx.dry_run {
-        if let Some((number, url, theirs)) = existing(ctx, &run)? {
-            // The run can be rendered again between a publish that died and
-            // this one. A tracker showing the earlier render is not adopted:
-            // a tick on it approves an offer this queue may not make.
-            let ours =
-                fs::read_to_string(&body).map_err(|e| Fail::failed(format!("cannot read {}: {e}", body.display())))?;
-            let text = |s: &str| s.replace("\r\n", "\n").trim_end().to_string();
-            if text(&ours) != text(&theirs) {
-                return Err(Fail::refused(format!(
-                    "this run already created tracker #{number} ({url}), and its body does not match the queue \
+    if !ctx.dry_run
+        && let Some((number, url, theirs)) = existing(ctx, &run)?
+    {
+        // The run can be rendered again between a publish that died and
+        // this one. A tracker showing the earlier render is not adopted:
+        // a tick on it approves an offer this queue may not make.
+        let ours =
+            fs::read_to_string(&body).map_err(|e| Fail::failed(format!("cannot read {}: {e}", body.display())))?;
+        let text = |s: &str| s.replace("\r\n", "\n").trim_end().to_string();
+        if text(&ours) != text(&theirs) {
+            return Err(Fail::refused(format!(
+                "this run already created tracker #{number} ({url}), and its body does not match the queue \
                      rendered now; close #{number} and publish again, or render the decisions it was made from"
-                )));
-            }
-            return record(ctx, "tracker_adopted", number, &url, run);
+            )));
         }
+        return record(ctx, "tracker_adopted", number, &url, run);
     }
 
     gh::write(

@@ -567,10 +567,8 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
 
     // 2 and 3. checks at the head
     let pinned = f.required.as_ref().is_ok_and(|r| r.iter().any(|c| c.app_id.is_some()));
-    if pinned {
-        if let Err(what) = &f.app_runs {
-            out.push(refusal("read_error", format!("could not read {what}")));
-        }
+    if pinned && let Err(what) = &f.app_runs {
+        out.push(refusal("read_error", format!("could not read {what}")));
     }
     match (&f.required, view) {
         (Err(what), _) => out.push(refusal("read_error", format!("could not read {what}"))),
@@ -2179,10 +2177,10 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         }
     });
     let view = read_view(&repo, pr);
-    if let Some(problem) = &note_problem {
-        if view.as_ref().map_or(true, |v| v.state != PrState::Merged) {
-            return Err(Fail::usage(problem.clone()));
-        }
+    if let Some(problem) = &note_problem
+        && view.as_ref().map_or(true, |v| v.state != PrState::Merged)
+    {
+        return Err(Fail::usage(problem.clone()));
     }
     let unit_entry = ctx
         .queue_unit(unit)
@@ -2195,45 +2193,45 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
 
     // A restarted driver asks again for a PR it already merged. Not for any
     // merged PR: this one must be the unit's, or `--pr` could name any number.
-    if let Ok(v) = &view {
-        if v.state == PrState::Merged {
-            let mut refusals = binding(&repo, &ctx.profile.base_branch, unit, pr, v, &unit_branch);
-            if let Err(what) = &unit_entry {
-                refusals.push(refusal("read_error", format!("could not read {what}")));
-            }
-            if !refusals.is_empty() {
-                report(ctx, unit, pr, &v.head, false, &refusals);
-                let list: Vec<Value> = refusals
-                    .iter()
-                    .map(|r| json!({"code": r.code, "detail": r.detail}))
-                    .collect();
-                println!(
-                    "{}",
-                    json!({"pr": pr, "unit": unit, "head": v.head, "merged": false, "refusals": list, "reviewers": []})
-                );
-                let codes: Vec<&str> = refusals.iter().map(|r| r.code).collect();
-                return Err(Fail::refused(format!(
-                    "PR #{pr} was not reported: {}",
-                    codes.join(", ")
-                )));
-            }
-            report(ctx, unit, pr, &v.head, true, &[]);
-            // A merge GitHub queued is merged by now, and its note was never
-            // posted: post it once, unless a comment already carries the marker.
-            let note_url = match &note_problem {
-                Some(problem) => {
-                    eprintln!("issue-drain: warning: PR #{pr} is merged, but the note was not posted: {problem}");
-                    Value::Null
-                }
-                None => post_note(ctx, unit, pr, &v.head, args.note_file.as_deref(), true),
-            };
-            let mut out = json!({"pr": pr, "unit": unit, "head": v.head, "merged": true, "already": true, "merge_commit": v.merge_commit, "refusals": [], "reviewers": [], "note_url": note_url});
-            if let (Some(problem), Some(map)) = (&note_problem, out.as_object_mut()) {
-                map.insert("note_warning".into(), json!(problem));
-            }
-            println!("{out}");
-            return Ok(());
+    if let Ok(v) = &view
+        && v.state == PrState::Merged
+    {
+        let mut refusals = binding(&repo, &ctx.profile.base_branch, unit, pr, v, &unit_branch);
+        if let Err(what) = &unit_entry {
+            refusals.push(refusal("read_error", format!("could not read {what}")));
         }
+        if !refusals.is_empty() {
+            report(ctx, unit, pr, &v.head, false, &refusals);
+            let list: Vec<Value> = refusals
+                .iter()
+                .map(|r| json!({"code": r.code, "detail": r.detail}))
+                .collect();
+            println!(
+                "{}",
+                json!({"pr": pr, "unit": unit, "head": v.head, "merged": false, "refusals": list, "reviewers": []})
+            );
+            let codes: Vec<&str> = refusals.iter().map(|r| r.code).collect();
+            return Err(Fail::refused(format!(
+                "PR #{pr} was not reported: {}",
+                codes.join(", ")
+            )));
+        }
+        report(ctx, unit, pr, &v.head, true, &[]);
+        // A merge GitHub queued is merged by now, and its note was never
+        // posted: post it once, unless a comment already carries the marker.
+        let note_url = match &note_problem {
+            Some(problem) => {
+                eprintln!("issue-drain: warning: PR #{pr} is merged, but the note was not posted: {problem}");
+                Value::Null
+            }
+            None => post_note(ctx, unit, pr, &v.head, args.note_file.as_deref(), true),
+        };
+        let mut out = json!({"pr": pr, "unit": unit, "head": v.head, "merged": true, "already": true, "merge_commit": v.merge_commit, "refusals": [], "reviewers": [], "note_url": note_url});
+        if let (Some(problem), Some(map)) = (&note_problem, out.as_object_mut()) {
+            map.insert("note_warning".into(), json!(problem));
+        }
+        println!("{out}");
+        return Ok(());
     }
 
     let facts = gather(ctx, &repo, unit, pr, view, unit_entry, unit_branch);

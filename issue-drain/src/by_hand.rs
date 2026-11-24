@@ -167,13 +167,12 @@ pub fn scope(ctx: &Ctx, command: &ScopeCommand) -> Res<()> {
     }
     // The unit's own copy, when `unit-prepare` has made one.
     let copy_path = ctx.path(&format!("units/{}/unit.json", args.unit));
-    if let Some(mut copy) = read_json::<Value>(&copy_path) {
-        if let Some(files) = copy["files"].as_array_mut() {
-            if !files.iter().any(|f| f == &args.file) {
-                files.push(json!(args.file));
-                write_json(&copy_path, &copy)?;
-            }
-        }
+    if let Some(mut copy) = read_json::<Value>(&copy_path)
+        && let Some(files) = copy["files"].as_array_mut()
+        && !files.iter().any(|f| f == &args.file)
+    {
+        files.push(json!(args.file));
+        write_json(&copy_path, &copy)?;
     }
     ctx.event(
         "scope_widen",

@@ -130,11 +130,11 @@ fn closing_issues(ctx: &Ctx, unit: u64, view: &Value) -> Vec<u64> {
         .as_array()
         .map(|list| list.iter().filter_map(|i| i["number"].as_u64()).collect())
         .unwrap_or_default();
-    if let Some(result) = read_json::<Value>(&ctx.path(&format!("units/{unit}/result.json"))) {
-        if let Some(closes) = result["closes"].as_array() {
-            let closes: Vec<u64> = closes.iter().filter_map(Value::as_u64).collect();
-            refs.retain(|n| closes.contains(n));
-        }
+    if let Some(result) = read_json::<Value>(&ctx.path(&format!("units/{unit}/result.json")))
+        && let Some(closes) = result["closes"].as_array()
+    {
+        let closes: Vec<u64> = closes.iter().filter_map(Value::as_u64).collect();
+        refs.retain(|n| closes.contains(n));
     }
     refs.sort_unstable();
     refs.dedup();

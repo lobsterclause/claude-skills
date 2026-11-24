@@ -673,12 +673,12 @@ fn event(ctx: &Ctx, args: &EventArgs) -> Res<()> {
             names.join(", ")
         ))
     })?;
-    if let Some(head) = &args.head {
-        if !is_sha(head) {
-            return Err(Fail::usage(format!(
-                "--head must be a full 40 or 64 digit commit SHA (got '{head}')"
-            )));
-        }
+    if let Some(head) = &args.head
+        && !is_sha(head)
+    {
+        return Err(Fail::usage(format!(
+            "--head must be a full 40 or 64 digit commit SHA (got '{head}')"
+        )));
     }
     let Replay { mut snapshot, text, .. } = started(ctx)?;
     let Some(unit) = snapshot.unit(args.unit) else {

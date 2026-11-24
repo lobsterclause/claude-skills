@@ -299,10 +299,10 @@ pub fn parse_added(patch: &str) -> Vec<AddedLine> {
         }
         if let Some(path) = text.strip_prefix("+++ b/") {
             file = path.to_string();
-        } else if text.starts_with("@@ ") {
-            if let Some((old, start, new)) = hunk(text) {
-                (old_left, line, new_left) = (old, start, new);
-            }
+        } else if text.starts_with("@@ ")
+            && let Some((old, start, new)) = hunk(text)
+        {
+            (old_left, line, new_left) = (old, start, new);
         }
     }
     out
