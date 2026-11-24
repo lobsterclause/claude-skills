@@ -21,9 +21,10 @@
 //! started at startup from `tracker parse` (saved as `parsed.json`) and
 //! `state init --parsed` when the run has none.
 //!
-//! One driver per repo. A lock file `$HOME/.issue-drain/<owner>__<repo>/drive.lock`
-//! holds the driver's pid; a lock whose pid is dead is taken over, and the file
-//! is removed on every exit path that runs destructors. (pr-drain's `lock.sh`
+//! One driver per repo. The driver holds an advisory lock (`flock`) on
+//! `$HOME/.issue-drain/<owner>__<repo>/drive.lock` for its whole life and writes
+//! its pid there for whoever is refused; the kernel releases the lock when the
+//! process exits, however it exits, and the file is left in place. (pr-drain's `lock.sh`
 //! is not located by this crate, so the lock is made here.) `caffeinate -i -w
 //! <pid>` keeps the Mac awake while the driver runs, if `caffeinate` exists.
 //!
@@ -134,8 +135,8 @@
 //! 2 on a missing setting.
 
 use std::cell::Cell;
-use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
@@ -349,16 +350,12 @@ struct Report {
     processed: Vec<(u64, State)>,
 }
 
-struct Lock(PathBuf);
-
-fn alive(pid: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", pid])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
+/// Held for the driver's life: an advisory lock (`flock`) on the lock file.
+/// The kernel releases it when the process exits by any path, so there is no
+/// stale lock to reap. The file is never removed: removing a locked file lets
+/// a later driver lock a new file at the same path while an earlier one still
+/// holds the old one.
+struct Lock(#[allow(dead_code)] File);
 
 impl Lock {
     fn take(ctx: &Ctx) -> Res<Lock> {
@@ -372,34 +369,34 @@ impl Lock {
         let dir = base.join(repo.replace('/', "__"));
         let path = dir.join("drive.lock");
         fs::create_dir_all(&dir).map_err(|e| Fail::failed(format!("cannot make {}: {e}", dir.display())))?;
-        let own = std::process::id().to_string();
-        for _ in 0..3 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut f) => {
-                    writeln!(f, "{own}").map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))?;
-                    return Ok(Lock(path));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let held = fs::read_to_string(&path).unwrap_or_default();
-                    let held = held.trim();
-                    if !held.is_empty() && held != own && alive(held) {
-                        return Err(Fail::refused(format!(
-                            "another driver (pid {held}) holds {}",
-                            path.display()
-                        )));
-                    }
-                    let _ = fs::remove_file(&path);
-                }
-                Err(e) => return Err(Fail::failed(format!("cannot take {}: {e}", path.display()))),
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| Fail::failed(format!("cannot open {}: {e}", path.display())))?;
+        match f.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                let held = fs::read_to_string(&path).unwrap_or_default();
+                let held = held.trim();
+                let who = if held.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (pid {held})")
+                };
+                return Err(Fail::refused(format!("another driver{who} holds {}", path.display())));
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(Fail::failed(format!("cannot lock {}: {e}", path.display())));
             }
         }
-        Err(Fail::failed(format!("cannot take {}", path.display())))
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        f.set_len(0)
+            .and_then(|()| f.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| writeln!(f, "{}", std::process::id()))
+            .map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))?;
+        Ok(Lock(f))
     }
 }
 

@@ -497,23 +497,31 @@ fn a_unit_process_may_not_drive() {
 }
 
 #[test]
-fn a_live_lock_refuses_and_a_dead_one_is_taken_over_and_removed() {
+fn a_held_lock_refuses_and_a_dead_drivers_file_does_not() {
     let c = case(&[1]);
     let lock_dir = c.env.dir.path().join("home/.issue-drain/example__tidepool");
     fs::create_dir_all(&lock_dir).unwrap();
     let lock = lock_dir.join("drive.lock");
-    fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+    fs::write(&lock, "4242\n").unwrap();
+    let held = fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    held.try_lock().unwrap();
     let (out, _) = c.drive(&[]);
     assert_eq!(out.code, 3, "{}", out.stderr);
-    assert!(out.stderr.contains("another driver"), "{}", out.stderr);
-    assert!(lock.exists(), "a refused driver leaves the other's lock alone");
+    assert!(out.stderr.contains("another driver (pid 4242)"), "{}", out.stderr);
+    assert!(c.calls().is_empty(), "a refused driver does nothing");
+    drop(held);
 
-    let mut dead = std::process::Command::new("true").spawn().unwrap();
-    let pid = dead.id();
-    dead.wait().unwrap();
-    fs::write(&lock, format!("{pid}\n")).unwrap();
     c.env.write("STOP", "");
     let (out, _) = c.drive(&[]);
-    assert_eq!(out.code, 0, "{}", out.stderr);
-    assert!(!lock.exists(), "the lock is removed on exit");
+    assert_eq!(
+        out.code, 0,
+        "a file left by a driver that exited does not block: {}",
+        out.stderr
+    );
+    let after = fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    after.try_lock().expect("the lock is released on exit");
+    assert!(
+        !fs::read_to_string(&lock).unwrap().contains("4242"),
+        "the new driver wrote its own pid"
+    );
 }
