@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 
 use crate::ctx::{Ctx, read_json, write_atomic, write_json};
 use crate::error::{Fail, Res};
-use crate::model::{Checked, Eligible, FixCommit, Intake, Line, Queue};
+use crate::model::{Checked, Eligible, FixCommit, Intake, Line, Overlap, Queue};
 use crate::profile::shared_entry;
 use crate::text::{clean, code, count, repo_path, sha7};
 
@@ -519,7 +519,12 @@ fn render(input: &Input) -> Res<Rendered> {
         count(input.intake.eligible.len(), "issue"),
         input.run
     );
-    let units: Vec<Value> = all.iter().enumerate().map(|(i, u)| unit_json(i, u)).collect();
+    let shares = shares_files_with(ctx_overlap(input.ctx).as_ref(), &all);
+    let units: Vec<Value> = all
+        .iter()
+        .enumerate()
+        .map(|(i, u)| unit_json(i, u, &shares[i]))
+        .collect();
     let closures_json: Vec<Value> = closures
         .iter()
         .map(|c| closure_json(c, ck.get(&c.number).copied()))
@@ -673,7 +678,38 @@ fn unit_errors(
     }
 }
 
-fn unit_json(index: usize, u: &Draft) -> Value {
+/// The run's `overlap.json`, if it has one that reads.
+fn ctx_overlap(ctx: &Ctx) -> Option<Overlap> {
+    read_json(&ctx.path("overlap.json"))
+}
+
+/// For each unit, in queue order, the numbers of the other units that hold an
+/// issue paired with one of its issues over at least one shared file.
+fn shares_files_with(overlap: Option<&Overlap>, all: &[&Draft]) -> Vec<Vec<u64>> {
+    let unit_of = |issue: u64| all.iter().position(|u| u.issues.contains(&issue));
+    let mut shares = vec![Vec::new(); all.len()];
+    for pair in overlap.map_or(&[][..], |o| &o.pairs[..]) {
+        if pair.shared_files.is_empty() {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (unit_of(pair.a), unit_of(pair.b))
+            && a != b
+        {
+            for (from, to) in [(a, b), (b, a)] {
+                let number = to as u64 + 1;
+                if !shares[from].contains(&number) {
+                    shares[from].push(number);
+                }
+            }
+        }
+    }
+    for list in &mut shares {
+        list.sort_unstable();
+    }
+    shares
+}
+
+fn unit_json(index: usize, u: &Draft, shares: &[u64]) -> Value {
     let mut m = Map::new();
     m.insert("id".into(), json!(format!("U{}", index + 1)));
     m.insert("issues".into(), json!(u.issues));
@@ -694,6 +730,7 @@ fn unit_json(index: usize, u: &Draft) -> Value {
     m.insert("waits".into(), json!(u.risk));
     m.insert("waits_for".into(), u.waits_for.clone());
     m.insert("priority".into(), json!(u.priority));
+    m.insert("shares_files_with".into(), json!(shares));
     Value::Object(m)
 }
 

@@ -159,7 +159,7 @@ Every subcommand uses the first four, and prints one line saying why on anything
 | `verdicts.checked.json` | `evidence-check` | the verdicts that survived, with fixing commits |
 | `overlap.json` | `overlap` | proposed pairs and groups |
 | `decisions.json` | you | units, confirmed closures, issues left out |
-| `queue.json`, `tracker.md` | `tracker render` | the queue as data and as the tracker body |
+| `queue.json`, `tracker.md` | `tracker render` | the queue as data and as the tracker body; each unit in `queue.json` has `shares_files_with`, the numbers of the other units that share a file with it (from `overlap.json`) |
 | `tracker.json` | `tracker publish` | the tracker's number and URL |
 | `publish.lock` | `tracker render`, `tracker publish` | present only while a render or a publish runs |
 | `closures/<n>.md` | `close-verified` | each closing comment |

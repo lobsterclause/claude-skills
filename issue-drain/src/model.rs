@@ -255,6 +255,10 @@ pub struct Unit {
     pub waits: bool,
     pub waits_for: Option<String>,
     pub priority: usize,
+    /// Unit numbers, in queue order, of the other units that share at least
+    /// one file with this one, from `overlap.json`. Absent in an older queue.
+    #[serde(default)]
+    pub shares_files_with: Vec<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
