@@ -1702,7 +1702,12 @@ impl<'a> Driver<'a> {
                                 self.merge_settled(u.unit)?;
                                 return self.merged(u.unit, pr);
                             }
-                            Outcome::NotMerging => self.merge_settled(u.unit)?,
+                            Outcome::NotMerging => {
+                                // The request is over and did not merge: the head
+                                // it approved must not judge a later merge.
+                                self.forget_approved_head(u.unit)?;
+                                self.merge_settled(u.unit)?;
+                            }
                             Outcome::Unsure(why) => {
                                 // The refusals cannot be acted on yet: a park
                                 // would release the claim on a PR that may merge.
@@ -1768,6 +1773,15 @@ impl<'a> Driver<'a> {
         match fs::remove_file(self.unit_dir(unit).join(MERGE_ASKED)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Fail::failed(format!(
                 "cannot remove the merge record of unit {unit}: {e}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    fn forget_approved_head(&self, unit: u64) -> Res<()> {
+        match fs::remove_file(self.unit_dir(unit).join(crate::merge_gate::APPROVED_HEAD)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Fail::failed(format!(
+                "cannot remove the approved head of unit {unit}: {e}"
             ))),
             _ => Ok(()),
         }

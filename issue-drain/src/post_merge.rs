@@ -120,8 +120,9 @@ fn without_code_spans(text: &str) -> String {
     while i < b.len() {
         // A backtick is escaped by an odd run of backslashes before it; after
         // an even run the backslashes escape each other and the tick opens.
-        let escapes = b[..i].iter().rev().take_while(|&&c| c == b'\\').count();
-        if b[i] != b'`' || escapes % 2 == 1 {
+        // The escape count is taken only at a backtick, so a long run of
+        // backslashes stays linear.
+        if b[i] != b'`' || b[..i].iter().rev().take_while(|&&c| c == b'\\').count() % 2 == 1 {
             i += 1;
             continue;
         }
@@ -553,6 +554,18 @@ mod tests {
         assert_eq!(body_closes(body, "a/b"), vec![1]);
         let odd = "A \\\\\\` here, then Fixes #3 and `Fixes #4`.";
         assert_eq!(body_closes(odd, "a/b"), vec![3]);
+    }
+
+    #[test]
+    fn a_long_run_of_backslashes_is_scanned_in_linear_time() {
+        let body = format!("{}Fixes #1.", "\\".repeat(200_000));
+        let started = std::time::Instant::now();
+        assert_eq!(body_closes(&body, "a/b"), vec![1]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

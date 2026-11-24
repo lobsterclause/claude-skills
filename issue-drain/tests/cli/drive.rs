@@ -1048,6 +1048,8 @@ fn a_hold_label_on_a_queued_pr_does_not_park_the_unit() {
     c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
     c.seed(1, &GATE_PATH, Some(4701));
     c.env.write("units/1/drive-merge-asked", "a merge was asked for\n");
+    c.env
+        .write("units/1/merge-approved-head", &format!("{}\n", "a".repeat(40)));
     pr_now(&c, "OPEN", None, true);
     c.canned(
         "merge-gate",
@@ -1061,6 +1063,10 @@ fn a_hold_label_on_a_queued_pr_does_not_park_the_unit() {
     assert!(
         c.env.workdir.join("units/1/drive-merge-asked").exists(),
         "the record stays"
+    );
+    assert!(
+        c.env.workdir.join("units/1/merge-approved-head").exists(),
+        "a queued merge keeps the head it was approved at"
     );
 }
 
@@ -1086,6 +1092,8 @@ fn a_refusal_once_the_pr_left_the_queue_is_acted_on() {
     c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
     c.seed(1, &GATE_PATH, Some(4701));
     c.env.write("units/1/drive-merge-asked", "a merge was asked for\n");
+    c.env
+        .write("units/1/merge-approved-head", &format!("{}\n", "a".repeat(40)));
     pr_now(&c, "OPEN", None, false);
     c.canned(
         "merge-gate",
@@ -1099,6 +1107,11 @@ fn a_refusal_once_the_pr_left_the_queue_is_acted_on() {
     assert!(
         !c.env.workdir.join("units/1/drive-merge-asked").exists(),
         "the record is gone"
+    );
+    // A merge by hand later must not be judged against the abandoned request.
+    assert!(
+        !c.env.workdir.join("units/1/merge-approved-head").exists(),
+        "the approved head is gone"
     );
 }
 
