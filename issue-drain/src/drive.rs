@@ -37,6 +37,13 @@
 //! started at startup from `tracker parse` (saved as `parsed.json`) and
 //! `state init --parsed` when the run has none.
 //!
+//! State against GitHub. Before the first unit starts, every unit that is not
+//! finished and has a `units/<n>/unit.json` gets one `gh pr list` read for its
+//! branch. If that branch's PR is merged or closed while the state says the unit
+//! is not finished, the driver refuses (exit 3) naming each unit and PR, and
+//! starts nothing; `state record` writes such a unit back. A read that fails is
+//! exit 1.
+//!
 //! One driver per repo. The driver holds an advisory lock (`flock`) on
 //! `$HOME/.issue-drain/<owner>__<repo>/drive.lock` for its whole life and writes
 //! its pid there for whoever is refused; the kernel releases the lock when the
@@ -205,6 +212,7 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, env_str, read_json, write_atomic};
 use crate::error::{Fail, Res};
 use crate::exec;
+use crate::gh;
 use crate::merge_gate::{PrState, PrView, binding, is_sha, merge_status, read_view};
 use crate::state::{self, MAX_BASE_SYNCS, MAX_REPAIRS, Snapshot, State, UnitState};
 use crate::tracker::io::Published;
@@ -1057,6 +1065,9 @@ impl<'a> Driver<'a> {
                 code: 3,
             }));
         }
+        if let Some(reason) = self.disagreements()? {
+            return Ok(Some(Stop { reason, code: 3 }));
+        }
         let mut visited: Vec<u64> = Vec::new();
         loop {
             self.reconcile()?;
@@ -1128,6 +1139,110 @@ impl<'a> Driver<'a> {
                 return Ok(None);
             }
         }
+    }
+
+    /// Units whose state says they are not finished while GitHub says their
+    /// branch's PR is merged or closed, as one reason line; `None` when state
+    /// and GitHub agree. One `gh pr list` read per unfinished unit that has a
+    /// `unit.json`. A branch with an open PR agrees with any unfinished state.
+    /// A unit with a merge request on record (`drive-merge-asked`) is skipped:
+    /// a driver killed after the merge leaves it at the gate with a merged PR,
+    /// which the gate step settles itself. A read that fails is exit 1.
+    fn disagreements(&self) -> Res<Option<String>> {
+        let mut found = Vec::new();
+        for u in &self.snapshot()?.units {
+            if u.state.is_terminal() || matches!(u.state, State::Merged) {
+                continue;
+            }
+            let dir = self.unit_dir(u.unit);
+            if dir.join(self.mark(MERGE_ASKED)).exists() || dir.join(MERGE_ASKED).exists() {
+                continue;
+            }
+            // A base sync cut short at the gate: the gate step finishes it, and
+            // settles a PR that merged meanwhile itself.
+            if u.state == State::Gate && dir.join(crate::base_sync::PENDING_MARKER).exists() {
+                continue;
+            }
+            // A gate that approved a head may have merged it before the driver
+            // was killed; the gate step reads the PR and settles that itself.
+            if u.state == State::Gate && dir.join(crate::merge_gate::APPROVED_HEAD).exists() {
+                continue;
+            }
+            let Some(branch) = read_json::<Value>(&dir.join("unit.json"))
+                .and_then(|v| v["branch"].as_str().map(str::to_string))
+                .filter(|b| !b.is_empty())
+            else {
+                continue;
+            };
+            let listed = gh::read(&[
+                "pr",
+                "list",
+                "--repo",
+                &self.repo,
+                "--head",
+                &branch,
+                "--state",
+                "all",
+                "--json",
+                "number,state,baseRefName,headRepository,headRepositoryOwner,createdAt",
+                "--limit",
+                "30",
+            ])
+            .map_err(|rc| {
+                Fail::failed(format!(
+                    "could not read the PRs of branch {branch} (unit {}): gh exited {rc}",
+                    u.unit
+                ))
+            })?;
+            let all: Vec<Value> = serde_json::from_str(&listed)
+                .map_err(|e| Fail::failed(format!("gh pr list for branch {branch} printed no JSON list: {e}")))?;
+            // `--head` matches the branch name in any fork and against any
+            // base, so keep only PRs that could be the unit's: from this
+            // repository, aimed at the base, the PR state names when it names
+            // one, and not opened before this run queued the unit (a branch
+            // name is the unit number and title, so an earlier run's PR can
+            // carry it).
+            let base = &self.ctx.profile.base_branch;
+            let queued = crate::state::queued_at(self.ctx, u.unit)?;
+            let prs: Vec<Value> = all
+                .into_iter()
+                .filter(|p| {
+                    let from = format!(
+                        "{}/{}",
+                        p["headRepositoryOwner"]["login"].as_str().unwrap_or_default(),
+                        p["headRepository"]["name"].as_str().unwrap_or_default()
+                    );
+                    p["baseRefName"].as_str() == Some(base.as_str())
+                        && from.eq_ignore_ascii_case(&self.repo)
+                        && u.pr.is_none_or(|n| p["number"].as_u64() == Some(n))
+                        && !crate::state::opened_before(p, queued)
+                })
+                .collect();
+            let state_of = |p: &Value| p["state"].as_str().unwrap_or_default().to_ascii_lowercase();
+            if prs.iter().any(|p| state_of(p) == "open") {
+                continue;
+            }
+            let ended = prs
+                .iter()
+                .filter(|p| matches!(state_of(p).as_str(), "merged" | "closed"))
+                .max_by_key(|p| p["number"].as_u64().unwrap_or(0));
+            if let Some(p) = ended {
+                found.push(format!(
+                    "unit {} is {} but PR #{} is {}",
+                    u.unit,
+                    u.state.as_str(),
+                    p["number"],
+                    state_of(p)
+                ));
+            }
+        }
+        if found.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "state disagrees with GitHub: {}; nothing was started. Record them with `state record --unit <n> --state merged|parked --pr <n> --reason <text>`, then drive again",
+            found.join("; ")
+        )))
     }
 
     /// Record a stop, tell the tracker, and hand the reason back.

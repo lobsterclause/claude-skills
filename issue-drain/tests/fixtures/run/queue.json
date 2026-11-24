@@ -35,7 +35,8 @@
       "risk_paths": [],
       "waits": false,
       "waits_for": null,
-      "priority": 1
+      "priority": 1,
+      "shares_files_with": []
     },
     {
       "id": "U2",
@@ -67,7 +68,8 @@
       "risk_paths": [],
       "waits": false,
       "waits_for": null,
-      "priority": 1
+      "priority": 1,
+      "shares_files_with": []
     },
     {
       "id": "U3",
@@ -95,7 +97,8 @@
       "risk_paths": [],
       "waits": false,
       "waits_for": null,
-      "priority": 99
+      "priority": 99,
+      "shares_files_with": []
     },
     {
       "id": "U4",
@@ -125,7 +128,8 @@
       ],
       "waits": true,
       "waits_for": "clinical review",
-      "priority": 0
+      "priority": 0,
+      "shares_files_with": []
     }
   ],
   "closures": [

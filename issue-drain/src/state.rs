@@ -142,6 +142,10 @@ pub struct Event {
     /// can rebuild the snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issues: Option<Vec<u64>>,
+    /// On a `state record` event only: the unit was worked by hand, so the
+    /// move skips the transition table and `merged` needs no `--head`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_hand: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -257,7 +261,25 @@ impl Snapshot {
                 ev.from.as_deref().unwrap_or_default()
             ));
         }
-        if !from.exits().contains(&to) {
+        let by_hand = ev.by_hand == Some(true);
+        if by_hand {
+            if !matches!(to, Merged | Parked) {
+                return Err(format!(
+                    "a record moves a unit to merged or parked, not {}",
+                    to.as_str()
+                ));
+            }
+            if from.is_terminal() || from == Merged {
+                return Err(format!(
+                    "unit {number} is in state {}, which is finished; it cannot be recorded as {}",
+                    from.as_str(),
+                    to.as_str()
+                ));
+            }
+            if to == Merged && ev.pr.is_none() {
+                return Err(format!("unit {number} cannot be recorded as merged without --pr"));
+            }
+        } else if !from.exits().contains(&to) {
             return Err(format!(
                 "unit {number} is in state {} and cannot move to {}",
                 from.as_str(),
@@ -276,10 +298,10 @@ impl Snapshot {
                 from.as_str()
             ));
         }
-        if to == PrOpen && ev.pr.is_none() {
+        if !by_hand && to == PrOpen && ev.pr.is_none() {
             return Err(format!("unit {number} cannot move to pr_open without --pr"));
         }
-        if to == Merged && ev.head.is_none() {
+        if !by_hand && to == Merged && ev.head.is_none() {
             return Err(format!("unit {number} cannot move to merged without --head"));
         }
         unit.state = to;
@@ -330,6 +352,27 @@ pub fn log_text(ctx: &Ctx) -> Res<String> {
         Ok(text) => Ok(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(Fail::failed(format!("cannot read {}: {e}", path.display()))),
+    }
+}
+
+/// When this run queued `unit`: the time of its first state event, as epoch
+/// seconds. `None` when the log has no event for it.
+pub fn queued_at(ctx: &Ctx, unit: u64) -> Res<Option<i64>> {
+    let text = log_text(ctx)?;
+    Ok(text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v.get("event").is_none() && v["unit"].as_u64() == Some(unit))
+        .find_map(|v| v["ts"].as_str().and_then(crate::ctx::parse_rfc3339)))
+}
+
+/// Whether a PR (a `gh` JSON object with `createdAt`) was opened before
+/// `queued`, so it belongs to an earlier run. A time that is missing or cannot
+/// be read is not before: such a PR is kept, and is compared like any other.
+pub fn opened_before(pr: &Value, queued: Option<i64>) -> bool {
+    match (pr["createdAt"].as_str().and_then(crate::ctx::parse_rfc3339), queued) {
+        (Some(created), Some(queued)) => created < queued,
+        _ => false,
     }
 }
 
@@ -415,8 +458,27 @@ fn write_snapshot(ctx: &Ctx, snapshot: &Snapshot) -> Res<()> {
     write_json(&snapshot_path(ctx), snapshot)
 }
 
+/// Held from the replay to the append, so two writers cannot both build an
+/// event on the same old state: the second waits, then replays the first's
+/// event. Released when the file is dropped.
+fn lock_state(ctx: &Ctx) -> Res<fs::File> {
+    let path = ctx.path(if ctx.dry_run { "state.dry.lock" } else { "state.lock" });
+    let open = || -> std::io::Result<fs::File> {
+        fs::create_dir_all(&ctx.workdir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        file.lock()?;
+        Ok(file)
+    };
+    open().map_err(|e| Fail::failed(format!("cannot lock {}: {e}", path.display())))
+}
+
 /// Apply one new event to a started drain, then record it.
 fn record(ctx: &Ctx, ev: Event) -> Res<()> {
+    let _lock = lock_state(ctx)?;
     let Replay { mut snapshot, text, .. } = started(ctx)?;
     snapshot.apply(&ev).map_err(Fail::refused)?;
     append(ctx, &text, &[ev])?;
@@ -433,6 +495,8 @@ pub enum Command {
     Stop(StopArgs),
     /// Lift a stop.
     Resume,
+    /// Write a unit worked by hand back into the state: merged or parked.
+    Record(RecordArgs),
     /// Print where every unit is.
     Show(ShowArgs),
     /// Print the number of the next unit still to work, if any.
@@ -466,6 +530,22 @@ pub struct EventArgs {
 }
 
 #[derive(clap::Args)]
+pub struct RecordArgs {
+    /// The unit's number (3 for U3).
+    #[arg(long)]
+    unit: u64,
+    /// What happened to it: merged or parked.
+    #[arg(long)]
+    state: String,
+    /// The PR's number. Required for merged.
+    #[arg(long)]
+    pr: Option<u64>,
+    /// Why the state is being written by hand.
+    #[arg(long)]
+    reason: String,
+}
+
+#[derive(clap::Args)]
 pub struct StopArgs {
     #[arg(long)]
     reason: String,
@@ -492,6 +572,7 @@ pub fn run(ctx: &Ctx, command: &Command) -> Res<()> {
         Command::Event(args) => event(ctx, args),
         Command::Stop(args) => record(ctx, now_event(ctx, None, STOP, Some(args.reason.clone()))),
         Command::Resume => record(ctx, now_event(ctx, None, RESUME, None)),
+        Command::Record(args) => record_by_hand(ctx, args),
         Command::Show(args) => show(ctx, args),
         Command::Next => next(ctx),
         Command::Rebuild => rebuild(ctx),
@@ -508,6 +589,7 @@ fn now_event(ctx: &Ctx, unit: Option<u64>, to: &str, note: Option<String>) -> Ev
         pr: None,
         head: None,
         issues: None,
+        by_hand: None,
     }
 }
 
@@ -599,6 +681,7 @@ fn init(ctx: &Ctx, args: &InitArgs) -> Res<usize> {
 /// `init`, with the approved tracker (a `tracker parse` answer and the name to
 /// call it in messages) already read.
 fn init_from(ctx: &Ctx, source: Option<(Value, String)>) -> Res<usize> {
+    let _lock = lock_state(ctx)?;
     let replay = replay(ctx)?;
     if replay.events > 0 {
         return Err(Fail::refused(format!(
@@ -656,6 +739,12 @@ fn init_from(ctx: &Ctx, source: Option<(Value, String)>) -> Res<usize> {
     append(ctx, &replay.text, &events)?;
     write_snapshot(ctx, &snapshot)?;
     Ok(events.len())
+}
+
+/// The run's state, or `None` when the run has none yet or its log does not
+/// replay. For a reader that can do without it.
+pub fn load(ctx: &Ctx) -> Option<Snapshot> {
+    replay(ctx).ok().filter(|r| r.events > 0).map(|r| r.snapshot)
 }
 
 /// Refuse (exit 3) a unit that is not in the run's state queue: the approved
@@ -722,6 +811,7 @@ fn event(ctx: &Ctx, args: &EventArgs) -> Res<()> {
             "--head must be a full 40 or 64 digit commit SHA (got '{head}')"
         )));
     }
+    let _lock = lock_state(ctx)?;
     let Replay { mut snapshot, text, .. } = started(ctx)?;
     let Some(unit) = snapshot.unit(args.unit) else {
         return Err(Fail::refused(format!(
@@ -737,6 +827,127 @@ fn event(ctx: &Ctx, args: &EventArgs) -> Res<()> {
     snapshot.apply(&ev).map_err(Fail::refused)?;
     append(ctx, &text, &[ev])?;
     write_snapshot(ctx, &snapshot)
+}
+
+/// `state record`: one event, through the same rules and the same log as
+/// `state event`, but from any unfinished state.
+fn record_by_hand(ctx: &Ctx, args: &RecordArgs) -> Res<()> {
+    let to = match State::from_name(&args.state) {
+        Some(to @ (Merged | Parked)) => to,
+        _ => {
+            return Err(Fail::usage(format!(
+                "--state must be merged or parked (got '{}')",
+                args.state
+            )));
+        }
+    };
+    if to == Merged && args.pr.is_none() {
+        return Err(Fail::usage("--pr is required to record a unit as merged"));
+    }
+    let reason = args.reason.trim();
+    if reason.is_empty() {
+        return Err(Fail::usage("--reason needs some text"));
+    }
+    let not_queued = || Fail::refused(format!("unit {} is not in the queue", args.unit));
+    let seen = started(ctx)?.snapshot;
+    let (seen_state, seen_pr) = seen.unit(args.unit).map(|u| (u.state, u.pr)).ok_or_else(not_queued)?;
+    let merge_commit = match (to, args.pr) {
+        (Merged, Some(pr)) => merged_pr_is_the_units(ctx, args.unit, pr)?,
+        _ => {
+            if let Some(pr) = args.pr.or(seen_pr) {
+                merge_is_settled(ctx, pr)?;
+            }
+            None
+        }
+    };
+    // GitHub was read without the lock. The log is replayed again under it, and
+    // the record stands only if the unit is where it was when GitHub was read.
+    let _lock = lock_state(ctx)?;
+    let Replay { mut snapshot, text, .. } = started(ctx)?;
+    let unit = snapshot.unit(args.unit).ok_or_else(not_queued)?;
+    if unit.state != seen_state || unit.pr != seen_pr {
+        return Err(Fail::refused(format!(
+            "unit {} moved to {} while this record was being checked; run it again",
+            args.unit,
+            unit.state.as_str()
+        )));
+    }
+    let mut ev = now_event(ctx, Some(args.unit), to.as_str(), Some(reason.to_string()));
+    ev.from = Some(unit.state.as_str().to_string());
+    ev.pr = args.pr;
+    ev.head = merge_commit;
+    ev.by_hand = Some(true);
+    snapshot.apply(&ev).map_err(Fail::refused)?;
+    append(ctx, &text, &[ev])?;
+    write_snapshot(ctx, &snapshot)
+}
+
+/// A unit is parked by hand only when its PR cannot merge behind the run's
+/// back. One in the merge queue, or with auto-merge armed, may still merge, and
+/// a parked unit gets no post-merge check of its tree; a merged PR is recorded
+/// as merged instead, which does get one. A PR that cannot be read refuses too.
+fn merge_is_settled(ctx: &Ctx, pr: u64) -> Res<()> {
+    use crate::merge_gate::{self, PrState};
+    let repo = ctx.repo()?;
+    let status = merge_gate::merge_status(&repo, pr).map_err(|e| Fail::failed(format!("could not read {e}")))?;
+    let why = match status.state {
+        PrState::Merged => {
+            format!("PR #{pr} is merged; record the unit with --state merged --pr {pr} so post-merge checks its tree")
+        }
+        PrState::Open if status.in_queue => format!(
+            "PR #{pr} is in the merge queue, so GitHub may still merge it; take it out of the queue or let it merge, then record the unit"
+        ),
+        PrState::Open if status.auto_merge => format!(
+            "PR #{pr} has auto-merge armed, so GitHub may still merge it; turn auto-merge off or let it merge, then record the unit"
+        ),
+        PrState::Other => format!("PR #{pr} is in a state issue-drain does not know"),
+        PrState::Open | PrState::Closed => return Ok(()),
+    };
+    Err(Fail::refused(why))
+}
+
+/// A merge recorded by hand is checked the way post-merge will check it: the
+/// PR is merged, and it is the unit's (its branch, the base, this repository,
+/// opened after this run queued the unit). A wrong number would otherwise stop
+/// the next drive, and a unit in merged cannot be recorded again. Returns the
+/// merge commit GitHub names, which the event keeps so a later base-sync
+/// conflict is put down to the files the merge really changed.
+fn merged_pr_is_the_units(ctx: &Ctx, unit: u64, pr: u64) -> Res<Option<String>> {
+    use crate::merge_gate::{self, PrState, UnitBranch};
+    let repo = ctx.repo()?;
+    let view = merge_gate::read_view(&repo, pr).map_err(|e| Fail::failed(format!("could not read PR #{pr}: {e}")))?;
+    if view.state != PrState::Merged {
+        return Err(Fail::refused(format!(
+            "PR #{pr} is not merged; record the unit as merged once it is"
+        )));
+    }
+    let branch = merge_gate::unit_file::<UnitBranch>(ctx, unit, "unit.json")
+        .map(|u| u.branch)
+        .and_then(|b| {
+            if b.is_empty() {
+                Err(format!("units/{unit}/unit.json names no branch"))
+            } else {
+                Ok(b)
+            }
+        });
+    let mut why: Vec<String> = merge_gate::binding(&repo, &ctx.profile.base_branch, unit, pr, &view, &branch)
+        .into_iter()
+        .map(|r| r.detail)
+        .collect();
+    let created = crate::gh::read(&["pr", "view", &pr.to_string(), "--repo", &repo, "--json", "createdAt"])
+        .map_err(|rc| Fail::failed(format!("could not read when PR #{pr} was opened: gh exited {rc}")))?;
+    let created: Value =
+        serde_json::from_str(&created).map_err(|e| Fail::failed(format!("gh pr view #{pr} printed no JSON: {e}")))?;
+    if opened_before(&created, queued_at(ctx, unit)?) {
+        why.push(format!("it was opened before this run queued unit {unit}"));
+    }
+    if why.is_empty() {
+        return Ok(view.merge_commit.filter(|c| merge_gate::is_sha(c)));
+    }
+    Err(Fail::refused(format!(
+        "PR #{pr} cannot be recorded for unit {unit}: {}",
+        why.join("; ")
+    )))
 }
 
 fn show(ctx: &Ctx, args: &ShowArgs) -> Res<()> {

@@ -625,3 +625,49 @@ fn a_folder_that_evidence_check_kept_renders_with_its_slash() {
     let queue = json(&env.workdir.join("queue.json")).to_string();
     assert!(queue.contains("\"src/timer/\""), "{queue}");
 }
+
+#[test]
+fn each_unit_lists_the_other_units_it_shares_files_with() {
+    let env = rendered_env();
+    // a pair that crosses U1 (103, 106) and U3 (111), one that shares only a
+    // symbol, and one inside U2 (104, 105): only the first counts
+    let mut overlap = json(&fixtures().join("run/overlap.json"));
+    let pairs = overlap["pairs"].as_array_mut().unwrap();
+    pairs.push(json!({"a": 103, "b": 111, "relation": "adjacent",
+        "shared_files": ["src/shared.ts"], "shared_symbols": [], "note": null}));
+    pairs.push(json!({"a": 108, "b": 111, "relation": "adjacent",
+        "shared_files": [], "shared_symbols": ["x"], "note": null}));
+    env.write("overlap.json", &overlap.to_string());
+    let out = render(&env);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let queue = json(&env.workdir.join("queue.json"));
+    let shares: Vec<(String, Value)> = queue["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| (u["id"].as_str().unwrap().to_string(), u["shares_files_with"].clone()))
+        .collect();
+    assert_eq!(
+        shares,
+        vec![
+            ("U1".to_string(), json!([3])),
+            ("U2".to_string(), json!([])),
+            ("U3".to_string(), json!([1])),
+            ("U4".to_string(), json!([])),
+        ]
+    );
+    // the tracker markdown is unchanged by it
+    let want = fs::read_to_string(fixtures().join("run/tracker.md")).expect("golden");
+    assert_eq!(md(&env), want);
+}
+
+#[test]
+fn a_run_with_no_overlap_file_gets_empty_lists() {
+    let env = rendered_env();
+    fs::remove_file(env.workdir.join("overlap.json")).unwrap();
+    let out = render(&env);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    for u in json(&env.workdir.join("queue.json"))["units"].as_array().unwrap() {
+        assert_eq!(u["shares_files_with"], json!([]));
+    }
+}

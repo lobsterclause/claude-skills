@@ -42,6 +42,17 @@
 //! the head recorded before the request only does the local steps and spends no
 //! slot. `review_round_needed` is false only if the review read is of the new head.
 //!
+//! When the branch cannot take the base because of conflicts (`gh pr update-branch`
+//! refuses, or the fast-forward fails), the error line lists the conflicting files
+//! (`git merge-tree`, read-only) and, for each, the merged units that share files
+//! with this one (`shares_files_with` in queue.json) and touched it. The files
+//! compared are the ones that failed: the PR's branch against the base when
+//! GitHub refuses the update, the local branch against the fetched PR branch when
+//! the fast-forward fails. A merged unit touched a file if its PR changed it
+//! (`gh pr diff --name-only`, whatever the merge method); failing that, if the
+//! commit it merged changed it; failing that, if its planned files cover it. The
+//! same list goes into a `base_sync_conflict` event. Nothing is resolved.
+//!
 //! With ISSUE_DRAIN_DRY_RUN=1 it prints what it would call and changes nothing.
 //! A unit process may not run it, as with `merge-gate`.
 //!
@@ -65,6 +76,7 @@ use crate::exec;
 use crate::gh;
 use crate::git;
 use crate::merge_gate::{PrState, PrView, Proof, binding, preflight, read_view};
+use crate::profile::shared_entry;
 use crate::state::MAX_BASE_SYNCS;
 
 #[derive(clap::Args)]
@@ -283,6 +295,107 @@ fn fetch(wt: &Path, branch: &str, base: &str, log: &Path) -> Res<()> {
     }
 }
 
+/// Two refs that would not merge, and how the error line names them.
+struct Sides<'a> {
+    ours: &'a str,
+    theirs: &'a str,
+    label: String,
+}
+
+/// When `sides` cannot be merged because of conflicts: the files that
+/// conflict, and for each the merged units that share files with this one and
+/// touched it. A merged unit touched a file if its PR changed it; when GitHub
+/// cannot list the PR's files, if the commit it merged changed it; without a
+/// commit that can be read, if the unit's planned files cover it. The PR's list
+/// comes first because a PR merged by hand with GitHub's rebase method leaves
+/// only its last commit as the merge commit. Logs `base_sync_conflict` and
+/// returns the text for the error line. `None` when the merge is clean or git
+/// cannot say, so the caller keeps its own error. Read-only: no ref moves and
+/// nothing is resolved.
+fn conflict_report(ctx: &Ctx, unit: u64, pr: u64, wt: &Path, sides: &Sides) -> Res<Option<String>> {
+    let Some(files) = git::merge_conflicts(wt, sides.ours, sides.theirs).filter(|f| !f.is_empty()) else {
+        return Ok(None);
+    };
+    let repo = ctx.repo()?;
+    let state = crate::state::load(ctx);
+    let merged: Vec<(u64, Changed)> = ctx
+        .queue_unit(unit)
+        .map(|u| u.shares_files_with)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|n| {
+            let on = state.as_ref()?.units.iter().find(|s| s.unit == n)?;
+            if !matches!(on.state, crate::state::State::Merged | crate::state::State::Done) {
+                return None;
+            }
+            let planned = ctx.queue_unit(n).map(|u| u.files).unwrap_or_default();
+            Some((n, changed_by(wt, &repo, on.pr, on.head.as_deref(), planned)))
+        })
+        .collect();
+    let touched: Vec<(String, Vec<u64>)> = files
+        .iter()
+        .map(|file| {
+            let by = merged
+                .iter()
+                .filter(|(_, changed)| match changed {
+                    Changed::Files(list) => list.iter().any(|l| l == file),
+                    Changed::Planned(planned) => planned.iter().any(|p| shared_entry(p, file).is_some()),
+                })
+                .map(|(n, _)| *n)
+                .collect();
+            (file.clone(), by)
+        })
+        .collect();
+    ctx.event(
+        "base_sync_conflict",
+        json!({
+            "unit": unit,
+            "pr": pr,
+            "between": [sides.ours, sides.theirs],
+            "files": files,
+            "touched_by": touched.iter().map(|(f, by)| (f.clone(), json!(by))).collect::<serde_json::Map<_, _>>(),
+        }),
+    )?;
+    let parts: Vec<String> = touched
+        .iter()
+        .map(|(file, by)| {
+            if by.is_empty() {
+                format!("{file} (no merged unit that shares files with this one touched it)")
+            } else {
+                let units: Vec<String> = by.iter().map(|n| format!("unit {n}")).collect();
+                format!("{file} (touched by merged {})", units.join(", "))
+            }
+        })
+        .collect();
+    Ok(Some(format!("{}: {}", sides.label, parts.join("; "))))
+}
+
+/// What a merged unit changed: the files it is known to have changed, or only
+/// the files it planned to.
+enum Changed {
+    Files(Vec<String>),
+    Planned(Vec<String>),
+}
+
+fn changed_by(wt: &Path, repo: &str, pr: Option<u64>, head: Option<&str>, planned: Vec<String>) -> Changed {
+    let from_pr =
+        pr.and_then(|pr| crate::gh::read(&["pr", "diff", &pr.to_string(), "--repo", repo, "--name-only"]).ok());
+    if let Some(list) = from_pr {
+        return Changed::Files(
+            list.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+        );
+    }
+    let from_commit = head.and_then(|h| git::out(wt, &["diff", "-z", "--name-only", &format!("{h}^"), h]));
+    match from_commit {
+        Some(list) => Changed::Files(list.split('\0').filter(|l| !l.is_empty()).map(str::to_string).collect()),
+        None => Changed::Planned(planned),
+    }
+}
+
 pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     ctx.require_driver("base-sync")?;
     let unit = args.unit;
@@ -419,7 +532,20 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             if !reissue {
                 let _ = fs::remove_file(&marker);
             }
-            return Err(Fail::failed(format!("gh pr update-branch {pr} failed (exit {rc})")));
+            let (remote, base_ref) = (
+                format!("refs/remotes/origin/{branch}"),
+                format!("refs/remotes/origin/{base}"),
+            );
+            let sides = Sides {
+                ours: &remote,
+                theirs: &base_ref,
+                label: format!("{branch} conflicts with {base}"),
+            };
+            let conflicts = conflict_report(ctx, unit, pr, &wt, &sides)?;
+            return Err(Fail::failed(match conflicts {
+                Some(report) => format!("gh pr update-branch {pr} failed (exit {rc}); {report}"),
+                None => format!("gh pr update-branch {pr} failed (exit {rc})"),
+            }));
         }
         if reissue {
             ctx.event(
@@ -447,10 +573,19 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         &log("merge"),
     )?;
     if !moved.ok() {
+        // The fast-forward that failed is the local branch onto the fetched
+        // one, so those are the two compared.
+        let sides = Sides {
+            ours: "HEAD",
+            theirs: &remote,
+            label: format!("the local {branch} in {} conflicts with origin/{branch}", wt.display()),
+        };
+        let conflicts = conflict_report(ctx, unit, pr, &wt, &sides)?;
         return Err(Fail::failed(format!(
-            "could not fast-forward {} to {remote}: {}",
+            "could not fast-forward {} to {remote}: {}{}",
             wt.display(),
-            moved.failure(GIT_LIMIT)
+            moved.failure(GIT_LIMIT),
+            conflicts.map_or(String::new(), |report| format!("; {report}"))
         )));
     }
     let now = git::commit(&wt, "HEAD").unwrap_or_default();

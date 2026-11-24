@@ -10,6 +10,11 @@
 #                         exit 1, as gh gives for a number that is no issue
 #   graphql-<n>.err.json  printed for that call, which then exits 1 (a request
 #                         that failed; the file may be empty)
+#   once-merge-queue      a shell script run on the next read that
+#                         merge-queue.json answers, before the answer (something changed elsewhere
+#                         while the caller was at work)
+#   pr-diff-<n>.txt       answer to `gh pr diff <n> ... --name-only`; without the
+#                         file the call fails, as for a diff GitHub will not give
 #   issue-list.txt        answer to `gh issue list`
 #   tracker-list.json     answer to `gh issue list ... --json number,url,body`
 #                         (publish looking for a tracker it already made);
@@ -28,6 +33,9 @@
 #   last-comment-body     written by `gh issue comment ... --body-file <f>`: a copy of f
 #   labels.txt            answer to `gh label list`, one name per line
 #   pr-view-<n>.json      answer to `gh pr view <n>`
+#   pr-list-<branch>.json answer to `gh pr list --head <branch>`, with each `/` in
+#                         the branch written as `_`; without the file, []
+#   fail-pr-list          `gh pr list` exits 1
 #   hang-pr-view          `gh pr view` sleeps 30 s before it answers
 #   linger-pr-view        `gh pr view` leaves a process holding stdout open
 #                         for 30 s, then answers and exits at once
@@ -108,7 +116,12 @@ case "${1:-} ${2:-}" in
         echo '{"data":{}}'; exit 0 ;;
     esac
     case "$*" in
-      *isInMergeQueue*) answer merge-queue.json; exit 0 ;;
+      *isInMergeQueue*)
+        if [ -f "$dir/once-merge-queue" ]; then
+          mv "$dir/once-merge-queue" "$dir/once-merge-queue.ran"
+          sh "$dir/once-merge-queue.ran" >&2 || exit 1
+        fi
+        answer merge-queue.json; exit 0 ;;
     esac
     n=""
     for arg in "$@"; do
@@ -160,6 +173,15 @@ case "${1:-} ${2:-}" in
     echo "https://github.com/example/tidepool/pull/$3#issuecomment-5001" ;;
   "pr create")
     echo "https://github.com/example/tidepool/pull/${GH_STUB_NEW_PR:-901}" ;;
+  "pr list")
+    if [ -e "$dir/fail-pr-list" ]; then echo "gh stub: pr list failed" >&2; exit 1; fi
+    b=""; prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--head" ]; then b="$arg"; fi
+      prev="$arg"
+    done
+    b=$(printf '%s' "$b" | tr '/' '_')
+    if [ -f "$dir/pr-list-$b.json" ]; then cat "$dir/pr-list-$b.json"; else echo "[]"; fi ;;
   "pr view")
     if [ -e "$dir/hang-pr-view" ]; then sleep 30; fi
     if [ -e "$dir/linger-pr-view" ]; then sleep 30 & fi
@@ -212,6 +234,7 @@ case "${1:-} ${2:-}" in
       *--add-label*) if [ -e "$dir/fail-add-label" ]; then echo "gh stub: add-label failed" >&2; exit 1; fi ;;
     esac
     : > "$dir/edited-$3" ;;
+  "pr diff") answer "pr-diff-$3.txt" ;;
   "run rerun") ;;
   "pr edit") ;;
   "label create") ;;
