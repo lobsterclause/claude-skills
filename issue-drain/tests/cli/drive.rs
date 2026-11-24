@@ -1186,3 +1186,36 @@ fn a_unit_with_a_sync_in_flight_finishes_it_before_the_gate_is_read() {
     assert_eq!(c.count("base-sync --unit 1 --pr 4701"), 1);
     assert!(c.at("base-sync --unit 1") < c.at("merge-gate --unit 1 --pr 4701"));
 }
+
+#[test]
+fn a_failed_cleanup_is_retried_on_the_next_drive_without_a_second_comment() {
+    let c = case(&[1]);
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    c.pr_view(1, 4701);
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n("merge-gate", 3, 0, &Case::merged());
+    c.canned_n("cleanup", 1, 1, "");
+
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "done"}]));
+    assert_eq!(c.count("cleanup --unit 1"), 1);
+    let unit = c.env.workdir.join("units/1");
+    assert!(unit.join("drive-cleanup-pending").exists(), "cleanup is still owed");
+    assert!(unit.join("drive-ended.json").exists());
+    let comments = || {
+        c.env
+            .gh_calls()
+            .iter()
+            .filter(|l| l.starts_with("issue comment 50 "))
+            .count()
+    };
+    let posted = comments();
+    assert!(posted >= 1);
+
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.count("cleanup --unit 1"), 2, "the retry");
+    assert!(!unit.join("drive-cleanup-pending").exists());
+    assert_eq!(comments(), posted, "the unit's comment is not posted again");
+}

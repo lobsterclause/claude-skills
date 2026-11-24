@@ -147,7 +147,10 @@
 //! branch and releases the claim if still held. The claim release comes first:
 //! if it fails (anything but exit 0, or exit 3 for a claim that is not ours),
 //! the driver stops with that exit code before the comment and before
-//! `drive-ended.json`, so a restart ends the unit again.
+//! `drive-ended.json`, so a restart ends the unit again. A failed `cleanup` does
+//! not do that: the comment is posted and `drive-ended.json` written, and
+//! `drive-cleanup-pending` stays until a later `cleanup` succeeds. Each pass
+//! of the loop, and each start, retries it (a retry posts no second comment).
 //!
 //! Stop conditions. Before claiming a unit: a `STOP` file in the run folder, or
 //! `tracker parse` saying the tracker is not OPEN, has a STOP line, or lists
@@ -241,6 +244,8 @@ const LONG_CHILDREN: [&str; 8] = [
 const HEARTBEAT: Duration = Duration::from_secs(300);
 /// Touched just before a resume; the resume's result.json must be newer.
 const RESUME_STARTED: &str = "drive-resume-started";
+/// Written when a done unit's `cleanup` failed; removed when it succeeds.
+const CLEANUP_PENDING: &str = "drive-cleanup-pending";
 const TREE_MISMATCH: &str = "drive-tree-mismatch";
 /// Written when the gate queued the PR or sent a merge call whose outcome is
 /// unknown, and removed once the PR is read back merged, or open and out of
@@ -1865,8 +1870,14 @@ impl<'a> Driver<'a> {
         let snap = self.snapshot()?;
         for u in snap.units.iter().filter(|u| u.state.is_terminal()) {
             let dir = self.unit_dir(u.unit);
-            if dir.join(self.mark("drive-owned")).exists() && !dir.join(self.mark("drive-ended.json")).exists() {
+            if !dir.join(self.mark("drive-owned")).exists() {
+                continue;
+            }
+            if !dir.join(self.mark("drive-ended.json")).exists() {
                 self.end_unit(u)?;
+            } else if u.state == State::Done && dir.join(self.mark(CLEANUP_PENDING)).exists() {
+                // The unit ended, comment and all; only its cleanup is owed.
+                self.cleanup_unit(u)?;
             }
         }
         Ok(())
@@ -1877,15 +1888,7 @@ impl<'a> Driver<'a> {
         let infra = note.starts_with(INFRA);
         let n = u.unit.to_string();
         if u.state == State::Done {
-            let pr = u.pr.map(|p| p.to_string());
-            let mut args = vec!["cleanup", "--unit", &n];
-            if let Some(pr) = &pr {
-                args.extend(["--pr", pr]);
-            }
-            let r = self.call(&args)?;
-            if !r.ok() {
-                self.log(Some(u.unit), "cleanup_failed", json!({"why": r.why()}))?;
-            }
+            self.cleanup_unit(u)?;
         } else if !note.starts_with(CLAIM_REFUSED) && note != REMOVED {
             let r = self.call(&["claim", "release", "--unit", &n])?;
             match r.code {
@@ -1934,6 +1937,26 @@ impl<'a> Driver<'a> {
             &self.unit_dir(u.unit).join(self.mark("drive-ended.json")),
             format!("{marker}\n").as_bytes(),
         )
+    }
+
+    /// `cleanup` for a done unit. A failure leaves `drive-cleanup-pending`, which
+    /// is apart from `drive-ended.json` (the comment was posted, once) and which
+    /// `reconcile` retries until `cleanup` succeeds.
+    fn cleanup_unit(&self, u: &UnitState) -> Res<()> {
+        let n = u.unit.to_string();
+        let pr = u.pr.map(|p| p.to_string());
+        let mut args = vec!["cleanup", "--unit", &n];
+        if let Some(pr) = &pr {
+            args.extend(["--pr", pr]);
+        }
+        let pending = self.unit_dir(u.unit).join(self.mark(CLEANUP_PENDING));
+        let r = self.call(&args)?;
+        if r.ok() {
+            let _ = fs::remove_file(&pending);
+            return Ok(());
+        }
+        self.log(Some(u.unit), "cleanup_failed", json!({"why": r.why()}))?;
+        write_atomic(&pending, format!("{}\n", one_line(&r.why())).as_bytes())
     }
 
     /// `(seq, blocked, infra)` of every unit the driver ended, in order.

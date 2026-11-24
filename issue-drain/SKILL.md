@@ -95,7 +95,7 @@ Lead with the tracker link. Then, briefly: how many issues were taken in and how
 
 ## Running the queue
 
-`drive` is the driver: a loop with no model in it that takes the next unit from the state log and carries it to `done`, `skipped`, `blocked` or `parked`. It claims the unit, runs `unit-prepare`, starts the unit's headless claude with `unit-run`, waits on `merge-gate --dry-run` for review and CI, merges through `merge-gate`, then runs `post-merge` and `cleanup`. Refusals map to `base-sync`, a resumed repair or review pass, or parking; the full map, the stop conditions and the known gaps are in the module doc at the top of `src/drive.rs`.
+`drive` is the driver: a loop with no model in it that takes the next unit from the state log and carries it to `done`, `skipped`, `blocked` or `parked`. It claims the unit, runs `unit-prepare`, starts the unit's headless claude with `unit-run`, waits on `merge-gate --dry-run` for review and CI, merges through `merge-gate`, then runs `post-merge` and `cleanup` (a cleanup that fails stays pending and is retried). Refusals map to `base-sync`, a resumed repair or review pass, or parking; the full map, the stop conditions and the known gaps are in the module doc at the top of `src/drive.rs`.
 
 The user starts it in a terminal, not from a session, so the merge is never a Claude tool call:
 
