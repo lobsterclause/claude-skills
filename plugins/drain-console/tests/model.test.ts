@@ -155,6 +155,12 @@ test('a unit whose lines left the tail keeps its note and refusals, only with no
   expect(gap.units[0]?.note).toBe(null)
   expect(gap.units[1]?.refusals).toEqual([])
 
+  // With no gap, a unit that moved keeps its last gate refusals but not its old note.
+  const movedQuiet = { ...quiet, state: files([unit(1, 'blocked'), unit(2, 'repairing')]).state }
+  const shifted = buildView({ ...movedQuiet, eventsStart: 99_000, eventsEnd: 160_000 }, first)
+  expect(shifted.units[0]?.note).toBe(null)
+  expect(shifted.units[1]?.refusals).toEqual(['ci red'])
+
   // A failed read keeps the last good baseline, and the next good read is checked against it.
   const failed = buildView(files([unit(1, 'parked'), unit(2, 'ci_wait')]), first)
   expect(failed.units[0]?.note).toBe('review cap reached')

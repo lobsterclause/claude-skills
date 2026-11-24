@@ -259,7 +259,8 @@ const msOf = (iso: string | null): number | null => {
  * A poll that could not read events.jsonl at all keeps the last view's event
  * details and end offset, so the next successful read is still checked
  * against the last one that worked. In both cases a unit whose state changed
- * since the last view takes no note or refusals from it.
+ * since the last view takes no note from it, and after a failed read no
+ * refusals either.
  */
 export function buildView(files: RunFiles, prev: View | null = null): View {
   const state = parseState(files.state)
@@ -286,10 +287,13 @@ export function buildView(files: RunFiles, prev: View | null = null): View {
   const before = new Map(unbroken || unread ? prev.units.map(u => [u.unit, u]) : [])
   const units: UnitRow[] = state.units.map(u => {
     const id = `U${u.unit}`
-    // A unit that changed state since the last view keeps nothing from it: an
-    // old note would read as the reason for the new state.
+    // A unit that changed state keeps no note from the last view: an old note
+    // would read as the reason for the new state. Refusals are the last gate
+    // result whatever the state, so an unbroken read keeps them; after a failed
+    // read a moved unit drops them, since an unseen gate result may have moved it.
     const last = before.get(u.unit)
-    const old = last !== undefined && last.state === u.state ? last : undefined
+    const same = last !== undefined && last.state === u.state
+    const keptRefusals = same || unbroken ? last?.refusals : undefined
     return {
       unit: u.unit,
       id,
@@ -298,8 +302,8 @@ export function buildView(files: RunFiles, prev: View | null = null): View {
       state: u.state,
       pr: u.pr,
       updatedMs: msOf(u.updated),
-      refusals: facts.refusals.get(u.unit) ?? old?.refusals ?? [],
-      note: facts.notes.has(u.unit) ? (facts.notes.get(u.unit) ?? null) : (old?.note ?? null),
+      refusals: facts.refusals.get(u.unit) ?? keptRefusals ?? [],
+      note: facts.notes.has(u.unit) ? (facts.notes.get(u.unit) ?? null) : (same ? last.note : null),
       costUsd: costOf(files.sessions[u.unit]),
     }
   })
