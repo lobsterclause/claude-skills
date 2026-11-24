@@ -21,7 +21,9 @@
 //! each command keeps the exit codes, refusals and logging it is tested for.
 //! Their stdout and stderr go to `<run folder>/drive/<seq>-<command>.out|.err`,
 //! and the driver reads the JSON line at the end of stdout. Each step also logs
-//! a `drive` event. A unit process cannot run the driver (exit 3).
+//! a `drive` event. A unit process cannot run the driver (exit 3). The driver's
+//! own `gh` reads (the PR view and the rest) are cut off after 60 s
+//! (ISSUE_DRAIN_GH_READ_TIMEOUT_SECS) and count as unreadable reads.
 //!
 //! State. Every unit move goes through `state event`; only the driver moves
 //! state. The snapshot (`state show --json`) decides what to do next, so a
@@ -52,7 +54,10 @@
 //! Per unit, by state:
 //!   queued        `claim take`. An exit 3 (an issue is someone else's) goes to
 //!                 skipped. A unit the tracker no longer lists goes to skipped.
-//!   claimed       `unit-prepare`; failure goes to blocked.
+//!   claimed       `unit-prepare`; failure goes to blocked. The driver's limit
+//!                 on it is the profile's bootstrap and codegraph limits plus a
+//!                 margin (at least 1800 s), so a slow bootstrap fails as the
+//!                 bootstrap, not as a driver timeout.
 //!   prepared      move to implementing.
 //!   implementing  read `result.json`; if absent, `unit-run` (first attempt), or
 //!                 one retry a model tier up (haiku, sonnet, opus, limited to
@@ -72,7 +77,12 @@
 //!                 refusal right after a pass (`drive-review-resumed`), or the
 //!                 cap, goes to parked. A resume whose run fails, or whose
 //!                 result.json says blocked, parked or cap_reached, ends the
-//!                 unit that way; repair resumes are read the same way.
+//!                 unit that way; repair resumes are read the same way. A
+//!                 resume has failed when `unit-run` fails, or when its JSON
+//!                 says the claude process exited nonzero or timed out, or when
+//!                 result.json is not newer than the `drive-resume-started`
+//!                 mark written just before the resume (an old result is not
+//!                 this round's answer); each blocks the unit.
 //!   ci_wait       poll `merge-gate --dry-run` every ISSUE_DRAIN_DRIVE_POLL_SECS
 //!                 (default 180) until no refusal says a check is pending, then
 //!                 move to gate. Five unreadable gate reads in a row block the
@@ -103,6 +113,10 @@
 //!                                 purpose: a person has to act on the PR, and
 //!                                 syncing or repairing it would move the head
 //!                                 under them.
+//!                                 A unit in `gate` with a `base-sync-pending.json`
+//!                                 (a sync cut short by a restart) runs `base-sync`
+//!                                 first, before the gate is read; it finishes
+//!                                 that sync and spends no second one.
 //!   behind_base                   `base-sync` (an exit 1 is tried up to
 //!                                 BASE_SYNC_TRIES times, since GitHub may not
 //!                                 have applied the update yet), then ci_wait, or reviewing if
@@ -133,7 +147,10 @@
 //! branch and releases the claim if still held. The claim release comes first:
 //! if it fails (anything but exit 0, or exit 3 for a claim that is not ours),
 //! the driver stops with that exit code before the comment and before
-//! `drive-ended.json`, so a restart ends the unit again.
+//! `drive-ended.json`, so a restart ends the unit again. A failed `cleanup` does
+//! not do that: the comment is posted and `drive-ended.json` written, and
+//! `drive-cleanup-pending` stays until a later `cleanup` succeeds. Each pass
+//! of the loop, and each start, retries it (a retry posts no second comment).
 //!
 //! Stop conditions. Before claiming a unit: a `STOP` file in the run folder, or
 //! `tracker parse` saying the tracker is not OPEN, has a STOP line, or lists
@@ -188,7 +205,7 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, env_str, read_json, write_atomic};
 use crate::error::{Fail, Res};
 use crate::exec;
-use crate::merge_gate::{PrState, binding, in_merge_queue, is_sha, read_view};
+use crate::merge_gate::{PrState, PrView, binding, in_merge_queue, is_sha, read_view};
 use crate::state::{self, MAX_BASE_SYNCS, MAX_REPAIRS, Snapshot, State, UnitState};
 use crate::tracker::io::Published;
 
@@ -225,6 +242,10 @@ const LONG_CHILDREN: [&str; 8] = [
 ];
 /// Longest gap between two waiting lines for one unit.
 const HEARTBEAT: Duration = Duration::from_secs(300);
+/// Touched just before a resume; the resume's result.json must be newer.
+const RESUME_STARTED: &str = "drive-resume-started";
+/// Written when a done unit's `cleanup` failed; removed when it succeeds.
+const CLEANUP_PENDING: &str = "drive-cleanup-pending";
 const TREE_MISMATCH: &str = "drive-tree-mismatch";
 /// Written when the gate queued the PR or sent a merge call whose outcome is
 /// unknown, and removed once the PR is read back merged, or open and out of
@@ -283,6 +304,37 @@ impl Reply {
             None if self.timed_out => "timed out".to_string(),
             None => format!("exit {}", self.code),
         }
+    }
+}
+
+/// How long the driver lets one child run. `unit-run` gets the unit's own
+/// limit plus a margin. `unit-prepare` runs the profile's bootstrap under
+/// `bootstrap_timeout_secs`, codegraph under `codegraph_timeout_secs` (up to two
+/// runs) and two git calls of 120 s; its limit is those plus a margin, so the
+/// inner limit always fires first and a slow bootstrap is reported as a
+/// bootstrap failure, not a driver timeout.
+fn call_limit(p: &crate::profile::Profile, command: Option<&str>) -> Duration {
+    let secs = match command {
+        Some("unit-run") => p.unit_timeout_secs + 900,
+        Some("unit-prepare") => (p.bootstrap_timeout_secs + 2 * p.codegraph_timeout_secs + 2 * 120 + 900).max(1800),
+        _ => 1800,
+    };
+    Duration::from_secs(secs)
+}
+
+/// Why the claude process inside a successful `unit-run` failed, from the
+/// `exit_code` and `timed_out` in its JSON; `None` when it exited 0.
+fn child_failure(ran: &Reply) -> Option<String> {
+    let Some(j) = ran.json() else {
+        return Some("unit-run printed no result, so the process's status is unknown".into());
+    };
+    if j["timed_out"] == true {
+        return Some("the unit's process timed out".into());
+    }
+    match j["exit_code"].as_i64() {
+        Some(0) => None,
+        Some(code) => Some(format!("the unit's process exited {code}")),
+        None => Some("the unit's process was killed".into()),
     }
 }
 
@@ -786,10 +838,7 @@ impl<'a> Driver<'a> {
             .collect();
         let out = self.ctx.path(&format!("drive/{seq:05}-{name}.out"));
         let err = self.ctx.path(&format!("drive/{seq:05}-{name}.err"));
-        let limit = match args.first() {
-            Some(&"unit-run") => Duration::from_secs(self.ctx.profile.unit_timeout_secs + 900),
-            _ => Duration::from_secs(1800),
-        };
+        let limit = call_limit(&self.ctx.profile, args.first().copied());
         // The logs exist before they are named, so a watcher can tail them at once.
         let files = exec::open_logs((&out, &err))?;
         if args.first().is_some_and(|a| LONG_CHILDREN.contains(a)) {
@@ -1227,6 +1276,8 @@ impl<'a> Driver<'a> {
         // Always named: a resume without one would fall back to the unit's
         // first model and undo an earlier step up the ladder.
         let model = model.map_or_else(|| self.last_model(unit), str::to_string);
+        // A fresh mark: the resume must write result.json after this.
+        write_atomic(&dir.join(self.mark(RESUME_STARTED)), b"1\n")?;
         self.call(&[
             "unit-run",
             "--unit",
@@ -1246,7 +1297,28 @@ impl<'a> Driver<'a> {
             self.block(u, &format!("{what} failed: {}", ran.why()), ran.infra())?;
             return Ok(true);
         }
-        let result: Value = read_json(&self.unit_dir(u.unit).join("result.json")).unwrap_or(Value::Null);
+        // `unit-run` exits 0 whatever its claude process did; the process's own
+        // status is in its JSON.
+        if let Some(why) = child_failure(ran) {
+            self.block(
+                u,
+                &format!("{what} failed: {why}"),
+                ran.json().is_some_and(|j| j["timed_out"] == true),
+            )?;
+            return Ok(true);
+        }
+        // An old result.json is not this resume's answer. The prompt tells the
+        // unit to update the file in place, so it is dated, not deleted.
+        let dir = self.unit_dir(u.unit);
+        let mtime = |name: &str| fs::metadata(dir.join(name)).and_then(|m| m.modified()).ok();
+        if !mtime("result.json")
+            .zip(mtime(&self.mark(RESUME_STARTED)))
+            .is_some_and(|(result, started)| result >= started)
+        {
+            self.block(u, &format!("{what} ended without writing a new result.json"), false)?;
+            return Ok(true);
+        }
+        let result: Value = read_json(&dir.join("result.json")).unwrap_or(Value::Null);
         let notes = notes_of(&result);
         let said = |outcome: &str| {
             if notes.is_empty() {
@@ -1306,17 +1378,23 @@ impl<'a> Driver<'a> {
         if view.state != PrState::Open {
             return Ok(Some(format!("PR #{pr} is not open")));
         }
+        Ok(self.not_the_units(unit, pr, &view))
+    }
+
+    /// Why the PR is not the unit's (wrong base, branch or repository), or
+    /// `None` when it is.
+    fn not_the_units(&self, unit: u64, pr: u64, view: &PrView) -> Option<String> {
         let unit_file: Value = read_json(&self.unit_dir(unit).join("unit.json")).unwrap_or(Value::Null);
         let branch = unit_file["branch"]
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| format!("unit {unit} has no branch in unit.json"));
-        let refusals = binding(&self.repo, &self.ctx.profile.base_branch, unit, pr, &view, &branch);
+        let refusals = binding(&self.repo, &self.ctx.profile.base_branch, unit, pr, view, &branch);
         if refusals.is_empty() {
-            Ok(None)
+            None
         } else {
             let text: Vec<String> = refusals.iter().map(|r| format!("{}: {}", r.code, r.detail)).collect();
-            Ok(Some(text.join("; ")))
+            Some(text.join("; "))
         }
     }
 
@@ -1492,9 +1570,87 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// The PR as GitHub has it, when it is merged.
+    fn merged_view(&self, pr: u64) -> Option<PrView> {
+        read_view(&self.repo, pr).ok().filter(|v| v.state == PrState::Merged)
+    }
+
+    /// Settle a unit whose PR merged while a base sync was in flight.
+    fn settle_merged(&self, u: &UnitState, pr: u64, view: &PrView, marker: &Path) -> Res<Option<String>> {
+        if let Some(why) = self.not_the_units(u.unit, pr, view) {
+            return self
+                .park(u, &format!("PR #{pr} merged, but {why}"), false)
+                .map(|()| None);
+        }
+        let Some(commit) = view.merge_commit.clone().filter(|c| is_sha(c)) else {
+            return self
+                .park(u, &format!("PR #{pr} is merged, but no merge commit was named"), false)
+                .map(|()| None);
+        };
+        let _ = fs::remove_file(marker);
+        self.mv(u.unit, "merged", None, None, Some(&commit))?;
+        self.merge_settled(u.unit)?;
+        self.merged(u.unit, pr)
+    }
+
     fn gate(&self, u: &UnitState) -> Res<Option<String>> {
         let pr = self.pr_of(u)?;
         let (n, p) = (u.unit.to_string(), pr.to_string());
+        // A base sync a dead driver left half done: finish it before the gate
+        // is read, or the gate would see a moved head and spend another sync
+        // or a repair round, or merge a head the delivery check never saw.
+        let marker = self.unit_dir(u.unit).join(crate::base_sync::PENDING_MARKER);
+        if !self.dry && marker.exists() {
+            // A PR that merged while the driver was down needs no sync, and
+            // base-sync would refuse it as not open: settle it as merged.
+            if let Some(view) = self.merged_view(pr) {
+                return self.settle_merged(u, pr, &view, &marker);
+            }
+            // A hold put on while the driver was down still stops the unit:
+            // the sync would push to the PR a person asked to be left alone.
+            // base-sync does not read holds, so a gate that could not read
+            // them is no answer: read again once, then block.
+            let mut reads = 0;
+            loop {
+                let (r, refusals) = self.gate_dry(u)?;
+                let person: Vec<Refusal> = refusals.iter().filter(|x| needs_a_person(x)).cloned().collect();
+                if !person.is_empty() {
+                    return self
+                        .park(u, &format!("needs a person: {}", listed(&person)), false)
+                        .map(|()| None);
+                }
+                if !unreadable(&r, &refusals) && !refusals.iter().any(|x| x.code == "read_error") {
+                    break;
+                }
+                reads += 1;
+                if reads >= 2 {
+                    let why = refusals
+                        .iter()
+                        .find(|x| x.code == "read_error")
+                        .map_or_else(|| r.why(), |x| x.detail.clone());
+                    return self
+                        .block(
+                            u,
+                            &format!("a base sync is in flight, but whether the PR is held could not be read: {why}"),
+                            true,
+                        )
+                        .map(|()| None);
+                }
+                self.nap(u);
+            }
+            if u.base_syncs >= MAX_BASE_SYNCS {
+                return self.base_sync(u).map(|()| None);
+            }
+            let r = self.sync_call(u)?;
+            // The sync may have failed because the PR merged in the meantime.
+            if !r.ok()
+                && let Some(view) = self.merged_view(pr)
+            {
+                return self.settle_merged(u, pr, &view, &marker);
+            }
+            self.after_sync(u, &r)?;
+            return Ok(None);
+        }
         let start = Instant::now();
         let mut errors = 0;
         loop {
@@ -1683,19 +1839,29 @@ impl<'a> Driver<'a> {
                 false,
             );
         }
+        let r = self.sync_call(u)?;
+        self.after_sync(u, &r)
+    }
+
+    /// Call `base-sync`, retrying an exit 1.
+    fn sync_call(&self, u: &UnitState) -> Res<Reply> {
         let (n, p) = (u.unit.to_string(), self.pr_of(u)?.to_string());
         // Exit 1 is often GitHub not having applied the update yet; a retry
         // spends no sync slot.
         let mut tries = 0;
-        let r = loop {
+        loop {
             let r = self.call(&["base-sync", "--unit", &n, "--pr", &p])?;
             tries += 1;
             if r.code == 1 && !r.timed_out && tries < BASE_SYNC_TRIES && !self.dry {
                 self.nap(u);
                 continue;
             }
-            break r;
-        };
+            return Ok(r);
+        }
+    }
+
+    /// Move the unit on from what `base-sync` answered.
+    fn after_sync(&self, u: &UnitState, r: &Reply) -> Res<()> {
         if !r.ok() {
             return self.park(u, &format!("base-sync failed: {}", r.why()), r.infra());
         }
@@ -1791,8 +1957,14 @@ impl<'a> Driver<'a> {
         let snap = self.snapshot()?;
         for u in snap.units.iter().filter(|u| u.state.is_terminal()) {
             let dir = self.unit_dir(u.unit);
-            if dir.join(self.mark("drive-owned")).exists() && !dir.join(self.mark("drive-ended.json")).exists() {
+            if !dir.join(self.mark("drive-owned")).exists() {
+                continue;
+            }
+            if !dir.join(self.mark("drive-ended.json")).exists() {
                 self.end_unit(u)?;
+            } else if u.state == State::Done && dir.join(self.mark(CLEANUP_PENDING)).exists() {
+                // The unit ended, comment and all; only its cleanup is owed.
+                self.cleanup_unit(u)?;
             }
         }
         Ok(())
@@ -1803,15 +1975,7 @@ impl<'a> Driver<'a> {
         let infra = note.starts_with(INFRA);
         let n = u.unit.to_string();
         if u.state == State::Done {
-            let pr = u.pr.map(|p| p.to_string());
-            let mut args = vec!["cleanup", "--unit", &n];
-            if let Some(pr) = &pr {
-                args.extend(["--pr", pr]);
-            }
-            let r = self.call(&args)?;
-            if !r.ok() {
-                self.log(Some(u.unit), "cleanup_failed", json!({"why": r.why()}))?;
-            }
+            self.cleanup_unit(u)?;
         } else if !note.starts_with(CLAIM_REFUSED) && note != REMOVED {
             let r = self.call(&["claim", "release", "--unit", &n])?;
             match r.code {
@@ -1860,6 +2024,26 @@ impl<'a> Driver<'a> {
             &self.unit_dir(u.unit).join(self.mark("drive-ended.json")),
             format!("{marker}\n").as_bytes(),
         )
+    }
+
+    /// `cleanup` for a done unit. A failure leaves `drive-cleanup-pending`, which
+    /// is apart from `drive-ended.json` (the comment was posted, once) and which
+    /// `reconcile` retries until `cleanup` succeeds.
+    fn cleanup_unit(&self, u: &UnitState) -> Res<()> {
+        let n = u.unit.to_string();
+        let pr = u.pr.map(|p| p.to_string());
+        let mut args = vec!["cleanup", "--unit", &n];
+        if let Some(pr) = &pr {
+            args.extend(["--pr", pr]);
+        }
+        let pending = self.unit_dir(u.unit).join(self.mark(CLEANUP_PENDING));
+        let r = self.call(&args)?;
+        if r.ok() {
+            let _ = fs::remove_file(&pending);
+            return Ok(());
+        }
+        self.log(Some(u.unit), "cleanup_failed", json!({"why": r.why()}))?;
+        write_atomic(&pending, format!("{}\n", one_line(&r.why())).as_bytes())
     }
 
     /// `(seq, blocked, infra)` of every unit the driver ended, in order.
@@ -2073,6 +2257,22 @@ mod tests {
             code: code.into(),
             detail: detail.into(),
         }
+    }
+
+    #[test]
+    fn the_unit_prepare_limit_is_longer_than_everything_it_runs() {
+        let mut p = crate::profile::Profile::default();
+        p.bootstrap_timeout_secs = 3000;
+        p.codegraph_timeout_secs = 300;
+        let limit = call_limit(&p, Some("unit-prepare")).as_secs();
+        assert!(limit >= 3000 + 300 + 300 + 240 + 600, "{limit}");
+        let quick = crate::profile::Profile::default();
+        assert!(call_limit(&quick, Some("unit-prepare")).as_secs() >= 1800);
+        assert_eq!(call_limit(&quick, Some("merge-gate")).as_secs(), 1800);
+        assert_eq!(
+            call_limit(&quick, Some("unit-run")).as_secs(),
+            quick.unit_timeout_secs + 900
+        );
     }
 
     fn names(list: &[&str]) -> Vec<String> {

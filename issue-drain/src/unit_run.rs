@@ -11,12 +11,20 @@
 //!
 //! One run of a unit at a time: it holds a lock on `units/<n>/unit-run.lock`
 //! from reading session.json to writing it, and a second run is refused (exit 3).
+//! While claude runs, its process group is in `units/<n>/unit-run-child.pid`.
+//! A `unit-run` killed mid-run leaves that file and claude may still be
+//! running, so the next run is refused (exit 3) while that group is alive, and
+//! removes the file once it is not.
 //!
 //! A new run starts a session with a fixed prompt that names the run, points at
 //! `references/unit.md` and at the unit file. It is refused when
 //! `units/<n>/session.json` already names a session: that unit has one, and the
 //! way on is `--resume`. A resume needs a recorded session id and a `--prompt-file`,
 //! whose text is the message; it keeps the session and may change model and effort.
+//!
+//! The prompt is not in argv: a failing check's log can be long, and argv is
+//! size-limited and visible to other users through `ps`. It is written to
+//! `units/<n>/prompt-<attempt>.txt` and that file is the process's stdin.
 //!
 //! The process is `claude -p` with `--permission-mode acceptEdits`,
 //! `--permission-prompts none`, the profile's `unit_allowed_tools`, the skill's
@@ -31,6 +39,7 @@
 //! Files, all under `units/<n>/`:
 //!   transcript-<attempt>.jsonl   its stdout, one stream-json object per line
 //!   transcript-<attempt>.stderr  its stderr
+//!   prompt-<attempt>.txt         the prompt, which is its stdin
 //!   session.json                 `{session_id, attempts: [{attempt, resumed, model,
 //!                                effort, started, ended, exit_code, timed_out,
 //!                                cost_usd, num_turns, is_error, session_id}]}`,
@@ -62,6 +71,9 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, read_json, rfc3339, write_json};
 use crate::error::{Fail, Res};
 use crate::exec;
+
+/// In the unit's folder while its claude process runs: the process group.
+const CHILD_PID: &str = "unit-run-child.pid";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -163,6 +175,10 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
     } else {
         Some(UnitLock::take(&state_dir, unit)?)
     };
+    let child_pid = state_dir.join(CHILD_PID);
+    if !ctx.dry_run {
+        refuse_if_child_alive(&child_pid, unit)?;
+    }
     let mut session: Value = read_json(&session_file).unwrap_or_else(|| json!({}));
     // A resume keeps what the session last ran with unless told otherwise, so
     // a repair round that stepped up a tier is not stepped back down.
@@ -228,7 +244,9 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
     };
     let (prompt, resume_id) = prompt_and_resume;
 
-    let mut argv: Vec<String> = vec!["-p".into(), prompt];
+    // The prompt goes to the child on stdin, never in argv: a failing check's
+    // log can be long, and argv is size-limited and visible to `ps`.
+    let mut argv: Vec<String> = vec!["-p".into()];
     if let Some(id) = &resume_id {
         argv.extend(["--resume".into(), id.clone()]);
     }
@@ -247,7 +265,7 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
 
     if ctx.dry_run {
         return Ok(
-            json!({"unit": unit, "dry_run": true, "argv": std::iter::once("claude".to_string()).chain(argv).collect::<Vec<_>>()}),
+            json!({"unit": unit, "dry_run": true, "prompt": prompt, "argv": std::iter::once("claude".to_string()).chain(argv).collect::<Vec<_>>()}),
         );
     }
 
@@ -255,6 +273,8 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
     let attempt = attempts.len() as u64 + 1;
     let transcript = state_dir.join(format!("transcript-{attempt}.jsonl"));
     let stderr_log = state_dir.join(format!("transcript-{attempt}.stderr"));
+    let prompt_file = state_dir.join(format!("prompt-{attempt}.txt"));
+    let prompt_input = write_prompt(&prompt_file, &prompt)?;
     let guards_file_text = guards_file.display().to_string();
     let env = [
         ("VERIFY_GATE_SKIP", "1"),
@@ -263,14 +283,15 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
         ("ISSUE_DRAIN_UNIT_FILE", guards_file_text.as_str()),
     ];
     let started = ctx.now();
-    let ran = exec::run_env(
+    let ran = exec::run_env_stdin(
         "claude",
         &argv,
         &worktree,
         Duration::from_secs(p.unit_timeout_secs),
         (&transcript, &stderr_log),
         &env,
-        None,
+        Some(&child_pid),
+        Some(prompt_input),
     )?;
     let ended = ctx.now();
 
@@ -346,6 +367,24 @@ impl UnitLock {
     }
 }
 
+/// An earlier `unit-run` killed while claude ran leaves `unit-run-child.pid`,
+/// and claude, in its own process group, may still be running in the worktree.
+/// Refuse while that group is alive; remove the file once it is not.
+fn refuse_if_child_alive(file: &std::path::Path, unit: u64) -> Res<()> {
+    let Ok(text) = fs::read_to_string(file) else {
+        return Ok(());
+    };
+    if exec::group_alive(&text) {
+        return Err(Fail::refused(format!(
+            "unit {unit}: a claude process an earlier unit-run started (process group {}) is still running; \
+             wait for it to end or kill it, then remove {}",
+            text.trim(),
+            file.display()
+        )));
+    }
+    fs::remove_file(file).map_err(|e| Fail::failed(format!("cannot remove {}: {e}", file.display())))
+}
+
 /// The session already recorded, else the one this run reported.
 fn known_or(session: &Value, seen: Option<String>) -> Option<String> {
     recorded_session(session).or(seen)
@@ -361,16 +400,69 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             .filter_map(Value::as_str)
             .map(|w| shlex::try_quote(w).map_or_else(|_| w.to_string(), |q| q.into_owned()))
             .collect();
-        println!("WOULD: {}", words.join(" "));
+        let prompt = out["prompt"].as_str().unwrap_or_default();
+        let prompt = shlex::try_quote(prompt).map_or_else(|_| prompt.to_string(), |q| q.into_owned());
+        println!("WOULD: {} < {prompt}", words.join(" "));
     } else {
         println!("{out}");
     }
     Ok(())
 }
 
+/// Write the prompt to a new file at `path` and return it open at its start.
+/// A file already there (a retry's, or a link someone planted) is removed
+/// first, and `create_new` refuses to follow a link put back in between, so
+/// the child reads exactly the text written here.
+fn write_prompt(path: &std::path::Path, prompt: &str) -> Res<fs::File> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let fail = |e: std::io::Error| Fail::failed(format!("cannot write {}: {e}", path.display()));
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(fail(e)),
+    }
+    // The prompt can carry CI logs: only the owner may read the copy.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(fail)?;
+    file.write_all(prompt.as_bytes()).map_err(fail)?;
+    file.seek(SeekFrom::Start(0)).map_err(fail)?;
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_is_never_written_through_a_link_planted_at_its_path() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.txt");
+        fs::write(&target, "keep me").unwrap();
+        let path = dir.path().join("prompt-1.txt");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let mut file = write_prompt(&path, "the prompt").unwrap();
+        let mut read = String::new();
+        file.read_to_string(&mut read).unwrap();
+        assert_eq!(read, "the prompt", "the child reads from the start");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn a_saved_prompt_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt-2.txt");
+        write_prompt(&path, "a CI log").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
 
     #[test]
     fn a_transcript_gives_the_session_and_the_last_result_and_skips_noise() {

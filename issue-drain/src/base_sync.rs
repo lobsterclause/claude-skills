@@ -11,6 +11,16 @@
 //! whose other parent is on the base branch: the repo's review status clears that
 //! one itself.
 //!
+//! A sync in flight leaves `units/<n>/base-sync-pending.json`, written before
+//! `gh pr update-branch` and removed when the sync is done. A process killed
+//! between the call and the log line that records it would otherwise leave no
+//! trace of a request GitHub may have applied. The next run that finds the marker
+//! with no such line logs the request, once, and finishes that sync (fetch,
+//! fast-forward, deliver check) instead of starting another; if the base is not
+//! in the PR's head it asks GitHub again, with no second slot. The driver also
+//! reads the marker (see `drive`): a unit that has one in `gate` finishes the
+//! sync before the gate is read.
+//!
 //! The PR is `--pr`, or else the last PR the run's log names for the unit (the
 //! `state event ... --pr` and `merge-gate` lines carry it).
 //!
@@ -42,12 +52,13 @@
 //! is not clean and on the branch); 2 no queue, unit files or PR number; 1 gh or
 //! git failed.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::ctx::{Ctx, read_json};
+use crate::ctx::{Ctx, read_json, write_json};
 use crate::deliver_check;
 use crate::error::{Fail, Res};
 use crate::exec;
@@ -67,6 +78,13 @@ pub struct Args {
 }
 
 const GIT_LIMIT: Duration = Duration::from_secs(120);
+
+/// In the unit's folder from just before `gh pr update-branch` until the sync is
+/// done: `{pr, pr_head, local_head, base_head}`. The request's own log line is
+/// written after the call, so a process killed between the two would leave no
+/// trace of a request GitHub may have applied. The driver also reads it: a unit
+/// that has it finishes the sync before anything else.
+pub const PENDING_MARKER: &str = "base-sync-pending.json";
 
 /// What `units/<n>/unit.json` says this command needs.
 pub struct UnitFiles {
@@ -147,8 +165,16 @@ struct Pending {
     pr: Option<u64>,
     pr_head: Option<String>,
     local_head: Option<String>,
-    /// The base commit the request aimed at; old lines lack it.
+    /// The base commit the request aimed at; old lines lack it. The marker is
+    /// matched against this one, as a resend does not rewrite the marker.
     base_head: Option<String>,
+    /// The base the newest request aimed at: a resend's when there was one,
+    /// since a base rewritten before it may leave the first target out of the
+    /// head the resend produced. Whether the update landed is checked on this.
+    target: Option<String>,
+    /// The line was written from the marker after a process died around the
+    /// call, and no request has been sent since: GitHub may never have had it.
+    unsent: bool,
 }
 
 fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<Pending> {
@@ -160,11 +186,18 @@ fn follow_up_pending(ctx: &Ctx, unit: u64) -> Option<Pending> {
     }
     let line = &events[remote];
     let text = |key: &str| line[key].as_str().map(str::to_string);
+    let resend = last("base_sync_reissued").filter(|&sent| sent > remote);
+    let resent = resend.is_some();
+    let target = resend
+        .and_then(|i| events[i]["base_head"].as_str().map(str::to_string))
+        .or_else(|| text("base_head"));
     Some(Pending {
         pr: line["pr"].as_u64(),
         pr_head: text("pr_head"),
         local_head: text("local_head"),
         base_head: text("base_head"),
+        target,
+        unsent: line["recovered"] == true && !resent,
     })
 }
 
@@ -284,19 +317,49 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     let log = |step: &str| log_dir.join(format!("base-sync-{step}.log"));
     let base = ctx.profile.base_branch.clone();
     let base_ref = format!("refs/remotes/origin/{base}");
+    let marker = log_dir.join(PENDING_MARKER);
     let mut resume = false;
+    let mut reissue = false;
     let mut old_head = local_head;
-    if let Some(p) = follow_up_pending(ctx, unit).filter(|p| p.pr == Some(pr)) {
-        resume = match &p.base_head {
+    let mut pending = follow_up_pending(ctx, unit).filter(|p| p.pr == Some(pr));
+    // The marker names the newest request; a pending line for an older one
+    // (a sync that was then started again on a moved base) is not its line.
+    let unlogged = |m: &Value| match &pending {
+        None => true,
+        Some(p) => m["base_head"]
+            .as_str()
+            .is_some_and(|b| p.base_head.as_deref() != Some(b)),
+    };
+    if !ctx.dry_run
+        && let Some(m) = read_json::<Value>(&marker).filter(|m| m["pr"].as_u64() == Some(pr) && unlogged(m))
+    {
+        // The marker was written, but the request's line was not: the process
+        // died around the call. That request spent the slot; log it now.
+        let mut line = json!({"unit": unit, "pr": pr, "recovered": true});
+        for key in ["pr_head", "local_head", "base_head"] {
+            line[key] = m[key].clone();
+        }
+        ctx.event("base_sync_remote", line)?;
+        pending = follow_up_pending(ctx, unit).filter(|p| p.pr == Some(pr));
+    }
+    if let Some(p) = pending {
+        // Read from the log, so a run that failed after the recovery (a fetch,
+        // or the request sent again) still knows on the next try.
+        let recovered = p.unsent;
+        resume = match &p.target {
             Some(aimed) if !ctx.dry_run => {
                 fetch(&wt, &branch, &base, &log("fetch"))?;
-                if !git::ok(&wt, &["merge-base", "--is-ancestor", aimed, &before.head]) {
+                let landed = git::ok(&wt, &["merge-base", "--is-ancestor", aimed, &before.head]);
+                if !landed && !recovered {
                     return Err(Fail::failed(format!(
                         "the update of PR #{pr} to base {aimed} is still pending: the base is not in the PR's head {} yet. Wait, then run base-sync again (no slot is spent)",
                         before.head
                     )));
                 }
-                git::ok(&wt, &["merge-base", "--is-ancestor", &base_ref, &before.head])
+                // A request the marker recovered may never have reached GitHub:
+                // when the base is not in the head, ask again for the same slot.
+                reissue = !landed;
+                landed && git::ok(&wt, &["merge-base", "--is-ancestor", &base_ref, &before.head])
             }
             Some(_) => false,
             None => p
@@ -304,12 +367,14 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                 .as_deref()
                 .is_some_and(|head| !before.head.eq_ignore_ascii_case(head)),
         };
-        if resume && let Some(recorded) = p.local_head {
+        if (resume || reissue)
+            && let Some(recorded) = p.local_head
+        {
             old_head = recorded;
         }
     }
     let taken = syncs_taken(ctx, unit);
-    if !resume && taken >= MAX_BASE_SYNCS {
+    if !resume && !reissue && taken >= MAX_BASE_SYNCS {
         return Err(Fail::refused(format!(
             "unit {unit} has taken {taken} base syncs; the cap is {MAX_BASE_SYNCS}. Park it for a person"
         )));
@@ -334,15 +399,42 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         fetch(&wt, &branch, &base, &log("fetch"))?;
         let aimed = git::commit(&wt, &base_ref).unwrap_or_default();
         let pr_arg = pr.to_string();
+        if !reissue {
+            // Before the call, so a process killed around it leaves a trace.
+            write_json(
+                &marker,
+                &json!({"pr": pr, "pr_head": before.head, "local_head": old_head, "base_head": aimed}),
+            )?;
+        }
         let (rc, _) = gh::read_raw(&["pr", "update-branch", &pr_arg, "--repo", &repo]);
+        if rc == gh::READ_TIMED_OUT {
+            // GitHub may have taken the request and gh never heard back. The
+            // marker stays, so the next run checks whether it landed before it
+            // asks again.
+            return Err(Fail::failed(format!(
+                "gh pr update-branch {pr} timed out; whether GitHub took it is unknown. Run base-sync again"
+            )));
+        }
         if rc != 0 {
+            if !reissue {
+                let _ = fs::remove_file(&marker);
+            }
             return Err(Fail::failed(format!("gh pr update-branch {pr} failed (exit {rc})")));
         }
-        // The slot is spent now, before any local step can fail.
-        ctx.event(
-            "base_sync_remote",
-            json!({"unit": unit, "pr": pr, "pr_head": before.head, "local_head": old_head, "base_head": aimed}),
-        )?;
+        if reissue {
+            ctx.event(
+                "base_sync_reissued",
+                json!({"unit": unit, "pr": pr, "base_head": aimed}),
+            )?;
+        }
+        // The slot is spent now, before any local step can fail. A recovered
+        // request's slot was logged when the marker was found.
+        if !reissue {
+            ctx.event(
+                "base_sync_remote",
+                json!({"unit": unit, "pr": pr, "pr_head": before.head, "local_head": old_head, "base_head": aimed}),
+            )?;
+        }
         owned_view(ctx, &repo, unit, pr, &branch)?.head
     };
 
@@ -391,6 +483,9 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         "deliver_ok": checked.ok,
         "review_round_needed": needed,
     });
+    // Before the line: a process killed between the two leaves a request with
+    // no finished line, which the next run finishes from the log.
+    let _ = fs::remove_file(&marker);
     ctx.event("base_sync", out.clone())?;
     println!("{out}");
     Ok(())

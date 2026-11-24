@@ -540,3 +540,154 @@ fn a_request_records_the_base_it_aimed_at() {
     printed(&c.sync());
     assert_eq!(c.env.events_named("base_sync_remote")[0]["base_head"], base);
 }
+
+#[test]
+fn a_sync_cut_short_right_after_the_update_call_is_finished_not_started_again() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    c.env.stub_file("die-after-update-branch", "");
+    let out = c.sync();
+    assert_ne!(out.code, 0, "the process was killed");
+    assert_eq!(c.update_calls(), 1);
+    assert!(c.env.workdir.join("units/3/base-sync-pending.json").is_file());
+
+    fs::remove_file(c.env.stub.join("die-after-update-branch")).unwrap();
+    let out = printed(&c.sync());
+    assert_eq!(out["new_head"], new_head);
+    assert_eq!(c.update_calls(), 1, "GitHub had applied it: no second update");
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 1, "one slot for one sync");
+    assert_eq!(c.env.events_named("base_sync").len(), 1);
+    assert_eq!(git(&c.wt, &["rev-parse", "HEAD"]), new_head);
+    assert!(!c.env.workdir.join("units/3/base-sync-pending.json").exists());
+}
+
+#[test]
+fn a_pending_marker_whose_update_never_reached_github_asks_again_for_the_same_slot() {
+    let c = case();
+    let base = c.advance_base();
+    c.pr_is_at(&c.old_head);
+    let marker = json!({"pr": 7, "pr_head": c.old_head, "local_head": c.old_head, "base_head": base});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    let out = c.sync();
+    assert_eq!(out.code, 1, "GitHub's update is still not in the head: {}", out.stderr);
+    assert_eq!(c.update_calls(), 1, "the request is made again");
+    assert_eq!(
+        c.env.events_named("base_sync_remote").len(),
+        1,
+        "and spends no second slot"
+    );
+    assert!(c.env.workdir.join("units/3/base-sync-pending.json").is_file());
+}
+
+#[test]
+fn a_failed_update_call_leaves_no_pending_marker() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    c.env.stub_file("fail-update-branch", "");
+    assert_eq!(c.sync().code, 1);
+    assert!(!c.env.workdir.join("units/3/base-sync-pending.json").exists());
+}
+
+#[test]
+fn a_recovered_request_whose_resend_failed_is_sent_again_next_time() {
+    let c = case();
+    let base = c.advance_base();
+    c.pr_is_at(&c.old_head);
+    let marker = json!({"pr": 7, "pr_head": c.old_head, "local_head": c.old_head, "base_head": base});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    c.env.stub_file("fail-update-branch", "");
+    assert_eq!(c.sync().code, 1);
+    assert_eq!(c.update_calls(), 1);
+    assert_eq!(c.sync().code, 1);
+    assert_eq!(
+        c.update_calls(),
+        2,
+        "the request never reached GitHub: ask again, do not wait"
+    );
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 1, "for the same slot");
+}
+
+#[test]
+fn a_resent_request_is_waited_for_not_sent_a_third_time() {
+    let c = case();
+    let base = c.advance_base();
+    c.pr_is_at(&c.old_head);
+    let marker = json!({"pr": 7, "pr_head": c.old_head, "local_head": c.old_head, "base_head": base});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    assert_eq!(c.sync().code, 1);
+    assert_eq!(c.update_calls(), 1);
+    assert_eq!(c.env.events_named("base_sync_reissued").len(), 1);
+    let out = c.sync();
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("still pending"), "{}", out.stderr);
+    assert_eq!(c.update_calls(), 1);
+}
+
+#[test]
+fn a_resend_to_a_rewritten_base_is_counted_landed_once_its_own_base_is_in() {
+    let c = case();
+    // The first request aimed at `lost`; the base was then rewritten without it.
+    let lost = c.advance_base();
+    git(&c.work, &["reset", "-q", "--hard", "HEAD~1"]);
+    fs::write(c.work.join("OTHER.md"), "rewritten\n").expect("the file");
+    git(&c.work, &["add", "OTHER.md"]);
+    identity(&c.work, &["commit", "-q", "-m", "rewritten"]);
+    git(&c.work, &["push", "-q", "-f", &c.bare.display().to_string(), "develop"]);
+    c.pr_is_at(&c.old_head);
+    let marker = json!({"pr": 7, "pr_head": c.old_head, "local_head": c.old_head, "base_head": lost});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    assert_eq!(c.sync().code, 1, "the resend is not in the head yet");
+    assert_eq!(c.update_calls(), 1);
+    assert_eq!(c.env.events_named("base_sync_reissued").len(), 1);
+    // GitHub applies the resend: the head now holds the rewritten base, never `lost`.
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    let out = c.sync();
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(printed(&out)["new_head"], new_head);
+    assert_eq!(c.update_calls(), 1, "nothing is sent a third time");
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 1, "one slot");
+}
+
+#[test]
+fn an_update_call_that_timed_out_keeps_the_pending_marker() {
+    let mut c = case();
+    c.env.set("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS", "1");
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    c.env.stub_file("hang-update-branch", "");
+    let out = c.sync();
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("timed out"), "{}", out.stderr);
+    assert!(
+        c.env.workdir.join("units/3/base-sync-pending.json").is_file(),
+        "whether GitHub took it is unknown"
+    );
+}
+
+#[test]
+fn a_newer_request_than_the_pending_line_is_counted_from_its_marker() {
+    let c = case();
+    let first = c.advance_base();
+    let h1 = c.update_branch(true);
+    let second = c.advance_base();
+    // The second request landed, but the process died before logging it.
+    let h2 = c.update_branch(true);
+    c.pr_is_at(&h2);
+    let line = json!({"ts": "t", "event": "base_sync_remote", "unit": 3, "pr": 7,
+        "pr_head": c.old_head, "local_head": c.old_head, "base_head": first});
+    c.env.write("events.jsonl", &format!("{line}\n"));
+    let marker = json!({"pr": 7, "pr_head": h1, "local_head": c.old_head, "base_head": second});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    let out = printed(&c.sync());
+    assert_eq!(out["new_head"], h2);
+    assert_eq!(c.update_calls(), 0, "it landed: nothing is sent again");
+    let remote = c.env.events_named("base_sync_remote");
+    assert_eq!(remote.len(), 2, "the second request spent its own slot");
+    assert_eq!(remote[1]["base_head"], second);
+}

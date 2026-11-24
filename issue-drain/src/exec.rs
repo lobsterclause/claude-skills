@@ -65,7 +65,7 @@ pub fn run(program: &str, args: &[String], dir: &Path, limit: Duration, log: &Pa
         Ok((out, err))
     };
     let (out, err) = open().map_err(|e| Fail::failed(format!("cannot write {}: {e}", log.display())))?;
-    supervise(program, args, dir, limit, (out, err), &[], log, None)
+    supervise(program, args, dir, limit, (out, err), &[], log, None, None)
 }
 
 /// `run`, with extra environment variables for the child and stdout and stderr
@@ -81,8 +81,27 @@ pub fn run_env(
     env: &[(&str, &str)],
     pidfile: Option<&Path>,
 ) -> Res<Ran> {
+    run_env_stdin(program, args, dir, limit, logs, env, pidfile, None)
+}
+
+/// `run_env`, with the child's standard input read from the open file `stdin`,
+/// positioned where the child should start reading. The child gets the file
+/// open from the start, so the text never goes through
+/// argv, which has a size limit and is visible to `ps`. Without it the child's
+/// stdin is empty.
+#[allow(clippy::too_many_arguments)] // `run_env` plus one
+pub fn run_env_stdin(
+    program: &str,
+    args: &[String],
+    dir: &Path,
+    limit: Duration,
+    logs: (&Path, &Path),
+    env: &[(&str, &str)],
+    pidfile: Option<&Path>,
+    stdin: Option<File>,
+) -> Res<Ran> {
     let files = open_logs(logs)?;
-    supervise(program, args, dir, limit, files, env, logs.1, pidfile)
+    supervise(program, args, dir, limit, files, env, logs.1, pidfile, stdin)
 }
 
 /// Create the stdout and stderr logs `run_opened` writes to, so a caller can
@@ -111,7 +130,7 @@ pub fn run_opened(
     env: &[(&str, &str)],
     pidfile: Option<&Path>,
 ) -> Res<Ran> {
-    supervise(program, args, dir, limit, files, env, err_log, pidfile)
+    supervise(program, args, dir, limit, files, env, err_log, pidfile, None)
 }
 
 /// A new, empty log file at `path`. Whatever was there is removed first
@@ -126,6 +145,42 @@ fn fresh(path: &Path) -> std::io::Result<File> {
     std::fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
+/// Where `program` is, as the child would find it: a path with a `/` is taken
+/// relative to `dir`, a bare name is looked up on the child's PATH (the one in
+/// `env`, else this process's). `None` when there is no executable file there.
+fn resolve(program: &str, dir: &Path, env: &[(&str, &str)]) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    if program.contains('/') {
+        let p = dir.join(program);
+        return runnable(&p).then(|| p.display().to_string());
+    }
+    let path = env
+        .iter()
+        .rev()
+        .find(|(k, _)| *k == "PATH")
+        .map(|(_, v)| v.to_string())
+        .or_else(|| std::env::var("PATH").ok())?;
+    // A relative or empty PATH entry names a folder under the child's
+    // directory, where the child would have looked, not the supervisor's.
+    std::env::split_paths(&path)
+        .map(|d| if d.is_absolute() { d } else { dir.join(d) }.join(program))
+        .find(|p| runnable(p))
+        .map(|p| p.display().to_string())
+}
+
+/// The shell a pidfile-holding child starts as: `$1` the pidfile, `$2` the
+/// supervisor's pid, then the program and its arguments. It polls for about 10
+/// seconds at most, and exits 125 (the program never ran) when it gives up.
+const PID_GATE: &str = r#"f=$1 sup=$2; shift 2
+i=0
+while [ "$(cat "$f" 2>/dev/null)" != "$$" ]; do
+  kill -0 "$sup" 2>/dev/null || exit 125
+  i=$((i + 1)); [ "$i" -lt 500 ] || exit 125
+  sleep 0.02
+done
+exec "$@""#;
+
 #[allow(clippy::too_many_arguments)] // private; every caller passes all of them
 fn supervise(
     program: &str,
@@ -136,12 +191,40 @@ fn supervise(
     env: &[(&str, &str)],
     tail_log: &Path,
     pidfile: Option<&Path>,
+    stdin: Option<File>,
 ) -> Res<Ran> {
-    let mut child = Command::new(program)
-        .args(args)
+    let input = stdin.map_or_else(Stdio::null, Stdio::from);
+    // With a pidfile, the child starts as a shell that waits until the file
+    // names it and only then becomes the program: a supervisor killed between
+    // the spawn and the write leaves nothing running that a later start could
+    // not see. The shell gives up if the supervisor is gone or the file never
+    // comes.
+    let mut gated = Vec::new();
+    let exe = match pidfile {
+        Some(path) => {
+            // Found here, so a program that is not there fails to start as it
+            // always did, rather than as a shell that exits 127.
+            let found =
+                resolve(program, dir, env).ok_or_else(|| Fail::failed(format!("cannot run {program}: not found")))?;
+            gated.extend(
+                ["-c", PID_GATE, "issue-drain-pid-gate"]
+                    .map(str::to_string)
+                    .into_iter()
+                    .chain([path.display().to_string(), std::process::id().to_string(), found]),
+            );
+            gated.extend(args.iter().cloned());
+            "/bin/sh"
+        }
+        None => {
+            gated.extend(args.iter().cloned());
+            program
+        }
+    };
+    let mut child = Command::new(exe)
+        .args(&gated)
         .envs(env.iter().copied())
         .current_dir(dir)
-        .stdin(Stdio::null())
+        .stdin(input)
         .stdout(out)
         .stderr(err)
         .process_group(0)
@@ -182,6 +265,19 @@ fn supervise(
         timed_out,
         tail: tail_of(tail_log),
     })
+}
+
+/// Is any process still in the process group whose leader had this pid? A
+/// pidfile written by `run_env` names such a group. Anything that is not a
+/// pid counts as not alive.
+pub fn group_alive(pid: &str) -> bool {
+    pid.trim().parse::<u32>().is_ok()
+        && Command::new("kill")
+            .args(["-0", "--", &format!("-{}", pid.trim())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
 }
 
 /// `git -C <dir> <args>`, with the same limits and log.
@@ -227,6 +323,105 @@ mod tests {
 
     fn temp() -> tempfile::TempDir {
         tempfile::tempdir().expect("a temporary folder")
+    }
+
+    #[test]
+    fn a_gated_child_runs_only_once_the_pidfile_names_it() {
+        let t = temp();
+        let (pidfile, seen) = (t.path().join("child.pid"), t.path().join("seen"));
+        let (out, err) = open_logs((&t.path().join("o"), &t.path().join("e"))).expect("logs");
+        let script = r#"printf '%s %s' "$$" "$(cat "$0")" > "$1""#;
+        let args = [
+            "-c",
+            script,
+            &pidfile.display().to_string(),
+            &seen.display().to_string(),
+        ]
+        .map(str::to_string);
+        let ran = run_opened(
+            "/bin/sh",
+            &args,
+            t.path(),
+            Duration::from_secs(20),
+            (out, err),
+            &t.path().join("e"),
+            &[],
+            Some(&pidfile),
+        )
+        .expect("it runs");
+        assert_eq!(ran.code, Some(0), "{}", ran.tail);
+        let text = std::fs::read_to_string(&seen).expect("the program ran");
+        let (own, read) = text.split_once(' ').expect("two words");
+        assert_eq!(own, read, "the pidfile named the program before it ran");
+        assert!(!pidfile.exists(), "the pidfile is removed after");
+    }
+
+    #[test]
+    fn a_gated_child_whose_supervisor_is_gone_never_runs_the_program() {
+        let t = temp();
+        let mut gone = Command::new("true").spawn().expect("a short process");
+        let dead = gone.id().to_string();
+        gone.wait().expect("it ends");
+        let marker = t.path().join("ran");
+        let pidfile = t.path().join("child.pid");
+        let status = Command::new("/bin/sh")
+            .args([
+                "-c",
+                PID_GATE,
+                "gate",
+                &pidfile.display().to_string(),
+                &dead,
+                "/usr/bin/touch",
+            ])
+            .arg(&marker)
+            .status()
+            .expect("the gate runs");
+        assert_eq!(status.code(), Some(125));
+        assert!(!marker.exists(), "the program was not started");
+    }
+
+    #[test]
+    fn a_relative_path_entry_is_looked_up_from_the_childs_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = temp();
+        std::fs::create_dir(t.path().join("tools")).expect("tools");
+        let prog = t.path().join("tools/issue-drain-relative-prog");
+        std::fs::write(&prog, "#!/bin/sh\necho found > here\n").expect("script");
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let (out, err) = open_logs((&t.path().join("o"), &t.path().join("e"))).expect("logs");
+        let ran = run_opened(
+            "issue-drain-relative-prog",
+            &[],
+            t.path(),
+            Duration::from_secs(20),
+            (out, err),
+            &t.path().join("e"),
+            &[("PATH", "tools:/usr/bin:/bin")],
+            Some(&t.path().join("child.pid")),
+        )
+        .expect("it runs");
+        assert_eq!(ran.code, Some(0), "{}", ran.tail);
+        assert_eq!(
+            std::fs::read_to_string(t.path().join("here")).expect("ran").trim(),
+            "found"
+        );
+    }
+
+    #[test]
+    fn a_gated_program_that_is_not_there_fails_to_start() {
+        let t = temp();
+        let (out, err) = open_logs((&t.path().join("o"), &t.path().join("e"))).expect("logs");
+        let r = run_opened(
+            "no-such-program-issue-drain",
+            &[],
+            t.path(),
+            Duration::from_secs(5),
+            (out, err),
+            &t.path().join("e"),
+            &[("PATH", "/usr/bin:/bin")],
+            Some(&t.path().join("child.pid")),
+        );
+        assert!(r.is_err());
     }
 
     #[test]

@@ -40,7 +40,7 @@ printf '%s\n' "$@" > "$FAKE_REC/argv.$u.$k"
 echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
 echo '{"type":"result","subtype":"success","session_id":"sess-1","total_cost_usd":0.1,"is_error":false,"num_turns":2}'
 if [ -e "$FAKE_REC/result.$u" ]; then cp "$FAKE_REC/result.$u" "$d/result.json"; fi
-exit 0
+exit "$(cat "$FAKE_REC/exit.$u" 2>/dev/null || echo 0)"
 "#;
 
 const MERGE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -426,6 +426,7 @@ fn a_failed_check_repairs_the_unit_and_names_the_check() {
         &Case::refused(&[("check_failed", "check 'lint' is failure")]),
     );
     c.canned_n("merge-gate", 3, 0, &Case::merged());
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
 
     let (out, report) = c.drive(&[]);
     assert_eq!(out.code, 0, "{}", out.stderr);
@@ -1071,4 +1072,279 @@ fn drive_pid_is_gone_after_a_normal_exit_and_named_while_running() {
     assert!(!c.env.workdir.join("drive.pid").exists());
     // The first line names the pid and the run folder.
     assert!(out.stderr.lines().next().unwrap_or_default().starts_with("drive: pid "));
+}
+
+fn repair_case(c: &Case) {
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write(
+        "units/1/session.json",
+        &json!({"session_id": "sess-1", "attempts": [{"attempt": 1, "model": "haiku"}]}).to_string(),
+    );
+    c.canned_n(
+        "merge-gate",
+        1,
+        3,
+        &Case::refused(&[("check_failed", "check 'lint' is failure")]),
+    );
+    c.canned("merge-gate", 0, &Case::clean());
+}
+
+#[test]
+fn a_repair_that_wrote_no_new_result_does_not_reuse_the_old_one() {
+    let c = case(&[1]);
+    repair_case(&c);
+    // The previous round's result is on disk; the fake claude writes none.
+    c.env.write(
+        "units/1/result.json",
+        &json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}).to_string(),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    assert_eq!(c.count("merge-gate"), 1, "no CI wait on an old result");
+    assert!(c.last_comment().contains("new result.json"), "{}", c.last_comment());
+}
+
+#[test]
+fn a_repair_whose_claude_exited_nonzero_is_a_failed_repair() {
+    let c = case(&[1]);
+    repair_case(&c);
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    fs::write(c.rec.join("exit.1"), "1").unwrap();
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    assert!(c.last_comment().contains("exited 1"), "{}", c.last_comment());
+}
+
+#[test]
+fn a_review_pass_whose_claude_exited_nonzero_is_not_a_pass() {
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.env.write(
+        "units/1/session.json",
+        &json!({"session_id": "sess-1", "attempts": [{"attempt": 1, "model": "haiku"}]}).to_string(),
+    );
+    c.canned("merge-gate", 3, &Case::refused(&[("review", "no review at the head")]));
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    fs::write(c.rec.join("exit.1"), "2").unwrap();
+    let (_, report) = c.drive(&[]);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    assert!(!c.env.workdir.join("units/1/drive-review-resumed").exists());
+}
+
+#[test]
+fn a_pr_read_that_hangs_is_cut_off_and_blocks_the_unit_as_infrastructure() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS", "1");
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    c.pr_view(1, 4701);
+    c.env.stub_file("hang-pr-view", "");
+    let started = std::time::Instant::now();
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the read was not cut off"
+    );
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "blocked"}]));
+    let comment = c.last_comment();
+    assert!(comment.contains("timed out"), "{comment}");
+    assert!(comment.contains("infrastructure"), "{comment}");
+}
+
+#[test]
+fn a_unit_with_a_sync_in_flight_finishes_it_before_the_gate_is_read() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    // The real base-sync removes the marker when it finishes.
+    fs::write(
+        c.fake.join("base-sync.sh"),
+        "rm -f \"$ISSUE_DRAIN_WORKDIR/units/1/base-sync-pending.json\"\n",
+    )
+    .unwrap();
+    c.canned(
+        "base-sync",
+        0,
+        &json!({"unit": 1, "deliver_ok": true, "review_round_needed": false}).to_string(),
+    );
+    c.canned("merge-gate", 0, &Case::clean());
+    // Call 1 is the hold check, call 2 the read in ci_wait, call 3 the merge.
+    c.canned_n("merge-gate", 3, 0, &Case::merged());
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        report["processed"],
+        json!([{"unit": 1, "state": "done"}]),
+        "{}",
+        c.last_comment()
+    );
+    assert_eq!(c.count("base-sync --unit 1 --pr 4701"), 1);
+    let calls = c.calls();
+    assert_eq!(
+        calls[c.at("merge-gate --unit 1")],
+        "merge-gate --unit 1 --pr 4701 --dry-run"
+    );
+    assert!(c.at("merge-gate --unit 1") < c.at("base-sync --unit 1"));
+    let merge = calls
+        .iter()
+        .position(|l| l == "merge-gate --unit 1 --pr 4701")
+        .expect("the merge call");
+    assert!(c.at("base-sync --unit 1") < merge);
+}
+
+#[test]
+fn a_held_pr_with_a_sync_in_flight_is_parked_not_synced() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    pr_now(&c, "OPEN", None, false);
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("hold_label", "PR #4701 carries 'needs-human'")]),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+    assert_eq!(c.count("base-sync"), 0, "a held PR is not pushed to");
+    assert!(c.last_comment().contains("hold_label"), "{}", c.last_comment());
+}
+
+#[test]
+fn a_sync_in_flight_is_not_resumed_when_the_holds_cannot_be_read() {
+    for (code, answer) in [
+        (3, Case::refused(&[("read_error", "could not read issue #5's labels")])),
+        (1, "{\"error\": \"gh timed out\"}".to_string()),
+    ] {
+        let c = case(&[1]);
+        c.seed(1, &GATE_PATH, Some(4701));
+        c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+        pr_now(&c, "OPEN", None, false);
+        c.canned("merge-gate", code, &answer);
+        let (_, report) = c.drive(&[]);
+        assert_eq!(c.count("base-sync"), 0, "an unread hold is not taken as no hold");
+        assert_eq!(c.count("merge-gate"), 2, "the gate is read once more before blocking");
+        // From the gate a unit can only be parked; the note marks it as infra.
+        assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+        assert!(c.last_comment().contains("could not be read"), "{}", c.last_comment());
+    }
+}
+
+#[test]
+fn a_sync_recovery_that_fails_because_the_pr_merged_settles_it_as_merged() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    let merged = fs::read_to_string(c.env.stub.join("pr-view-4701.json")).unwrap();
+    c.env.stub_file("merged-view.json", &merged);
+    pr_now(&c, "OPEN", None, false);
+    c.canned("merge-gate", 0, &Case::clean());
+    // The PR merges while the sync runs, and base-sync refuses it as not open.
+    let stub = c.env.stub.display().to_string();
+    fs::write(
+        c.fake.join("base-sync.sh"),
+        format!("cp \"{stub}/merged-view.json\" \"{stub}/pr-view-4701.json\"\n"),
+    )
+    .unwrap();
+    c.canned("base-sync", 3, "{\"error\": \"PR #4701 is not open\"}");
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "done", "{}", c.last_comment());
+    assert_eq!(c.count("base-sync --unit 1"), 1);
+    assert!(!c.env.workdir.join("units/1/base-sync-pending.json").exists());
+}
+
+#[test]
+fn a_failed_cleanup_is_retried_on_the_next_drive_without_a_second_comment() {
+    let c = case(&[1]);
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    c.pr_view(1, 4701);
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n("merge-gate", 3, 0, &Case::merged());
+    c.canned_n("cleanup", 1, 1, "");
+
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "done"}]));
+    assert_eq!(c.count("cleanup --unit 1"), 1);
+    let unit = c.env.workdir.join("units/1");
+    assert!(unit.join("drive-cleanup-pending").exists(), "cleanup is still owed");
+    assert!(unit.join("drive-ended.json").exists());
+    let comments = || {
+        c.env
+            .gh_calls()
+            .iter()
+            .filter(|l| l.starts_with("issue comment 50 "))
+            .count()
+    };
+    let posted = comments();
+    assert!(posted >= 1);
+
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.count("cleanup --unit 1"), 2, "the retry");
+    assert!(!unit.join("drive-cleanup-pending").exists());
+    assert_eq!(comments(), posted, "the unit's comment is not posted again");
+}
+
+#[test]
+fn a_pr_that_merged_while_a_sync_was_in_flight_is_settled_as_merged_not_synced() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "done", "{}", c.last_comment());
+    assert_eq!(c.count("base-sync --unit 1"), 0, "a merged PR needs no sync");
+    assert!(!c.env.workdir.join("units/1/base-sync-pending.json").exists());
+}
+
+#[test]
+fn a_merged_pr_that_is_not_the_units_is_parked_when_a_sync_was_in_flight() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    let path = c.env.stub.join("pr-view-4701.json");
+    let mut view: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    view["headRefName"] = json!("someone-else");
+    c.env.stub_file("pr-view-4701.json", &view.to_string());
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_ne!(c.state_of(1), "done");
+    assert_eq!(c.count("base-sync --unit 1"), 0);
+    assert!(c.last_comment().contains("not unit 1's branch"), "{}", c.last_comment());
+}
+
+#[test]
+fn a_pr_read_whose_output_a_leftover_process_holds_open_is_still_answered() {
+    let drive = |linger: bool| {
+        let mut c = case(&[1]);
+        c.env.set("ISSUE_DRAIN_GH_READ_TIMEOUT_SECS", "1");
+        c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+        c.pr_view(1, 4701);
+        if linger {
+            c.env.stub_file("linger-pr-view", "");
+        }
+        let started = std::time::Instant::now();
+        let (out, report) = c.drive(&[]);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        (started.elapsed(), report["processed"].clone(), c.last_comment())
+    };
+    let (took, lingered, note) = drive(true);
+    assert!(
+        took < std::time::Duration::from_secs(20),
+        "the read waited for the leftover process"
+    );
+    // gh exited with its answer; the process it left behind changes nothing.
+    assert_eq!(lingered, drive(false).1, "{note}");
+    assert!(!note.contains("timed out"), "{note}");
 }
