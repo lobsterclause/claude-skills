@@ -117,7 +117,7 @@ fn without_code_spans(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let (mut i, mut copied) = (0, 0);
     while i < b.len() {
-        if b[i] != b'`' {
+        if b[i] != b'`' || (i > 0 && b[i - 1] == b'\\') {
             i += 1;
             continue;
         }
@@ -513,6 +513,12 @@ mod tests {
     #[test]
     fn a_code_span_does_not_cross_a_blank_line() {
         let body = "A lone ` here.\n\nFixes #1 and `Fixes #2`.";
+        assert_eq!(body_closes(body, "a/b"), vec![1]);
+    }
+
+    #[test]
+    fn an_escaped_backtick_opens_nothing() {
+        let body = "A \\` here, then Fixes #1 and `Fixes #2`.";
         assert_eq!(body_closes(body, "a/b"), vec![1]);
     }
 
