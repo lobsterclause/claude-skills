@@ -305,3 +305,24 @@ pub fn queue_with_unit(unit: Value) -> Value {
         "title": "Drain"
     })
 }
+
+/// What `state record --state merged` reads: the unit's branch in
+/// `units/<unit>/unit.json` and a merged PR from that branch into develop.
+pub fn merged_by_hand(env: &Env, unit: u64, pr: u64) {
+    let branch = format!("fix/{unit}");
+    env.write(
+        &format!("units/{unit}/unit.json"),
+        &serde_json::json!({"unit": unit, "branch": branch}).to_string(),
+    );
+    env.stub_file(
+        &format!("pr-view-{pr}.json"),
+        &serde_json::json!({
+            "state": "MERGED", "headRefOid": "b".repeat(40), "headRefName": branch,
+            "baseRefName": "develop", "headRepository": {"name": "tidepool"},
+            "headRepositoryOwner": {"login": "example"}, "mergeStateStatus": "CLEAN", "reviewDecision": "",
+            "labels": [], "body": "", "closingIssuesReferences": [], "changedFiles": 1,
+            "statusCheckRollup": [], "mergeCommit": {"oid": "c".repeat(40)}
+        })
+        .to_string(),
+    );
+}

@@ -302,11 +302,11 @@ fn a_run_whose_state_disagrees_with_github_is_refused_before_any_unit_starts() {
     c.seed(1, &[], None);
     c.env.stub_file(
         "pr-list-fix_2.json",
-        &json!([{"number": 41, "state": "MERGED"}]).to_string(),
+        &json!([listed(41, "MERGED", "fix/2")]).to_string(),
     );
     c.env.stub_file(
         "pr-list-fix_1.json",
-        &json!([{"number": 40, "state": "CLOSED"}]).to_string(),
+        &json!([listed(40, "CLOSED", "fix/1")]).to_string(),
     );
     let (out, _) = c.drive(&[]);
     assert_eq!(out.code, 3, "{}", out.stderr);
@@ -333,15 +333,14 @@ fn state_that_matches_github_is_not_refused() {
     let c = case(&[1, 2]);
     c.seed(1, &[], None);
     // an open PR on a queued unit's branch is no disagreement
-    c.env.stub_file(
-        "pr-list-fix_1.json",
-        &json!([{"number": 40, "state": "OPEN"}]).to_string(),
-    );
+    c.env
+        .stub_file("pr-list-fix_1.json", &json!([listed(40, "OPEN", "fix/1")]).to_string());
     // a unit already finished by hand and recorded may have a merged PR
     c.env.stub_file(
         "pr-list-fix_2.json",
-        &json!([{"number": 41, "state": "MERGED"}]).to_string(),
+        &json!([listed(41, "MERGED", "fix/2")]).to_string(),
     );
+    merged_by_hand(&c.env, 2, 41);
     assert_eq!(
         c.env
             .run(&[
@@ -353,6 +352,59 @@ fn state_that_matches_github_is_not_refused() {
     let (out, _) = c.drive(&["--once"]);
     assert!(!out.stderr.contains("state disagrees"), "{}", out.stderr);
     assert_eq!(c.count("claim take --unit 1"), 1);
+}
+
+/// One `gh pr list` row from this repository into develop.
+fn listed(number: u64, state: &str, _branch: &str) -> Value {
+    json!({"number": number, "state": state, "baseRefName": "develop",
+        "headRepository": {"name": "tidepool"}, "headRepositoryOwner": {"login": "example"}})
+}
+
+#[test]
+fn a_pr_that_cannot_be_the_units_does_not_stop_the_run() {
+    let c = case(&[1, 2]);
+    c.seed(1, &[], None);
+    // U1's branch name was used by a fork, and by a PR into another base
+    let mut fork = listed(40, "CLOSED", "fix/1");
+    fork["headRepositoryOwner"] = json!({"login": "stranger"});
+    let mut elsewhere = listed(42, "MERGED", "fix/1");
+    elsewhere["baseRefName"] = json!("release");
+    c.env
+        .stub_file("pr-list-fix_1.json", &json!([fork, elsewhere]).to_string());
+    let (out, _) = c.drive(&["--once"]);
+    assert!(!out.stderr.contains("state disagrees"), "{}", out.stderr);
+    assert_eq!(c.count("claim take --unit 1"), 1);
+}
+
+#[test]
+fn the_pr_the_state_names_is_the_one_compared() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    // an unrelated open PR on the branch does not hide the unit's closed one
+    c.env.stub_file(
+        "pr-list-fix_1.json",
+        &json!([listed(4702, "OPEN", "fix/1"), listed(4701, "CLOSED", "fix/1")]).to_string(),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("PR #4701 is closed"), "{}", out.stderr);
+}
+
+#[test]
+fn a_merge_during_a_cut_short_base_sync_is_left_to_the_gate() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    c.env.stub_file(
+        "pr-list-fix_1.json",
+        &json!([listed(4701, "MERGED", "fix/1")]).to_string(),
+    );
+    let (out, _) = c.drive(&[]);
+    assert!(!out.stderr.contains("state disagrees"), "{}", out.stderr);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "done");
+    assert!(!c.env.workdir.join("units/1/base-sync-pending.json").exists());
 }
 
 #[test]

@@ -326,9 +326,9 @@ fn conflict_report(ctx: &Ctx, unit: u64, pr: u64, wt: &Path, branch: &str) -> Re
                 .filter(|(_, head, planned)| {
                     match head
                         .as_deref()
-                        .and_then(|h| git::out(wt, &["diff", "--name-only", &format!("{h}^"), h]))
+                        .and_then(|h| git::out(wt, &["diff", "-z", "--name-only", &format!("{h}^"), h]))
                     {
-                        Some(changed) => changed.lines().any(|l| l == file),
+                        Some(changed) => changed.split('\0').any(|l| l == file),
                         None => planned.iter().any(|p| shared_entry(p, file).is_some()),
                     }
                 })

@@ -40,7 +40,7 @@ pub fn merge_conflicts(dir: &Path, a: &str, b: &str) -> Option<Vec<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["merge-tree", "--write-tree", "--name-only", "--no-messages", a, b])
+        .args(["merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", a, b])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -48,11 +48,13 @@ pub fn merge_conflicts(dir: &Path, a: &str, b: &str) -> Option<Vec<String>> {
     match output.status.code()? {
         0 => Some(Vec::new()),
         1 => {
+            // With -z: the tree, then each conflicted path, NUL-terminated and
+            // unquoted, so a path with non-ASCII bytes reads as written.
             let text = String::from_utf8_lossy(&output.stdout);
             let mut files: Vec<String> = text
-                .lines()
+                .split('\0')
                 .skip(1)
-                .take_while(|line| !line.is_empty())
+                .take_while(|path| !path.is_empty())
                 .map(str::to_string)
                 .collect();
             files.sort();
@@ -124,7 +126,47 @@ fn github_repo(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::github_repo;
+    use super::{github_repo, merge_conflicts};
+    use std::process::Command;
+
+    #[test]
+    fn a_conflicted_path_is_returned_as_written() {
+        let dir = std::env::temp_dir().join(format!("issue-drain-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let file = dir.join("café.ts");
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(&file, "a\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["checkout", "-qb", "other"]);
+        std::fs::write(&file, "b\n").unwrap();
+        git(&["commit", "-qam", "other"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(&file, "c\n").unwrap();
+        git(&["commit", "-qam", "main"]);
+        let files = merge_conflicts(&dir, "main", "other");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(files, Some(vec!["café.ts".to_string()]));
+    }
 
     #[test]
     fn origin_urls_name_their_repo() {

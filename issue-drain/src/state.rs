@@ -810,6 +810,11 @@ fn record_by_hand(ctx: &Ctx, args: &RecordArgs) -> Res<()> {
     let Some(unit) = snapshot.unit(args.unit) else {
         return Err(Fail::refused(format!("unit {} is not in the queue", args.unit)));
     };
+    if to == Merged
+        && let Some(pr) = args.pr
+    {
+        merged_pr_is_the_units(ctx, args.unit, pr)?;
+    }
     let mut ev = now_event(ctx, Some(args.unit), to.as_str(), Some(reason.to_string()));
     ev.from = Some(unit.state.as_str().to_string());
     ev.pr = args.pr;
@@ -817,6 +822,39 @@ fn record_by_hand(ctx: &Ctx, args: &RecordArgs) -> Res<()> {
     snapshot.apply(&ev).map_err(Fail::refused)?;
     append(ctx, &text, &[ev])?;
     write_snapshot(ctx, &snapshot)
+}
+
+/// A merge recorded by hand is checked the way post-merge will check it: the
+/// PR is merged, and it is the unit's (its branch, the base, this repository).
+/// A wrong number would otherwise stop the next drive, and a unit in merged
+/// cannot be recorded again.
+fn merged_pr_is_the_units(ctx: &Ctx, unit: u64, pr: u64) -> Res<()> {
+    use crate::merge_gate::{self, PrState, UnitBranch};
+    let repo = ctx.repo()?;
+    let view = merge_gate::read_view(&repo, pr).map_err(|e| Fail::failed(format!("could not read PR #{pr}: {e}")))?;
+    if view.state != PrState::Merged {
+        return Err(Fail::refused(format!(
+            "PR #{pr} is not merged; record the unit as merged once it is"
+        )));
+    }
+    let branch = merge_gate::unit_file::<UnitBranch>(ctx, unit, "unit.json")
+        .map(|u| u.branch)
+        .and_then(|b| {
+            if b.is_empty() {
+                Err(format!("units/{unit}/unit.json names no branch"))
+            } else {
+                Ok(b)
+            }
+        });
+    let refusals = merge_gate::binding(&repo, &ctx.profile.base_branch, unit, pr, &view, &branch);
+    if refusals.is_empty() {
+        return Ok(());
+    }
+    let why: Vec<String> = refusals.into_iter().map(|r| r.detail).collect();
+    Err(Fail::refused(format!(
+        "PR #{pr} cannot be recorded for unit {unit}: {}",
+        why.join("; ")
+    )))
 }
 
 fn show(ctx: &Ctx, args: &ShowArgs) -> Res<()> {

@@ -733,6 +733,7 @@ impl Case {
 fn a_conflicting_update_names_the_files_and_the_merged_unit_that_touched_them() {
     let c = case_with(two_unit_queue(json!(["src/timer/countdown.ts"])));
     c.conflicting_base();
+    merged_by_hand(&c.env, 2, 41);
     c.state(&[
         "record", "--unit", "2", "--state", "merged", "--pr", "41", "--reason", "by hand",
     ]);

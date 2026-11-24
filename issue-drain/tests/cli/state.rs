@@ -528,6 +528,7 @@ fn record(env: &Env, args: &[&str]) -> Out {
 #[test]
 fn record_writes_a_unit_worked_by_hand_as_merged_with_its_reason() {
     let env = ready();
+    merged_by_hand(&env, 1, 41);
     let out = record(
         &env,
         &[
@@ -593,4 +594,39 @@ fn record_refuses_an_empty_reason() {
     let env = ready();
     let out = record(&env, &["--unit", "1", "--state", "parked", "--reason", "  "]);
     assert_eq!(out.code, 2, "{}", out.stderr);
+}
+
+#[test]
+fn record_refuses_a_merge_github_does_not_show_for_the_unit() {
+    let env = ready();
+    let merged = ["--unit", "1", "--state", "merged", "--pr", "41", "--reason", "by hand"];
+    // no unit.json: the PR cannot be tied to the unit
+    merged_by_hand(&env, 1, 41);
+    fs::remove_file(env.workdir.join("units/1/unit.json")).unwrap();
+    let out = record(&env, &merged);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("cannot be recorded"), "{}", out.stderr);
+    // a PR from another unit's branch
+    merged_by_hand(&env, 1, 41);
+    env.write("units/1/unit.json", &json!({"unit": 1, "branch": "fix/2"}).to_string());
+    let out = record(&env, &merged);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("fix/2"), "{}", out.stderr);
+    // an empty branch
+    env.write("units/1/unit.json", &json!({"unit": 1, "branch": ""}).to_string());
+    assert_eq!(record(&env, &merged).code, 3);
+    // a PR that is still open
+    merged_by_hand(&env, 1, 41);
+    let path = env.stub.join("pr-view-41.json");
+    let mut view: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    view["state"] = json!("OPEN");
+    env.stub_file("pr-view-41.json", &view.to_string());
+    let out = record(&env, &merged);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("not merged"), "{}", out.stderr);
+    assert_eq!(unit_state(&env, 1), "queued");
+    // control: the same record with GitHub agreeing is taken
+    merged_by_hand(&env, 1, 41);
+    assert_eq!(record(&env, &merged).code, 0);
+    assert_eq!(unit_state(&env, 1), "merged");
 }

@@ -1158,6 +1158,11 @@ impl<'a> Driver<'a> {
             if dir.join(self.mark(MERGE_ASKED)).exists() || dir.join(MERGE_ASKED).exists() {
                 continue;
             }
+            // A base sync cut short at the gate: the gate step finishes it, and
+            // settles a PR that merged meanwhile itself.
+            if u.state == State::Gate && dir.join(crate::base_sync::PENDING_MARKER).exists() {
+                continue;
+            }
             let Some(branch) = read_json::<Value>(&dir.join("unit.json"))
                 .and_then(|v| v["branch"].as_str().map(str::to_string))
                 .filter(|b| !b.is_empty())
@@ -1174,7 +1179,7 @@ impl<'a> Driver<'a> {
                 "--state",
                 "all",
                 "--json",
-                "number,state",
+                "number,state,baseRefName,headRepository,headRepositoryOwner",
                 "--limit",
                 "30",
             ])
@@ -1184,8 +1189,26 @@ impl<'a> Driver<'a> {
                     u.unit
                 ))
             })?;
-            let prs: Vec<Value> = serde_json::from_str(&listed)
+            let all: Vec<Value> = serde_json::from_str(&listed)
                 .map_err(|e| Fail::failed(format!("gh pr list for branch {branch} printed no JSON list: {e}")))?;
+            // `--head` matches the branch name in any fork and against any
+            // base, so keep only PRs that could be the unit's: from this
+            // repository, aimed at the base, and the PR state names when it
+            // names one.
+            let base = &self.ctx.profile.base_branch;
+            let prs: Vec<Value> = all
+                .into_iter()
+                .filter(|p| {
+                    let from = format!(
+                        "{}/{}",
+                        p["headRepositoryOwner"]["login"].as_str().unwrap_or_default(),
+                        p["headRepository"]["name"].as_str().unwrap_or_default()
+                    );
+                    p["baseRefName"].as_str() == Some(base.as_str())
+                        && from.eq_ignore_ascii_case(&self.repo)
+                        && u.pr.is_none_or(|n| p["number"].as_u64() == Some(n))
+                })
+                .collect();
             let state_of = |p: &Value| p["state"].as_str().unwrap_or_default().to_ascii_lowercase();
             if prs.iter().any(|p| state_of(p) == "open") {
                 continue;
