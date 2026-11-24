@@ -415,16 +415,19 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
 /// the child reads exactly the text written here.
 fn write_prompt(path: &std::path::Path, prompt: &str) -> Res<fs::File> {
     use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
     let fail = |e: std::io::Error| Fail::failed(format!("cannot write {}: {e}", path.display()));
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(fail(e)),
     }
+    // The prompt can carry CI logs: only the owner may read the copy.
     let mut file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)
         .map_err(fail)?;
     file.write_all(prompt.as_bytes()).map_err(fail)?;
@@ -450,6 +453,15 @@ mod tests {
         assert_eq!(read, "the prompt", "the child reads from the start");
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
         assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn a_saved_prompt_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt-2.txt");
+        write_prompt(&path, "a CI log").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

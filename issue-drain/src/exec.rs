@@ -161,8 +161,10 @@ fn resolve(program: &str, dir: &Path, env: &[(&str, &str)]) -> Option<String> {
         .find(|(k, _)| *k == "PATH")
         .map(|(_, v)| v.to_string())
         .or_else(|| std::env::var("PATH").ok())?;
+    // A relative or empty PATH entry names a folder under the child's
+    // directory, where the child would have looked, not the supervisor's.
     std::env::split_paths(&path)
-        .map(|d| d.join(program))
+        .map(|d| if d.is_absolute() { d } else { dir.join(d) }.join(program))
         .find(|p| runnable(p))
         .map(|p| p.display().to_string())
 }
@@ -376,6 +378,33 @@ mod tests {
             .expect("the gate runs");
         assert_eq!(status.code(), Some(125));
         assert!(!marker.exists(), "the program was not started");
+    }
+
+    #[test]
+    fn a_relative_path_entry_is_looked_up_from_the_childs_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = temp();
+        std::fs::create_dir(t.path().join("tools")).expect("tools");
+        let prog = t.path().join("tools/issue-drain-relative-prog");
+        std::fs::write(&prog, "#!/bin/sh\necho found > here\n").expect("script");
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let (out, err) = open_logs((&t.path().join("o"), &t.path().join("e"))).expect("logs");
+        let ran = run_opened(
+            "issue-drain-relative-prog",
+            &[],
+            t.path(),
+            Duration::from_secs(20),
+            (out, err),
+            &t.path().join("e"),
+            &[("PATH", "tools:/usr/bin:/bin")],
+            Some(&t.path().join("child.pid")),
+        )
+        .expect("it runs");
+        assert_eq!(ran.code, Some(0), "{}", ran.tail);
+        assert_eq!(
+            std::fs::read_to_string(t.path().join("here")).expect("ran").trim(),
+            "found"
+        );
     }
 
     #[test]
