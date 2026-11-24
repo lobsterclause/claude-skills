@@ -1,19 +1,27 @@
 //! `issue-drain post-merge --unit <n> --pr <n>`: the checks after a unit's PR
 //! merged (plan step 9).
 //!
-//! 1. The PR must be MERGED (exit 3 otherwise).
+//! 1. The PR must be MERGED, and it must be the unit's: aimed at the profile's
+//!    base branch, from the branch `unit.json` names, in the profile's
+//!    repository (`merge_gate::binding`). Exit 3 otherwise.
 //! 2. Tree check: the merge commit's tree is compared with the tree of the PR
 //!    head the gate approved, in the unit's worktree when it still exists, else
 //!    in the repo checkout. A different tree is not an error: the base moved
 //!    between the gate and the merge, so the base tip needs a verify of its
 //!    own. It is reported as `tree_match: false` and said on stderr.
-//! 3. Closures: the issues the PR closes (intersected with `result.json`
-//!    `closes` when that file exists). GitHub closes them itself on a merge
-//!    into the default branch, but a merge into another base branch does not,
-//!    and the autoclose can lag. Each is read, polling up to
-//!    ISSUE_DRAIN_POST_MERGE_WAIT_SECS (default 60); one still open is closed
-//!    here with a comment, through `gh::write` (the same path `close-verified`
-//!    uses), and read back. Anything still open after that is a failure.
+//! 3. Closures: the unit's queued issues that the PR names as closed (its
+//!    same-repository closing references, or a closing keyword in its body),
+//!    narrowed to `result.json` `closes` when that file exists. An issue the
+//!    unit was not queued with is never touched, whatever the PR says. GitHub
+//!    closes them itself on a merge into the default branch, but a merge into
+//!    another base branch does not, and the autoclose can lag. Each is read,
+//!    polling up to ISSUE_DRAIN_POST_MERGE_WAIT_SECS (default 60). One still
+//!    open is read again: if it now carries a hold label (the profile's or
+//!    `needs-human`, `ready-for-human`, `security-review`) it is left open for
+//!    a person and listed in `held`; otherwise it is closed here with a
+//!    comment, through `gh::write` (the same path `close-verified` uses), and
+//!    read back. The comment opens with a marker line, and a retry that finds
+//!    its own marked comment on the issue does not post it again.
 //! 4. The unit's claim is released (`claim::release_unit`) once every issue is
 //!    closed; a run without `tracker.json` took no claim.
 //!
@@ -21,13 +29,16 @@
 //! the tracker. With ISSUE_DRAIN_DRY_RUN=1 the reads happen and the writes
 //! print `WOULD: ...`; the issues it would close are listed in `closed_here`.
 //!
-//! Exit: 0 done (a tree mismatch included); 3 the PR is not merged or a unit
-//! process asked; 1 GitHub or git failed, or an issue is still open; 2 usage.
+//! Exit: 0 done (a tree mismatch included); 3 the PR is not merged or not the
+//! unit's, an issue is held for a person, or a unit process asked; 1 GitHub or
+//! git failed, or an issue is still open; 2 usage.
 
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::claim;
@@ -36,7 +47,8 @@ use crate::error::{Fail, Res};
 use crate::exec;
 use crate::gh::{self, Write};
 use crate::git;
-use crate::merge_gate::is_sha;
+use crate::merge_gate::{self, ALWAYS_HOLD, PrState, PrView, UnitBranch, is_sha};
+use crate::profile::same_label;
 use crate::text::sha7;
 
 #[derive(clap::Args)]
@@ -53,25 +65,29 @@ const GIT_LIMIT: Duration = Duration::from_secs(120);
 const DEFAULT_WAIT_SECS: u64 = 60;
 const POLL: Duration = Duration::from_secs(5);
 
-fn read_pr(repo: &str, pr: u64) -> Res<Value> {
-    let n = pr.to_string();
-    let raw = gh::read(&[
-        "pr",
-        "view",
-        &n,
-        "--repo",
-        repo,
-        "--json",
-        "state,mergeCommit,headRefOid,baseRefName,closingIssuesReferences",
-    ])
-    .map_err(|rc| Fail::failed(format!("could not read PR #{pr} (gh exit {rc})")))?;
-    serde_json::from_str(&raw).map_err(|_| Fail::failed(format!("could not read PR #{pr}: gh did not return JSON")))
+/// A closing keyword and the issue it names, as GitHub reads a PR body:
+/// `Fixes #12`, `closes: owner/repo#12`.
+static CLOSING_KEYWORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+(?:([\w.-]+/[\w.-]+))?#(\d+)\b")
+        .expect("a fixed pattern")
+});
+
+/// The issues in `repo` that `body` says it closes.
+fn body_closes(body: &str, repo: &str) -> Vec<u64> {
+    CLOSING_KEYWORD
+        .captures_iter(body)
+        .filter(|c| c.get(1).is_none_or(|r| r.as_str().eq_ignore_ascii_case(repo)))
+        .filter_map(|c| c[2].parse().ok())
+        .collect()
 }
 
-/// The merge commit: `{"oid": ...}` as gh prints it, or a bare string.
-fn merge_commit(view: &Value) -> Option<String> {
-    let c = &view["mergeCommit"];
-    c["oid"].as_str().or_else(|| c.as_str()).map(str::to_string)
+fn state_name(state: PrState) -> &'static str {
+    match state {
+        PrState::Open => "OPEN",
+        PrState::Closed => "CLOSED",
+        PrState::Merged => "MERGED",
+        PrState::Other => "in an unknown state",
+    }
 }
 
 /// Where the trees are compared: the unit's worktree while it exists.
@@ -123,30 +139,97 @@ fn trees_match(ctx: &Ctx, unit: u64, merge: &str, head: &str) -> Res<bool> {
     Ok(tree(merge)? == tree(head)?)
 }
 
-/// The issues to check: the PR's closing references, narrowed to what the
-/// unit's result.json says it closes (the PR alone when there is none).
-fn closing_issues(ctx: &Ctx, unit: u64, view: &Value) -> Vec<u64> {
-    let mut refs: Vec<u64> = view["closingIssuesReferences"]
-        .as_array()
-        .map(|list| list.iter().filter_map(|i| i["number"].as_u64()).collect())
-        .unwrap_or_default();
+/// The issues to check: the unit's queued issues that the PR names as closed
+/// (same-repository closing references or body keywords), narrowed to what
+/// the unit's result.json says it closes when there is one.
+fn closing_issues(ctx: &Ctx, unit: u64, repo: &str, view: &PrView) -> Res<Vec<u64>> {
+    let queued = ctx.queue_unit(unit)?.issues;
+    let mut named: Vec<u64> = view
+        .closing
+        .iter()
+        .filter(|c| c.repo.eq_ignore_ascii_case(repo))
+        .map(|c| c.number)
+        .collect();
+    named.extend(body_closes(&view.body, repo));
+    named.retain(|n| queued.contains(n));
     if let Some(result) = read_json::<Value>(&ctx.path(&format!("units/{unit}/result.json")))
         && let Some(closes) = result["closes"].as_array()
     {
         let closes: Vec<u64> = closes.iter().filter_map(Value::as_u64).collect();
-        refs.retain(|n| closes.contains(n));
+        named.retain(|n| closes.contains(n));
     }
-    refs.sort_unstable();
-    refs.dedup();
-    refs
+    named.sort_unstable();
+    named.dedup();
+    Ok(named)
 }
 
-fn issue_state(repo: &str, number: u64) -> Res<String> {
+/// An issue's state and labels.
+struct Issue {
+    state: String,
+    labels: Vec<String>,
+}
+
+fn read_issue(repo: &str, number: u64) -> Res<Issue> {
     let unread = || Fail::failed(format!("could not read #{number}"));
-    let raw =
-        gh::read(&["issue", "view", &number.to_string(), "--repo", repo, "--json", "state"]).map_err(|_| unread())?;
+    let raw = gh::read(&[
+        "issue",
+        "view",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--json",
+        "state,labels",
+    ])
+    .map_err(|_| unread())?;
     let value: Value = serde_json::from_str(&raw).map_err(|_| unread())?;
-    Ok(value["state"].as_str().unwrap_or("unknown").to_string())
+    let state = value["state"].as_str().ok_or_else(unread)?.to_string();
+    let labels = value["labels"]
+        .as_array()
+        .ok_or_else(unread)?
+        .iter()
+        .map(|l| l["name"].as_str().map(str::to_string).ok_or_else(unread))
+        .collect::<Res<Vec<String>>>()?;
+    Ok(Issue { state, labels })
+}
+
+/// The hold label on `labels`, if any.
+fn hold(ctx: &Ctx, labels: &[String]) -> Option<String> {
+    labels
+        .iter()
+        .find(|l| {
+            ctx.profile
+                .hold_labels
+                .iter()
+                .map(String::as_str)
+                .chain(ALWAYS_HOLD)
+                .any(|h| same_label(l, h))
+        })
+        .cloned()
+}
+
+/// The first line of the closing comment, so a retry can find its own.
+fn comment_marker(pr: u64, merge: &str) -> String {
+    format!("<!-- issue-drain:post-merge pr={pr} merge={merge} -->")
+}
+
+/// Whether `me` already posted the marked closing comment on the issue.
+fn commented(repo: &str, number: u64, marker: &str, me: &str) -> Res<bool> {
+    let raw = gh::read(&[
+        "api",
+        &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+        "--paginate",
+    ])
+    .map_err(|rc| Fail::failed(format!("could not read the comments on #{number} (gh exit {rc})")))?;
+    merge_gate::marked_comment(&raw, marker, me)
+        .map_err(|e| Fail::failed(format!("could not read the comments on #{number}: {e}")))
+}
+
+fn whoami() -> Res<String> {
+    gh::read(&["api", "user", "--jq", ".login"])
+        .ok()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| Fail::failed("could not read who gh is logged in as"))
 }
 
 fn wait_limit() -> Duration {
@@ -165,7 +248,7 @@ fn await_autoclose(repo: &str, issues: &[u64]) -> Res<(Vec<u64>, Vec<u64>)> {
     loop {
         let mut still = Vec::new();
         for &n in &open {
-            if issue_state(repo, n)? == "CLOSED" {
+            if read_issue(repo, n)?.state == "CLOSED" {
                 closed.push(n);
             } else {
                 still.push(n);
@@ -184,19 +267,25 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     ctx.require_driver("post-merge")?;
     let (unit, pr) = (args.unit, args.pr);
     let repo = ctx.repo()?;
-    let view = read_pr(&repo, pr)?;
-    let state = view["state"].as_str().unwrap_or("unknown");
-    if state != "MERGED" {
-        return Err(Fail::refused(format!("PR #{pr} is {state}, not MERGED")));
+    let view = merge_gate::read_view(&repo, pr).map_err(|e| Fail::failed(format!("could not read PR #{pr}: {e}")))?;
+    if view.state != PrState::Merged {
+        return Err(Fail::refused(format!(
+            "PR #{pr} is {}, not MERGED",
+            state_name(view.state)
+        )));
     }
-    let merge = merge_commit(&view)
+    let branch = merge_gate::unit_file::<UnitBranch>(ctx, unit, "unit.json").map(|u| u.branch);
+    let refusals = merge_gate::binding(&repo, &ctx.profile.base_branch, unit, pr, &view, &branch);
+    if !refusals.is_empty() {
+        let why: Vec<String> = refusals.into_iter().map(|r| r.detail).collect();
+        return Err(Fail::refused(why.join("; ")));
+    }
+    let merge = view
+        .merge_commit
+        .clone()
         .filter(|s| is_sha(s))
         .ok_or_else(|| Fail::failed(format!("PR #{pr} is merged but names no merge commit")))?;
-    let head = view["headRefOid"]
-        .as_str()
-        .filter(|s| is_sha(s))
-        .ok_or_else(|| Fail::failed(format!("PR #{pr} names no head commit")))?
-        .to_string();
+    let head = view.head.clone();
 
     let tree_match = trees_match(ctx, unit, &merge, &head)?;
     if !tree_match {
@@ -209,24 +298,39 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         );
     }
 
-    let issues = closing_issues(ctx, unit, &view);
-    let (closed_by_merge, open) = await_autoclose(&repo, &issues)?;
+    let issues = closing_issues(ctx, unit, &repo, &view)?;
+    let (mut closed_by_merge, open) = await_autoclose(&repo, &issues)?;
     let mut closed_here = Vec::new();
     let mut still_open = Vec::new();
+    let mut held: Vec<Value> = Vec::new();
+    let marker = comment_marker(pr, &merge);
+    let me = if open.is_empty() { String::new() } else { whoami()? };
     for number in open {
-        let body = format!("Fixed by #{pr} (merged as {}).\n", sha7(&merge));
-        let file = ctx.path(&format!("units/{unit}/post-merge-{number}.md"));
-        write_atomic(&file, body.as_bytes())?;
-        gh::write(
-            ctx,
-            &Write::Comment {
-                number,
-                body_file: &file,
-            },
-        )?;
+        // Read again: a hold label may have arrived while the PR waited.
+        let now = read_issue(&repo, number)?;
+        if now.state == "CLOSED" {
+            closed_by_merge.push(number);
+            continue;
+        }
+        if let Some(label) = hold(ctx, &now.labels) {
+            held.push(json!({"issue": number, "label": label}));
+            continue;
+        }
+        if !commented(&repo, number, &marker, &me)? {
+            let body = format!("{marker}\n\nFixed by #{pr} (merged as {}).\n", sha7(&merge));
+            let file = ctx.path(&format!("units/{unit}/post-merge-{number}.md"));
+            write_atomic(&file, body.as_bytes())?;
+            gh::write(
+                ctx,
+                &Write::Comment {
+                    number,
+                    body_file: &file,
+                },
+            )?;
+        }
         gh::write(ctx, &Write::CloseIssue { number })?;
         // A dry run wrote nothing, so there is nothing to read back.
-        if ctx.dry_run || issue_state(&repo, number)? == "CLOSED" {
+        if ctx.dry_run || read_issue(&repo, number)?.state == "CLOSED" {
             closed_here.push(number);
         } else {
             still_open.push(number);
@@ -235,7 +339,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
 
     // A claim is released only when the unit's issues are all closed.
     let mut claims_released: Vec<u64> = Vec::new();
-    if still_open.is_empty() && ctx.path("tracker.json").is_file() {
+    if still_open.is_empty() && held.is_empty() && ctx.path("tracker.json").is_file() {
         let report = claim::release_unit(ctx, unit)?;
         claims_released = report
             .iter()
@@ -253,6 +357,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         "closed_by_merge": closed_by_merge,
         "closed_here": closed_here,
         "still_open": still_open,
+        "held": held,
         "claims_released": claims_released,
     });
     if ctx.dry_run {
@@ -260,13 +365,19 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
     }
     ctx.event("post_merge", out.clone())?;
     println!("{out}");
-    if still_open.is_empty() {
-        Ok(())
-    } else {
+    if !still_open.is_empty() {
         let list: Vec<String> = still_open.iter().map(|n| format!("#{n}")).collect();
-        Err(Fail::failed(format!(
+        return Err(Fail::failed(format!(
             "still open after the merge and a close call: {}",
             list.join(", ")
-        )))
+        )));
     }
+    if !held.is_empty() {
+        let list: Vec<String> = held
+            .iter()
+            .map(|h| format!("#{} carries '{}'", h["issue"], h["label"].as_str().unwrap_or_default()))
+            .collect();
+        return Err(Fail::refused(format!("left open for a person: {}", list.join(", "))));
+    }
+    Ok(())
 }

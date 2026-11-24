@@ -157,7 +157,7 @@ pub struct Args {
 }
 
 /// Labels that park a PR for a person, whatever the profile says.
-const ALWAYS_HOLD: [&str; 3] = ["needs-human", "ready-for-human", "security-review"];
+pub(crate) const ALWAYS_HOLD: [&str; 3] = ["needs-human", "ready-for-human", "security-review"];
 
 /// A value that was read, or the name of what could not be.
 pub type Read<T> = Result<T, String>;
@@ -1803,12 +1803,12 @@ pub fn preflight(ctx: &Ctx, repo: &str, pr: u64) -> Read<Preflight> {
 
 /// What `units/<n>/unit.json` says the gate needs: the unit's branch.
 #[derive(Deserialize)]
-struct UnitBranch {
+pub(crate) struct UnitBranch {
     #[serde(default)]
-    branch: String,
+    pub(crate) branch: String,
 }
 
-fn unit_file<T: serde::de::DeserializeOwned>(ctx: &Ctx, unit: u64, name: &str) -> Read<T> {
+pub(crate) fn unit_file<T: serde::de::DeserializeOwned>(ctx: &Ctx, unit: u64, name: &str) -> Read<T> {
     read_json(&ctx.path(&format!("units/{unit}/{name}")))
         .ok_or_else(|| format!("units/{unit}/{name} is missing or not the expected shape"))
 }
@@ -2052,7 +2052,12 @@ fn note_marker(head: &str) -> String {
 /// marker for this head. A marker further down, or in someone else's comment,
 /// is a quotation and counts for nothing.
 fn note_posted(raw: &str, head: &str, me: &str) -> Read<bool> {
-    let marker = note_marker(head);
+    marked_comment(raw, &note_marker(head), me)
+}
+
+/// Whether a comment in `raw` (the pages `gh api --paginate` prints for an
+/// issue's or PR's comments), written by `me`, has `marker` as its first line.
+pub(crate) fn marked_comment(raw: &str, marker: &str, me: &str) -> Read<bool> {
     for page in serde_json::Deserializer::from_str(raw).into_iter::<Value>() {
         let page = page.map_err(|_| "the answer is not JSON".to_string())?;
         let list = page.as_array().ok_or("a page is not a list of comments")?;

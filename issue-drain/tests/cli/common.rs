@@ -167,6 +167,20 @@ impl Env {
 
     /// `run`, started in `dir` (a command that works on the current folder).
     pub fn run_in(&self, dir: Option<&Path>, args: &[&str]) -> Out {
+        self.command(dir, args).output().expect("the binary runs").into()
+    }
+
+    /// Start `issue-drain <args>` and return at once, its output piped.
+    #[allow(dead_code)]
+    pub fn spawn(&self, args: &[&str]) -> std::process::Child {
+        self.command(None, args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the binary starts")
+    }
+
+    fn command(&self, dir: Option<&Path>, args: &[&str]) -> Command {
         let stub_bin = manifest_dir().join("tests/stub");
         let path = format!("{}:{}", stub_bin.display(), std::env::var("PATH").unwrap_or_default());
         let mut command = Command::new(env!("CARGO_BIN_EXE_issue-drain"));
@@ -182,7 +196,7 @@ impl Env {
         if let Some(dir) = dir {
             command.current_dir(dir);
         }
-        command.output().expect("the binary runs").into()
+        command
     }
 
     /// Every call the stub gh received, one line of arguments each.

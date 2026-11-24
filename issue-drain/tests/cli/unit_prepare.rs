@@ -700,3 +700,44 @@ fn a_copied_index_that_will_not_sync_is_removed_and_built_fresh() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines, ["sync .", "init -i", "none"], "{text}");
 }
+
+#[test]
+fn an_index_already_in_a_reused_worktree_is_synced_and_never_removed() {
+    let mut c = case("codegraph_init = true\n");
+    let exclude = c.checkout.join(".git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, ".codegraph/\n").unwrap();
+    let path = c.path_with(&[]);
+    c.env.set("PATH", &path);
+    c.prepared();
+    assert_eq!(c.unit_json()["codegraph"], "absent");
+    // An index the unit worktree got some other way (its own session, a
+    // bootstrap), ignored by git so the worktree stays clean for reuse.
+    let own = c.worktree().join(".codegraph/own");
+    fs::create_dir_all(own.parent().unwrap()).unwrap();
+    fs::write(&own, "own").unwrap();
+
+    seed_main_index(&c);
+    let seen = c.env.dir.path().join("codegraph.seen");
+    let bin = c.fake_codegraph(&format!("echo \"$@\" >> {0}\nexit 1", seen.display()));
+    let path = c.path_with(&[&bin]);
+    c.env.set("PATH", &path);
+    let again = c.prepared();
+    assert_eq!(again["reused"], true);
+    assert_eq!(c.unit_json()["codegraph"], "failed");
+    let text = fs::read_to_string(&seen).expect("codegraph ran");
+    assert_eq!(text.lines().collect::<Vec<_>>(), ["sync ."], "{text}");
+    assert!(own.is_file(), "an index this attempt did not make is left alone");
+    assert!(!c.worktree().join(".codegraph/codegraph.db").exists(), "not seeded over");
+}
+
+#[test]
+fn a_fresh_index_that_fails_to_build_is_removed() {
+    let mut c = case("codegraph_init = true\n");
+    let bin = c.fake_codegraph("mkdir -p .codegraph && echo half > .codegraph/half\nexit 1");
+    let path = c.path_with(&[&bin]);
+    c.env.set("PATH", &path);
+    c.prepared();
+    assert_eq!(c.unit_json()["codegraph"], "failed");
+    assert!(!c.worktree().join(".codegraph").exists());
+}

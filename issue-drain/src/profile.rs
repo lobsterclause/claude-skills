@@ -210,9 +210,16 @@ impl Profile {
         if self.unit_timeout_secs == 0 {
             return Err(Fail::usage("profile key unit_timeout_secs must be above 0"));
         }
-        if self.unit_allowed_tools.iter().any(|t| t.trim().is_empty()) {
+        // `--allowedTools` takes every word after it, so an empty list would
+        // swallow the next flag, and a word starting with '-' would be one.
+        if self.unit_allowed_tools.is_empty()
+            || self
+                .unit_allowed_tools
+                .iter()
+                .any(|t| t.trim().is_empty() || t.starts_with('-'))
+        {
             return Err(Fail::usage(
-                "profile key unit_allowed_tools must hold tool names, none empty",
+                "profile key unit_allowed_tools must hold at least one tool name, none empty or starting with '-'",
             ));
         }
         // A required path is joined onto the main checkout: it stays inside it.
@@ -360,6 +367,8 @@ mod tests {
         );
         assert_eq!(load("unit_timeout_secs = 0\n").unwrap_err().code, 2);
         assert_eq!(load("unit_allowed_tools = [\"\"]\n").unwrap_err().code, 2);
+        assert_eq!(load("unit_allowed_tools = []\n").unwrap_err().code, 2);
+        assert_eq!(load("unit_allowed_tools = [\"--plugin-dir\"]\n").unwrap_err().code, 2);
     }
 
     #[test]

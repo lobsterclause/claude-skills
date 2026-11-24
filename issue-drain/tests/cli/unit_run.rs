@@ -56,6 +56,10 @@ fn case(profile_extra: &str) -> Case {
         "units/3/unit.json",
         &json!({"unit": 3, "worktree": worktree, "model": "haiku", "effort": "low", "branch": "fix/3"}).to_string(),
     );
+    env.write(
+        "units/3/guards-unit.json",
+        &json!({"unit": 3, "worktree": worktree, "branch": "fix/3", "protected_paths": [".github/workflows/"]}).to_string(),
+    );
     env.set(
         "FAKE_RESULT",
         &env.workdir.join("units/3/result.json").display().to_string(),
@@ -143,7 +147,8 @@ fn a_new_run_starts_claude_in_the_worktree_with_the_unit_environment() {
     let env: Vec<&str> = env.lines().collect();
     assert_eq!(
         env,
-        ["1", "0", "unit", &c.unit_dir().join("unit.json").display().to_string()]
+        ["1", "0", "unit", &c.unit_dir().join("guards-unit.json").display().to_string()],
+        "the guards read guards-unit.json, which carries protected_paths"
     );
 
     assert_eq!(out["unit"], 3);
@@ -313,4 +318,55 @@ fn a_command_that_cannot_start_exits_1() {
     let out = c.env.run(&["unit-run", "--unit", "3"]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(!c.unit_dir().join("session.json").exists());
+}
+
+#[test]
+fn a_missing_guards_file_says_to_prepare_first() {
+    let c = case("");
+    fs::remove_file(c.unit_dir().join("guards-unit.json")).unwrap();
+    let out = c.env.run(&["unit-run", "--unit", "3"]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(out.stderr.contains("guards-unit.json"), "{}", out.stderr);
+    assert_eq!(c.calls(), 0);
+}
+
+#[test]
+fn a_resume_keeps_the_last_attempts_model_and_effort() {
+    let c = case("");
+    c.start();
+    assert_eq!(c.resume("one", &["--model", "sonnet", "--effort", "medium"]).code, 0);
+    let out = c.resume("two", &[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let argv = c.argv(3);
+    assert_eq!(after(&argv, "--model"), "sonnet", "not unit.json's haiku");
+    assert_eq!(after(&argv, "--effort"), "medium");
+}
+
+#[test]
+fn a_prompt_file_without_resume_is_a_usage_error() {
+    let c = case("");
+    let prompt = c.env.dir.path().join("p.txt");
+    fs::write(&prompt, "x").unwrap();
+    let out = c
+        .env
+        .run(&["unit-run", "--unit", "3", "--prompt-file", &prompt.display().to_string()]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(c.calls(), 0);
+}
+
+#[test]
+fn a_unit_already_running_is_refused() {
+    let c = case("unit_timeout_secs = 20\n");
+    fs::write(c.rec.join("sleep"), "3").unwrap();
+    let first = c.env.spawn(&["unit-run", "--unit", "3"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while c.calls() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = c.env.run(&["unit-run", "--unit", "3"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("already running"), "{}", out.stderr);
+    let status = first.wait_with_output().expect("the first run");
+    assert!(status.status.success());
+    assert_eq!(c.calls(), 1);
 }

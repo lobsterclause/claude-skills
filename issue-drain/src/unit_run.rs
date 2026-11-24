@@ -2,10 +2,15 @@
 //! start, or resume, one unit's headless `claude -p` process and record the
 //! session.
 //!
-//! The unit must have been prepared (`unit-prepare` writes `units/<n>/unit.json`);
-//! without it the command stops with exit 2. The model and effort are `--model`
-//! and `--effort` when given, otherwise the ones in unit.json, and both must be in
-//! the profile's `allowed_models` and `allowed_efforts`.
+//! The unit must have been prepared (`unit-prepare` writes `units/<n>/unit.json`
+//! and `guards-unit.json`); without either the command stops with exit 2. The
+//! model and effort are `--model` and `--effort` when given; otherwise, on a
+//! resume, the last attempt's in session.json; otherwise the ones in unit.json.
+//! Both must be in the profile's `allowed_models` and `allowed_efforts`.
+//! `--prompt-file` is only taken with `--resume`.
+//!
+//! One run of a unit at a time: it holds a lock on `units/<n>/unit-run.lock`
+//! from reading session.json to writing it, and a second run is refused (exit 3).
 //!
 //! A new run starts a session with a fixed prompt that names the run, points at
 //! `references/unit.md` and at the unit file. It is refused when
@@ -18,7 +23,8 @@
 //! `guards` mod as `--plugin-dir`, and `--output-format stream-json --verbose`. It
 //! runs in the unit's worktree and inherits the environment, plus
 //! `VERIFY_GATE_SKIP=1`, `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`,
-//! `ISSUE_DRAIN_MODE=unit` and `ISSUE_DRAIN_UNIT_FILE`. It is killed, with its
+//! `ISSUE_DRAIN_MODE=unit` and `ISSUE_DRAIN_UNIT_FILE` naming `guards-unit.json`
+//! (the guards' scope, with `protected_paths`). It is killed, with its
 //! process group, after the profile's `unit_timeout_secs`. `claude` is looked up
 //! on PATH.
 //!
@@ -42,9 +48,9 @@
 //! exit_code, timed_out, cost_usd, result}`, where `result` is units/<n>/result.json
 //! as the process left it, or null. An `unit_run` event is logged too. Exit: 0 when
 //! the process ran, whatever its own exit code (the caller reads `exit_code` and
-//! `timed_out`); 2 no unit file, no session to resume or no prompt file; 3 refused
-//! (a unit process asked, a new run over an existing session, or a model or effort
-//! the profile does not allow); 1 the process could not be started or a file could
+//! `timed_out`); 2 no unit or guards file, no session to resume, or no prompt file;
+//! 3 refused (a unit process asked, the unit is already running, a new run over an
+//! existing session, or a model or effort the profile does not allow); 1 the process could not be started or a file could
 //! not be written.
 
 use std::fs;
@@ -66,7 +72,7 @@ pub struct Args {
     #[arg(long)]
     pub resume: bool,
     /// The message for a resumed session (a failed check's log, open threads).
-    #[arg(long)]
+    #[arg(long, requires = "resume")]
     pub prompt_file: Option<PathBuf>,
     /// Override the unit's model (must be in the profile's allowed_models).
     #[arg(long)]
@@ -95,9 +101,6 @@ fn parse_transcript(text: &str) -> Transcript {
             t.session_id = obj["session_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
         }
         if obj["type"] == "result" {
-            if let Some(id) = obj["session_id"].as_str().filter(|s| !s.is_empty()) {
-                t.session_id = t.session_id.or_else(|| Some(id.to_string()));
-            }
             t.cost_usd = obj["total_cost_usd"].as_f64();
             t.num_turns = obj["num_turns"].as_u64();
             t.is_error = obj["is_error"].as_bool();
@@ -111,7 +114,7 @@ fn result_session(text: &str) -> Option<String> {
     text.lines()
         .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
         .filter(|o| o["type"] == "result")
-        .filter_map(|o| o["session_id"].as_str().map(str::to_string))
+        .filter_map(|o| o["session_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string))
         .next_back()
 }
 
@@ -146,16 +149,37 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
             unit_file.display()
         ))
     })?;
+    let guards_file = state_dir.join("guards-unit.json");
+    if !guards_file.is_file() {
+        return Err(Fail::usage(format!(
+            "no guards file at {}; run `unit-prepare --unit {unit}` first",
+            guards_file.display()
+        )));
+    }
     let p = &ctx.profile;
-    let model = args
-        .model
-        .clone()
-        .or_else(|| prepared["model"].as_str().map(str::to_string))
+    let session_file = state_dir.join("session.json");
+    let _held = if ctx.dry_run {
+        None
+    } else {
+        Some(UnitLock::take(&state_dir, unit)?)
+    };
+    let mut session: Value = read_json(&session_file).unwrap_or_else(|| json!({}));
+    // A resume keeps what the session last ran with unless told otherwise, so
+    // a repair round that stepped up a tier is not stepped back down.
+    let last = if args.resume {
+        session["attempts"].as_array().and_then(|a| a.last()).cloned()
+    } else {
+        None
+    };
+    let pick = |given: &Option<String>, key: &str| {
+        given
+            .clone()
+            .or_else(|| last.as_ref().and_then(|a| a[key].as_str()).map(str::to_string))
+            .or_else(|| prepared[key].as_str().map(str::to_string))
+    };
+    let model = pick(&args.model, "model")
         .ok_or_else(|| Fail::usage(format!("{} has no model; pass --model", unit_file.display())))?;
-    let effort = args
-        .effort
-        .clone()
-        .or_else(|| prepared["effort"].as_str().map(str::to_string))
+    let effort = pick(&args.effort, "effort")
         .ok_or_else(|| Fail::usage(format!("{} has no effort; pass --effort", unit_file.display())))?;
     check_allowed("model", &model, &p.allowed_models)?;
     check_allowed("effort", &effort, &p.allowed_efforts)?;
@@ -170,8 +194,6 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
             ))
         })?;
 
-    let session_file = state_dir.join("session.json");
-    let mut session: Value = read_json(&session_file).unwrap_or_else(|| json!({}));
     let known = recorded_session(&session);
     let prompt_and_resume = if args.resume {
         let id = known.clone().ok_or_else(|| {
@@ -233,12 +255,12 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
     let attempt = attempts.len() as u64 + 1;
     let transcript = state_dir.join(format!("transcript-{attempt}.jsonl"));
     let stderr_log = state_dir.join(format!("transcript-{attempt}.stderr"));
-    let unit_file_text = unit_file.display().to_string();
+    let guards_file_text = guards_file.display().to_string();
     let env = [
         ("VERIFY_GATE_SKIP", "1"),
         ("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "0"),
         ("ISSUE_DRAIN_MODE", "unit"),
-        ("ISSUE_DRAIN_UNIT_FILE", unit_file_text.as_str()),
+        ("ISSUE_DRAIN_UNIT_FILE", guards_file_text.as_str()),
     ];
     let started = ctx.now();
     let ran = exec::run_env(
@@ -294,6 +316,33 @@ pub fn launch(ctx: &Ctx, args: &Args) -> Res<Value> {
         "cost_usd": cost,
         "result": result,
     }))
+}
+
+/// Held while one unit's process runs: an advisory lock on
+/// `units/<n>/unit-run.lock`, so two runs of one unit (the driver and a run by
+/// hand) cannot both read session.json, start a process and write it back.
+/// The kernel drops it when the process exits; the file is never removed.
+struct UnitLock(#[allow(dead_code)] fs::File);
+
+impl UnitLock {
+    fn take(state_dir: &std::path::Path, unit: u64) -> Res<UnitLock> {
+        let path = state_dir.join("unit-run.lock");
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| Fail::failed(format!("cannot open {}: {e}", path.display())))?;
+        match f.try_lock() {
+            Ok(()) => Ok(UnitLock(f)),
+            Err(fs::TryLockError::WouldBlock) => Err(Fail::refused(format!(
+                "unit {unit} is already running ({} is held)",
+                path.display()
+            ))),
+            Err(fs::TryLockError::Error(e)) => Err(Fail::failed(format!("cannot lock {}: {e}", path.display()))),
+        }
+    }
 }
 
 /// The session already recorded, else the one this run reported.

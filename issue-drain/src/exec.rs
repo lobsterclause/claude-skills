@@ -60,7 +60,7 @@ pub fn run(program: &str, args: &[String], dir: &Path, limit: Duration, log: &Pa
         if let Some(parent) = log.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let out = File::create(log)?;
+        let out = fresh(log)?;
         let err = out.try_clone()?;
         Ok((out, err))
     };
@@ -84,10 +84,22 @@ pub fn run_env(
             std::fs::create_dir_all(parent)
                 .map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))?;
         }
-        File::create(path).map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))
+        fresh(path).map_err(|e| Fail::failed(format!("cannot write {}: {e}", path.display())))
     };
     let files = (open(logs.0)?, open(logs.1)?);
     supervise(program, args, dir, limit, files, env, logs.1)
+}
+
+/// A new, empty log file at `path`. Whatever was there is removed first
+/// (`remove_file` removes a symlink, not what it points at) and the file is
+/// made with `create_new`, so a link planted at the path is never followed.
+fn fresh(path: &Path) -> std::io::Result<File> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 fn supervise(
@@ -193,6 +205,20 @@ mod tests {
         assert_eq!(program_in("./stamp.sh", dir), "/work/tree/./stamp.sh");
         assert_eq!(program_in("/usr/bin/env", dir), "/usr/bin/env");
         assert_eq!(program_in("pnpm", dir), "pnpm");
+    }
+
+    #[test]
+    fn a_log_path_that_is_a_symlink_is_replaced_and_its_target_left_alone() {
+        let dir = temp();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "keep me").unwrap();
+        let log = dir.path().join("l.log");
+        std::os::unix::fs::symlink(&target, &log).unwrap();
+        let args = ["-c", "echo new"].map(String::from);
+        run("sh", &args, dir.path(), Duration::from_secs(10), &log).expect("ran");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(!std::fs::symlink_metadata(&log).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "new");
     }
 
     #[test]

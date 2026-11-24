@@ -117,6 +117,11 @@ fn case(units: &[u64]) -> Case {
             &json!({"unit": n, "worktree": wt, "model": "haiku", "effort": "low", "branch": format!("fix/{n}")})
                 .to_string(),
         );
+        // What unit-prepare writes beside unit.json; unit-run refuses without it.
+        env.write(
+            &format!("units/{n}/guards-unit.json"),
+            &json!({"unit": n, "worktree": wt, "branch": format!("fix/{n}"), "protected_paths": []}).to_string(),
+        );
     }
     let c = Case { env, fake, rec };
     let ids: Vec<String> = units.iter().map(|n| format!("U{n}")).collect();
