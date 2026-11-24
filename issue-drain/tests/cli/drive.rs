@@ -1013,3 +1013,62 @@ fn a_refusal_once_the_pr_left_the_queue_is_acted_on() {
         "the record is gone"
     );
 }
+
+fn one_unit_case() -> Case {
+    let c = case(&[1]);
+    c.result(1, json!({"unit": 1, "outcome": "pr_open", "pr": 4701, "notes": []}));
+    c.pr_view(1, 4701);
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n("merge-gate", 3, 0, &Case::merged());
+    c
+}
+
+#[test]
+fn progress_goes_to_stderr_and_stdout_stays_one_json_line() {
+    let c = one_unit_case();
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stdout.trim().lines().count(), 1, "{}", out.stdout);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "done"}]));
+    assert!(out.stderr.lines().all(|l| l.starts_with("drive: ")), "{}", out.stderr);
+    assert!(out.stderr.contains("drive: U1 -> implementing"), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .lines()
+            .any(|l| l.starts_with("drive: running unit-run --unit 1 (stdout drive/")
+                && l.contains(".out, stderr drive/")
+                && l.ends_with(".err)")),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("state show"), "{}", out.stderr);
+    // The files the line names exist in the run folder.
+    let named = out
+        .stderr
+        .lines()
+        .find(|l| l.contains("running unit-run"))
+        .and_then(|l| l.split("stdout ").nth(1))
+        .and_then(|l| l.split(',').next())
+        .expect("a stdout path")
+        .to_string();
+    assert!(c.env.workdir.join(named).exists());
+}
+
+#[test]
+fn quiet_turns_the_progress_lines_off() {
+    let c = one_unit_case();
+    let (out, report) = c.drive(&["--quiet"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stderr, "");
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "done"}]));
+}
+
+#[test]
+fn drive_pid_is_gone_after_a_normal_exit_and_named_while_running() {
+    let c = one_unit_case();
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(!c.env.workdir.join("drive.pid").exists());
+    // The first line names the pid and the run folder.
+    assert!(out.stderr.lines().next().unwrap_or_default().starts_with("drive: pid "));
+}
