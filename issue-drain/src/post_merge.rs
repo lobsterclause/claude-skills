@@ -123,11 +123,12 @@ fn without_code_spans(text: &str) -> String {
         }
         let n = run_at(i);
         let mut j = i + n;
+        let block = block_end(text, j);
         let close = loop {
-            match b[j..].iter().position(|&c| c == b'`') {
+            match b[j..block].iter().position(|&c| c == b'`') {
                 None => break None,
                 Some(k) => {
-                    let m = run_at(j + k);
+                    let m = b[j + k..block].iter().take_while(|&&c| c == b'`').count();
                     if m == n {
                         break Some(j + k + m);
                     }
@@ -147,6 +148,19 @@ fn without_code_spans(text: &str) -> String {
     }
     out.push_str(&text[copied..]);
     out
+}
+
+/// Where the block that holds `from` ends: at the next blank line, or the end
+/// of the text. A code span cannot cross a blank line.
+fn block_end(text: &str, from: usize) -> usize {
+    let mut at = from;
+    for line in text[from..].split_inclusive('\n') {
+        if at > from && line.trim().is_empty() {
+            return at;
+        }
+        at += line.len();
+    }
+    text.len()
 }
 
 /// The issues in `repo` that `body` says it closes.
@@ -494,6 +508,12 @@ mod tests {
         // A run with no closer of its own length is literal, as GitHub reads it.
         assert_eq!(body_closes("``close #4` and fixes #5", "a/b"), vec![4, 5]);
         assert_eq!(body_closes("A lone ` then Fixes #6", "a/b"), vec![6]);
+    }
+
+    #[test]
+    fn a_code_span_does_not_cross_a_blank_line() {
+        let body = "A lone ` here.\n\nFixes #1 and `Fixes #2`.";
+        assert_eq!(body_closes(body, "a/b"), vec![1]);
     }
 
     #[test]
