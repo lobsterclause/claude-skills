@@ -881,3 +881,34 @@ fn the_lock_is_one_per_repo_whatever_the_case_of_its_name() {
     assert_eq!(out.code, 3, "{}", out.stderr);
     assert!(out.stderr.contains("4242"), "{}", out.stderr);
 }
+
+#[test]
+fn a_park_lost_to_a_restart_is_kept_from_the_saved_result() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH[..4], Some(4701));
+    c.env.write(
+        "units/1/result.json",
+        &json!({"unit": 1, "outcome": "cap_reached", "pr": 4701, "notes": ["two findings open"]}).to_string(),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "parked");
+    assert_eq!(c.count("merge-gate"), 0, "nothing asked the gate");
+}
+
+#[test]
+fn an_unknown_merge_outcome_stops_the_drain_with_the_claim_kept() {
+    let mut c = case(&[1]);
+    c.env.set("ISSUE_DRAIN_DRIVE_CI_MAX_SECS", "0");
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.canned("merge-gate", 0, &Case::clean());
+    let unknown = json!({"merged": false, "state_unknown": true}).to_string();
+    c.canned_n("merge-gate", 2, 1, &unknown);
+    c.canned_n("merge-gate", 3, 1, &unknown);
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let stopped = report["stopped"].as_str().unwrap_or_default();
+    assert!(stopped.contains("did not say whether it merged"), "{report}");
+    assert_eq!(c.state_of(1), "gate", "the unit is not parked");
+    assert_eq!(c.count("claim release"), 0);
+}

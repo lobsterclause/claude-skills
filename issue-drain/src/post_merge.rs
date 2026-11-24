@@ -76,8 +76,10 @@ static HTML_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?
 static INLINE_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`\n]*`").expect("a fixed pattern"));
 
 /// `body` without the text GitHub does not read for closing keywords: fenced
-/// code blocks, HTML comments and inline code. A PR body that quotes
-/// "Fixes #12" as an example does not close #12.
+/// code blocks, indented code, HTML comments and inline code. A PR body that
+/// quotes "Fixes #12" as an example does not close #12. Every line indented by
+/// four spaces or a tab is dropped, nested list items too: a keyword missed
+/// here leaves an issue open, which is the safe way to be wrong.
 fn prose(body: &str) -> String {
     let mut kept = String::new();
     let mut fence: Option<(char, usize)> = None;
@@ -94,6 +96,7 @@ fn prose(body: &str) -> String {
                 let opener = ['`', '~'].into_iter().map(|c| (c, run(c))).find(|&(_, n)| n >= 3);
                 match opener {
                     Some(open) => fence = Some(open),
+                    None if line.starts_with("    ") || line.starts_with('\t') => {}
                     None => {
                         kept.push_str(line);
                         kept.push('\n');
@@ -436,6 +439,12 @@ mod tests {
                     An example: `Fixes #105`.\n\
                     Closes example/tidepool#106 and closes other/repo#107\n";
         assert_eq!(body_closes(body, "example/tidepool"), vec![101, 106]);
+    }
+
+    #[test]
+    fn indented_code_closes_nothing() {
+        let body = "Fixes #1\n\nFor example:\n\n    Fixes #2\n\tCloses #3\n";
+        assert_eq!(body_closes(body, "a/b"), vec![1]);
     }
 
     #[test]

@@ -900,12 +900,14 @@ impl<'a> Driver<'a> {
     }
 
     /// The first `units/<n>/drive-tree-mismatch` marker, if any unit left one.
+    /// A dry run also sees its own `dry-` marker; a live run sees only live ones.
     fn tree_mismatch(&self) -> Option<PathBuf> {
+        let names = [TREE_MISMATCH.to_string(), self.mark(TREE_MISMATCH)];
         let mut found: Vec<PathBuf> = fs::read_dir(self.ctx.path("units"))
             .into_iter()
             .flatten()
             .flatten()
-            .map(|e| e.path().join(TREE_MISMATCH))
+            .flat_map(|e| names.iter().map(move |n| e.path().join(n)))
             .filter(|p| p.exists())
             .collect();
         found.sort();
@@ -936,7 +938,7 @@ impl<'a> Driver<'a> {
             State::Claimed => self.claimed(u),
             State::Prepared => self.mv(u.unit, "implementing", None, None, None),
             State::Implementing => self.implementing(u),
-            State::PrOpen => self.mv(u.unit, "reviewing", None, None, None),
+            State::PrOpen => self.pr_open(u),
             State::Reviewing => self.reviewing(u),
             State::CiWait => self.ci_wait(u),
             State::Repairing => self.repairing(u),
@@ -1149,6 +1151,24 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// `pr_open` goes on to review, unless the unit's result says it parked
+    /// or reached the review cap: a driver killed between recording the PR
+    /// and recording the park must not carry a PR left for a person to merge.
+    fn pr_open(&self, u: &UnitState) -> Res<()> {
+        let result: Value = read_json(&self.unit_dir(u.unit).join("result.json")).unwrap_or(Value::Null);
+        let outcome = result["outcome"].as_str().unwrap_or_default();
+        if matches!(outcome, "parked" | "cap_reached") && result["pr"].as_u64() == u.pr {
+            let notes = notes_of(&result);
+            let note = if notes.is_empty() {
+                format!("the unit reported {outcome}")
+            } else {
+                format!("the unit reported {outcome}: {notes}")
+            };
+            return self.park(u, &note, false);
+        }
+        self.mv(u.unit, "reviewing", None, None, None)
+    }
+
     fn gate_dry(&self, u: &UnitState) -> Res<(Reply, Vec<Refusal>)> {
         let (n, p) = (u.unit.to_string(), self.pr_of(u)?.to_string());
         let r = self.call(&["merge-gate", "--unit", &n, "--pr", &p, "--dry-run"])?;
@@ -1158,8 +1178,8 @@ impl<'a> Driver<'a> {
 
     fn reviewing(&self, u: &UnitState) -> Res<()> {
         let dir = self.unit_dir(u.unit);
-        let marker = dir.join("drive-review-resumed");
-        let passes_file = dir.join("drive-review-passes");
+        let marker = dir.join(self.mark("drive-review-resumed"));
+        let passes_file = dir.join(self.mark("drive-review-passes"));
         let mut reads = 0;
         loop {
             let (r, refusals) = self.gate_dry(u)?;
@@ -1307,6 +1327,20 @@ impl<'a> Driver<'a> {
                         u.unit
                     )));
                 }
+                _ if r.json().is_some_and(|j| j["state_unknown"] == true) => {
+                    // GitHub took the merge call but the read-back failed: the
+                    // PR may have merged. Parking would release the claim and
+                    // skip the post-merge checks, so ask once more, then stop
+                    // with the unit at the gate.
+                    errors += 1;
+                    if errors >= 2 || self.dry {
+                        return Ok(Some(format!(
+                            "the merge call on PR #{pr} of unit {} was sent but GitHub did not say whether it merged: check the PR, then `state resume` and drive again",
+                            u.unit
+                        )));
+                    }
+                    self.nap();
+                }
                 _ => {
                     errors += 1;
                     if errors >= 2 || self.dry {
@@ -1449,7 +1483,7 @@ impl<'a> Driver<'a> {
             // Written before `done`, so a driver that dies between the two
             // still refuses to go on.
             write_atomic(
-                &self.unit_dir(unit).join(TREE_MISMATCH),
+                &self.unit_dir(unit).join(self.mark(TREE_MISMATCH)),
                 format!("unit {unit}, PR #{pr}: the merge commit's tree is not the tree the gate approved\n")
                     .as_bytes(),
             )?;
