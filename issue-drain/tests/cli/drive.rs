@@ -1069,8 +1069,63 @@ fn a_driver_killed_mid_cascade_parks_the_held_units_before_it_would_claim_them()
     assert_eq!(c.state_of(2), "parked");
     assert_eq!(c.count("claim take --unit 2"), 0, "a held unit is never claimed");
     assert_eq!(c.count("claim take --unit 3"), 1, "a unit that shares nothing goes on");
+    // The same side effects as an uninterrupted cascade: the driver never
+    // owned unit 2, so it releases no claim and posts no end-of-unit comment.
+    assert!(!c.env.workdir.join("units/2/drive-owned").exists());
+    assert_eq!(c.count("claim release --unit 2"), 0);
     let events = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("events");
     assert!(events.contains("waiting for unit 1"), "{events}");
+}
+
+#[test]
+fn the_fourth_driver_pass_takes_the_cap_default_with_the_open_findings() {
+    // The driver ran three passes; the fourth leaves the gate refusing. The
+    // cap default is weighed before the after-a-pass park, and the follow-up
+    // carries the findings result.json left open.
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.pr_view(1, 4701);
+    c.env.write(
+        "units/1/session.json",
+        &json!({"session_id": "sess-1", "attempts": [{"attempt": 1, "model": "sonnet"}]}).to_string(),
+    );
+    c.env.write("units/1/drive-review-passes", "3\n");
+    let reviewed = "c".repeat(40);
+    history(&c, 1, &reviewed, &[2, 1, 0, 0]);
+    c.result(
+        1,
+        json!({"unit": 1, "outcome": "pr_open", "pr": 4701,
+               "review": {"open_findings": ["- [P2] kimi: a finding left open"]}}),
+    );
+    c.canned("merge-gate", 0, &Case::clean());
+    for n in 1..=2 {
+        c.canned_n(
+            "merge-gate",
+            n,
+            3,
+            &Case::refused(&[("review", "verdict is NEEDS_DECISION")]),
+        );
+    }
+    c.canned_n("merge-gate", 5, 0, &Case::merged());
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        report["processed"],
+        json!([{"unit": 1, "state": "done"}]),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(c.claude_runs(1), 1, "the fourth pass, and no fifth");
+    assert_eq!(
+        c.count(&format!("merge-gate --unit 1 --pr 4701 --accept-cap {reviewed}")),
+        1
+    );
+    let body = fs::read_to_string(c.env.workdir.join("units/1/drive-cap-followup.md")).expect("the body");
+    assert!(body.contains("kimi: a finding left open"), "{body}");
 }
 
 #[test]

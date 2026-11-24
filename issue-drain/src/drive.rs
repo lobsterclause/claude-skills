@@ -271,7 +271,7 @@ const CAP_DEFAULT_FROM: usize = 3;
 /// Written when the cap default accepted a review that stopped at the cap:
 /// `{"reviewed": <sha>, "followup": <url or null>, "passes": <n>}`. While it
 /// exists the driver passes `--accept-cap <reviewed>` to the gate.
-const CAP_ACCEPTED: &str = "drive-cap-accepted.json";
+pub(crate) const CAP_ACCEPTED: &str = "drive-cap-accepted.json";
 /// The later queued units a parked unit holds back (`{"held": [<unit>...]}`).
 const PARK_HOLDS: &str = "drive-park-holds.json";
 /// Calls of `base-sync` for one sync while GitHub has not applied the update.
@@ -1414,6 +1414,25 @@ impl<'a> Driver<'a> {
                     }
                     continue;
                 }
+                // A park cascade a killed driver left half done: the unit
+                // parks as the cascade would have parked it, before `carry`
+                // takes ownership, so it gets no claim release or end-of-unit
+                // comment that the uninterrupted cascade does not give it.
+                if let Some(by) = self.held_by(unit) {
+                    self.mv(
+                        unit,
+                        "parked",
+                        Some(&format!("{WAITING_FOR}{by} (it parked, and they share files)")),
+                        None,
+                        None,
+                    )?;
+                    report.processed.push((unit, State::Parked));
+                    if once {
+                        self.reconcile()?;
+                        return Ok(None);
+                    }
+                    continue;
+                }
             }
             let halt = self.carry(unit)?;
             report.processed.push((unit, self.unit_state(unit)?.state));
@@ -1623,15 +1642,6 @@ impl<'a> Driver<'a> {
     // ---- handlers ----
 
     fn queued(&self, u: &UnitState) -> Res<()> {
-        if let Some(by) = self.held_by(u.unit) {
-            return self.mv(
-                u.unit,
-                "parked",
-                Some(&format!("{WAITING_FOR}{by} (it parked, and they share files)")),
-                None,
-                None,
-            );
-        }
         let n = u.unit.to_string();
         let r = self.call(&["claim", "take", "--unit", &n])?;
         match r.code {
@@ -1934,13 +1944,6 @@ impl<'a> Driver<'a> {
                 }
                 return self.mv(u.unit, "ci_wait", None, None, None);
             }
-            if marker.exists() {
-                return self.park(
-                    u,
-                    &format!("still refused after a review pass: {}", listed(&review)),
-                    false,
-                );
-            }
             // The cap default already took this unit's capped review (the
             // unit may have reported cap_reached itself, before the driver
             // counted any pass): a gate that still refuses under it parks,
@@ -1964,7 +1967,8 @@ impl<'a> Driver<'a> {
                 // capped review; a gate that still refuses after it parks.
                 if !cap_tried {
                     cap_tried = true;
-                    match self.cap_default(u, &[])? {
+                    let result: Value = read_json(&dir.join("result.json")).unwrap_or(Value::Null);
+                    match self.cap_default(u, &open_findings(&result))? {
                         None if self.dry => return Ok(()),
                         None => continue,
                         Some(why) => {
@@ -1986,6 +1990,15 @@ impl<'a> Driver<'a> {
                         "review cap reached: the driver asked for {passes} review passes; still refused: {}",
                         listed(&review)
                     ),
+                    false,
+                );
+            }
+            // After the cap checks: a final pass that leaves the gate refusing
+            // takes the cap default above, not this park.
+            if marker.exists() {
+                return self.park(
+                    u,
+                    &format!("still refused after a review pass: {}", listed(&review)),
                     false,
                 );
             }
