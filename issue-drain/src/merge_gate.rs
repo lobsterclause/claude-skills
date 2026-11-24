@@ -67,6 +67,17 @@
 //! NEEDS_DECISION one was written by an untrusted author. A person must then
 //! merge the PR or remove that comment.
 //! No record, or comments that cannot be read, refuse too.
+//!
+//! `--accept-cap <sha>` is the driver's cap default (see `drive`): a review
+//! that stopped at the pass cap stands for a CLEAN one, at that commit only.
+//! It applies when the script's status is pending, its verdict is
+//! FIXES_APPLIED or NEEDS_DECISION, its `reviewed` is the named commit and
+//! the live head, and its `head` is the live head; the comment's stamp must
+//! then name that verdict. A head that moved after the capped review (status
+//! stale) is never waived: ancestry cannot tell a base-only sync from new
+//! unreviewed code. Without the flag, or when any of that fails, the
+//! review refusal stands and says why the waiver did not apply. The output's
+//! `cap_waiver` names the commit a waiver let stand, or is null.
 //! GitHub's association is what the gate can read; a login is not compared.
 //!
 //! Within one check name and source, the newest entry is kept per workflow run,
@@ -154,6 +165,13 @@ pub struct Args {
     /// After a successful merge, post this file's contents as a comment on the PR.
     #[arg(long, value_name = "PATH")]
     note_file: Option<std::path::PathBuf>,
+    /// Accept a review that stopped at the pass cap: the record at this commit
+    /// may say FIXES_APPLIED or NEEDS_DECISION instead of CLEAN. The driver
+    /// passes it only after its cap default held (see `drive`), and the flag
+    /// waives nothing unless `units/<n>/drive-cap-accepted.json`, which the
+    /// cap default writes, accepted the PR head.
+    #[arg(long, value_name = "SHA")]
+    pub accept_cap: Option<String>,
 }
 
 /// Labels that park a PR for a person, whatever the profile says.
@@ -261,6 +279,9 @@ pub struct ReviewRecord {
     pub sha: String,
     /// The marker's `verdict=`; empty when it carries none.
     pub verdict: String,
+    /// GitHub's id of the comment; 0 when the answer carried none. Ids only
+    /// grow, so a newer record has a larger one.
+    pub id: u64,
 }
 
 /// Whether an `author_association` is in the profile's trusted list (case
@@ -301,12 +322,24 @@ pub struct Reviewer {
     pub has_output: bool,
     #[serde(default)]
     pub failure_kind: Option<String>,
+    /// The finding lines of the reviewer's last review block (`- [Pn] ...`);
+    /// `None` when its output was not parsed or had no block to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<Vec<String>>,
+    /// How many of `findings` are P0 or P1; `None` when `findings` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proof {
     pub head: String,
     pub reviewers: Vec<Reviewer>,
+    /// Whether the run reviewed only some paths of the diff (cross-review's
+    /// `--paths`); `None` in a proof written before the field existed, which
+    /// neither the cap default nor a cap waiver accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -376,6 +409,14 @@ pub struct Facts {
     pub merge_base: Read<String>,
     /// The unit's queue entry.
     pub unit_entry: Read<UnitEntry>,
+    /// The commit `--accept-cap` names, if it was given.
+    pub accept_cap: Option<String>,
+    /// The commit the driver's cap decision (`units/<n>/drive-cap-accepted.json`)
+    /// accepted, if the driver wrote one. The flag alone waives nothing.
+    pub cap_record: Option<String>,
+    /// The review record (comment id) the first waiver under that cap decision
+    /// let stand (`units/<n>/cap-waived-record.json`), if one did.
+    pub cap_pin: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -522,6 +563,77 @@ pub fn binding(repo: &str, base: &str, unit: u64, pr: u64, view: &PrView, branch
 
 /// Every condition that stops the merge. No I/O. An empty list is the only
 /// way to a merge.
+/// Whether `--accept-cap` lets a review that stopped at the pass cap stand
+/// for a CLEAN one. `Ok(None)` when the flag was not given, `Ok(Some(sha))`
+/// when it applies, and `Err(why)` when it was given and does not.
+///
+/// It applies only to a record the review script read as `pending`: stamped
+/// at the PR head itself, with a FIXES_APPLIED or NEEDS_DECISION verdict
+/// (BLOCKED never), at the commit the flag names. A head that moved after the
+/// record is `stale` to the script, and ancestry cannot tell a base-only sync
+/// from new unreviewed code, so the waiver never covers it: the unit is
+/// reviewed again or parked. What it does not cover: only codex's findings
+/// were weighed by the driver that passed the flag. The flag alone is not
+/// trusted: the driver's own record of the cap decision must name the head.
+pub fn cap_waiver(f: &Facts, head: Option<&str>) -> Result<Option<String>, String> {
+    let Some(sha) = f.accept_cap.as_deref() else {
+        return Ok(None);
+    };
+    let Some(rec) = f.cap_record.as_deref() else {
+        return Err("the driver recorded no cap decision for this unit".into());
+    };
+    let Ok(p) = &f.preflight else {
+        return Err("the review record could not be read".into());
+    };
+    if p.status != "pending" {
+        return Err(format!(
+            "it covers a record the script reads as pending (stamped at the head), not '{}'",
+            p.status
+        ));
+    }
+    if !matches!(p.verdict.as_str(), "FIXES_APPLIED" | "NEEDS_DECISION") {
+        return Err(format!(
+            "it covers a FIXES_APPLIED or NEEDS_DECISION verdict, not '{}'",
+            p.verdict
+        ));
+    }
+    if p.reviewed.is_empty() || !(same_commit(&p.reviewed, sha) || same_commit(sha, &p.reviewed)) {
+        return Err(format!("the record is stamped at '{}', not at '{sha}'", p.reviewed));
+    }
+    let Some(h) = head else {
+        return Err("the PR head could not be read".into());
+    };
+    if p.head != h {
+        return Err(format!("the review script read head {}, not the PR head", p.head));
+    }
+    if !same_commit(&p.reviewed, h) {
+        return Err(format!("the record is stamped at {}, not at the PR head", p.reviewed));
+    }
+    if !same_commit(rec, h) {
+        return Err(format!("the driver's cap decision accepted {rec}, not the PR head"));
+    }
+    match &f.proof {
+        Ok(proof) if proof.scoped == Some(false) => {}
+        Ok(proof) if proof.scoped == Some(true) => {
+            return Err(
+                "the review proof covers only some paths of the diff, and a scoped review cannot clear a merge".into(),
+            );
+        }
+        Ok(_) => return Err("the review proof does not say it covered the whole diff".into()),
+        Err(_) => return Err("the review proof could not be read".into()),
+    }
+    let id = match &f.review_record {
+        Ok(Some(r)) if r.id != 0 => r.id,
+        _ => return Err("the newest review record has no comment id to bind the waiver to".into()),
+    };
+    if let Some(pin) = f.cap_pin.filter(|pin| *pin != id) {
+        return Err(format!(
+            "the cap decision was first used for review record {pin}, and record {id} was posted since"
+        ));
+    }
+    Ok(Some(p.reviewed.clone()))
+}
+
 pub fn judge(f: &Facts) -> Vec<Refusal> {
     let mut out = Vec::new();
     let n = f.pr;
@@ -683,14 +795,22 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
         (Ok(_), None) => {}
     }
 
-    // 4. the review record
+    // 4. the review record. A review that stopped at the pass cap is not
+    // CLEAN; `--accept-cap` lets its record stand for one (see `cap_waiver`).
+    let waiver = cap_waiver(f, head);
     match &f.preflight {
         Err(what) => out.push(refusal("read_error", format!("could not read {what}"))),
         Ok(p) => {
-            if p.status != "clear" || p.verdict != "CLEAN" {
+            if !matches!(waiver, Ok(Some(_))) && (p.status != "clear" || p.verdict != "CLEAN") {
                 out.push(refusal(
                     "review",
-                    format!("the review record says status '{}', verdict '{}'", p.status, p.verdict),
+                    match &waiver {
+                        Err(why) => format!(
+                            "the review record says status '{}', verdict '{}', and the cap waiver does not apply: {why}",
+                            p.status, p.verdict
+                        ),
+                        _ => format!("the review record says status '{}', verdict '{}'", p.status, p.verdict),
+                    },
                 ));
             } else if p.head.is_empty() {
                 out.push(refusal("review", "the review record names no head commit"));
@@ -755,12 +875,19 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
             } else if let Some(p) = f.preflight.as_ref().ok().filter(|p| !p.reviewed.is_empty()) {
                 // An empty `reviewed` is refused under 4 already.
                 let same = same_commit(&rec.sha, &p.reviewed) || same_commit(&p.reviewed, &rec.sha);
-                if !same || rec.verdict != "CLEAN" {
+                // Under the cap waiver the record says what the script read
+                // (FIXES_APPLIED or NEEDS_DECISION), not CLEAN.
+                let want = if matches!(waiver, Ok(Some(_))) {
+                    p.verdict.as_str()
+                } else {
+                    "CLEAN"
+                };
+                if !same || rec.verdict != want {
                     out.push(refusal(
                         "review_author",
                         format!(
                             "the newest cross-review record on PR #{n} is stamped at '{}' with verdict '{}', \
-                             not at '{}' with CLEAN as the review script reported",
+                             not at '{}' with {want} as the review script reported",
                             rec.sha, rec.verdict, p.reviewed
                         ),
                     ));
@@ -801,8 +928,7 @@ pub fn judge(f: &Facts) -> Vec<Refusal> {
     // only once that commit is shown to be an ancestor of the head.
     let ancestor = match (&f.preflight, head) {
         (Ok(p), Some(h))
-            if p.status == "clear"
-                && p.verdict == "CLEAN"
+            if ((p.status == "clear" && p.verdict == "CLEAN") || matches!(waiver, Ok(Some(_))))
                 && !p.reviewed.is_empty()
                 && !same_commit(&p.reviewed, h)
                 && matches!(f.reviewed_ancestry, Some(Ok(true))) =>
@@ -1681,6 +1807,7 @@ pub fn parse_review_records(raw: &str) -> Read<Vec<ReviewRecord>> {
                     association: word("/author_association"),
                     sha,
                     verdict,
+                    id: comment.get("id").and_then(Value::as_u64).unwrap_or(0),
                 });
             }
         }
@@ -1873,6 +2000,38 @@ pub(crate) fn unit_file<T: serde::de::DeserializeOwned>(ctx: &Ctx, unit: u64, na
         .ok_or_else(|| format!("units/{unit}/{name} is missing or not the expected shape"))
 }
 
+/// The commit the driver's cap decision accepted for this unit, if it wrote
+/// one: `units/<n>/drive-cap-accepted.json` (`dry-` prefixed in a dry run,
+/// as the driver names it; see `marked`).
+fn cap_record(ctx: &Ctx, unit: u64) -> Option<String> {
+    let v: Value = read_json(&ctx.path(&format!("units/{unit}/{}", marked(ctx, crate::drive::CAP_ACCEPTED))))?;
+    v["reviewed"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// The file that pins a cap decision to the review record its first waiver
+/// let stand.
+const CAP_PIN: &str = "cap-waived-record.json";
+
+/// A file name with the driver's `dry-` prefix in a dry run. The prefix
+/// follows the run (`ctx.dry_files`), not `--dry-run`: the live driver asks
+/// the gate with `--dry-run` and the gate must read its unprefixed files.
+fn marked(ctx: &Ctx, name: &str) -> String {
+    if ctx.dry_files {
+        format!("dry-{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// The review record the first waiver under the cap decision for `reviewed`
+/// let stand. A pin written for another cap decision does not count.
+fn cap_pin(ctx: &Ctx, unit: u64, reviewed: Option<&str>) -> Option<u64> {
+    let v: Value = read_json(&ctx.path(&format!("units/{unit}/{}", marked(ctx, CAP_PIN))))?;
+    (reviewed.is_some() && v["reviewed"].as_str() == reviewed)
+        .then(|| v["record"].as_u64())
+        .flatten()
+}
+
 /// Every read the decision needs. Nothing here decides anything.
 fn gather(
     ctx: &Ctx,
@@ -2035,6 +2194,9 @@ fn gather(
         behind_by,
         merge_base,
         unit_entry,
+        accept_cap: None,
+        cap_record: None,
+        cap_pin: None,
     }
 }
 
@@ -2299,15 +2461,42 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         return Ok(());
     }
 
-    let facts = gather(ctx, &repo, unit, pr, view, unit_entry, unit_branch);
+    let mut facts = gather(ctx, &repo, unit, pr, view, unit_entry, unit_branch);
+    facts.accept_cap = args.accept_cap.clone();
+    facts.cap_record = cap_record(ctx, unit);
+    facts.cap_pin = cap_pin(ctx, unit, facts.cap_record.as_deref());
     let refusals = judge(&facts);
     let head = facts.view.as_ref().map(|v| v.head.clone()).unwrap_or_default();
+    // The commit a cap waiver let stand for a CLEAN review, so the record of
+    // the merge says the review stopped at the cap.
+    let waived = cap_waiver(&facts, facts.view.as_ref().ok().map(|v| v.head.as_str()))
+        .ok()
+        .flatten();
+    // The first waiver under a cap decision pins the record it let stand, so
+    // a record posted later at the same head is never waived unread. The
+    // driver asks the gate right after it accepts the cap. A record the gate
+    // refused (its author, its proof) is never pinned: removing it must leave
+    // the valid record eligible. Pending CI does not stop the pin.
+    let review_refused = refusals
+        .iter()
+        .any(|r| matches!(r.code, "review" | "review_author" | "review_proof"));
+    if waived.is_some()
+        && !review_refused
+        && facts.cap_pin.is_none()
+        && let (Some(rec), Ok(Some(r))) = (&facts.cap_record, &facts.review_record)
+    {
+        let pin = json!({"reviewed": rec, "record": r.id});
+        crate::ctx::write_atomic(
+            &ctx.path(&format!("units/{unit}/{}", marked(ctx, CAP_PIN))),
+            format!("{pin}\n").as_bytes(),
+        )?;
+    }
     let output = |merged: bool| {
         let list: Vec<Value> = refusals
             .iter()
             .map(|r| json!({"code": r.code, "detail": r.detail}))
             .collect();
-        json!({"pr": pr, "unit": unit, "head": head, "merged": merged, "refusals": list, "reviewers": reviewers(&facts), "note_url": null})
+        json!({"pr": pr, "unit": unit, "head": head, "merged": merged, "refusals": list, "reviewers": reviewers(&facts), "note_url": null, "cap_waiver": waived})
     };
     // `output` plus the fields only a merge call has.
     let output_with = |merged: bool, extra: Value| {
@@ -2480,6 +2669,8 @@ mod tests {
             name: name.into(),
             has_output,
             failure_kind: None,
+            findings: None,
+            blocking: None,
         }
     }
 
@@ -2513,6 +2704,9 @@ mod tests {
             app_runs: Ok(Vec::new()),
             workflow_runs: Vec::new(),
             reviewed_ancestry: None,
+            accept_cap: None,
+            cap_record: None,
+            cap_pin: None,
             preflight: Ok(Preflight {
                 status: "clear".into(),
                 verdict: "CLEAN".into(),
@@ -2525,12 +2719,14 @@ mod tests {
                 association: "OWNER".into(),
                 sha: HEAD.into(),
                 verdict: "CLEAN".into(),
+                id: 7,
             })),
             trusted_authors: vec!["OWNER".into(), "MEMBER".into()],
             in_merge_queue: Ok(false),
             proof: Ok(Proof {
                 head: HEAD.into(),
                 reviewers: vec![reviewer("codex", true), reviewer("kimi", true)],
+                scoped: Some(false),
             }),
             deliver: Ok(Deliver {
                 ok: true,
@@ -3243,6 +3439,115 @@ mod tests {
         f.review_record.as_mut().unwrap().as_mut().unwrap().sha = HEAD.into();
         f.reviewed_ancestry = None;
         assert!(codes(&f).is_empty());
+    }
+
+    #[test]
+    fn a_review_stopped_at_the_cap_stands_only_under_a_matching_waiver() {
+        let capped = |verdict: &str| {
+            let mut f = clear();
+            let p = f.preflight.as_mut().unwrap();
+            p.status = "pending".into();
+            p.verdict = verdict.into();
+            f.review_record.as_mut().unwrap().as_mut().unwrap().verdict = verdict.into();
+            f.cap_record = Some(HEAD.into());
+            f
+        };
+        let mut f = capped("NEEDS_DECISION");
+        assert_eq!(codes(&f), ["review", "review_author"], "no waiver, no merge");
+        f.accept_cap = Some(HEAD.into());
+        assert!(codes(&f).is_empty(), "{:?}", judge(&f));
+        // The flag alone waives nothing: the driver must have recorded the
+        // cap decision, at the PR head.
+        f.cap_record = None;
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("no cap decision"), "{why}");
+        assert_eq!(codes(&f), ["review", "review_author"]);
+        f.cap_record = Some(BASE_TIP.into());
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("cap decision accepted"), "{why}");
+        f.cap_record = Some(HEAD.into());
+        assert_eq!(cap_waiver(&f, Some(HEAD)), Ok(Some(HEAD.into())));
+        f.accept_cap = Some(HEAD[..9].into());
+        assert!(codes(&f).is_empty(), "an abbreviated commit names it too");
+        // The first waiver pins the record it let stand; a newer record at
+        // the same head is not waived under that decision.
+        f.cap_pin = Some(7);
+        assert!(codes(&f).is_empty(), "the pinned record still stands");
+        f.cap_pin = Some(6);
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("was posted since"), "{why}");
+        assert_eq!(codes(&f), ["review", "review_author"]);
+        f.cap_pin = None;
+        f.review_record.as_mut().unwrap().as_mut().unwrap().id = 0;
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("no comment id"), "{why}");
+        f.review_record.as_mut().unwrap().as_mut().unwrap().id = 7;
+        // A path-scoped review never stands for the whole PR.
+        f.proof.as_mut().unwrap().scoped = Some(true);
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("only some paths"), "{why}");
+        f.proof.as_mut().unwrap().scoped = None;
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("whole diff"), "{why}");
+        f.proof.as_mut().unwrap().scoped = Some(false);
+        assert_eq!(cap_waiver(&f, Some(HEAD)), Ok(Some(HEAD.into())));
+
+        let mut f = capped("FIXES_APPLIED");
+        f.accept_cap = Some(HEAD.into());
+        assert!(codes(&f).is_empty(), "{:?}", judge(&f));
+
+        // BLOCKED is never waived, and a record that says CLEAN needs no waiver.
+        let mut f = capped("BLOCKED");
+        f.accept_cap = Some(HEAD.into());
+        let found = judge(&f);
+        assert!(found[0].detail.contains("does not apply"), "{}", found[0].detail);
+        let mut f = clear();
+        f.accept_cap = Some(HEAD.into());
+        assert!(codes(&f).is_empty());
+        assert!(cap_waiver(&f, Some(HEAD)).is_err());
+
+        // Another commit than the record's.
+        let mut f = capped("NEEDS_DECISION");
+        f.accept_cap = Some(BASE_TIP.into());
+        assert_eq!(codes(&f), ["review", "review_author"]);
+
+        // The record says CLEAN where the script read NEEDS_DECISION.
+        let mut f = capped("NEEDS_DECISION");
+        f.accept_cap = Some(HEAD.into());
+        f.review_record.as_mut().unwrap().as_mut().unwrap().verdict = "CLEAN".into();
+        assert_eq!(codes(&f), ["review_author"]);
+    }
+
+    #[test]
+    fn a_waiver_never_covers_a_head_that_moved_after_the_capped_review() {
+        // A stale record: the head moved after the capped review. Ancestry
+        // cannot tell a base-only sync from new unreviewed code, so the
+        // waiver does not apply even when the reviewed commit is an ancestor.
+        let mut f = clear();
+        let p = f.preflight.as_mut().unwrap();
+        p.status = "stale".into();
+        p.verdict = "NEEDS_DECISION".into();
+        p.reviewed = BASE_TIP.into();
+        let rec = f.review_record.as_mut().unwrap().as_mut().unwrap();
+        rec.verdict = "NEEDS_DECISION".into();
+        rec.sha = BASE_TIP.into();
+        f.proof.as_mut().unwrap().head = BASE_TIP.into();
+        f.accept_cap = Some(BASE_TIP.into());
+        f.cap_record = Some(BASE_TIP.into());
+        f.reviewed_ancestry = Some(Ok(true));
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("pending"), "{why}");
+        let found = judge(&f);
+        assert!(
+            found
+                .iter()
+                .any(|r| r.code == "review" && r.detail.contains("does not apply")),
+            "{found:?}"
+        );
+        // A pending record stamped elsewhere than the head is refused too.
+        f.preflight.as_mut().unwrap().status = "pending".into();
+        let why = cap_waiver(&f, Some(HEAD)).unwrap_err();
+        assert!(why.contains("not at the PR head"), "{why}");
     }
 
     #[test]

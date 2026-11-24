@@ -108,7 +108,8 @@ impl State {
     /// The transition table: every state a unit may move to from this one.
     pub fn exits(self) -> &'static [State] {
         match self {
-            Queued => &[Claimed, Skipped],
+            // Parked: held by an earlier unit that parked with files it shares.
+            Queued => &[Claimed, Skipped, Parked],
             Claimed => &[Prepared, Skipped, Blocked],
             Prepared => &[Implementing, Skipped, Blocked],
             Implementing => &[PrOpen, Skipped, Blocked],

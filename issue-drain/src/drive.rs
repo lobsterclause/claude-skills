@@ -72,19 +72,23 @@
 //!                 session.json has one. A second miss goes to blocked. Then
 //!                 outcome: skipped, blocked as written; pr_open moves to
 //!                 pr_open after a live read shows the PR open, from the unit's
-//!                 branch and aimed at the base; cap_reached or parked with a
-//!                 PR moves to pr_open then parked; without a PR it goes to
-//!                 blocked.
+//!                 branch and aimed at the base; parked with a PR moves to
+//!                 pr_open then parked; cap_reached with a PR moves to pr_open
+//!                 and then to reviewing when the cap default holds (below),
+//!                 parked when it does not; without a PR it goes to blocked.
 //!   pr_open       move to reviewing.
 //!   reviewing     `merge-gate --dry-run`. A refusal that needs a person parks
 //!                 the unit. No review refusal moves to ci_wait (an unreadable
 //!                 gate is read once more, then blocked as infrastructure).
 //!                 Otherwise the unit is resumed to run a review pass, at most
 //!                 MAX_REVIEW_PASSES over its life (`drive-review-passes`); a
-//!                 refusal right after a pass (`drive-review-resumed`), or the
-//!                 cap, goes to parked. A resume whose run fails, or whose
-//!                 result.json says blocked, parked or cap_reached, ends the
-//!                 unit that way; repair resumes are read the same way. A
+//!                 refusal right after a pass (`drive-review-resumed`) goes to
+//!                 parked. At the cap the cap default is tried once; when it
+//!                 holds the gate is asked again with `--accept-cap`, and a
+//!                 refusal then parks. A resume whose run fails, or whose
+//!                 result.json says blocked or parked, ends the unit that way,
+//!                 and cap_reached goes to the cap default; repair resumes are
+//!                 read the same way. A
 //!                 resume has failed when `unit-run` fails, or when its JSON
 //!                 says the claude process exited nonzero or timed out, or when
 //!                 result.json is not newer than the `drive-resume-started`
@@ -178,13 +182,40 @@
 //! ISSUE_DRAIN_DRY_RUN=1 every child inherits it and each unit gets one step,
 //! since a dry-run gate never merges.
 //!
+//! The cap default. A review that stopped at the pass cap is not parked when
+//! `units/<n>/review-history.jsonl` (appended by `review-proof`) has at least
+//! CAP_DEFAULT_FROM passes and, in every pass from that one on, codex reviewed,
+//! its findings were read and none is P0 or P1. Only codex's severities are
+//! read, so another reviewer's output in those passes stops the default, unless
+//! a later queued unit shares files with this one and would be parked with it.
+//! The driver then files one follow-up issue (`gh-write followup-create`) with
+//! codex's last findings and the result's `open_findings`, writes
+//! `drive-cap-accepted.json` (`reviewed`, `followup`, `passes`), logs
+//! `cap_default`, and passes `--accept-cap <reviewed>` to every later gate
+//! call. The gate then takes a FIXES_APPLIED or NEEDS_DECISION record at that
+//! commit as it would a CLEAN one while that commit is the PR head; nothing
+//! else about the gate changes. A dry
+//! run logs what it would do and files nothing.
+//!
+//! A parked unit parks with it every later queued unit that shares a file with
+//! it (`shares_files_with`), noted "waiting for unit <n>": their change would
+//! be made over files the parked PR still changes. They were never claimed, so
+//! they get no end-of-unit work, and they stay parked for the run. The held
+//! units are written to `units/<n>/drive-park-holds.json` before the unit
+//! parks, and a queued unit a parked unit's file names is parked instead of
+//! claimed, so a driver killed part way through the cascade finishes it.
+//!
 //! Known gaps. The tracker has no rolling status comment, because there is no
 //! comment-edit verb: it gets one comment per ended unit and one per stop. The
 //! end-of-unit comment is tried once; a failed post is logged and not retried.
 //! A unit that fails inside an exit-1 child (GitHub or git down) while queued,
 //! claimed or merged ends the driver with exit 1 rather than being blocked,
 //! since the table has no move to blocked from queued and a merged unit is
-//! already merged.
+//! already merged. The cap default reads the unit's own review history, which
+//! is as trusted as its review proof; a driver killed between filing the
+//! follow-up and writing `drive-cap-accepted.json` files a second one. A unit
+//! parked for another unit is not started again when that unit is unparked by
+//! hand; run it in a later drain.
 //!
 //! Test hook: with ISSUE_DRAIN_DRIVE_TESTING=1, ISSUE_DRAIN_DRIVE_EXE names the
 //! program run in place of this binary for every child call. The tests give it
@@ -213,7 +244,7 @@ use crate::ctx::{Ctx, env_str, read_json, write_atomic};
 use crate::error::{Fail, Res};
 use crate::exec;
 use crate::gh;
-use crate::merge_gate::{PrState, PrView, binding, is_sha, merge_status, read_view};
+use crate::merge_gate::{PrState, PrView, Proof, binding, is_sha, merge_status, read_view};
 use crate::state::{self, MAX_BASE_SYNCS, MAX_REPAIRS, Snapshot, State, UnitState};
 use crate::tracker::io::Published;
 
@@ -231,6 +262,18 @@ pub(crate) const LADDER: [&str; 3] = ["haiku", "sonnet", "opus"];
 const MAX_STEPS: u32 = 200;
 /// Review passes the driver asks of one unit, over its whole life.
 const MAX_REVIEW_PASSES: u32 = 4;
+/// The note of a queued unit parked because an earlier unit that shares files
+/// with it parked.
+const WAITING_FOR: &str = "waiting for unit ";
+/// The cap default weighs the passes from this one on (1-based): the first
+/// passes of a review are expected to find things.
+const CAP_DEFAULT_FROM: usize = 3;
+/// Written when the cap default accepted a review that stopped at the cap:
+/// `{"reviewed": <sha>, "followup": <url or null>, "passes": <n>}`. While it
+/// exists the driver passes `--accept-cap <reviewed>` to the gate.
+pub(crate) const CAP_ACCEPTED: &str = "drive-cap-accepted.json";
+/// The later queued units a parked unit holds back (`{"held": [<unit>...]}`).
+const PARK_HOLDS: &str = "drive-park-holds.json";
 /// Calls of `base-sync` for one sync while GitHub has not applied the update.
 const BASE_SYNC_TRIES: u32 = 3;
 const CHILD_PID: &str = "drive-child.pid";
@@ -499,6 +542,79 @@ fn notes_of(result: &Value) -> String {
         Value::String(s) => s.clone(),
         _ => String::new(),
     }
+}
+
+/// A unit's review passes from `units/<n>/review-history.jsonl`: each run
+/// folder's proof, in the order the folders were first recorded, the later
+/// line winning for a folder recorded twice. A line that cannot be read is an
+/// error, not skipped: dropping one would renumber the passes after it.
+fn review_passes(history: &str) -> Result<Vec<Proof>, String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_dir: std::collections::BTreeMap<String, Proof> = std::collections::BTreeMap::new();
+    for (i, line) in history.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+        let bad = || format!("line {} of the review history cannot be read", i + 1);
+        let v: Value = serde_json::from_str(line).map_err(|_| bad())?;
+        let dir = v["run_dir"].as_str().filter(|d| !d.is_empty()).ok_or_else(bad)?;
+        let proof: Proof = serde_json::from_value(v["proof"].clone()).map_err(|_| bad())?;
+        if !by_dir.contains_key(dir) {
+            order.push(dir.to_string());
+        }
+        by_dir.insert(dir.to_string(), proof);
+    }
+    Ok(order.into_iter().filter_map(|d| by_dir.remove(&d)).collect())
+}
+
+/// Whether the cap default holds for these passes: there are at least
+/// CAP_DEFAULT_FROM, and in each from that one on the whole diff was reviewed
+/// (a path-scoped pass cannot clear a merge), codex reviewed, its findings
+/// were read, and none is P0 or P1. Only codex's severities are read, so another
+/// reviewer's output in those passes stops the default, unless `others_allowed`
+/// (a later queued unit shares files with this one and is held by it).
+fn cap_default_holds(passes: &[Proof], others_allowed: bool) -> Result<(), String> {
+    if passes.len() < CAP_DEFAULT_FROM {
+        return Err(format!(
+            "the review history has {} pass(es); the default needs {CAP_DEFAULT_FROM} or more",
+            passes.len()
+        ));
+    }
+    let is_codex = |name: &str| name.eq_ignore_ascii_case("codex");
+    for (i, pass) in passes.iter().enumerate().skip(CAP_DEFAULT_FROM - 1) {
+        let k = i + 1;
+        match pass.scoped {
+            Some(false) => {}
+            Some(true) => return Err(format!("pass {k} reviewed only some paths of the diff")),
+            None => return Err(format!("pass {k} does not say it reviewed the whole diff")),
+        }
+        let codex = pass.reviewers.iter().find(|r| is_codex(&r.name));
+        match codex {
+            None => return Err(format!("pass {k} has no codex review")),
+            Some(c) if !c.has_output => return Err(format!("codex produced no output in pass {k}")),
+            Some(c) => match c.blocking {
+                None => return Err(format!("codex's findings in pass {k} could not be read")),
+                Some(0) => {}
+                Some(n) => return Err(format!("codex found {n} P0/P1 finding(s) in pass {k}")),
+            },
+        }
+        if !others_allowed && let Some(other) = pass.reviewers.iter().find(|r| !is_codex(&r.name) && r.has_output) {
+            return Err(format!(
+                "{} also reviewed pass {k}, and only codex's severities are read",
+                other.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The findings `result.json` left open (`review.open_findings`), one line each.
+fn open_findings(result: &Value) -> Vec<String> {
+    result["review"]["open_findings"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|f| f.as_str().map_or_else(|| f.to_string(), str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The tracker lines the run never offered, when `tracker parse` named any.
@@ -957,8 +1073,40 @@ impl<'a> Driver<'a> {
         self.settle(u, State::Blocked, note, infra)
     }
 
+    /// Park a unit, and with it every later queued unit that shares a file
+    /// with it: their change would be made over files this unit's open PR
+    /// still changes. Those units were never claimed or prepared, so they get
+    /// no end-of-unit work, and they stay parked for this run.
+    ///
+    /// The held units are written to PARK_HOLDS before the unit parks, so a
+    /// driver killed part way through finishes the job: `queued` parks any
+    /// unit a parked unit's PARK_HOLDS names before it would claim it.
     fn park(&self, u: &UnitState, note: &str, infra: bool) -> Res<()> {
-        self.settle(u, State::Parked, note, infra)
+        let held = self.later_overlapping_queued(u.unit);
+        if !held.is_empty() {
+            let dir = self.unit_dir(u.unit);
+            fs::create_dir_all(&dir).map_err(|e| Fail::failed(format!("cannot create {}: {e}", dir.display())))?;
+            write_atomic(
+                &dir.join(self.mark(PARK_HOLDS)),
+                serde_json::to_vec(&json!({"held": held}))
+                    .map_err(|e| Fail::failed(e.to_string()))?
+                    .as_slice(),
+            )?;
+        }
+        self.settle(u, State::Parked, note, infra)?;
+        if self.unit_state(u.unit)?.state != State::Parked {
+            return Ok(());
+        }
+        for n in held {
+            self.mv(
+                n,
+                "parked",
+                Some(&format!("{WAITING_FOR}{} (it parked, and they share files)", u.unit)),
+                None,
+                None,
+            )?;
+        }
+        Ok(())
     }
 
     fn unit_dir(&self, unit: u64) -> PathBuf {
@@ -973,6 +1121,164 @@ impl<'a> Driver<'a> {
                 u.state.as_str()
             ))
         })
+    }
+
+    /// The commit the cap default accepted for this unit, if it accepted one.
+    fn cap_accepted(&self, unit: u64) -> Option<String> {
+        let v: Value = read_json(&self.unit_dir(unit).join(self.mark(CAP_ACCEPTED)))?;
+        v["reviewed"].as_str().filter(|s| is_sha(s)).map(str::to_string)
+    }
+
+    /// The parked unit that holds this one, if any: one whose PARK_HOLDS names
+    /// it, or one earlier in the queue that has a PR and shares files with
+    /// it. A unit parked by hand (`state record --state parked`) writes no
+    /// PARK_HOLDS, and while it has a PR its change can still land, so the
+    /// queue's overlap is read for it directly. Whether that PR is still open
+    /// is not read: a parked unit's PR holds until a person moves the unit.
+    fn held_by(&self, unit: u64) -> Option<u64> {
+        let snap = state::load(self.ctx)?;
+        let pos = |n: u64| snap.queue.iter().position(|q| *q == n);
+        let me = pos(unit);
+        snap.units
+            .iter()
+            .filter(|s| s.state == State::Parked && s.unit != unit)
+            .find(|s| {
+                let n = s.unit;
+                let listed = read_json::<Value>(&self.unit_dir(n).join(self.mark(PARK_HOLDS))).is_some_and(|v| {
+                    v["held"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|x| x.as_u64() == Some(unit)))
+                });
+                listed
+                    || (s.pr.is_some()
+                        && pos(n).zip(me).is_some_and(|(p, m)| p < m)
+                        && self
+                            .ctx
+                            .queue_unit(n)
+                            .is_ok_and(|e| e.shares_files_with.contains(&unit)))
+            })
+            .map(|s| s.unit)
+    }
+
+    /// The later queued units (by queue position) that share a file with this one.
+    fn later_overlapping_queued(&self, unit: u64) -> Vec<u64> {
+        let (Ok(entry), Some(snap)) = (self.ctx.queue_unit(unit), state::load(self.ctx)) else {
+            return Vec::new();
+        };
+        let pos = |n: u64| snap.queue.iter().position(|q| *q == n);
+        let Some(me) = pos(unit) else {
+            return Vec::new();
+        };
+        entry
+            .shares_files_with
+            .into_iter()
+            .filter(|n| pos(*n).is_some_and(|p| p > me))
+            .filter(|n| snap.units.iter().any(|s| s.unit == *n && s.state == State::Queued))
+            .collect()
+    }
+
+    /// The cap default: a review that stopped at the pass cap goes on to the
+    /// gate, instead of parking, when `cap_default_holds` says so for the
+    /// unit's review history. The driver files the findings left open as one
+    /// follow-up issue, writes CAP_ACCEPTED and logs `cap_default`. `None`
+    /// when the unit may go on; `Some(why)` when the default does not hold and
+    /// the unit parks. A dry run logs what it would do and writes nothing.
+    ///
+    /// Known gaps: a driver killed after the follow-up was filed and before
+    /// CAP_ACCEPTED was written files a second one; the history is the unit's
+    /// own record, as trusted as its review proof.
+    fn cap_default(&self, u: &UnitState, left_open: &[String]) -> Res<Option<String>> {
+        let path = self.unit_dir(u.unit).join("review-history.jsonl");
+        let history = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some("the unit recorded no review history".into()));
+            }
+            Err(e) => return Err(Fail::failed(format!("cannot read {}: {e}", path.display()))),
+        };
+        let passes = match review_passes(&history) {
+            Ok(passes) => passes,
+            Err(why) => return Ok(Some(why)),
+        };
+        let held = self.later_overlapping_queued(u.unit);
+        if let Err(why) = cap_default_holds(&passes, !held.is_empty()) {
+            return Ok(Some(why));
+        }
+        let last = passes.last().expect("cap_default_holds needs passes");
+        if self.cap_accepted(u.unit).as_deref() == Some(last.head.as_str()) {
+            return Ok(None);
+        }
+        let detail = json!({"reviewed": last.head, "passes": passes.len(), "held": held});
+        if self.dry {
+            self.log(Some(u.unit), "cap_default", json!({"would": detail}))?;
+            return Ok(None);
+        }
+        let pr = self.pr_of(u)?;
+        let codex: Vec<String> = last
+            .reviewers
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case("codex"))
+            .and_then(|r| r.findings.clone())
+            .unwrap_or_default();
+        let list = |items: &[String]| {
+            if items.is_empty() {
+                "- (none)\n".to_string()
+            } else {
+                items
+                    .iter()
+                    .map(|f| format!("- {}\n", f.trim_start_matches("- ")))
+                    .collect()
+            }
+        };
+        let body = format!(
+            "PR #{pr} (issue-drain unit {unit}) stopped at the review cap after {n} passes, with no P0 or P1 \
+             finding from codex from pass {CAP_DEFAULT_FROM} on, so the driver sent it to the merge gate.\n\n\
+             Reviewed commit: {head}\n\n## Codex findings in the last pass\n\n{codex}\n\
+             ## Findings the unit left open\n\n{open}\n\
+             Commits pushed after the reviewed commit were not reviewed.\n",
+            unit = u.unit,
+            n = passes.len(),
+            head = last.head,
+            codex = list(&codex),
+            open = list(left_open),
+        );
+        let file = self.unit_dir(u.unit).join("drive-cap-followup.md");
+        write_atomic(&file, body.as_bytes())?;
+        let title = format!("Follow-up: findings left at the review cap on PR #{pr}");
+        let f = file.display().to_string();
+        let r = self.call(&["gh-write", "followup-create", "--title", &title, "--body-file", &f])?;
+        if !r.ok() {
+            return Ok(Some(format!("the follow-up issue could not be filed: {}", r.why())));
+        }
+        let url = r
+            .stdout
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| l.starts_with("https://"))
+            .map(str::to_string);
+        write_atomic(
+            &self.unit_dir(u.unit).join(self.mark(CAP_ACCEPTED)),
+            format!(
+                "{}\n",
+                json!({"reviewed": last.head, "followup": url, "passes": passes.len()})
+            )
+            .as_bytes(),
+        )?;
+        self.log(
+            Some(u.unit),
+            "cap_default",
+            json!({"accepted": detail, "followup": url}),
+        )?;
+        Ok(None)
+    }
+
+    /// The `--accept-cap` arguments for a gate call, when the cap default
+    /// accepted a review for this unit.
+    fn cap_args(&self, unit: u64) -> Vec<String> {
+        self.cap_accepted(unit)
+            .map(|sha| vec!["--accept-cap".to_string(), sha])
+            .unwrap_or_default()
     }
 
     // ---- startup and boundaries ----
@@ -1122,6 +1428,25 @@ impl<'a> Driver<'a> {
                     self.touch(unit)?;
                     self.mv(unit, "skipped", Some(REMOVED), None, None)?;
                     report.processed.push((unit, State::Skipped));
+                    if once {
+                        self.reconcile()?;
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                // A park cascade a killed driver left half done: the unit
+                // parks as the cascade would have parked it, before `carry`
+                // takes ownership, so it gets no claim release or end-of-unit
+                // comment that the uninterrupted cascade does not give it.
+                if let Some(by) = self.held_by(unit) {
+                    self.mv(
+                        unit,
+                        "parked",
+                        Some(&format!("{WAITING_FOR}{by} (it parked, and they share files)")),
+                        None,
+                        None,
+                    )?;
+                    report.processed.push((unit, State::Parked));
                     if once {
                         self.reconcile()?;
                         return Ok(None);
@@ -1447,7 +1772,18 @@ impl<'a> Driver<'a> {
         };
         match result["outcome"].as_str() {
             Some("blocked") => self.block(u, &said("blocked"), false).map(|()| true),
-            Some(o @ ("parked" | "cap_reached")) => self.park(u, &said(o), false).map(|()| true),
+            Some("cap_reached") => match self.cap_default(u, &open_findings(&result))? {
+                // The next gate read takes the capped review under the waiver.
+                None => Ok(false),
+                Some(why) => self
+                    .park(
+                        u,
+                        &format!("{}; the cap default does not hold: {why}", said("cap_reached")),
+                        false,
+                    )
+                    .map(|()| true),
+            },
+            Some("parked") => self.park(u, &said("parked"), false).map(|()| true),
             _ => Ok(false),
         }
     }
@@ -1532,11 +1868,23 @@ impl<'a> Driver<'a> {
                     Ok(None) => {
                         self.mv(u.unit, "pr_open", None, Some(pr), None)?;
                         if outcome == "pr_open" {
-                            Ok(())
-                        } else {
-                            let to = self.unit_state(u.unit)?;
-                            self.park(&to, &said(&format!("the unit reported {outcome}")), false)
+                            return Ok(());
                         }
+                        let to = self.unit_state(u.unit)?;
+                        if outcome == "cap_reached" {
+                            return match self.cap_default(&to, &open_findings(result))? {
+                                None => Ok(()),
+                                Some(why) => self.park(
+                                    &to,
+                                    &format!(
+                                        "{}; the cap default does not hold: {why}",
+                                        said("the unit reported cap_reached")
+                                    ),
+                                    false,
+                                ),
+                            };
+                        }
+                        self.park(&to, &said(&format!("the unit reported {outcome}")), false)
                     }
                 }
             }
@@ -1556,11 +1904,19 @@ impl<'a> Driver<'a> {
         let outcome = result["outcome"].as_str().unwrap_or_default();
         if matches!(outcome, "parked" | "cap_reached") && result["pr"].as_u64() == u.pr {
             let notes = notes_of(&result);
-            let note = if notes.is_empty() {
+            let mut note = if notes.is_empty() {
                 format!("the unit reported {outcome}")
             } else {
                 format!("the unit reported {outcome}: {notes}")
             };
+            // A driver killed between recording the PR and the cap default
+            // asks for the default again; one that accepted goes on.
+            if outcome == "cap_reached" {
+                match self.cap_default(u, &open_findings(&result))? {
+                    None => return self.mv(u.unit, "reviewing", None, None, None),
+                    Some(why) => note = format!("{note}; the cap default does not hold: {why}"),
+                }
+            }
             return self.park(u, &note, false);
         }
         self.mv(u.unit, "reviewing", None, None, None)
@@ -1568,7 +1924,10 @@ impl<'a> Driver<'a> {
 
     fn gate_dry(&self, u: &UnitState) -> Res<(Reply, Vec<Refusal>)> {
         let (n, p) = (u.unit.to_string(), self.pr_of(u)?.to_string());
-        let r = self.call(&["merge-gate", "--unit", &n, "--pr", &p, "--dry-run"])?;
+        let cap = self.cap_args(u.unit);
+        let mut args = vec!["merge-gate", "--unit", &n, "--pr", &p, "--dry-run"];
+        args.extend(cap.iter().map(String::as_str));
+        let r = self.call(&args)?;
         let refusals = refusals_of(&r);
         Ok((r, refusals))
     }
@@ -1578,6 +1937,7 @@ impl<'a> Driver<'a> {
         let marker = dir.join(self.mark("drive-review-resumed"));
         let passes_file = dir.join(self.mark("drive-review-passes"));
         let mut reads = 0;
+        let mut cap_tried = false;
         loop {
             let (r, refusals) = self.gate_dry(u)?;
             let person: Vec<Refusal> = refusals.iter().filter(|x| needs_a_person(x)).cloned().collect();
@@ -1604,10 +1964,17 @@ impl<'a> Driver<'a> {
                 }
                 return self.mv(u.unit, "ci_wait", None, None, None);
             }
-            if marker.exists() {
+            // The cap default already took this unit's capped review (the
+            // unit may have reported cap_reached itself, before the driver
+            // counted any pass): a gate that still refuses under it parks,
+            // and no further pass is run.
+            if let Some(sha) = self.cap_accepted(u.unit) {
                 return self.park(
                     u,
-                    &format!("still refused after a review pass: {}", listed(&review)),
+                    &format!(
+                        "review cap reached: the cap default accepted the review at {sha}; still refused: {}",
+                        listed(&review)
+                    ),
                     false,
                 );
             }
@@ -1616,12 +1983,42 @@ impl<'a> Driver<'a> {
                 .and_then(|t| t.trim().parse().ok())
                 .unwrap_or(0);
             if passes >= MAX_REVIEW_PASSES {
+                // Once per step: the cap default may let the gate take the
+                // capped review; a gate that still refuses after it parks.
+                if !cap_tried {
+                    cap_tried = true;
+                    let result: Value = read_json(&dir.join("result.json")).unwrap_or(Value::Null);
+                    match self.cap_default(u, &open_findings(&result))? {
+                        None if self.dry => return Ok(()),
+                        None => continue,
+                        Some(why) => {
+                            return self.park(
+                                u,
+                                &format!(
+                                    "review cap reached: the driver asked for {passes} review passes; still refused: {}; \
+                                     the cap default does not hold: {why}",
+                                    listed(&review)
+                                ),
+                                false,
+                            );
+                        }
+                    }
+                }
                 return self.park(
                     u,
                     &format!(
                         "review cap reached: the driver asked for {passes} review passes; still refused: {}",
                         listed(&review)
                     ),
+                    false,
+                );
+            }
+            // After the cap checks: a final pass that leaves the gate refusing
+            // takes the cap default above, not this park.
+            if marker.exists() {
+                return self.park(
+                    u,
+                    &format!("still refused after a review pass: {}", listed(&review)),
                     false,
                 );
             }
@@ -1765,7 +2162,10 @@ impl<'a> Driver<'a> {
         let start = Instant::now();
         let mut errors = 0;
         loop {
-            let r = self.call(&["merge-gate", "--unit", &n, "--pr", &p])?;
+            let cap = self.cap_args(u.unit);
+            let mut args = vec!["merge-gate", "--unit", &n, "--pr", &p];
+            args.extend(cap.iter().map(String::as_str));
+            let r = self.call(&args)?;
             match r.code {
                 0 => {
                     let j = r.json().unwrap_or(Value::Null);
@@ -2514,5 +2914,137 @@ mod tests {
         drop(guard);
         assert!(!dir.join(DRIVE_PID).exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn pass(head: &str, codex: Option<(bool, Option<u64>)>, others: &[(&str, bool)]) -> super::Proof {
+        let mut reviewers = Vec::new();
+        if let Some((has_output, blocking)) = codex {
+            reviewers.push(crate::merge_gate::Reviewer {
+                name: "codex".into(),
+                has_output,
+                failure_kind: None,
+                findings: blocking.map(|_| vec!["- [P2] a thing".into()]),
+                blocking,
+            });
+        }
+        for (name, has_output) in others {
+            reviewers.push(crate::merge_gate::Reviewer {
+                name: (*name).into(),
+                has_output: *has_output,
+                failure_kind: None,
+                findings: None,
+                blocking: None,
+            });
+        }
+        super::Proof {
+            head: head.into(),
+            reviewers,
+            scoped: Some(false),
+        }
+    }
+
+    fn line(dir: &str, p: &super::Proof) -> String {
+        format!("{}\n", serde_json::json!({"run_dir": dir, "proof": p}))
+    }
+
+    #[test]
+    fn review_passes_count_run_folders_and_the_later_line_wins() {
+        let a = pass("a", Some((true, Some(1))), &[]);
+        let b = pass("b", Some((true, Some(0))), &[]);
+        let b2 = pass("b2", Some((true, Some(0))), &[]);
+        let history = [line("/r/1", &a), line("/r/2", &b), "\n".into(), line("/r/2", &b2)].concat();
+        let passes = super::review_passes(&history).expect("readable");
+        let heads: Vec<&str> = passes.iter().map(|p| p.head.as_str()).collect();
+        assert_eq!(heads, ["a", "b2"]);
+        assert!(super::review_passes("").expect("empty is readable").is_empty());
+    }
+
+    #[test]
+    fn a_review_history_line_that_cannot_be_read_is_an_error() {
+        let a = pass("a", Some((true, Some(0))), &[]);
+        for bad in [
+            "not json\n",
+            "{\"proof\": {}}\n",
+            "{\"run_dir\": \"\", \"proof\": {\"head\": \"x\", \"reviewers\": []}}\n",
+        ] {
+            let history = [line("/r/1", &a), bad.into()].concat();
+            let why = super::review_passes(&history).expect_err(bad);
+            assert!(why.contains("line 2"), "{why}");
+        }
+    }
+
+    #[test]
+    fn the_cap_default_holds_only_for_clean_codex_passes_from_the_third_on() {
+        let clean = || pass("h", Some((true, Some(0))), &[]);
+        let early_p1 = pass("h", Some((true, Some(2))), &[]);
+        // Passes 1 and 2 may find anything.
+        assert_eq!(
+            super::cap_default_holds(&[early_p1.clone(), early_p1.clone(), clean(), clean()], false),
+            Ok(())
+        );
+        assert_eq!(
+            super::cap_default_holds(&[early_p1.clone(), early_p1.clone(), clean()], false),
+            Ok(())
+        );
+
+        let too_few = super::cap_default_holds(&[clean(), clean()], false).unwrap_err();
+        assert!(too_few.contains("2 pass(es)"), "{too_few}");
+
+        let p1 = super::cap_default_holds(&[clean(), clean(), clean(), early_p1.clone()], false).unwrap_err();
+        assert!(p1.contains("2 P0/P1") && p1.contains("pass 4"), "{p1}");
+
+        // A path-scoped pass, or one that does not say, never counts.
+        let mut scoped = clean();
+        scoped.scoped = Some(true);
+        let why = super::cap_default_holds(&[clean(), clean(), scoped.clone()], false).unwrap_err();
+        assert!(why.contains("pass 3 reviewed only some paths"), "{why}");
+        scoped.scoped = None;
+        let why = super::cap_default_holds(&[clean(), clean(), clean(), scoped], false).unwrap_err();
+        assert!(why.contains("pass 4 does not say"), "{why}");
+        // Passes before the third may be scoped.
+        let mut early = clean();
+        early.scoped = Some(true);
+        assert_eq!(
+            super::cap_default_holds(&[early.clone(), early, clean()], false),
+            Ok(())
+        );
+
+        let unread = pass("h", Some((true, None)), &[]);
+        let why = super::cap_default_holds(&[clean(), clean(), unread], false).unwrap_err();
+        assert!(why.contains("could not be read") && why.contains("pass 3"), "{why}");
+
+        let silent = pass("h", Some((false, Some(0))), &[]);
+        let why = super::cap_default_holds(&[clean(), clean(), silent], false).unwrap_err();
+        assert!(why.contains("no output"), "{why}");
+
+        let none = pass("h", None, &[]);
+        let why = super::cap_default_holds(&[clean(), clean(), none], false).unwrap_err();
+        assert!(why.contains("no codex review"), "{why}");
+    }
+
+    #[test]
+    fn another_reviewers_output_stops_the_cap_default_unless_a_later_unit_is_held() {
+        let clean = || pass("h", Some((true, Some(0))), &[]);
+        let with_kimi = pass("h", Some((true, Some(0))), &[("kimi", true)]);
+        let kimi_silent = pass("h", Some((true, Some(0))), &[("kimi", false)]);
+        let why = super::cap_default_holds(&[clean(), clean(), with_kimi.clone()], false).unwrap_err();
+        assert!(why.contains("kimi") && why.contains("pass 3"), "{why}");
+        assert_eq!(
+            super::cap_default_holds(&[clean(), clean(), with_kimi.clone()], true),
+            Ok(())
+        );
+        assert_eq!(
+            super::cap_default_holds(&[clean(), clean(), kimi_silent], false),
+            Ok(())
+        );
+        // Before pass 3 another reviewer is not weighed.
+        assert_eq!(super::cap_default_holds(&[with_kimi, clean(), clean()], false), Ok(()));
+    }
+
+    #[test]
+    fn open_findings_are_read_as_lines() {
+        let result = serde_json::json!({"review": {"open_findings": ["- [P2] one", {"sev": "P3"}]}});
+        assert_eq!(super::open_findings(&result), ["- [P2] one", "{\"sev\":\"P3\"}"]);
+        assert!(super::open_findings(&serde_json::json!({})).is_empty());
     }
 }

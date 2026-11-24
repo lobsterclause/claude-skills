@@ -20,8 +20,7 @@ fn no_verb_is_a_usage_error_and_calls_nothing() {
 fn bad_arguments_are_usage_errors_and_call_nothing() {
     let env = Env::new();
     let body = body(&env);
-    let cases: [&[&str]; 6] = [
-        &["gh-write", "frobnicate"],
+    let cases: [&[&str]; 5] = [
         &["gh-write", "comment", "7"],
         &["gh-write", "comment", "7", "--body-file", "/nonexistent/body.md"],
         &["gh-write", "comment", "seven", "--body-file", &body],
@@ -33,6 +32,28 @@ fn bad_arguments_are_usage_errors_and_call_nothing() {
         assert_eq!(out.code, 2, "{args:?}: {}", out.stderr);
     }
     assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
+fn a_write_with_no_verb_is_refused_naming_the_missing_verb_and_logged() {
+    let env = Env::new();
+    for verb in ["frobnicate", "pr-close", "issue-close"] {
+        let out = env.run(&["gh-write", verb, "7"]);
+        assert_eq!(out.code, 3, "{verb}: {}", out.stderr);
+        assert!(
+            out.stderr.contains(&format!("report the missing verb '{verb}'")),
+            "{}",
+            out.stderr
+        );
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+    let events = env.events_named("gh_write_refused");
+    let missing: Vec<&str> = events
+        .iter()
+        .filter(|e| e["missing_verb"] == true)
+        .filter_map(|e| e["verb"].as_str())
+        .collect();
+    assert_eq!(missing, ["frobnicate", "pr-close", "issue-close"]);
 }
 
 #[test]

@@ -602,6 +602,73 @@ fn a_dry_run_prints_the_merge_and_records_no_write() {
     assert_eq!(events[0]["dry_run"], true);
 }
 
+/// A PR whose review stopped at the cap: the record at the head says
+/// FIXES_APPLIED, the proof covered the whole diff, and the live driver's cap
+/// decision accepted the head. The newest record carries comment id 41.
+fn capped(association: &str) -> Env {
+    let mut env = ready();
+    preflight(
+        &mut env,
+        &json!({"status": "pending", "pr": "12", "head": HEAD, "reviewed": HEAD, "verdict": "FIXES_APPLIED"})
+            .to_string(),
+        0,
+    );
+    let mut c = comment(&record(HEAD, "FIXES_APPLIED"), association);
+    c["id"] = json!(41);
+    comments(&env, &[c]);
+    env.write(
+        "units/3/review-proof.json",
+        &json!({"head": HEAD, "scoped": false, "reviewers": [
+            {"name": "codex", "has_output": true, "failure_kind": null}
+        ]})
+        .to_string(),
+    );
+    env.write(
+        "units/3/drive-cap-accepted.json",
+        &json!({"reviewed": HEAD}).to_string(),
+    );
+    env
+}
+
+fn capped_args() -> Vec<&'static str> {
+    let mut args = ARGS.to_vec();
+    args.extend(["--dry-run", "--accept-cap", HEAD]);
+    args
+}
+
+#[test]
+fn the_live_drivers_cap_decision_is_read_by_a_gate_asked_with_dry_run() {
+    // The live driver writes drive-cap-accepted.json and judges with
+    // `merge-gate --dry-run`; the gate's no-merge flag must not send it
+    // looking for the dry-run driver's dry- file.
+    let env = capped("OWNER");
+    let out = env.run(&capped_args());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = result(&out);
+    assert_eq!(r["refusals"], json!([]), "{}", out.stdout);
+    assert_eq!(r["merged"], false);
+    assert!(merged_calls(&env).is_empty());
+    let pin: Value =
+        serde_json::from_str(&fs::read_to_string(env.workdir.join("units/3/cap-waived-record.json")).expect("the pin"))
+            .expect("JSON");
+    assert_eq!(pin, json!({"reviewed": HEAD, "record": 41}));
+    assert!(!env.workdir.join("units/3/dry-cap-waived-record.json").exists());
+}
+
+#[test]
+fn a_review_record_the_gate_refuses_is_not_pinned_by_the_cap_waiver() {
+    let env = capped("NONE");
+    let out = env.run(&capped_args());
+    assert_eq!(out.code, 3, "{}", out.stdout);
+    assert!(
+        codes(&result(&out)).contains(&"review_author".to_string()),
+        "{}",
+        out.stdout
+    );
+    assert!(!env.workdir.join("units/3/cap-waived-record.json").exists());
+    assert!(!env.workdir.join("units/3/dry-cap-waived-record.json").exists());
+}
+
 #[test]
 fn a_dry_run_still_refuses_what_a_live_run_would() {
     let env = ready();

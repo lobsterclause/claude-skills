@@ -883,6 +883,279 @@ fn the_review_cap_parks_a_unit_after_four_passes() {
     assert!(c.last_comment().contains("review cap reached"), "{}", c.last_comment());
 }
 
+/// A review history of `passes` codex passes at `head`, each with the given
+/// P0/P1 count, as `review-proof` appends it.
+fn history(c: &Case, unit: u64, head: &str, blocking: &[u64]) {
+    let text: String = blocking
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let findings: Vec<String> = (0..*b).map(|k| format!("- [P1] finding {k}")).collect();
+            let line = json!({"run_dir": format!("/runs/pass-{}", i + 1), "proof": {"head": head, "reviewers": [
+                {"name": "codex", "has_output": true, "findings": findings, "blocking": b}
+            ], "scoped": false}});
+            format!("{line}\n")
+        })
+        .collect();
+    c.env.write(&format!("units/{unit}/review-history.jsonl"), &text);
+}
+
+#[test]
+fn a_capped_review_with_clean_late_passes_goes_to_the_gate_with_a_followup() {
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.pr_view(1, 4701);
+    c.env.write("units/1/drive-review-passes", "4\n");
+    let reviewed = "c".repeat(40);
+    history(&c, 1, &reviewed, &[2, 1, 0, 0]);
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n(
+        "merge-gate",
+        1,
+        3,
+        &Case::refused(&[("review", "verdict is NEEDS_DECISION")]),
+    );
+    c.canned_n("merge-gate", 4, 0, &Case::merged());
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        report["processed"],
+        json!([{"unit": 1, "state": "done"}]),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(c.claude_runs(1), 0, "no fifth review pass");
+    let waived = format!("merge-gate --unit 1 --pr 4701 --dry-run --accept-cap {reviewed}");
+    assert!(c.at(&waived) > c.at("merge-gate --unit 1 --pr 4701 --dry-run"));
+    assert_eq!(
+        c.count(&format!("merge-gate --unit 1 --pr 4701 --accept-cap {reviewed}")),
+        1
+    );
+    let creates: Vec<String> = c
+        .env
+        .gh_calls()
+        .into_iter()
+        .filter(|l| l.starts_with("issue create"))
+        .collect();
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    let body = fs::read_to_string(c.env.workdir.join("units/1/drive-cap-followup.md")).expect("the body");
+    assert!(body.contains("PR #4701") && body.contains(&reviewed), "{body}");
+    let accepted: Value = serde_json::from_str(
+        &fs::read_to_string(c.env.workdir.join("units/1/drive-cap-accepted.json")).expect("the record"),
+    )
+    .expect("json");
+    assert_eq!(accepted["reviewed"], json!(reviewed));
+    assert_eq!(
+        accepted["followup"],
+        json!("https://github.com/example/tidepool/issues/900")
+    );
+    let events = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("events");
+    assert!(events.contains("\"cap_default\""), "{events}");
+}
+
+#[test]
+fn a_unit_whose_cap_was_accepted_parks_when_the_gate_still_refuses_and_runs_no_fifth_pass() {
+    // The unit reported cap_reached on its own run, so the driver counted no
+    // pass; the cap default accepted it, and the gate still refuses.
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    let reviewed = "c".repeat(40);
+    c.env.write(
+        "units/1/drive-cap-accepted.json",
+        &json!({"reviewed": reviewed, "followup": null, "passes": 4}).to_string(),
+    );
+    c.canned("merge-gate", 3, &Case::refused(&[("review", "verdict is BLOCKED")]));
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+    assert_eq!(c.claude_runs(1), 0, "no fifth review pass");
+    let comment = c.last_comment();
+    assert!(comment.contains("the cap default accepted the review"), "{comment}");
+    assert_eq!(
+        c.count(&format!(
+            "merge-gate --unit 1 --pr 4701 --dry-run --accept-cap {reviewed}"
+        )),
+        1
+    );
+}
+
+#[test]
+fn a_capped_review_with_a_late_p1_still_parks() {
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.env.write("units/1/drive-review-passes", "4\n");
+    history(&c, 1, &"c".repeat(40), &[0, 0, 0, 1]);
+    c.canned(
+        "merge-gate",
+        3,
+        &Case::refused(&[("review", "verdict is NEEDS_DECISION")]),
+    );
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(report["processed"], json!([{"unit": 1, "state": "parked"}]));
+    let comment = c.last_comment();
+    assert!(
+        comment.contains("the cap default does not hold") && comment.contains("P0/P1"),
+        "{comment}"
+    );
+    assert!(!c.env.gh_calls().iter().any(|l| l.starts_with("issue create")));
+    assert!(!c.env.workdir.join("units/1/drive-cap-accepted.json").exists());
+    assert_eq!(c.count("merge-gate --unit 1 --pr 4701 --dry-run --accept-cap"), 0);
+}
+
+#[test]
+fn a_parked_unit_parks_the_later_queued_units_that_share_its_files() {
+    let c = case(&[1, 2, 3]);
+    let path = c.env.workdir.join("queue.json");
+    let mut queue: Value = serde_json::from_str(&fs::read_to_string(&path).expect("queue")).expect("json");
+    queue["units"][0]["shares_files_with"] = json!([2]);
+    queue["units"][1]["shares_files_with"] = json!([1]);
+    c.env.write("queue.json", &queue.to_string());
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.env.write("units/1/drive-review-passes", "4\n");
+    c.canned("merge-gate", 3, &Case::refused(&[("review", "verdict is NEEDS_WORK")]));
+    c.result(
+        3,
+        json!({"unit": 3, "outcome": "blocked", "pr": null, "notes": ["stop here"]}),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(1), "parked");
+    assert_eq!(c.state_of(2), "parked");
+    assert_eq!(c.count("claim take --unit 2"), 0, "a held unit is never claimed");
+    assert_eq!(c.count("claim take --unit 3"), 1, "a unit that shares nothing goes on");
+    let events = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("events");
+    assert!(events.contains("waiting for unit 1"), "{events}");
+}
+
+#[test]
+fn a_unit_parked_by_hand_with_a_pr_holds_the_later_units_that_share_its_files() {
+    // `state record --state parked` writes no drive-park-holds.json; the PR
+    // is still open, so a later unit that shares its files waits for it.
+    let c = case(&[1, 2, 3]);
+    let path = c.env.workdir.join("queue.json");
+    let mut queue: Value = serde_json::from_str(&fs::read_to_string(&path).expect("queue")).expect("json");
+    queue["units"][0]["shares_files_with"] = json!([2]);
+    queue["units"][1]["shares_files_with"] = json!([1]);
+    c.env.write("queue.json", &queue.to_string());
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing", "parked"],
+        Some(4701),
+    );
+    c.result(
+        3,
+        json!({"unit": 3, "outcome": "blocked", "pr": null, "notes": ["stop here"]}),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(2), "parked");
+    assert_eq!(c.count("claim take --unit 2"), 0, "a held unit is never claimed");
+    assert_eq!(c.count("claim take --unit 3"), 1, "a unit that shares nothing goes on");
+    let events = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("events");
+    assert!(events.contains("waiting for unit 1"), "{events}");
+}
+
+#[test]
+fn a_driver_killed_mid_cascade_parks_the_held_units_before_it_would_claim_them() {
+    // Unit 1 parked and recorded that it holds unit 2, and the driver died
+    // before it parked unit 2. The next drive parks unit 2 instead of claiming it.
+    let c = case(&[1, 2, 3]);
+    let path = c.env.workdir.join("queue.json");
+    let mut queue: Value = serde_json::from_str(&fs::read_to_string(&path).expect("queue")).expect("json");
+    queue["units"][0]["shares_files_with"] = json!([2]);
+    queue["units"][1]["shares_files_with"] = json!([1]);
+    c.env.write("queue.json", &queue.to_string());
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing", "parked"],
+        Some(4701),
+    );
+    c.env.write("units/1/drive-park-holds.json", r#"{"held":[2]}"#);
+    c.result(
+        3,
+        json!({"unit": 3, "outcome": "blocked", "pr": null, "notes": ["stop here"]}),
+    );
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(c.state_of(2), "parked");
+    assert_eq!(c.count("claim take --unit 2"), 0, "a held unit is never claimed");
+    assert_eq!(c.count("claim take --unit 3"), 1, "a unit that shares nothing goes on");
+    // The same side effects as an uninterrupted cascade: the driver never
+    // owned unit 2, so it releases no claim and posts no end-of-unit comment.
+    assert!(!c.env.workdir.join("units/2/drive-owned").exists());
+    assert_eq!(c.count("claim release --unit 2"), 0);
+    let events = fs::read_to_string(c.env.workdir.join("events.jsonl")).expect("events");
+    assert!(events.contains("waiting for unit 1"), "{events}");
+}
+
+#[test]
+fn the_fourth_driver_pass_takes_the_cap_default_with_the_open_findings() {
+    // The driver ran three passes; the fourth leaves the gate refusing. The
+    // cap default is weighed before the after-a-pass park, and the follow-up
+    // carries the findings result.json left open.
+    let c = case(&[1]);
+    c.seed(
+        1,
+        &["claimed", "prepared", "implementing", "pr_open", "reviewing"],
+        Some(4701),
+    );
+    c.pr_view(1, 4701);
+    c.env.write(
+        "units/1/session.json",
+        &json!({"session_id": "sess-1", "attempts": [{"attempt": 1, "model": "sonnet"}]}).to_string(),
+    );
+    c.env.write("units/1/drive-review-passes", "3\n");
+    let reviewed = "c".repeat(40);
+    history(&c, 1, &reviewed, &[2, 1, 0, 0]);
+    c.result(
+        1,
+        json!({"unit": 1, "outcome": "pr_open", "pr": 4701,
+               "review": {"open_findings": ["- [P2] kimi: a finding left open"]}}),
+    );
+    c.canned("merge-gate", 0, &Case::clean());
+    for n in 1..=2 {
+        c.canned_n(
+            "merge-gate",
+            n,
+            3,
+            &Case::refused(&[("review", "verdict is NEEDS_DECISION")]),
+        );
+    }
+    c.canned_n("merge-gate", 5, 0, &Case::merged());
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        report["processed"],
+        json!([{"unit": 1, "state": "done"}]),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(c.claude_runs(1), 1, "the fourth pass, and no fifth");
+    assert_eq!(
+        c.count(&format!("merge-gate --unit 1 --pr 4701 --accept-cap {reviewed}")),
+        1
+    );
+    let body = fs::read_to_string(c.env.workdir.join("units/1/drive-cap-followup.md")).expect("the body");
+    assert!(body.contains("kimi: a finding left open"), "{body}");
+}
+
 #[test]
 fn a_review_pass_whose_result_says_blocked_blocks_the_unit() {
     let c = case(&[1]);

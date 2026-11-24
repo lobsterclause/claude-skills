@@ -46,6 +46,11 @@ pub struct Ctx {
     /// The profile file, absolute, so the driver can hand it to its children.
     pub profile_path: PathBuf,
     pub dry_run: bool,
+    /// The run is a dry run (`ISSUE_DRAIN_DRY_RUN=1`), so the driver's unit
+    /// files carry the `dry-` prefix. `merge-gate --dry-run` sets `dry_run`
+    /// but not this: the live driver calls the gate that way to judge without
+    /// merging, and the gate must read the files the live driver wrote.
+    pub dry_files: bool,
 }
 
 pub fn env_str(name: &str) -> String {
@@ -112,6 +117,7 @@ impl Ctx {
             profile_path,
             skill_dir,
             dry_run: env_str("ISSUE_DRAIN_DRY_RUN") == "1",
+            dry_files: env_str("ISSUE_DRAIN_DRY_RUN") == "1",
         })
     }
 

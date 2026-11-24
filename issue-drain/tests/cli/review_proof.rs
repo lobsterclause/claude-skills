@@ -75,7 +75,7 @@ fn each_reviewer_is_recorded_with_its_output_and_failure_kind() {
             {"name": "codex", "has_output": true, "failure_kind": null},
             {"name": "gemini", "has_output": false, "failure_kind": null},
             {"name": "kimi", "has_output": false, "failure_kind": "timeout"},
-        ]})
+        ], "scoped": false})
     );
     assert_eq!(env.events_named("review_proof").len(), 1);
 }
@@ -251,7 +251,7 @@ fn reviewer_files_at_the_run_root_are_read_when_there_is_no_raw_folder() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(
         proof_file(&env),
-        json!({"head": HEAD, "reviewers": [{"name": "codex", "has_output": true, "failure_kind": null}]})
+        json!({"head": HEAD, "reviewers": [{"name": "codex", "has_output": true, "failure_kind": null}], "scoped": false})
     );
 }
 
@@ -301,4 +301,43 @@ fn merge_gate_reads_what_review_proof_wrote() {
     assert_eq!(read.reviewers.len(), 2);
     assert!(read.reviewers[0].has_output);
     assert_eq!(read.reviewers[1].failure_kind.as_deref(), Some("quota"));
+}
+
+#[test]
+fn a_path_scoped_run_is_recorded_as_scoped() {
+    // The scope in context.json (worktree.sh start --paths).
+    let env = Env::new();
+    let dir = run_dir(&env, &[("codex.stdout", &review()), ("codex.meta.json", OK)]);
+    let context = json!({"head_sha": HEAD, "paths": ["src/"], "paths_mode": "filtered"});
+    fs::write(dir.join("context.json"), context.to_string()).expect("context.json");
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
+    assert_eq!(proof_file(&env)["scoped"], true);
+    let history = fs::read_to_string(env.workdir.join("units/3/review-history.jsonl")).expect("history");
+    assert!(history.contains("\"scoped\":true"), "{history}");
+
+    // The scope only in a lane's meta file (run_reviewers.sh --paths alone).
+    let env = Env::new();
+    let scoped_meta = r#"{"exit_code": 0, "timed_out": false, "failure_kind": null, "paths": ["src/"]}"#;
+    let dir = run_dir(
+        &env,
+        &[
+            ("codex.stdout", &review()),
+            ("codex.meta.json", OK),
+            ("kimi.stdout", &review()),
+            ("kimi.meta.json", scoped_meta),
+        ],
+    );
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
+    assert_eq!(proof_file(&env)["scoped"], true);
+
+    // An empty list is the whole diff.
+    let env = Env::new();
+    let dir = run_dir(&env, &[("codex.stdout", &review()), ("codex.meta.json", OK)]);
+    fs::write(
+        dir.join("context.json"),
+        json!({"head_sha": HEAD, "paths": []}).to_string(),
+    )
+    .expect("context.json");
+    assert_eq!(prove(&env, &dir, HEAD).code, 0);
+    assert_eq!(proof_file(&env)["scoped"], false);
 }

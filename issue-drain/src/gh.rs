@@ -1069,6 +1069,23 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
     if mode == Mode::Unit && !unit_may(verb) {
         return Err(refuse(ctx, verb, mode, format!("{verb} is the driver's job in a unit")));
     }
+    // A unit is refused every verb it may not use, known or not, above. A
+    // write the driver needed and has no verb for is logged under
+    // `missing_verb`, so a look over `events.jsonl` finds every one.
+    if verb != "close-issue" && !USAGES.iter().any(|(name, _)| *name == verb) {
+        let logged = ctx.event(
+            "gh_write_refused",
+            json!({"verb": verb, "missing_verb": true, "mode": mode.as_str(),
+                   "why": format!("gh-write has no verb '{verb}'")}),
+        );
+        return Err(match logged {
+            Ok(()) => Fail::refused(format!(
+                "refused: gh-write has no verb '{verb}' (the verbs are {VERBS}). Do not make this write with gh; \
+                 report the missing verb '{verb}' instead"
+            )),
+            Err(e) => e,
+        });
+    }
 
     let mut body_file = String::new();
     let mut title = String::new();
@@ -1198,7 +1215,12 @@ pub fn cli(ctx: &Ctx, argv: &[String]) -> Res<()> {
                 "issues are closed only by `issue-drain close-verified`".to_string(),
             ));
         }
-        other => return Err(Fail::usage(format!("unknown verb '{other}'"))),
+        // Listed in USAGES with no arm here: a bug in this file, not the caller's.
+        other => {
+            return Err(Fail::failed(format!(
+                "gh-write lists '{other}' but has no handler for it"
+            )));
+        }
     };
     print!("{}", write(ctx, &w)?.stdout);
     Ok(())
