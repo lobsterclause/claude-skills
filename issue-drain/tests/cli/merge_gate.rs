@@ -177,6 +177,8 @@ fn a_clear_pr_is_merged_with_the_exact_arguments() {
     assert_eq!(r["refusals"], json!([]));
     assert_eq!(r["reviewers"], json!(["codex", "kimi"]));
     assert_eq!(merged_calls(&env), [MERGE]);
+    let record = fs::read_to_string(env.workdir.join("units/3/merge-approved-head")).expect("the approved head");
+    assert_eq!(record.trim(), HEAD);
     let calls = env.gh_calls();
     assert!(
         calls.iter().all(|c| !c.contains("--admin") && !c.contains("--auto")),
@@ -724,6 +726,28 @@ fn a_failed_merge_call_exits_1() {
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert_eq!(result(&out)["merged"], false);
     assert_eq!(merged_calls(&env), [MERGE]);
+    // The status read in ready() does not say the PR is open and idle, so the
+    // outcome is unknown and the record of the approved head is kept.
+    let record = env.workdir.join("units/3/merge-approved-head");
+    assert!(record.exists(), "an unknown outcome keeps the record");
+}
+
+#[test]
+fn a_merge_call_github_turned_down_forgets_the_approved_head() {
+    let env = ready();
+    env.stub_file("fail-merge", "");
+    put(
+        &env,
+        "merge-queue.json",
+        &json!({"data": {"repository": {"pullRequest": {
+            "state": "OPEN", "isInMergeQueue": false, "mergeCommit": null, "autoMergeRequest": null}}}}),
+    );
+    let out = env.run(&ARGS);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(
+        !env.workdir.join("units/3/merge-approved-head").exists(),
+        "a head that never merged is not left as the approved one"
+    );
 }
 
 #[test]

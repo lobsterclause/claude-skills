@@ -1691,7 +1691,48 @@ pub fn parse_review_records(raw: &str) -> Read<Vec<ReviewRecord>> {
     Ok(all)
 }
 
+/// The file in the unit folder that names the head the gate asked GitHub to merge.
+pub const APPROVED_HEAD: &str = "merge-approved-head";
+
 const QUEUE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){isInMergeQueue}}}";
+
+const STATUS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){state isInMergeQueue mergeCommit{oid} autoMergeRequest{enabledAt}}}}";
+
+/// What GitHub says of a PR, read in one query so the parts agree: its state,
+/// merge commit, merge-queue membership and whether auto-merge is armed.
+#[derive(Debug, PartialEq)]
+pub struct MergeStatus {
+    pub state: PrState,
+    pub merge_commit: Option<String>,
+    pub in_queue: bool,
+    pub auto_merge: bool,
+}
+
+pub fn parse_merge_status(raw: &str) -> Read<MergeStatus> {
+    let v: Value = serde_json::from_str(raw).map_err(|_| "the answer is not JSON".to_string())?;
+    if v.get("errors").is_some_and(|e| !e.is_null()) {
+        return Err("GitHub answered with errors".into());
+    }
+    let pr = v
+        .pointer("/data/repository/pullRequest")
+        .filter(|p| p.is_object())
+        .ok_or_else(|| "no pull request in the answer".to_string())?;
+    let in_queue = pr
+        .get("isInMergeQueue")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "no isInMergeQueue in the answer".to_string())?;
+    let auto_merge = match pr.get("autoMergeRequest") {
+        Some(Value::Null) => false,
+        Some(_) => true,
+        None => return Err("no autoMergeRequest in the answer".into()),
+    };
+    Ok(MergeStatus {
+        state: pr_state(pr)?,
+        merge_commit: merge_commit_of(pr),
+        in_queue,
+        auto_merge,
+    })
+}
 
 /// `isInMergeQueue` of the GraphQL answer. `gh pr view --json` has no such
 /// field (gh 2.96.0), so it is read through `gh api graphql`.
@@ -1765,6 +1806,19 @@ pub fn in_merge_queue(repo: &str, pr: u64) -> Read<bool> {
     ])
     .and_then(|raw| parse_in_queue(&raw))
     .map_err(|e| format!("whether PR #{pr} is in the merge queue ({e})"))
+}
+
+/// The PR's state, merge commit, merge-queue membership and auto-merge request,
+/// in one GraphQL query.
+pub fn merge_status(repo: &str, pr: u64) -> Read<MergeStatus> {
+    let (owner, name) = repo.split_once('/').ok_or("the repo is not owner/name")?;
+    let (query, number) = (format!("query={STATUS_QUERY}"), format!("number={pr}"));
+    let (owner_arg, name_arg) = (format!("owner={owner}"), format!("name={name}"));
+    read_gh(&[
+        "api", "graphql", "-f", &query, "-f", &owner_arg, "-f", &name_arg, "-F", &number,
+    ])
+    .and_then(|raw| parse_merge_status(&raw))
+    .map_err(|e| format!("the merge status of PR #{pr} ({e})"))
 }
 
 fn preflight_path() -> Read<String> {
@@ -2281,7 +2335,29 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         )));
     }
 
-    // The head was read at the start; the merge names it.
+    // The head was read at the start; the merge names it. Record it first, so
+    // post-merge compares the merge commit with the head this gate approved,
+    // not with whatever head the PR has by then.
+    let approved = ctx.path(&format!("units/{unit}/{APPROVED_HEAD}"));
+    if !ctx.dry_run {
+        crate::ctx::write_atomic(&approved, format!("{head}\n").as_bytes())?;
+    }
+    // A merge call that was turned down leaves the record naming a head that
+    // never merged; a person who then merges a newer head by hand would get a
+    // false tree mismatch. It is removed only when GitHub says the PR is open,
+    // unqueued and not set to merge itself; an unknown outcome keeps it.
+    let forget_if_rejected = || {
+        if !ctx.dry_run
+            && let Ok(MergeStatus {
+                state: PrState::Open,
+                in_queue: false,
+                auto_merge: false,
+                ..
+            }) = merge_status(&repo, pr)
+        {
+            let _ = std::fs::remove_file(&approved);
+        }
+    };
     match gh::write(
         ctx,
         &Write::MergePr {
@@ -2324,6 +2400,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
                     report(ctx, unit, pr, &head, false, &[]);
                     match gh::write(ctx, &Write::DisableAutoMerge { number: pr }) {
                         Ok(_) => {
+                            forget_if_rejected();
                             println!("{}", output_with(false, json!({"auto_merge_disabled": true})));
                             Err(Fail::refused(format!(
                                 "PR #{pr}: the merge call armed auto-merge instead of merging; auto-merge has been turned off"
@@ -2363,6 +2440,7 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
             }
         }
         Err(fail) => {
+            forget_if_rejected();
             report(ctx, unit, pr, &head, false, &[]);
             println!("{}", output(false));
             Err(fail)
@@ -3626,6 +3704,32 @@ mod tests {
         assert_eq!(codes(&f), ["review_author"]);
         f.review_record = Err("the comments of PR #12 (gh exit 1)".into());
         assert_eq!(codes(&f), ["read_error"]);
+    }
+
+    #[test]
+    fn the_merge_status_answer_names_state_queue_and_auto_merge() {
+        let answer = |v: Value| json!({"data": {"repository": {"pullRequest": v}}}).to_string();
+        let open = |queued: bool, armed: Value| {
+            answer(json!({"state": "OPEN", "isInMergeQueue": queued, "mergeCommit": null, "autoMergeRequest": armed}))
+        };
+        let status = parse_merge_status(&open(false, json!({"enabledAt": "2026-11-24T00:00:00Z"}))).expect("status");
+        assert_eq!(
+            (status.state, status.in_queue, status.auto_merge),
+            (PrState::Open, false, true)
+        );
+        let status = parse_merge_status(&open(true, Value::Null)).expect("status");
+        assert_eq!((status.in_queue, status.auto_merge), (true, false));
+        let sha = "a".repeat(40);
+        let merged = answer(
+            json!({"state": "MERGED", "isInMergeQueue": false, "mergeCommit": {"oid": sha}, "autoMergeRequest": null}),
+        );
+        let status = parse_merge_status(&merged).expect("status");
+        assert_eq!((status.state, status.merge_commit), (PrState::Merged, Some(sha)));
+        // A missing field is unreadable, never "not armed" or "not queued".
+        assert!(parse_merge_status(&answer(json!({"state": "OPEN", "isInMergeQueue": false}))).is_err());
+        assert!(parse_merge_status(&answer(json!({"state": "OPEN", "autoMergeRequest": null}))).is_err());
+        assert!(parse_merge_status(&answer(Value::Null)).is_err());
+        assert!(parse_merge_status(&json!({"errors": [{}]}).to_string()).is_err());
     }
 
     #[test]

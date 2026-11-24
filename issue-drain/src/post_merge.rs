@@ -33,6 +33,7 @@
 //! unit's, an issue is held for a person, or a unit process asked; 1 GitHub or
 //! git failed, or an issue is still open; 2 usage.
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::thread::sleep;
@@ -115,19 +116,28 @@ fn without_code_spans(text: &str) -> String {
     let b = text.as_bytes();
     let run_at = |i: usize| b[i..].iter().take_while(|&&c| c == b'`').count();
     let mut out = String::with_capacity(text.len());
-    let (mut i, mut copied) = (0, 0);
+    let (mut i, mut copied, mut block) = (0, 0, 0);
     while i < b.len() {
-        if b[i] != b'`' {
+        // A backtick is escaped by an odd run of backslashes before it; after
+        // an even run the backslashes escape each other and the tick opens.
+        // The escape count is taken only at a backtick, so a long run of
+        // backslashes stays linear.
+        if b[i] != b'`' || b[..i].iter().rev().take_while(|&&c| c == b'\\').count() % 2 == 1 {
             i += 1;
             continue;
         }
         let n = run_at(i);
         let mut j = i + n;
+        // A paragraph's end is found once and reused for every span in it,
+        // so many short spans in one long paragraph stay linear.
+        if j >= block {
+            block = block_end(text, j);
+        }
         let close = loop {
-            match b[j..].iter().position(|&c| c == b'`') {
+            match b[j..block].iter().position(|&c| c == b'`') {
                 None => break None,
                 Some(k) => {
-                    let m = run_at(j + k);
+                    let m = b[j + k..block].iter().take_while(|&&c| c == b'`').count();
                     if m == n {
                         break Some(j + k + m);
                     }
@@ -147,6 +157,24 @@ fn without_code_spans(text: &str) -> String {
     }
     out.push_str(&text[copied..]);
     out
+}
+
+/// Where the block that holds `from` ends: at the next blank line, or the end
+/// of the text. A code span cannot cross a blank line.
+fn block_end(text: &str, from: usize) -> usize {
+    let mut at = from;
+    for line in text[from..].split_inclusive('\n') {
+        // Blank means spaces and tabs only, as Markdown counts it; a line of
+        // other whitespace (a no-break space) does not end a paragraph.
+        let content = line
+            .strip_suffix('\n')
+            .map_or(line, |l| l.strip_suffix('\r').unwrap_or(l));
+        if at > from && content.bytes().all(|c| c == b' ' || c == b'\t') {
+            return at;
+        }
+        at += line.len();
+    }
+    text.len()
 }
 
 /// The issues in `repo` that `body` says it closes.
@@ -362,7 +390,34 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         .clone()
         .filter(|s| is_sha(s))
         .ok_or_else(|| Fail::failed(format!("PR #{pr} is merged but names no merge commit")))?;
-    let head = view.head.clone();
+    let record = ctx.path(&format!("units/{unit}/{}", merge_gate::APPROVED_HEAD));
+    let head = match fs::read_to_string(&record) {
+        // The gate's merge call pins the head it approved, so a merge it made
+        // has that head. A record naming another head belongs to an approval
+        // that never merged (a dropped queue entry, then a merge by hand), and
+        // comparing with it would report a tree mismatch that is not there.
+        Ok(text) if is_sha(text.trim()) && text.trim() != view.head => {
+            eprintln!(
+                "issue-drain post-merge: the gate approved {} for unit {unit} but PR #{pr} merged {}, so that approval is not this merge's; comparing with the merged head",
+                sha7(text.trim()),
+                sha7(&view.head)
+            );
+            view.head.clone()
+        }
+        Ok(text) if is_sha(text.trim()) => text.trim().to_string(),
+        Ok(_) => {
+            return Err(Fail::failed(format!("{} does not hold a commit SHA", record.display())));
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(Fail::failed(format!("could not read {}: {e}", record.display())));
+        }
+        Err(_) => {
+            eprintln!(
+                "issue-drain post-merge: there is no record of the head the gate approved for unit {unit}; comparing with the PR's current head"
+            );
+            view.head.clone()
+        }
+    };
 
     let tree_match = trees_match(ctx, unit, &merge, &head)?;
     if !tree_match {
@@ -494,6 +549,59 @@ mod tests {
         // A run with no closer of its own length is literal, as GitHub reads it.
         assert_eq!(body_closes("``close #4` and fixes #5", "a/b"), vec![4, 5]);
         assert_eq!(body_closes("A lone ` then Fixes #6", "a/b"), vec![6]);
+    }
+
+    #[test]
+    fn a_code_span_does_not_cross_a_blank_line() {
+        let body = "A lone ` here.\n\nFixes #1 and `Fixes #2`.";
+        assert_eq!(body_closes(body, "a/b"), vec![1]);
+    }
+
+    #[test]
+    fn an_escaped_backtick_opens_nothing() {
+        let body = "A \\` here, then Fixes #1 and `Fixes #2`.";
+        assert_eq!(body_closes(body, "a/b"), vec![1]);
+    }
+
+    #[test]
+    fn a_backtick_after_an_escaped_backslash_opens_a_span() {
+        // Two backslashes escape each other, so the tick after them is code.
+        let body = "A \\\\`Fixes #2` and Fixes #1.";
+        assert_eq!(body_closes(body, "a/b"), vec![1]);
+        let odd = "A \\\\\\` here, then Fixes #3 and `Fixes #4`.";
+        assert_eq!(body_closes(odd, "a/b"), vec![3]);
+    }
+
+    #[test]
+    fn a_long_run_of_backslashes_is_scanned_in_linear_time() {
+        let body = format!("{}Fixes #1.", "\\".repeat(200_000));
+        let started = std::time::Instant::now();
+        assert_eq!(body_closes(&body, "a/b"), vec![1]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn many_code_spans_in_one_long_paragraph_are_scanned_in_linear_time() {
+        let body = format!("{}Fixes #1.", "`a` b\n".repeat(60_000));
+        let started = std::time::Instant::now();
+        assert_eq!(body_closes(&body, "a/b"), vec![1]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_line_of_other_whitespace_is_not_blank() {
+        let body = "`Fixes #1\n\u{a0}\nstill code` and Fixes #2.";
+        assert_eq!(body_closes(body, "a/b"), vec![2]);
+        let spaces = "A lone ` here.\n \t\r\nFixes #3 and `Fixes #4`.";
+        assert_eq!(body_closes(spaces, "a/b"), vec![3]);
     }
 
     #[test]

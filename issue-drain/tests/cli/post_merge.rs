@@ -102,6 +102,74 @@ fn a_merge_with_the_approved_tree_and_an_issue_the_merge_closed() {
 }
 
 #[test]
+fn the_tree_is_compared_with_the_head_the_gate_approved() {
+    let mut c = case();
+    quick(&mut c);
+    let merge = squash_merge(&c);
+    merged(&c, &merge, &[103]);
+    issue(&c, 103, "CLOSED");
+    c.env.write("units/3/merge-approved-head", &format!("{}\n", c.old_head));
+    let out = post_merge(&c);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = printed(&out);
+    assert_eq!(r["head"], c.old_head);
+    assert_eq!(r["tree_match"], true);
+    assert!(!out.stderr.contains("no record"), "{}", out.stderr);
+    assert!(!out.stderr.contains("not this merge's"), "{}", out.stderr);
+}
+
+#[test]
+fn an_approval_for_a_head_that_never_merged_is_not_used() {
+    let mut c = case();
+    quick(&mut c);
+    let merge = squash_merge(&c);
+    // The gate approved a head that was dropped from the queue; a person then
+    // merged the PR at old_head by hand.
+    merged(&c, &merge, &[103]);
+    issue(&c, 103, "CLOSED");
+    c.env
+        .write("units/3/merge-approved-head", &format!("{}\n", "c".repeat(40)));
+    let out = post_merge(&c);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = printed(&out);
+    assert_eq!(r["head"], c.old_head);
+    assert_eq!(r["tree_match"], true);
+    assert!(out.stderr.contains("not this merge's"), "{}", out.stderr);
+}
+
+#[test]
+fn without_a_record_the_current_head_is_used_and_the_report_says_so() {
+    let mut c = case();
+    quick(&mut c);
+    let merge = squash_merge(&c);
+    merged(&c, &merge, &[103]);
+    issue(&c, 103, "CLOSED");
+    let out = post_merge(&c);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(printed(&out)["head"], c.old_head);
+    assert!(out.stderr.contains("no record"), "{}", out.stderr);
+}
+
+#[test]
+fn an_unreadable_or_invalid_record_fails_instead_of_using_the_current_head() {
+    let mut c = case();
+    quick(&mut c);
+    let merge = squash_merge(&c);
+    merged(&c, &merge, &[103]);
+    issue(&c, 103, "CLOSED");
+    c.env.write("units/3/merge-approved-head", "not a sha\n");
+    let out = post_merge(&c);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("does not hold a commit SHA"), "{}", out.stderr);
+    let record = c.env.workdir.join("units/3/merge-approved-head");
+    fs::remove_file(&record).expect("remove the record");
+    fs::create_dir(&record).expect("a directory where the record goes");
+    let out = post_merge(&c);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stderr.contains("could not read"), "{}", out.stderr);
+}
+
+#[test]
 fn a_moved_base_is_reported_but_is_not_an_error() {
     let mut c = case();
     quick(&mut c);

@@ -205,7 +205,7 @@ use serde_json::{Value, json};
 use crate::ctx::{Ctx, env_str, read_json, write_atomic};
 use crate::error::{Fail, Res};
 use crate::exec;
-use crate::merge_gate::{PrState, PrView, binding, in_merge_queue, is_sha, read_view};
+use crate::merge_gate::{PrState, PrView, binding, is_sha, merge_status, read_view};
 use crate::state::{self, MAX_BASE_SYNCS, MAX_REPAIRS, Snapshot, State, UnitState};
 use crate::tracker::io::Published;
 
@@ -248,8 +248,8 @@ const RESUME_STARTED: &str = "drive-resume-started";
 const CLEANUP_PENDING: &str = "drive-cleanup-pending";
 const TREE_MISMATCH: &str = "drive-tree-mismatch";
 /// Written when the gate queued the PR or sent a merge call whose outcome is
-/// unknown, and removed once the PR is read back merged, or open and out of
-/// the merge queue. While it exists no refusal parks the unit: a park releases
+/// unknown, and removed once the PR is read back merged, closed, or open and out of
+/// the merge queue with no auto-merge armed. While it exists no refusal parks the unit: a park releases
 /// the claim on a PR that may still merge.
 const MERGE_ASKED: &str = "drive-merge-asked";
 const INFRA: &str = "infrastructure failure: ";
@@ -259,8 +259,11 @@ const REMOVED: &str = "removed from the tracker";
 /// What became of a merge the gate asked for.
 enum Outcome {
     Merged(String),
-    /// Open and out of the merge queue, or closed: nothing can merge it now.
+    /// Open, out of the merge queue and with no auto-merge request, or closed:
+    /// nothing can merge it now.
     NotMerging,
+    /// Merged, but not the unit's PR: why.
+    Unbound(String),
     Unsure(String),
 }
 
@@ -1378,24 +1381,7 @@ impl<'a> Driver<'a> {
         if view.state != PrState::Open {
             return Ok(Some(format!("PR #{pr} is not open")));
         }
-        Ok(self.not_the_units(unit, pr, &view))
-    }
-
-    /// Why the PR is not the unit's (wrong base, branch or repository), or
-    /// `None` when it is.
-    fn not_the_units(&self, unit: u64, pr: u64, view: &PrView) -> Option<String> {
-        let unit_file: Value = read_json(&self.unit_dir(unit).join("unit.json")).unwrap_or(Value::Null);
-        let branch = unit_file["branch"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| format!("unit {unit} has no branch in unit.json"));
-        let refusals = binding(&self.repo, &self.ctx.profile.base_branch, unit, pr, view, &branch);
-        if refusals.is_empty() {
-            None
-        } else {
-            let text: Vec<String> = refusals.iter().map(|r| format!("{}: {}", r.code, r.detail)).collect();
-            Some(text.join("; "))
-        }
+        self.binding_problem(unit, pr, &view)
     }
 
     fn read_result(&self, u: &UnitState, result: &Value) -> Res<()> {
@@ -1577,10 +1563,20 @@ impl<'a> Driver<'a> {
 
     /// Settle a unit whose PR merged while a base sync was in flight.
     fn settle_merged(&self, u: &UnitState, pr: u64, view: &PrView, marker: &Path) -> Res<Option<String>> {
-        if let Some(why) = self.not_the_units(u.unit, pr, view) {
-            return self
-                .park(u, &format!("PR #{pr} merged, but {why}"), false)
-                .map(|()| None);
+        match self.binding_problem(u.unit, pr, view) {
+            Ok(None) => {}
+            Ok(Some(why)) => {
+                return self
+                    .park(u, &format!("PR #{pr} merged, but {why}"), false)
+                    .map(|()| None);
+            }
+            // Parking would release the claim on what may be the unit's merge.
+            Err(e) => {
+                return Ok(Some(format!(
+                    "PR #{pr} of unit {} merged, but {e}: fix the unit's record, then drive again",
+                    u.unit
+                )));
+            }
         }
         let Some(commit) = view.merge_commit.clone().filter(|c| is_sha(c)) else {
             return self
@@ -1670,7 +1666,11 @@ impl<'a> Driver<'a> {
                             .ok_or_else(|| Fail::failed(format!("PR #{pr} merged, but no merge commit was named")))?,
                     };
                     self.mv(u.unit, "merged", None, None, Some(&commit))?;
-                    self.merge_settled(u.unit)?;
+                    // A dry run never asked for a merge, so it keeps the record
+                    // of a live one.
+                    if !self.dry {
+                        self.merge_settled(u.unit)?;
+                    }
                     return self.merged(u.unit, pr);
                 }
                 4 => {
@@ -1691,13 +1691,23 @@ impl<'a> Driver<'a> {
                 }
                 3 => {
                     if !self.dry && self.unit_dir(u.unit).join(MERGE_ASKED).exists() {
-                        match self.merge_outcome(pr) {
+                        match self.merge_outcome(u.unit, pr) {
+                            Outcome::Unbound(why) => {
+                                self.merge_settled(u.unit)?;
+                                self.block(u, &why, false)?;
+                                return Ok(None);
+                            }
                             Outcome::Merged(commit) => {
                                 self.mv(u.unit, "merged", None, None, Some(&commit))?;
                                 self.merge_settled(u.unit)?;
                                 return self.merged(u.unit, pr);
                             }
-                            Outcome::NotMerging => self.merge_settled(u.unit)?,
+                            Outcome::NotMerging => {
+                                // The request is over and did not merge: the head
+                                // it approved must not judge a later merge.
+                                self.forget_approved_head(u.unit)?;
+                                self.merge_settled(u.unit)?;
+                            }
                             Outcome::Unsure(why) => {
                                 // The refusals cannot be acted on yet: a park
                                 // would release the claim on a PR that may merge.
@@ -1768,24 +1778,70 @@ impl<'a> Driver<'a> {
         }
     }
 
-    /// What became of a merge the gate asked for, read from GitHub.
-    fn merge_outcome(&self, pr: u64) -> Outcome {
-        let view = match read_view(&self.repo, pr) {
-            Ok(v) => v,
+    fn forget_approved_head(&self, unit: u64) -> Res<()> {
+        match fs::remove_file(self.unit_dir(unit).join(crate::merge_gate::APPROVED_HEAD)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Fail::failed(format!(
+                "cannot remove the approved head of unit {unit}: {e}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// What became of a merge the gate asked for, read from GitHub. State,
+    /// merge-queue membership and the auto-merge request come from one query,
+    /// so they describe one moment.
+    fn merge_outcome(&self, unit: u64, pr: u64) -> Outcome {
+        let status = match merge_status(&self.repo, pr) {
+            Ok(s) => s,
             Err(e) => return Outcome::Unsure(format!("PR #{pr} could not be read: {e}")),
         };
-        match view.state {
-            PrState::Merged => match view.merge_commit.filter(|c| is_sha(c)) {
-                Some(commit) => Outcome::Merged(commit),
+        match status.state {
+            PrState::Merged => match status.merge_commit {
+                Some(commit) => match self.unbound(unit, pr) {
+                    Ok(None) => Outcome::Merged(commit),
+                    Ok(Some(why)) => {
+                        Outcome::Unbound(format!("PR #{pr} merged, but it is not unit {unit}'s PR: {why}"))
+                    }
+                    Err(e) => Outcome::Unsure(e),
+                },
                 None => Outcome::Unsure(format!("PR #{pr} is merged, but no merge commit was named")),
             },
             PrState::Closed => Outcome::NotMerging,
-            PrState::Open => match in_merge_queue(&self.repo, pr) {
-                Ok(false) => Outcome::NotMerging,
-                Ok(true) => Outcome::Unsure(format!("PR #{pr} is still in the merge queue")),
-                Err(e) => Outcome::Unsure(format!("could not read {e}")),
-            },
+            PrState::Open if status.in_queue => Outcome::Unsure(format!("PR #{pr} is still in the merge queue")),
+            PrState::Open if status.auto_merge => {
+                Outcome::Unsure(format!("PR #{pr} has auto-merge armed, so GitHub may still merge it"))
+            }
+            PrState::Open => Outcome::NotMerging,
             PrState::Other => Outcome::Unsure(format!("PR #{pr} is in a state the driver does not know")),
+        }
+    }
+
+    /// Whether the PR is the unit's, whatever its state: `None` when it is,
+    /// else why not. `Err` is a read that failed.
+    fn unbound(&self, unit: u64, pr: u64) -> Result<Option<String>, String> {
+        let view = read_view(&self.repo, pr).map_err(|e| format!("could not read PR #{pr}: {e}"))?;
+        self.binding_problem(unit, pr, &view)
+    }
+
+    /// Why the PR is not the unit's (wrong base, branch or repository):
+    /// `Ok(None)` when it is. `Err` is a `unit.json` that cannot be read or
+    /// names no branch: that proves nothing about the PR, so no caller may
+    /// treat it as a mismatch and let the unit go.
+    fn binding_problem(&self, unit: u64, pr: u64, view: &PrView) -> Result<Option<String>, String> {
+        let path = self.unit_dir(unit).join("unit.json");
+        let unit_file: Value =
+            read_json(&path).ok_or_else(|| format!("{} is missing or not valid JSON", path.display()))?;
+        let branch = unit_file["branch"]
+            .as_str()
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("unit {unit} has no branch in unit.json"))?;
+        let refusals = binding(&self.repo, &self.ctx.profile.base_branch, unit, pr, view, &Ok(branch));
+        if refusals.is_empty() {
+            Ok(None)
+        } else {
+            let text: Vec<String> = refusals.iter().map(|r| format!("{}: {}", r.code, r.detail)).collect();
+            Ok(Some(text.join("; ")))
         }
     }
 
