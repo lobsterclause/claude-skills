@@ -633,10 +633,11 @@ impl<'a> Driver<'a> {
         }
     }
 
-    /// One progress line on stderr, unless `--quiet`.
+    /// One progress line on stderr, unless `--quiet`. Best effort: a closed
+    /// stderr must not stop the run, so a failed write is ignored.
     fn say(&self, line: &str) {
         if !self.quiet {
-            eprintln!("drive: {line}");
+            let _ = writeln!(std::io::stderr(), "drive: {line}");
         }
     }
 

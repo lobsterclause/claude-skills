@@ -549,12 +549,20 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
             if title.is_empty() {
                 return Err(Fail::usage("followup-create needs --title"));
             }
-            if let Some(tracker) = labels.iter().find(|l| same_label(l, &p.tracker_label)) {
+            // `gh` splits a `--label` value on commas, so each part is checked.
+            for label in labels.iter().flat_map(|l| l.split(',')).map(str::trim) {
+                let why = if same_label(label, &p.tracker_label) {
+                    "the tracker label"
+                } else if same_label(label, &p.claim_label) {
+                    "the claim label, which only `claim take` adds"
+                } else {
+                    continue;
+                };
                 return Err(refuse(
                     ctx,
                     verb,
                     mode,
-                    format!("'{tracker}' is the tracker label, which a follow-up never carries"),
+                    format!("'{label}' is {why}; a follow-up never carries it"),
                 ));
             }
             (
@@ -905,7 +913,7 @@ const USAGES: &[(&str, &str)] = &[
     ),
     (
         "followup-create",
-        "followup-create --title <text> --body-file <file> [--label <name>]...\n    Create an ordinary issue, never with the tracker label (that label is refused, exit 3). Prints the new issue URL. A unit may.",
+        "followup-create --title <text> --body-file <file> [--label <name>]...\n    Create an ordinary issue, never with the tracker or claim label (either is refused, exit 3, also inside a comma-separated value). Prints the new issue URL. A unit may.",
     ),
     (
         "comment",

@@ -1009,6 +1009,32 @@ fn followup_create_refuses_the_tracker_label_in_any_case() {
 }
 
 #[test]
+fn followup_create_refuses_the_claim_label_and_a_refused_label_inside_a_list() {
+    let env = Env::new();
+    let body = body(&env);
+    for (label, why) in [
+        ("agent-in-progress", "claim label"),
+        ("Agent-In-Progress", "claim label"),
+        ("bug,issue-drain", "tracker label"),
+        ("bug, agent-in-progress", "claim label"),
+    ] {
+        let out = env.run(&[
+            "gh-write",
+            "followup-create",
+            "--title",
+            "x",
+            "--body-file",
+            &body,
+            "--label",
+            label,
+        ]);
+        assert_eq!(out.code, 3, "{label}: {}", out.stderr);
+        assert!(out.stderr.contains(why), "{label}: {}", out.stderr);
+    }
+    assert!(env.gh_calls().is_empty(), "{:?}", env.gh_calls());
+}
+
+#[test]
 fn followup_create_dry_run_prints_would_and_calls_nothing() {
     let mut env = Env::new();
     env.set("ISSUE_DRAIN_DRY_RUN", "1");
