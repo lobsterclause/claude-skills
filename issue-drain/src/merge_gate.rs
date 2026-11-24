@@ -1691,6 +1691,9 @@ pub fn parse_review_records(raw: &str) -> Read<Vec<ReviewRecord>> {
     Ok(all)
 }
 
+/// The file in the unit folder that names the head the gate asked GitHub to merge.
+pub const APPROVED_HEAD: &str = "merge-approved-head";
+
 const QUEUE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){isInMergeQueue}}}";
 
 /// `isInMergeQueue` of the GraphQL answer. `gh pr view --json` has no such
@@ -2281,7 +2284,13 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         )));
     }
 
-    // The head was read at the start; the merge names it.
+    // The head was read at the start; the merge names it. Record it first, so
+    // post-merge compares the merge commit with the head this gate approved,
+    // not with whatever head the PR has by then.
+    if !ctx.dry_run {
+        let path = ctx.path(&format!("units/{unit}/{APPROVED_HEAD}"));
+        crate::ctx::write_atomic(&path, format!("{head}\n").as_bytes())?;
+    }
     match gh::write(
         ctx,
         &Write::MergePr {

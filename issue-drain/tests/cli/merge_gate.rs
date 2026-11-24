@@ -177,6 +177,8 @@ fn a_clear_pr_is_merged_with_the_exact_arguments() {
     assert_eq!(r["refusals"], json!([]));
     assert_eq!(r["reviewers"], json!(["codex", "kimi"]));
     assert_eq!(merged_calls(&env), [MERGE]);
+    let record = fs::read_to_string(env.workdir.join("units/3/merge-approved-head")).expect("the approved head");
+    assert_eq!(record.trim(), HEAD);
     let calls = env.gh_calls();
     assert!(
         calls.iter().all(|c| !c.contains("--admin") && !c.contains("--auto")),

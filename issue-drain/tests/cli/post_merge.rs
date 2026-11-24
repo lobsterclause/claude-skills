@@ -102,6 +102,38 @@ fn a_merge_with_the_approved_tree_and_an_issue_the_merge_closed() {
 }
 
 #[test]
+fn the_tree_is_compared_with_the_head_the_gate_approved() {
+    let mut c = case();
+    quick(&mut c);
+    let merge = squash_merge(&c);
+    // The PR's head moved after the gate approved old_head.
+    let mut view = merged_view(&c, &merge, &[103]);
+    view["headRefOid"] = json!("b".repeat(40));
+    c.pr_with(&view);
+    issue(&c, 103, "CLOSED");
+    c.env.write("units/3/merge-approved-head", &format!("{}\n", c.old_head));
+    let out = post_merge(&c);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let r = printed(&out);
+    assert_eq!(r["head"], c.old_head);
+    assert_eq!(r["tree_match"], true);
+    assert!(!out.stderr.contains("no record"), "{}", out.stderr);
+}
+
+#[test]
+fn without_a_record_the_current_head_is_used_and_the_report_says_so() {
+    let mut c = case();
+    quick(&mut c);
+    let merge = squash_merge(&c);
+    merged(&c, &merge, &[103]);
+    issue(&c, 103, "CLOSED");
+    let out = post_merge(&c);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(printed(&out)["head"], c.old_head);
+    assert!(out.stderr.contains("no record"), "{}", out.stderr);
+}
+
+#[test]
 fn a_moved_base_is_reported_but_is_not_an_error() {
     let mut c = case();
     quick(&mut c);

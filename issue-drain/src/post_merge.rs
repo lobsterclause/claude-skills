@@ -33,6 +33,7 @@
 //! unit's, an issue is held for a person, or a unit process asked; 1 GitHub or
 //! git failed, or an issue is still open; 2 usage.
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::thread::sleep;
@@ -376,7 +377,15 @@ pub fn run(ctx: &Ctx, args: &Args) -> Res<()> {
         .clone()
         .filter(|s| is_sha(s))
         .ok_or_else(|| Fail::failed(format!("PR #{pr} is merged but names no merge commit")))?;
-    let head = view.head.clone();
+    let head = match fs::read_to_string(ctx.path(&format!("units/{unit}/{}", merge_gate::APPROVED_HEAD))) {
+        Ok(text) if is_sha(text.trim()) => text.trim().to_string(),
+        _ => {
+            eprintln!(
+                "issue-drain post-merge: there is no record of the head the gate approved for unit {unit}; comparing with the PR's current head"
+            );
+            view.head.clone()
+        }
+    };
 
     let tree_match = trees_match(ctx, unit, &merge, &head)?;
     if !tree_match {
