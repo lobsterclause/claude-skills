@@ -52,7 +52,10 @@
 //! Per unit, by state:
 //!   queued        `claim take`. An exit 3 (an issue is someone else's) goes to
 //!                 skipped. A unit the tracker no longer lists goes to skipped.
-//!   claimed       `unit-prepare`; failure goes to blocked.
+//!   claimed       `unit-prepare`; failure goes to blocked. The driver's limit
+//!                 on it is the profile's bootstrap and codegraph limits plus a
+//!                 margin (at least 1800 s), so a slow bootstrap fails as the
+//!                 bootstrap, not as a driver timeout.
 //!   prepared      move to implementing.
 //!   implementing  read `result.json`; if absent, `unit-run` (first attempt), or
 //!                 one retry a model tier up (haiku, sonnet, opus, limited to
@@ -291,6 +294,21 @@ impl Reply {
             None => format!("exit {}", self.code),
         }
     }
+}
+
+/// How long the driver lets one child run. `unit-run` gets the unit's own
+/// limit plus a margin. `unit-prepare` runs the profile's bootstrap under
+/// `bootstrap_timeout_secs`, codegraph under `codegraph_timeout_secs` (up to two
+/// runs) and two git calls of 120 s; its limit is those plus a margin, so the
+/// inner limit always fires first and a slow bootstrap is reported as a
+/// bootstrap failure, not a driver timeout.
+fn call_limit(p: &crate::profile::Profile, command: Option<&str>) -> Duration {
+    let secs = match command {
+        Some("unit-run") => p.unit_timeout_secs + 900,
+        Some("unit-prepare") => (p.bootstrap_timeout_secs + 2 * p.codegraph_timeout_secs + 2 * 120 + 900).max(1800),
+        _ => 1800,
+    };
+    Duration::from_secs(secs)
 }
 
 /// Why the claude process inside a successful `unit-run` failed, from the
@@ -809,10 +827,7 @@ impl<'a> Driver<'a> {
             .collect();
         let out = self.ctx.path(&format!("drive/{seq:05}-{name}.out"));
         let err = self.ctx.path(&format!("drive/{seq:05}-{name}.err"));
-        let limit = match args.first() {
-            Some(&"unit-run") => Duration::from_secs(self.ctx.profile.unit_timeout_secs + 900),
-            _ => Duration::from_secs(1800),
-        };
+        let limit = call_limit(&self.ctx.profile, args.first().copied());
         // The logs exist before they are named, so a watcher can tail them at once.
         let files = exec::open_logs((&out, &err))?;
         if args.first().is_some_and(|a| LONG_CHILDREN.contains(a)) {
@@ -2119,6 +2134,22 @@ mod tests {
             code: code.into(),
             detail: detail.into(),
         }
+    }
+
+    #[test]
+    fn the_unit_prepare_limit_is_longer_than_everything_it_runs() {
+        let mut p = crate::profile::Profile::default();
+        p.bootstrap_timeout_secs = 3000;
+        p.codegraph_timeout_secs = 300;
+        let limit = call_limit(&p, Some("unit-prepare")).as_secs();
+        assert!(limit >= 3000 + 300 + 300 + 240 + 600, "{limit}");
+        let quick = crate::profile::Profile::default();
+        assert!(call_limit(&quick, Some("unit-prepare")).as_secs() >= 1800);
+        assert_eq!(call_limit(&quick, Some("merge-gate")).as_secs(), 1800);
+        assert_eq!(
+            call_limit(&quick, Some("unit-run")).as_secs(),
+            quick.unit_timeout_secs + 900
+        );
     }
 
     fn names(list: &[&str]) -> Vec<String> {
