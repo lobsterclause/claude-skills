@@ -1,0 +1,30 @@
+{
+  "name": "drain-console",
+  "version": "0.1.0",
+  "description": "Watch an issue-drain run from inside Claude Code: a pane with one row per unit, a status line entry, a notification when a unit merges, blocks or parks, a /drain command, and a button that asks the driver to stop after the current unit. It reads the run folder and never merges or changes the run's state.",
+  "author": {
+    "name": "lobsterclause",
+    "url": "https://github.com/lobsterclause/claude-skills"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "run_dir": {
+      "type": "string",
+      "title": "Run folder",
+      "description": "The issue-drain run folder to watch, e.g. ~/.issue-drain/owner__repo/2026-11-23-a. Empty watches the run whose state.json changed last.",
+      "default": ""
+    },
+    "poll_seconds": {
+      "type": "number",
+      "title": "Poll interval (seconds)",
+      "description": "How often to read the run folder. Values under 5 use 15.",
+      "default": 15
+    },
+    "summarise_on_stop": {
+      "type": "boolean",
+      "title": "Summarise when the drain needs a person",
+      "description": "When a unit blocks or parks, or the drain stops or finishes, submit a prompt asking Claude to read the run and propose the next move. Off by default: it starts a model turn.",
+      "default": false
+    }
+  }
+}
