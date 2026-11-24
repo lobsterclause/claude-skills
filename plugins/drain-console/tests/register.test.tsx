@@ -31,6 +31,8 @@ const state = (u1: string) =>
 
 const call = (args: string[], code = 0) =>
   JSON.stringify({ ts: '2026-11-24T10:00:00Z', event: 'drive', unit: null, step: 'call', detail: { args, code } })
+const moved = (unit: number, to: string, note: string) =>
+  JSON.stringify({ ts: '2026-11-24T10:00:00Z', unit, from: 'reviewing', to, note })
 
 type World = {
   clock: ReturnType<typeof mock.clock>
@@ -138,7 +140,7 @@ const parkIt = (w: World) => {
   w.files.set(
     `${RUN}/events.jsonl`,
     w.files.get(`${RUN}/events.jsonl`) +
-      call(['state', 'event', '1', 'parked', '--note', 'review cap reached']) + '\n',
+      moved(1, 'parked', 'review cap reached') + '\n',
   )
 }
 
@@ -186,6 +188,7 @@ test(
     expect(w.prompts.length).toBe(1)
     expect(w.prompts[0]).toContain(RUN)
     expect(w.prompts[0]).toContain('Change nothing')
+    expect(w.prompts[0]).not.toContain('review cap reached')
   },
 )
 
@@ -199,6 +202,39 @@ test('the stop button writes the STOP file and nothing else', async ($, on) => {
   expect(w.writes.map(x => x.path)).toEqual([`${RUN}/STOP`])
   expect(w.statuses.at(-1)).toBe('drain 0/2 · U1 #11 implementing 5m · stop requested')
   await ui.unmount()
+})
+
+test('after a switch, the stop button stops the run it now shows, never the old one', async ($, on) => {
+  const w = world(on)
+  const OTHER = `${HOME}/.issue-drain/acme__app/2026-11-24-b`
+  for (const [k, v] of [...w.files]) {
+    if (k.startsWith(RUN)) w.files.set(k.replace(RUN, OTHER), v)
+  }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  // The switch redraws the pane, so the button is now bound to OTHER. A press
+  // that lands between a poll and its redraw is refused by requestStop's check.
+  await $.command.run(typed(OTHER))
+  expect(await ui.find({ type: 'Text', text: /run 2026-11-24-b/ })).toBeTruthy()
+  await ui.press({ key: 'stop' })
+  expect(w.writes.map(x => x.path)).toEqual([`${OTHER}/STOP`])
+  await ui.unmount()
+})
+
+test('/drain stop after a switch reads the new run, not a poll already running', async ($, on) => {
+  const w = world(on)
+  const OTHER = `${HOME}/.issue-drain/acme__app/2026-11-24-b`
+  for (const [k, v] of [...w.files]) {
+    if (k.startsWith(RUN)) w.files.set(k.replace(RUN, OTHER), v)
+  }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const out = await $.command.run(typed(OTHER))
+  expect(out.text).toContain('run 2026-11-24-b')
+  const stop = await $.command.run(typed('stop'))
+  expect(stop.text).toBe(`Wrote ${OTHER}/STOP. The driver finishes the unit it is on and stops before it claims the next one.`)
+  expect(w.writes.map(x => x.path)).toEqual([`${OTHER}/STOP`])
 })
 
 test('/drain prints the run without a model turn', async ($, on) => {
@@ -239,6 +275,12 @@ test('a headless session gets nothing', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: false })
   expect(w.commands).toEqual([])
   expect(w.statuses).toEqual([])
+})
+
+test('an empty ISSUE_DRAIN_UNIT_FILE counts as unset', async ($, on) => {
+  const w = world(on, { HOME, ISSUE_DRAIN_UNIT_FILE: '' })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(w.commands).toEqual(['drain'])
 })
 
 test('a unit process gets nothing', async ($, on) => {

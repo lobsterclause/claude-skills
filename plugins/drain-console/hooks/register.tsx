@@ -48,8 +48,9 @@ const errText = (err: unknown): string =>
 /** `~` and `~/x` against HOME; anything else as given. */
 const expand = (path: string, home: string | undefined): string => {
   const p = path.trim().replace(/\/+$/, '')
-  if (home !== undefined && (p === '~' || p.startsWith('~/'))) {
-    return `${home}${p.slice(1)}`
+  const h = home?.replace(/\/+$/, '') ?? ''
+  if (h !== '' && (p === '~' || p.startsWith('~/'))) {
+    return `${h}${p.slice(1)}`
   }
   return p
 }
@@ -158,13 +159,26 @@ async function readRun($: EngineInterface, dir: string): Promise<RunFiles> {
   }
 }
 
-/** Reads the run, stores the view, and says what changed. */
-function poll($: EngineInterface, options: PluginOptions): Promise<Snapshot> {
-  if (polling !== null) return polling
-  polling = pollOnce($, options).finally(() => {
-    polling = null
+/**
+ * Reads the run, stores the view, and says what changed. A timer poll joins
+ * one already running. `fresh` is for a caller that has just changed what a
+ * poll would read (the STOP file, the chosen run): a poll already running
+ * may have read before the change, so it waits for that one and reads again.
+ */
+async function poll(
+  $: EngineInterface,
+  options: PluginOptions,
+  fresh = false,
+): Promise<Snapshot> {
+  while (polling !== null) {
+    if (!fresh) return polling
+    await polling.catch(() => undefined)
+  }
+  const run = pollOnce($, options).finally(() => {
+    if (polling === run) polling = null
   })
-  return polling
+  polling = run
+  return run
 }
 
 async function pollOnce($: EngineInterface, options: PluginOptions): Promise<Snapshot> {
@@ -176,7 +190,7 @@ async function pollOnce($: EngineInterface, options: PluginOptions): Promise<Sna
     next = { view: null, note: 'No issue-drain run found under ~/.issue-drain.', readAtMs: now }
   } else {
     try {
-      next = { view: buildView(await readRun($, dir)), note: '', readAtMs: now }
+      next = { view: buildView(await readRun($, dir), prev.view), note: '', readAtMs: now }
     } catch (err) {
       // A failed read of the same run keeps the last view, so a state.json
       // caught mid-write does not reset the baseline and lose a transition.
@@ -205,16 +219,31 @@ async function pollOnce($: EngineInterface, options: PluginOptions): Promise<Sna
   return next
 }
 
-/** Writes the STOP file, which the driver checks before it claims a unit. */
-async function requestStop($: EngineInterface, options: PluginOptions): Promise<string> {
+/**
+ * Writes the STOP file, which the driver checks before it claims a unit.
+ * `shown` is the run folder the pane drew the button for: a poll since then
+ * may have moved the console to another run, and a press must not stop that.
+ */
+async function requestStop(
+  $: EngineInterface,
+  options: PluginOptions,
+  shown?: string,
+): Promise<string> {
   const view = (await read($, snapshot)).view
   if (view === null) return 'No run to stop.'
+  if (shown !== undefined && view.runDir !== shown) {
+    return `The console now shows ${view.runDir}, not ${shown}; nothing was stopped.`
+  }
   if (view.stopped !== null) return `The run already stopped: ${view.stopped.reason}`
   if (view.isFinished) return 'The run has finished; there is nothing to stop.'
   const path = `${view.runDir}/STOP`
   const at = new Date(await $.clock.now()).toISOString()
-  await $.fs.write(path, `stop requested from drain-console at ${at}\n`)
-  await poll($, options)
+  try {
+    await $.fs.write(path, `stop requested from drain-console at ${at}\n`)
+  } catch (err) {
+    return `Cannot write ${path}: ${clip(errText(err), 160)}`
+  }
+  await poll($, options, true).catch(() => undefined)
   return `Wrote ${path}. The driver finishes the unit it is on and stops before it claims the next one.`
 }
 
@@ -225,7 +254,9 @@ async function isConsoleSession(
 ): Promise<boolean> {
   if (!isInteractive) return false
   if ((await $.env.get('ISSUE_DRAIN_MODE')) === 'unit') return false
-  if ((await $.env.get('ISSUE_DRAIN_UNIT_FILE')) !== undefined) return false
+  // Set and empty counts as unset, as it does for the driver and the guards mod.
+  const unitFile = await $.env.get('ISSUE_DRAIN_UNIT_FILE')
+  if (unitFile !== undefined && unitFile !== '') return false
   return true
 }
 
@@ -242,10 +273,17 @@ export const register: Register = (on, options) => {
         description: 'Show the issue-drain run: status, the pane, or a STOP request',
         argumentHint: '[pane | stop | auto | <run folder>]',
       })
-      const first = await poll($, options)
-      const view = first.view
-      if (view !== null && !view.isFinished && view.stopped === null && isRecent(view, first.readAtMs)) {
-        void $.ui.open({ id: PANE, title: TITLE })
+      // A failed first read must not fail the session's start.
+      const first = await poll($, options).catch(() => null)
+      const view = first?.view ?? null
+      if (
+        first !== null &&
+        view !== null &&
+        !view.isFinished &&
+        view.stopped === null &&
+        isRecent(view, first.readAtMs)
+      ) {
+        void $.ui.open({ id: PANE, title: TITLE }).catch(() => undefined)
       }
       $.clock.every(seconds * 1000, () => {
         void poll($, options).catch(() => undefined)
@@ -273,7 +311,7 @@ export const register: Register = (on, options) => {
       }
       await $.store.set(STORE_RUN, dir)
     }
-    const snap = await poll($, options)
+    const snap = await poll($, options, arg !== '')
     const pinned = typeof options.run_dir === 'string' && options.run_dir.trim() !== ''
     const note =
       pinned && arg !== ''
@@ -314,7 +352,10 @@ export const register: Register = (on, options) => {
             <Button
               key="stop"
               label="Stop after this unit"
-              onPress={() => requestStop($, options)}
+              onPress={async () => {
+                const said = await requestStop($, options, view.runDir)
+                if (!said.startsWith('Wrote ')) $.ui.toast(said)
+              }}
             />
           )}
           {view.stopRequested && view.stopped === null && (
@@ -322,7 +363,7 @@ export const register: Register = (on, options) => {
           )}
         </Box>
         {view.units.map(u => (
-          <Box flexDirection="column" marginTop={1}>
+          <Box key={u.id} flexDirection="column" marginTop={1}>
             <Box flexDirection="row" gap={1}>
               <Text bold>
                 {u.id}

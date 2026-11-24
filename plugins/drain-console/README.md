@@ -30,7 +30,7 @@ The pane opens on its own at session start when that run is active and unfinishe
 |---|---|---|
 | `run_dir` | empty | Pin one run folder. `~` is expanded. |
 | `poll_seconds` | 15 | How often to read the run. Values under 5 use 15. |
-| `summarise_on_stop` | off | When a unit blocks or parks, or the drain stops or finishes, submit a prompt asking Claude to read the run and propose the next move. The prompt tells Claude to change nothing. It is off by default because it starts a model turn. |
+| `summarise_on_stop` | off | When a unit blocks or parks, or the drain stops or finishes, submit a prompt asking Claude to read the run and propose the next move. The prompt names units and states only, never a note or a stop reason (a unit can write those), and tells Claude to change nothing. It is off by default because it starts a model turn. |
 
 ## Where it stays quiet
 
