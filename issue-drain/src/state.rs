@@ -355,6 +355,27 @@ pub fn log_text(ctx: &Ctx) -> Res<String> {
     }
 }
 
+/// When this run queued `unit`: the time of its first state event, as epoch
+/// seconds. `None` when the log has no event for it.
+pub fn queued_at(ctx: &Ctx, unit: u64) -> Res<Option<i64>> {
+    let text = log_text(ctx)?;
+    Ok(text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v.get("event").is_none() && v["unit"].as_u64() == Some(unit))
+        .find_map(|v| v["ts"].as_str().and_then(crate::ctx::parse_rfc3339)))
+}
+
+/// Whether a PR (a `gh` JSON object with `createdAt`) was opened before
+/// `queued`, so it belongs to an earlier run. A time that is missing or cannot
+/// be read is not before: such a PR is kept, and is compared like any other.
+pub fn opened_before(pr: &Value, queued: Option<i64>) -> bool {
+    match (pr["createdAt"].as_str().and_then(crate::ctx::parse_rfc3339), queued) {
+        (Some(created), Some(queued)) => created < queued,
+        _ => false,
+    }
+}
+
 /// Throw away a dry run's state, so the next dry run starts from the live log.
 pub fn reset_dry(ctx: &Ctx) -> Res<()> {
     for name in ["events.dry.jsonl", "state.dry.json"] {
@@ -810,14 +831,14 @@ fn record_by_hand(ctx: &Ctx, args: &RecordArgs) -> Res<()> {
     let Some(unit) = snapshot.unit(args.unit) else {
         return Err(Fail::refused(format!("unit {} is not in the queue", args.unit)));
     };
-    if to == Merged
-        && let Some(pr) = args.pr
-    {
-        merged_pr_is_the_units(ctx, args.unit, pr)?;
-    }
+    let merge_commit = match (to, args.pr) {
+        (Merged, Some(pr)) => merged_pr_is_the_units(ctx, args.unit, pr)?,
+        _ => None,
+    };
     let mut ev = now_event(ctx, Some(args.unit), to.as_str(), Some(reason.to_string()));
     ev.from = Some(unit.state.as_str().to_string());
     ev.pr = args.pr;
+    ev.head = merge_commit;
     ev.by_hand = Some(true);
     snapshot.apply(&ev).map_err(Fail::refused)?;
     append(ctx, &text, &[ev])?;
@@ -825,10 +846,12 @@ fn record_by_hand(ctx: &Ctx, args: &RecordArgs) -> Res<()> {
 }
 
 /// A merge recorded by hand is checked the way post-merge will check it: the
-/// PR is merged, and it is the unit's (its branch, the base, this repository).
-/// A wrong number would otherwise stop the next drive, and a unit in merged
-/// cannot be recorded again.
-fn merged_pr_is_the_units(ctx: &Ctx, unit: u64, pr: u64) -> Res<()> {
+/// PR is merged, and it is the unit's (its branch, the base, this repository,
+/// opened after this run queued the unit). A wrong number would otherwise stop
+/// the next drive, and a unit in merged cannot be recorded again. Returns the
+/// merge commit GitHub names, which the event keeps so a later base-sync
+/// conflict is put down to the files the merge really changed.
+fn merged_pr_is_the_units(ctx: &Ctx, unit: u64, pr: u64) -> Res<Option<String>> {
     use crate::merge_gate::{self, PrState, UnitBranch};
     let repo = ctx.repo()?;
     let view = merge_gate::read_view(&repo, pr).map_err(|e| Fail::failed(format!("could not read PR #{pr}: {e}")))?;
@@ -846,11 +869,20 @@ fn merged_pr_is_the_units(ctx: &Ctx, unit: u64, pr: u64) -> Res<()> {
                 Ok(b)
             }
         });
-    let refusals = merge_gate::binding(&repo, &ctx.profile.base_branch, unit, pr, &view, &branch);
-    if refusals.is_empty() {
-        return Ok(());
+    let mut why: Vec<String> = merge_gate::binding(&repo, &ctx.profile.base_branch, unit, pr, &view, &branch)
+        .into_iter()
+        .map(|r| r.detail)
+        .collect();
+    let created = crate::gh::read(&["pr", "view", &pr.to_string(), "--repo", &repo, "--json", "createdAt"])
+        .map_err(|rc| Fail::failed(format!("could not read when PR #{pr} was opened: gh exited {rc}")))?;
+    let created: Value =
+        serde_json::from_str(&created).map_err(|e| Fail::failed(format!("gh pr view #{pr} printed no JSON: {e}")))?;
+    if opened_before(&created, queued_at(ctx, unit)?) {
+        why.push(format!("it was opened before this run queued unit {unit}"));
     }
-    let why: Vec<String> = refusals.into_iter().map(|r| r.detail).collect();
+    if why.is_empty() {
+        return Ok(view.merge_commit.filter(|c| merge_gate::is_sha(c)));
+    }
     Err(Fail::refused(format!(
         "PR #{pr} cannot be recorded for unit {unit}: {}",
         why.join("; ")

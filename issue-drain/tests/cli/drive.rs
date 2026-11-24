@@ -408,6 +408,48 @@ fn a_merge_during_a_cut_short_base_sync_is_left_to_the_gate() {
 }
 
 #[test]
+fn a_merge_the_gate_approved_before_a_restart_is_left_to_the_gate() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    // the driver was killed after GitHub merged, before the merge-asked
+    // record or the merged event were written
+    c.env
+        .write("units/1/merge-approved-head", &format!("{}\n", "a".repeat(40)));
+    pr_now(&c, "MERGED", Some(&"c".repeat(40)), false);
+    c.env.stub_file(
+        "pr-list-fix_1.json",
+        &json!([listed(4701, "MERGED", "fix/1")]).to_string(),
+    );
+    let (out, _) = c.drive(&[]);
+    assert!(!out.stderr.contains("state disagrees"), "{}", out.stderr);
+}
+
+#[test]
+fn a_pr_from_before_the_unit_was_queued_does_not_stop_the_run() {
+    let c = case(&[1, 2]);
+    c.seed(1, &[], None);
+    // an earlier run's PR on the same branch name
+    let mut old = listed(30, "MERGED", "fix/1");
+    old["createdAt"] = json!("2026-01-01T00:00:00Z");
+    c.env.stub_file("pr-list-fix_1.json", &json!([old]).to_string());
+    let (out, _) = c.drive(&["--once"]);
+    assert!(!out.stderr.contains("state disagrees"), "{}", out.stderr);
+    assert_eq!(c.count("claim take --unit 1"), 1);
+}
+
+#[test]
+fn a_pr_from_this_run_that_ended_still_stops_the_run() {
+    let c = case(&[1]);
+    c.seed(1, &[], None);
+    let mut new = listed(31, "MERGED", "fix/1");
+    new["createdAt"] = json!("2027-01-01T00:00:00Z");
+    c.env.stub_file("pr-list-fix_1.json", &json!([new]).to_string());
+    let (out, _) = c.drive(&[]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("PR #31 is merged"), "{}", out.stderr);
+}
+
+#[test]
 fn a_failed_github_read_is_reported_not_ignored() {
     let c = case(&[1]);
     c.seed(1, &[], None);

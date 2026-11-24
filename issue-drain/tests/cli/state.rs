@@ -547,6 +547,8 @@ fn record_writes_a_unit_worked_by_hand_as_merged_with_its_reason() {
     let last = state_events(&env).pop().unwrap();
     assert_eq!(last["note"], "merged by hand");
     assert_eq!(last["pr"], 41);
+    // the merge commit GitHub names is kept, for conflict attribution later
+    assert_eq!(last["head"], "c".repeat(40));
     // the log alone rebuilds the same state
     assert_eq!(env.run(&["state", "rebuild"]).code, 0);
     assert_eq!(unit_state(&env, 1), "merged");
@@ -624,6 +626,16 @@ fn record_refuses_a_merge_github_does_not_show_for_the_unit() {
     let out = record(&env, &merged);
     assert_eq!(out.code, 3, "{}", out.stderr);
     assert!(out.stderr.contains("not merged"), "{}", out.stderr);
+    assert_eq!(unit_state(&env, 1), "queued");
+    // a PR opened before this run queued the unit: an earlier run's, on a
+    // reused branch name
+    merged_by_hand(&env, 1, 41);
+    let mut view: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    view["createdAt"] = json!("2026-01-01T00:00:00Z");
+    env.stub_file("pr-view-41.json", &view.to_string());
+    let out = record(&env, &merged);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert!(out.stderr.contains("before this run queued"), "{}", out.stderr);
     assert_eq!(unit_state(&env, 1), "queued");
     // control: the same record with GitHub agreeing is taken
     merged_by_hand(&env, 1, 41);

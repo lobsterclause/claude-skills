@@ -1163,6 +1163,11 @@ impl<'a> Driver<'a> {
             if u.state == State::Gate && dir.join(crate::base_sync::PENDING_MARKER).exists() {
                 continue;
             }
+            // A gate that approved a head may have merged it before the driver
+            // was killed; the gate step reads the PR and settles that itself.
+            if u.state == State::Gate && dir.join(crate::merge_gate::APPROVED_HEAD).exists() {
+                continue;
+            }
             let Some(branch) = read_json::<Value>(&dir.join("unit.json"))
                 .and_then(|v| v["branch"].as_str().map(str::to_string))
                 .filter(|b| !b.is_empty())
@@ -1179,7 +1184,7 @@ impl<'a> Driver<'a> {
                 "--state",
                 "all",
                 "--json",
-                "number,state,baseRefName,headRepository,headRepositoryOwner",
+                "number,state,baseRefName,headRepository,headRepositoryOwner,createdAt",
                 "--limit",
                 "30",
             ])
@@ -1193,9 +1198,12 @@ impl<'a> Driver<'a> {
                 .map_err(|e| Fail::failed(format!("gh pr list for branch {branch} printed no JSON list: {e}")))?;
             // `--head` matches the branch name in any fork and against any
             // base, so keep only PRs that could be the unit's: from this
-            // repository, aimed at the base, and the PR state names when it
-            // names one.
+            // repository, aimed at the base, the PR state names when it names
+            // one, and not opened before this run queued the unit (a branch
+            // name is the unit number and title, so an earlier run's PR can
+            // carry it).
             let base = &self.ctx.profile.base_branch;
+            let queued = crate::state::queued_at(self.ctx, u.unit)?;
             let prs: Vec<Value> = all
                 .into_iter()
                 .filter(|p| {
@@ -1207,6 +1215,7 @@ impl<'a> Driver<'a> {
                     p["baseRefName"].as_str() == Some(base.as_str())
                         && from.eq_ignore_ascii_case(&self.repo)
                         && u.pr.is_none_or(|n| p["number"].as_u64() == Some(n))
+                        && !crate::state::opened_before(p, queued)
                 })
                 .collect();
             let state_of = |p: &Value| p["state"].as_str().unwrap_or_default().to_ascii_lowercase();
