@@ -142,6 +142,10 @@ pub struct Event {
     /// can rebuild the snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issues: Option<Vec<u64>>,
+    /// On a `state record` event only: the unit was worked by hand, so the
+    /// move skips the transition table and `merged` needs no `--head`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_hand: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -257,7 +261,25 @@ impl Snapshot {
                 ev.from.as_deref().unwrap_or_default()
             ));
         }
-        if !from.exits().contains(&to) {
+        let by_hand = ev.by_hand == Some(true);
+        if by_hand {
+            if !matches!(to, Merged | Parked) {
+                return Err(format!(
+                    "a record moves a unit to merged or parked, not {}",
+                    to.as_str()
+                ));
+            }
+            if from.is_terminal() || from == Merged {
+                return Err(format!(
+                    "unit {number} is in state {}, which is finished; it cannot be recorded as {}",
+                    from.as_str(),
+                    to.as_str()
+                ));
+            }
+            if to == Merged && ev.pr.is_none() {
+                return Err(format!("unit {number} cannot be recorded as merged without --pr"));
+            }
+        } else if !from.exits().contains(&to) {
             return Err(format!(
                 "unit {number} is in state {} and cannot move to {}",
                 from.as_str(),
@@ -276,10 +298,10 @@ impl Snapshot {
                 from.as_str()
             ));
         }
-        if to == PrOpen && ev.pr.is_none() {
+        if !by_hand && to == PrOpen && ev.pr.is_none() {
             return Err(format!("unit {number} cannot move to pr_open without --pr"));
         }
-        if to == Merged && ev.head.is_none() {
+        if !by_hand && to == Merged && ev.head.is_none() {
             return Err(format!("unit {number} cannot move to merged without --head"));
         }
         unit.state = to;
@@ -433,6 +455,8 @@ pub enum Command {
     Stop(StopArgs),
     /// Lift a stop.
     Resume,
+    /// Write a unit worked by hand back into the state: merged or parked.
+    Record(RecordArgs),
     /// Print where every unit is.
     Show(ShowArgs),
     /// Print the number of the next unit still to work, if any.
@@ -466,6 +490,22 @@ pub struct EventArgs {
 }
 
 #[derive(clap::Args)]
+pub struct RecordArgs {
+    /// The unit's number (3 for U3).
+    #[arg(long)]
+    unit: u64,
+    /// What happened to it: merged or parked.
+    #[arg(long)]
+    state: String,
+    /// The PR's number. Required for merged.
+    #[arg(long)]
+    pr: Option<u64>,
+    /// Why the state is being written by hand.
+    #[arg(long)]
+    reason: String,
+}
+
+#[derive(clap::Args)]
 pub struct StopArgs {
     #[arg(long)]
     reason: String,
@@ -492,6 +532,7 @@ pub fn run(ctx: &Ctx, command: &Command) -> Res<()> {
         Command::Event(args) => event(ctx, args),
         Command::Stop(args) => record(ctx, now_event(ctx, None, STOP, Some(args.reason.clone()))),
         Command::Resume => record(ctx, now_event(ctx, None, RESUME, None)),
+        Command::Record(args) => record_by_hand(ctx, args),
         Command::Show(args) => show(ctx, args),
         Command::Next => next(ctx),
         Command::Rebuild => rebuild(ctx),
@@ -508,6 +549,7 @@ fn now_event(ctx: &Ctx, unit: Option<u64>, to: &str, note: Option<String>) -> Ev
         pr: None,
         head: None,
         issues: None,
+        by_hand: None,
     }
 }
 
@@ -734,6 +776,38 @@ fn event(ctx: &Ctx, args: &EventArgs) -> Res<()> {
     ev.from = Some(unit.state.as_str().to_string());
     ev.pr = args.pr;
     ev.head = args.head.clone();
+    snapshot.apply(&ev).map_err(Fail::refused)?;
+    append(ctx, &text, &[ev])?;
+    write_snapshot(ctx, &snapshot)
+}
+
+/// `state record`: one event, through the same rules and the same log as
+/// `state event`, but from any unfinished state.
+fn record_by_hand(ctx: &Ctx, args: &RecordArgs) -> Res<()> {
+    let to = match State::from_name(&args.state) {
+        Some(to @ (Merged | Parked)) => to,
+        _ => {
+            return Err(Fail::usage(format!(
+                "--state must be merged or parked (got '{}')",
+                args.state
+            )));
+        }
+    };
+    if to == Merged && args.pr.is_none() {
+        return Err(Fail::usage("--pr is required to record a unit as merged"));
+    }
+    let reason = args.reason.trim();
+    if reason.is_empty() {
+        return Err(Fail::usage("--reason needs some text"));
+    }
+    let Replay { mut snapshot, text, .. } = started(ctx)?;
+    let Some(unit) = snapshot.unit(args.unit) else {
+        return Err(Fail::refused(format!("unit {} is not in the queue", args.unit)));
+    };
+    let mut ev = now_event(ctx, Some(args.unit), to.as_str(), Some(reason.to_string()));
+    ev.from = Some(unit.state.as_str().to_string());
+    ev.pr = args.pr;
+    ev.by_hand = Some(true);
     snapshot.apply(&ev).map_err(Fail::refused)?;
     append(ctx, &text, &[ev])?;
     write_snapshot(ctx, &snapshot)

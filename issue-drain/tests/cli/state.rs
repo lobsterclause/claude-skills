@@ -518,3 +518,79 @@ fn no_temporary_file_is_left_behind() {
     names.sort();
     assert_eq!(names, ["events.jsonl", "queue.json", "state.json"]);
 }
+
+fn record(env: &Env, args: &[&str]) -> Out {
+    let mut full = vec!["state", "record"];
+    full.extend_from_slice(args);
+    env.run(&full)
+}
+
+#[test]
+fn record_writes_a_unit_worked_by_hand_as_merged_with_its_reason() {
+    let env = ready();
+    let out = record(
+        &env,
+        &[
+            "--unit",
+            "1",
+            "--state",
+            "merged",
+            "--pr",
+            "41",
+            "--reason",
+            "merged by hand",
+        ],
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(unit_state(&env, 1), "merged");
+    let last = state_events(&env).pop().unwrap();
+    assert_eq!(last["note"], "merged by hand");
+    assert_eq!(last["pr"], 41);
+    // the log alone rebuilds the same state
+    assert_eq!(env.run(&["state", "rebuild"]).code, 0);
+    assert_eq!(unit_state(&env, 1), "merged");
+    // control: the unit is the only one that moved
+    assert_eq!(unit_state(&env, 2), "queued");
+}
+
+#[test]
+fn record_parks_a_unit_and_needs_no_pr() {
+    let env = ready();
+    let out = record(&env, &["--unit", "1", "--state", "parked", "--reason", "split into #9"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(unit_state(&env, 1), "parked");
+}
+
+#[test]
+fn record_refuses_other_states_and_a_merge_without_a_pr() {
+    let env = ready();
+    let out = record(&env, &["--unit", "1", "--state", "done", "--reason", "x"]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    let out = record(&env, &["--unit", "1", "--state", "merged", "--reason", "x"]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(unit_state(&env, 1), "queued");
+}
+
+#[test]
+fn record_refuses_a_finished_unit_an_unknown_unit_and_a_unit_process() {
+    let env = ready();
+    ok(&env, &["1", "skipped"]);
+    let out = record(&env, &["--unit", "1", "--state", "parked", "--reason", "x"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let out = record(&env, &["--unit", "99", "--state", "parked", "--reason", "x"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    let mut unit = Env::new();
+    unit.seed(&["queue.json"]);
+    assert_eq!(unit.run(&["state", "init"]).code, 0);
+    unit.set("ISSUE_DRAIN_MODE", "unit");
+    let out = record(&unit, &["--unit", "1", "--state", "parked", "--reason", "x"]);
+    assert_eq!(out.code, 3, "{}", out.stderr);
+    assert_eq!(snapshot(&unit)["units"][0]["state"], "queued");
+}
+
+#[test]
+fn record_refuses_an_empty_reason() {
+    let env = ready();
+    let out = record(&env, &["--unit", "1", "--state", "parked", "--reason", "  "]);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+}

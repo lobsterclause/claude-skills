@@ -93,6 +93,7 @@ fn name(command: &Command) -> &'static str {
         Command::State(state::Command::Event(_)) => "state event",
         Command::State(state::Command::Stop(_)) => "state stop",
         Command::State(state::Command::Resume) => "state resume",
+        Command::State(state::Command::Record(_)) => "state record",
         Command::State(state::Command::Show(_)) => "state show",
         Command::State(state::Command::Next) => "state next",
         Command::State(state::Command::Rebuild) => "state rebuild",

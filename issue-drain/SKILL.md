@@ -146,7 +146,7 @@ Every subcommand uses the first four, and prints one line saying why on anything
 
 `close-verified`, `tracker publish`, `merge-gate` and every `state` verb refuse with exit 3, before they write or log anything, in a unit process: `ISSUE_DRAIN_MODE=unit`, or `ISSUE_DRAIN_UNIT_FILE` set with no mode.
 
-`state init --parsed` takes the same go-ahead as step 1 above: it refuses (exit 3) a saved `tracker parse` that has `stop: true`, a `tracker_state` other than `OPEN` (null only in a dry run), a non-empty `unknown`, or a `run` that is not this run's (a parse without `run` is exit 2). `state event --head` takes a full 40 or 64 digit commit SHA.
+`state init --parsed` takes the same go-ahead as step 1 above: it refuses (exit 3) a saved `tracker parse` that has `stop: true`, a `tracker_state` other than `OPEN` (null only in a dry run), a non-empty `unknown`, or a `run` that is not this run's (a parse without `run` is exit 2). `state event --head` takes a full 40 or 64 digit commit SHA. `state record --unit <n> --state merged|parked --pr <n> --reason <text>` writes a unit worked by hand back into the state, so `state.json` matches what happened. It moves the unit from any unfinished state, skips the transition table, needs `--pr` for `merged` (and no `--head`), and keeps the reason as the event's note; any other `--state` is exit 2.
 
 ## The run folder
 
