@@ -113,6 +113,10 @@
 //!                                 purpose: a person has to act on the PR, and
 //!                                 syncing or repairing it would move the head
 //!                                 under them.
+//!                                 A unit in `gate` with a `base-sync-pending.json`
+//!                                 (a sync cut short by a restart) runs `base-sync`
+//!                                 first, before the gate is read; it finishes
+//!                                 that sync and spends no second one.
 //!   behind_base                   `base-sync` (an exit 1 is tried up to
 //!                                 BASE_SYNC_TRIES times, since GitHub may not
 //!                                 have applied the update yet), then ci_wait, or reviewing if
@@ -1558,6 +1562,13 @@ impl<'a> Driver<'a> {
     fn gate(&self, u: &UnitState) -> Res<Option<String>> {
         let pr = self.pr_of(u)?;
         let (n, p) = (u.unit.to_string(), pr.to_string());
+        // A base sync a dead driver left half done: finish it before the gate
+        // is read, or the gate would see a moved head and spend another sync
+        // or a repair round, or merge a head the delivery check never saw.
+        if !self.dry && self.unit_dir(u.unit).join(crate::base_sync::PENDING_MARKER).exists() {
+            self.base_sync(u)?;
+            return Ok(None);
+        }
         let start = Instant::now();
         let mut errors = 0;
         loop {

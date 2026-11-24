@@ -540,3 +540,54 @@ fn a_request_records_the_base_it_aimed_at() {
     printed(&c.sync());
     assert_eq!(c.env.events_named("base_sync_remote")[0]["base_head"], base);
 }
+
+#[test]
+fn a_sync_cut_short_right_after_the_update_call_is_finished_not_started_again() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    c.env.stub_file("die-after-update-branch", "");
+    let out = c.sync();
+    assert_ne!(out.code, 0, "the process was killed");
+    assert_eq!(c.update_calls(), 1);
+    assert!(c.env.workdir.join("units/3/base-sync-pending.json").is_file());
+
+    fs::remove_file(c.env.stub.join("die-after-update-branch")).unwrap();
+    let out = printed(&c.sync());
+    assert_eq!(out["new_head"], new_head);
+    assert_eq!(c.update_calls(), 1, "GitHub had applied it: no second update");
+    assert_eq!(c.env.events_named("base_sync_remote").len(), 1, "one slot for one sync");
+    assert_eq!(c.env.events_named("base_sync").len(), 1);
+    assert_eq!(git(&c.wt, &["rev-parse", "HEAD"]), new_head);
+    assert!(!c.env.workdir.join("units/3/base-sync-pending.json").exists());
+}
+
+#[test]
+fn a_pending_marker_whose_update_never_reached_github_asks_again_for_the_same_slot() {
+    let c = case();
+    let base = c.advance_base();
+    c.pr_is_at(&c.old_head);
+    let marker = json!({"pr": 7, "pr_head": c.old_head, "local_head": c.old_head, "base_head": base});
+    c.env.write("units/3/base-sync-pending.json", &marker.to_string());
+    let out = c.sync();
+    assert_eq!(out.code, 1, "GitHub's update is still not in the head: {}", out.stderr);
+    assert_eq!(c.update_calls(), 1, "the request is made again");
+    assert_eq!(
+        c.env.events_named("base_sync_remote").len(),
+        1,
+        "and spends no second slot"
+    );
+    assert!(c.env.workdir.join("units/3/base-sync-pending.json").is_file());
+}
+
+#[test]
+fn a_failed_update_call_leaves_no_pending_marker() {
+    let c = case();
+    c.advance_base();
+    let new_head = c.update_branch(true);
+    c.pr_is_at(&new_head);
+    c.env.stub_file("fail-update-branch", "");
+    assert_eq!(c.sync().code, 1);
+    assert!(!c.env.workdir.join("units/3/base-sync-pending.json").exists());
+}

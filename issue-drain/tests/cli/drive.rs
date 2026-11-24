@@ -1156,3 +1156,33 @@ fn a_pr_read_that_hangs_is_cut_off_and_blocks_the_unit_as_infrastructure() {
     assert!(comment.contains("timed out"), "{comment}");
     assert!(comment.contains("infrastructure"), "{comment}");
 }
+
+#[test]
+fn a_unit_with_a_sync_in_flight_finishes_it_before_the_gate_is_read() {
+    let c = case(&[1]);
+    c.seed(1, &GATE_PATH, Some(4701));
+    c.env.write("units/1/base-sync-pending.json", "{\"pr\": 4701}\n");
+    // The real base-sync removes the marker when it finishes.
+    fs::write(
+        c.fake.join("base-sync.sh"),
+        "rm -f \"$ISSUE_DRAIN_WORKDIR/units/1/base-sync-pending.json\"\n",
+    )
+    .unwrap();
+    c.canned(
+        "base-sync",
+        0,
+        &json!({"unit": 1, "deliver_ok": true, "review_round_needed": false}).to_string(),
+    );
+    c.canned("merge-gate", 0, &Case::clean());
+    c.canned_n("merge-gate", 2, 0, &Case::merged());
+    let (out, report) = c.drive(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        report["processed"],
+        json!([{"unit": 1, "state": "done"}]),
+        "{}",
+        c.last_comment()
+    );
+    assert_eq!(c.count("base-sync --unit 1 --pr 4701"), 1);
+    assert!(c.at("base-sync --unit 1") < c.at("merge-gate --unit 1 --pr 4701"));
+}
