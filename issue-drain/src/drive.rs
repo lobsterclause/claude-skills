@@ -7,8 +7,9 @@
 //! move (`drive: U1 -> parked (cap reached)`), a line before each long child
 //! (`unit-run`, `merge-gate`, `base-sync`, `post-merge`, `stamp-remote-pass`,
 //! `unit-prepare`, `cleanup`, `retro`) naming its `drive/<seq>-<name>.out|.err`
-//! files, and, while CI is awaited, a line at most every five minutes saying
-//! which unit and PR the driver waits on. `--quiet` turns all of it off. While
+//! files, and, while CI is awaited, a line about every five minutes (never more
+//! than one poll early) saying which unit and PR the driver waits on. `--quiet`
+//! turns all of it off. While
 //! the driver runs, `<run folder>/drive.pid` holds its pid; the file is removed
 //! on any return, but a killed driver leaves it, so a watcher must check the
 //! pid is alive (`kill -0`). The repo-level `drive.lock` below also holds a pid.
@@ -656,8 +657,9 @@ impl<'a> Driver<'a> {
             .event("drive", json!({"unit": unit, "step": what, "detail": detail}))
     }
 
-    /// Sleep one poll. While one unit keeps the driver waiting, say so at most
-    /// every five minutes.
+    /// Sleep one poll. While one unit keeps the driver waiting, say so about
+    /// every five minutes: never more than one poll early, and late by no more
+    /// than the gate call between polls.
     fn nap(&self, u: &UnitState) {
         let since = match self.waiting.get() {
             Some((unit, at)) if unit == u.unit => at,
@@ -668,7 +670,13 @@ impl<'a> Driver<'a> {
                 now
             }
         };
-        if self.last_beat.get().is_none_or(|t| t.elapsed() >= HEARTBEAT) {
+        // Say it now if waiting for the next poll would pass the heartbeat, so
+        // the gap between lines stays within HEARTBEAT plus one gate call.
+        if self
+            .last_beat
+            .get()
+            .is_none_or(|t| t.elapsed() + self.poll >= HEARTBEAT)
+        {
             let pr = u.pr.map_or_else(String::new, |p| format!(" PR #{p}"));
             self.say(&format!(
                 "U{}{pr} in {} waiting, {}s so far",

@@ -549,8 +549,18 @@ pub fn write(ctx: &Ctx, w: &Write) -> Res<Written> {
             if title.is_empty() {
                 return Err(Fail::usage("followup-create needs --title"));
             }
-            // `gh` splits a `--label` value on commas, so each part is checked.
-            for label in labels.iter().flat_map(|l| l.split(',')).map(str::trim) {
+            // `gh` reads a `--label` value as CSV, so a comma, a quote or a line
+            // break could smuggle in a label this check never saw. One label per
+            // `--label`, as written, is all it forwards.
+            if let Some(bad) = labels.iter().find(|l| l.contains([',', '"', '\n', '\r'])) {
+                return Err(refuse(
+                    ctx,
+                    verb,
+                    mode,
+                    format!("'{bad}' is not one label: pass each label with its own --label, without commas or quotes"),
+                ));
+            }
+            for label in labels.iter().map(|l| l.trim()) {
                 let why = if same_label(label, &p.tracker_label) {
                     "the tracker label"
                 } else if same_label(label, &p.claim_label) {
@@ -913,7 +923,7 @@ const USAGES: &[(&str, &str)] = &[
     ),
     (
         "followup-create",
-        "followup-create --title <text> --body-file <file> [--label <name>]...\n    Create an ordinary issue, never with the tracker or claim label (either is refused, exit 3, also inside a comma-separated value). Prints the new issue URL. A unit may.",
+        "followup-create --title <text> --body-file <file> [--label <name>]...\n    Create an ordinary issue, never with the tracker or claim label (either is refused, exit 3), one label per --label (a comma, quote or line break is refused). Prints the new issue URL. A unit may.",
     ),
     (
         "comment",

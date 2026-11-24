@@ -1015,8 +1015,10 @@ fn followup_create_refuses_the_claim_label_and_a_refused_label_inside_a_list() {
     for (label, why) in [
         ("agent-in-progress", "claim label"),
         ("Agent-In-Progress", "claim label"),
-        ("bug,issue-drain", "tracker label"),
-        ("bug, agent-in-progress", "claim label"),
+        ("bug,issue-drain", "not one label"),
+        ("bug, agent-in-progress", "not one label"),
+        ("\"issue-drain\"", "not one label"),
+        ("bug\nissue-drain", "not one label"),
     ] {
         let out = env.run(&[
             "gh-write",
