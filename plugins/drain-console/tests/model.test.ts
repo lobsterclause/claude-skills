@@ -171,6 +171,41 @@ test('a unit whose lines left the tail keeps its note and refusals, only with no
   expect(buildView({ ...quiet, eventsStart: 99_000, eventsEnd: 160_000 }, { ...first, runDir: '/x' }).units[0]?.note).toBe(null)
 })
 
+test('a failed read carries the last call, refusals and activity, but not onto a moved unit', () => {
+  const first = buildView(
+    files([unit(1, 'parked'), unit(2, 'ci_wait')], {
+      eventsTail: [
+        moved(1, 'parked', 'review cap reached'),
+        line({ event: 'merge_gate', unit: 2, merged: false, refusals: ['ci red'] }),
+        call(['unit-run', '--unit', '2'], 1),
+      ].join('\n'),
+      eventsStart: 0,
+      eventsEnd: 100_000,
+      eventsMtimeMs: T0 + 60_000,
+    }),
+  )
+  const failed = buildView(files([unit(1, 'parked'), unit(2, 'ci_wait')]), first)
+  expect(failed.lastCall).toBe('unit-run --unit 2 (exit 1)')
+  expect(failed.units[1]?.refusals).toEqual(['ci red'])
+  expect(failed.lastActivityMs).toBe(T0 + 60_000)
+
+  // Two failed reads in a row still hold the first good baseline.
+  const again = buildView(files([unit(1, 'parked'), unit(2, 'ci_wait')]), failed)
+  expect(again.eventsEnd).toBe(100_000)
+  expect(again.units[0]?.note).toBe('review cap reached')
+  expect(again.lastCall).toBe('unit-run --unit 2 (exit 1)')
+
+  // A unit that moved while events.jsonl could not be read gets no stale note or refusals.
+  const movedOn = buildView(files([unit(1, 'blocked'), unit(2, 'merged')]), again)
+  expect(movedOn.units[0]?.note).toBe(null)
+  expect(movedOn.units[1]?.refusals).toEqual([])
+  expect(transitions(again, movedOn)).toContainEqual({
+    kind: 'blocked',
+    text: 'U1 #101 blocked',
+    brief: 'U1 #101 blocked',
+  })
+})
+
 test('the summarise prompt carries no note or stop reason', () => {
   const before = buildView(files([unit(1, 'reviewing')]))
   const after = buildView(

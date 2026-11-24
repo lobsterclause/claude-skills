@@ -258,7 +258,8 @@ const msOf = (iso: string | null): number | null => {
  *
  * A poll that could not read events.jsonl at all keeps the last view's event
  * details and end offset, so the next successful read is still checked
- * against the last one that worked.
+ * against the last one that worked. In both cases a unit whose state changed
+ * since the last view takes no note or refusals from it.
  */
 export function buildView(files: RunFiles, prev: View | null = null): View {
   const state = parseState(files.state)
@@ -276,6 +277,8 @@ export function buildView(files: RunFiles, prev: View | null = null): View {
     (files.eventsStart === 0 || files.eventsStart < prev.eventsEnd)
   const unread =
     files.eventsEnd === null &&
+    files.eventsStart === null &&
+    files.eventsTail === null &&
     prev !== null &&
     prev.runDir === files.runDir &&
     prev.eventsEnd !== undefined &&
@@ -283,7 +286,10 @@ export function buildView(files: RunFiles, prev: View | null = null): View {
   const before = new Map(unbroken || unread ? prev.units.map(u => [u.unit, u]) : [])
   const units: UnitRow[] = state.units.map(u => {
     const id = `U${u.unit}`
-    const old = before.get(u.unit)
+    // A unit that changed state since the last view keeps nothing from it: an
+    // old note would read as the reason for the new state.
+    const last = before.get(u.unit)
+    const old = last !== undefined && last.state === u.state ? last : undefined
     return {
       unit: u.unit,
       id,
@@ -298,7 +304,7 @@ export function buildView(files: RunFiles, prev: View | null = null): View {
     }
   })
   const finished = units.filter(u => TERMINAL.has(u.state)).length
-  let lastActivityMs = files.eventsMtimeMs
+  let lastActivityMs = files.eventsMtimeMs ?? (unread ? prev.lastActivityMs : null)
   for (const u of units) {
     if (u.updatedMs !== null && (lastActivityMs === null || u.updatedMs > lastActivityMs)) {
       lastActivityMs = u.updatedMs
